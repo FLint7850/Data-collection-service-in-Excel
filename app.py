@@ -213,6 +213,36 @@ def normalize_start_urls(value: object) -> List[str]:
     return urls or [DEFAULT_START_URL]
 
 
+def normalize_feed_url(raw_url: str) -> str:
+    raw_url = str(raw_url or "").strip()
+    if not raw_url:
+        return ""
+    if not raw_url.startswith(("http://", "https://")):
+        raw_url = "https://" + raw_url
+    absolute_url, _fragment = urldefrag(raw_url)
+    parsed = urlparse(absolute_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", parsed.query, ""))
+
+
+def normalize_feed_urls(value: object, fallback: str) -> List[str]:
+    if isinstance(value, str):
+        raw_items = re.split(r"[\n,]+", value)
+    elif isinstance(value, list):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = [fallback]
+
+    urls = []
+    for item in raw_items:
+        normalized = normalize_feed_url(item)
+        if normalized and normalized not in urls:
+            urls.append(normalized)
+    return urls or [fallback]
+
+
 def normalize_patterns(value: object) -> List[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\n,]+", value)
@@ -755,20 +785,20 @@ def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]
         for index, item in enumerate(settings.get("own_sites", []), start=1):
             if not isinstance(item, dict):
                 continue
-            feed_url = str(item.get("feed_url") or "").strip()
+            feed_url = normalize_feed_url(str(item.get("feed_url") or "").strip())
             if not feed_url:
                 continue
             sites.append(
                 {
                     "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
                     "feed_url": feed_url,
-                    "feed_generate_url": str(item.get("feed_generate_url") or "").strip(),
+                    "feed_generate_url": normalize_feed_url(str(item.get("feed_generate_url") or "").strip()),
                 }
             )
         if sites:
             return sites
-    feed_urls = normalize_start_urls(settings.get("feed_urls") or settings.get("feed_url") or DEFAULT_FEED_URL)
-    generate_urls = normalize_start_urls(settings.get("feed_generate_urls") or settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL)
+    feed_urls = normalize_feed_urls(settings.get("feed_urls") or settings.get("feed_url") or DEFAULT_FEED_URL, DEFAULT_FEED_URL)
+    generate_urls = normalize_feed_urls(settings.get("feed_generate_urls") or settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL, DEFAULT_FEED_GENERATE_URL)
     sites = []
     for index, feed_url in enumerate(feed_urls):
         generate_url = generate_urls[index] if index < len(generate_urls) else (generate_urls[0] if generate_urls else "")
@@ -3802,12 +3832,10 @@ def api_update_news_settings():
             own_sites_payload = [item for item in payload.get("own_sites", []) if isinstance(item, dict)]
             own_sites = []
             for index, item in enumerate(own_sites_payload, start=1):
-                raw_feed_url = str(item.get("feed_url") or "").strip()
-                feed_url = normalize_url(raw_feed_url, raw_feed_url)
+                feed_url = normalize_feed_url(str(item.get("feed_url") or "").strip())
                 if not feed_url:
                     continue
-                raw_generate_url = str(item.get("feed_generate_url") or "").strip()
-                feed_generate_url = normalize_url(raw_generate_url, raw_generate_url) if raw_generate_url else ""
+                feed_generate_url = normalize_feed_url(str(item.get("feed_generate_url") or "").strip())
                 own_sites.append(
                     {
                         "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
@@ -3836,11 +3864,11 @@ def api_update_news_settings():
         if "feed_generate_url" in payload:
             news_settings["feed_generate_url"] = str(payload.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL).strip()
         if "feed_urls" in payload:
-            feed_urls = normalize_start_urls(payload.get("feed_urls") or DEFAULT_FEED_URL)
+            feed_urls = normalize_feed_urls(payload.get("feed_urls") or DEFAULT_FEED_URL, DEFAULT_FEED_URL)
             news_settings["feed_urls"] = feed_urls
             news_settings["feed_url"] = feed_urls[0] if feed_urls else DEFAULT_FEED_URL
         if "feed_generate_urls" in payload:
-            feed_generate_urls = normalize_start_urls(payload.get("feed_generate_urls") or DEFAULT_FEED_GENERATE_URL)
+            feed_generate_urls = normalize_feed_urls(payload.get("feed_generate_urls") or DEFAULT_FEED_GENERATE_URL, DEFAULT_FEED_GENERATE_URL)
             news_settings["feed_generate_urls"] = feed_generate_urls
             news_settings["feed_generate_url"] = feed_generate_urls[0] if feed_generate_urls else DEFAULT_FEED_GENERATE_URL
         if "auto_cleanup" in payload:
