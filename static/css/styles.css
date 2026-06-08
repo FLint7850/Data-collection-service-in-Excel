@@ -104,6 +104,69 @@ h2 {
   gap: 8px;
 }
 
+.project-tab {
+  display: inline-flex;
+  align-items: stretch;
+  min-height: 40px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.project-tab.active {
+  border-color: var(--primary);
+  background: rgba(45, 168, 157, 0.16);
+}
+
+.project-tab-button,
+.project-tab-close {
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.project-tab-button {
+  min-width: 0;
+  max-width: 180px;
+  padding: 8px 10px 8px 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  min-width: 34px;
+  border-left: 1px solid var(--line);
+  padding: 0;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.project-tab.active .project-tab-button {
+  color: var(--text);
+}
+
+.project-tab-close:hover {
+  color: var(--danger);
+  background: rgba(210, 100, 95, 0.16);
+}
+
+.project-tab-close:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.project-tab-close:disabled:hover {
+  color: var(--muted);
+  background: transparent;
+}
+
 .tab-button {
   min-height: 40px;
   border: 1px solid var(--line);
@@ -177,7 +240,7 @@ h2 {
 .control-panel {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) 110px auto;
-  align-items: end;
+  align-items: start;
   gap: 18px;
   margin-bottom: 20px;
 }
@@ -825,6 +888,10 @@ select:focus {
   background: var(--panel);
   box-shadow: 0 28px 80px rgba(0, 0, 0, 0.48);
   padding: 20px;
+}
+
+.confirm-modal-panel {
+  width: min(480px, 100%);
 }
 
 .modal-head {

@@ -237,6 +237,22 @@
       </div>
     </section>
 
+    <div class="modal-backdrop hidden" id="deleteProjectModal" aria-hidden="true">
+      <div class="modal-panel confirm-modal-panel" role="dialog" aria-modal="true" aria-labelledby="deleteProjectTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="deleteProjectTitle">Удалить проект</h2>
+            <p id="deleteProjectText"></p>
+          </div>
+          <button class="remove-button modal-close" id="cancelDeleteProjectIconButton" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <div class="modal-actions">
+          <button class="button danger" id="confirmDeleteProjectButton" type="button">Удалить</button>
+          <button class="button secondary" id="cancelDeleteProjectButton" type="button">Отмена</button>
+        </div>
+      </div>
+    </div>
+
     <section class="logs-view hidden" id="logsView">
       <div class="panel logs-panel">
         <div class="logs-header">

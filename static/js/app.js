@@ -64,6 +64,11 @@ const newsModalTitle = document.querySelector("#newsModalTitle");
 const newsModalSubtitle = document.querySelector("#newsModalSubtitle");
 const newsModalContent = document.querySelector("#newsModalContent");
 const closeNewsModalButton = document.querySelector("#closeNewsModalButton");
+const deleteProjectModal = document.querySelector("#deleteProjectModal");
+const deleteProjectText = document.querySelector("#deleteProjectText");
+const confirmDeleteProjectButton = document.querySelector("#confirmDeleteProjectButton");
+const cancelDeleteProjectButton = document.querySelector("#cancelDeleteProjectButton");
+const cancelDeleteProjectIconButton = document.querySelector("#cancelDeleteProjectIconButton");
 
 let projects = [];
 let newsData = null;
@@ -77,6 +82,8 @@ const monitorSaveTimers = new Map();
 const selectedNewsSites = new Map();
 let activeNewsBrandKey = null;
 let activeNewsSelectorsOpen = false;
+let pendingDeleteProjectId = null;
+let tabsRenderKey = "";
 
 const statusLabels = {
   idle: "ожидание",
@@ -144,21 +151,82 @@ function setControls(status) {
 }
 
 function renderTabs() {
+  const nextRenderKey = JSON.stringify({
+    activeProjectId,
+    activeView,
+    projects: projects.map((project) => ({
+      id: project.id,
+      name: project.name,
+    })),
+  });
+  if (nextRenderKey === tabsRenderKey) {
+    return;
+  }
+  tabsRenderKey = nextRenderKey;
+
   projectTabs.innerHTML = "";
   projects.forEach((project) => {
+    const tab = document.createElement("div");
+    tab.className = `project-tab ${project.id === activeProjectId && activeView === "project" ? "active" : ""}`;
+
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `tab-button ${project.id === activeProjectId && activeView === "project" ? "active" : ""}`;
+    button.className = "project-tab-button";
     button.textContent = project.name;
     button.addEventListener("click", () => {
       activeView = "project";
       activeProjectId = project.id;
       renderAll();
     });
-    projectTabs.append(button);
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "project-tab-close";
+    closeButton.textContent = "×";
+    closeButton.dataset.projectId = project.id;
+    closeButton.setAttribute("aria-label", `Удалить проект ${project.name}`);
+    closeButton.disabled = projects.length <= 1;
+    closeButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openDeleteProjectModal(event.currentTarget.dataset.projectId);
+    });
+
+    tab.append(button, closeButton);
+    projectTabs.append(tab);
   });
   newItemsTabButton.classList.toggle("active", activeView === "news");
   logsTabButton.classList.toggle("active", activeView === "logs");
+}
+
+function openDeleteProjectModal(projectId) {
+  const project = projects.find((item) => item.id === projectId);
+  if (!project) return;
+  pendingDeleteProjectId = projectId;
+  deleteProjectText.textContent = `Проект "${project.name}" будет удален. Это действие нельзя отменить.`;
+  deleteProjectModal.classList.remove("hidden");
+  deleteProjectModal.setAttribute("aria-hidden", "false");
+  confirmDeleteProjectButton.focus();
+}
+
+function closeDeleteProjectModal() {
+  pendingDeleteProjectId = null;
+  deleteProjectModal.classList.add("hidden");
+  deleteProjectModal.setAttribute("aria-hidden", "true");
+}
+
+async function deletePendingProject() {
+  const projectId = pendingDeleteProjectId;
+  if (!projectId) return;
+
+  const index = projects.findIndex((project) => project.id === projectId);
+  await requestJson(`/api/projects/${projectId}`, { method: "DELETE" });
+  projects = projects.filter((project) => project.id !== projectId);
+  if (activeProjectId === projectId) {
+    activeProjectId = projects[Math.max(0, index - 1)]?.id || projects[0]?.id || null;
+    activeView = "project";
+  }
+  closeDeleteProjectModal();
+  renderAll();
 }
 
 function renderProjectForm(project) {
@@ -942,6 +1010,21 @@ newsGroups.addEventListener("click", async (event) => {
 });
 
 closeNewsModalButton.addEventListener("click", closeNewsModal);
+
+cancelDeleteProjectButton.addEventListener("click", closeDeleteProjectModal);
+cancelDeleteProjectIconButton.addEventListener("click", closeDeleteProjectModal);
+confirmDeleteProjectButton.addEventListener("click", () => {
+  deletePendingProject().catch((error) => {
+    errorText.textContent = error.message;
+    closeDeleteProjectModal();
+  });
+});
+
+deleteProjectModal.addEventListener("click", (event) => {
+  if (event.target === deleteProjectModal) {
+    closeDeleteProjectModal();
+  }
+});
 
 newsMonitorModal.addEventListener("click", (event) => {
   if (event.target === newsMonitorModal) {
