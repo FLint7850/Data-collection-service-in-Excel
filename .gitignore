@@ -28,6 +28,9 @@ logs.json
 projects.json
 new_items.json
 exclusions.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
 
 # Logs
 /logs

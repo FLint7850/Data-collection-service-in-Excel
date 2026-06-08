@@ -21,8 +21,11 @@ import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, Response, jsonify, render_template, request, send_file
+from flask import Flask, Response, g, jsonify, render_template, request, send_file
+from sqlalchemy import delete, select
 
+from db import SessionLocal, init_db, session_scope
+from models import AppSetting, Brand, Donor, FeedProduct, LogEntry, OwnSite, Project, ScanRun
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -84,6 +87,41 @@ BLOCKED_PAGE_MARKERS = (
 )
 
 app = Flask(__name__)
+
+
+def load_env_file() -> None:
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file()
+
+
+@app.before_request
+def open_request_db_session() -> None:
+    g.db = SessionLocal()
+
+
+@app.teardown_request
+def close_request_db_session(error: Optional[BaseException] = None) -> None:
+    db = g.pop("db", None)
+    if db is None:
+        return
+    if error is None:
+        db.commit()
+    else:
+        db.rollback()
+    db.close()
 
 state_lock = threading.RLock()
 exclusions_lock = threading.Lock()
@@ -148,6 +186,7 @@ def ensure_storage() -> None:
     EXPORT_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     FEED_DIR.mkdir(exist_ok=True)
+    init_db()
     if not EXCLUSIONS_FILE.exists():
         save_exclusions(DEFAULT_EXCLUSIONS)
     load_projects()
@@ -257,103 +296,168 @@ def public_project(project: Dict[str, object]) -> Dict[str, object]:
     }
 
 
+def project_model_to_dict(row: Project) -> Dict[str, object]:
+    thread_count = parse_thread_count(row.thread_count)
+    project = {
+        "id": row.id,
+        "name": row.name,
+        "start_urls": normalize_start_urls(row.start_urls or [DEFAULT_START_URL]),
+        "thread_count": thread_count,
+        "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
+        "product_url_filters": normalize_patterns(row.product_url_filters or []),
+        "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
+        "state": {**make_state(thread_count), **(row.state or {})},
+        "logs": [],
+        "auto_cleanup": bool(row.auto_cleanup),
+        "connection_method": normalize_connection_method(row.connection_method),
+        "auto_connection_fallback": bool(row.auto_connection_fallback),
+        "worker_thread": None,
+        "stop_event": threading.Event(),
+        "finish_event": threading.Event(),
+        "crawler": None,
+        "run_id": 0,
+    }
+    if project["state"].get("status") == "running":
+        project["state"]["status"] = "error"
+        project["state"]["error"] = "Сбор был прерван перезапуском сервера. Запустите его снова."
+    return project
+
+
+def upsert_project_model(session, project: Dict[str, object]) -> None:
+    row = session.get(Project, str(project["id"]))
+    if row is None:
+        row = Project(id=str(project["id"]), name=str(project.get("name") or "Проект"))
+        session.add(row)
+    row.name = str(project.get("name") or "Проект")
+    row.start_urls = normalize_start_urls(project.get("start_urls") or DEFAULT_START_URL)
+    row.thread_count = parse_thread_count(project.get("thread_count", 4))
+    row.exclusions = normalize_patterns(project.get("exclusions", DEFAULT_EXCLUSIONS))
+    row.product_url_filters = normalize_patterns(project.get("product_url_filters", []))
+    row.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
+    row.state = dict(project.get("state") or make_state(row.thread_count))
+    row.auto_cleanup = bool(project.get("auto_cleanup", False))
+    row.connection_method = normalize_connection_method(project.get("connection_method"))
+    row.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
+
+
 def save_projects() -> None:
     with projects_lock:
-        data = []
-        for project in projects.values():
-            data.append(
-                {
-                    "id": project["id"],
-                    "name": project["name"],
-                    "start_urls": project["start_urls"],
-                    "thread_count": project["thread_count"],
-                    "exclusions": project["exclusions"],
-                    "product_url_filters": project.get("product_url_filters", []),
-                    "extraction_rules": project.get("extraction_rules", {}),
-                    "auto_cleanup": project.get("auto_cleanup", False),
-                    "connection_method": project.get("connection_method", "requests"),
-                    "auto_connection_fallback": project.get("auto_connection_fallback", True),
-                }
-            )
-        PROJECTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with session_scope() as session:
+            current_ids = set()
+            for project in projects.values():
+                current_ids.add(str(project["id"]))
+                upsert_project_model(session, project)
+            if current_ids:
+                session.execute(delete(Project).where(Project.id.not_in(current_ids)))
 
 
 def save_logs() -> None:
     with projects_lock:
-        data = []
-        for project in projects.values():
-            data.extend(project.get("logs", []))
-        LOGS_FILE.parent.mkdir(exist_ok=True)
-        LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        with session_scope() as session:
+            session.execute(delete(LogEntry).where(LogEntry.project_id.not_like("news%")))
+            for project in projects.values():
+                for item in project.get("logs", []):
+                    session.add(
+                        LogEntry(
+                            time=str(item.get("time") or datetime.now().isoformat(timespec="seconds")),
+                            project_id=str(item.get("project_id") or project["id"]),
+                            project_name=str(item.get("project_name") or project["name"]),
+                            level=str(item.get("level") or "info"),
+                            message=str(item.get("message") or ""),
+                        )
+                    )
 
 
 def load_logs() -> None:
-    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
-    if not source_file.exists():
-        return
-    try:
-        data = json.loads(source_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(data, list):
-        return
+    data: List[Dict[str, object]] = []
+    with session_scope() as session:
+        rows = session.scalars(select(LogEntry).where(LogEntry.project_id.not_like("news%")).order_by(LogEntry.id)).all()
+        if not rows:
+            source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
+            if source_file.exists():
+                try:
+                    loaded = json.loads(source_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    loaded = []
+                if isinstance(loaded, list):
+                    for item in loaded:
+                        if not isinstance(item, dict):
+                            continue
+                        session.add(
+                            LogEntry(
+                                time=str(item.get("time") or datetime.now().isoformat(timespec="seconds")),
+                                project_id=str(item.get("project_id") or ""),
+                                project_name=str(item.get("project_name") or ""),
+                                level=str(item.get("level") or "info"),
+                                message=str(item.get("message") or ""),
+                            )
+                        )
+                    session.flush()
+                    rows = session.scalars(select(LogEntry).where(LogEntry.project_id.not_like("news%")).order_by(LogEntry.id)).all()
+        data = [
+            {
+                "time": row.time,
+                "project_id": row.project_id,
+                "project_name": row.project_name,
+                "level": row.level,
+                "message": row.message,
+            }
+            for row in rows
+        ]
     for item in data:
-        if not isinstance(item, dict):
-            continue
         project_id = item.get("project_id")
         project = projects.get(project_id)
         if project:
             project.setdefault("logs", []).append(item)
-    if source_file == LEGACY_LOGS_FILE:
-        save_logs()
 
 
 def load_projects() -> None:
     with projects_lock:
         if projects:
             return
-        loaded = []
-        if PROJECTS_FILE.exists():
-            try:
-                loaded = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                loaded = []
+        with session_scope() as session:
+            rows = session.scalars(select(Project).order_by(Project.created_at, Project.id)).all()
 
-        if not isinstance(loaded, list) or not loaded:
-            project = make_project("Проект 1", [DEFAULT_START_URL])
-            projects[project["id"]] = project
+        if not rows:
+            loaded = []
+            if PROJECTS_FILE.exists():
+                try:
+                    loaded = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    loaded = []
+            if isinstance(loaded, list) and loaded:
+                for item in loaded:
+                    if not isinstance(item, dict):
+                        continue
+                    project_id = str(item.get("id") or uuid.uuid4().hex[:10])
+                    thread_count = parse_thread_count(item.get("thread_count", 4))
+                    project = {
+                        "id": project_id,
+                        "name": str(item.get("name") or "Проект"),
+                        "start_urls": normalize_start_urls(item.get("start_urls") or [DEFAULT_START_URL]),
+                        "thread_count": thread_count,
+                        "exclusions": normalize_patterns(item.get("exclusions", DEFAULT_EXCLUSIONS)),
+                        "product_url_filters": normalize_patterns(item.get("product_url_filters", [])),
+                        "extraction_rules": normalize_extraction_rules(item.get("extraction_rules", {})),
+                        "state": make_state(thread_count),
+                        "logs": [],
+                        "auto_cleanup": bool(item.get("auto_cleanup", False)),
+                        "connection_method": normalize_connection_method(item.get("connection_method")),
+                        "auto_connection_fallback": bool(item.get("auto_connection_fallback", True)),
+                        "worker_thread": None,
+                        "stop_event": threading.Event(),
+                        "finish_event": threading.Event(),
+                        "crawler": None,
+                        "run_id": 0,
+                    }
+                    projects[project_id] = project
+            else:
+                project = make_project("Проект 1", [DEFAULT_START_URL])
+                projects[project["id"]] = project
             save_projects()
-            return
-
-        for item in loaded:
-            if not isinstance(item, dict):
-                continue
-            project_id = str(item.get("id") or uuid.uuid4().hex[:10])
-            thread_count = parse_thread_count(item.get("thread_count", 4))
-            project = {
-                "id": project_id,
-                "name": str(item.get("name") or "Проект"),
-                "start_urls": normalize_start_urls(item.get("start_urls") or [DEFAULT_START_URL]),
-                "thread_count": thread_count,
-                "exclusions": [
-                    str(pattern).strip()
-                    for pattern in item.get("exclusions", DEFAULT_EXCLUSIONS)
-                    if str(pattern).strip()
-                ],
-                "product_url_filters": normalize_patterns(item.get("product_url_filters", [])),
-                "extraction_rules": normalize_extraction_rules(item.get("extraction_rules", {})),
-                "state": make_state(thread_count),
-                "logs": [],
-                "auto_cleanup": bool(item.get("auto_cleanup", False)),
-                "connection_method": normalize_connection_method(item.get("connection_method")),
-                "auto_connection_fallback": bool(item.get("auto_connection_fallback", True)),
-                "worker_thread": None,
-                "stop_event": threading.Event(),
-                "finish_event": threading.Event(),
-                "crawler": None,
-                "run_id": 0,
-            }
-            projects[project_id] = project
+        else:
+            for row in rows:
+                projects[row.id] = project_model_to_dict(row)
 
         if not projects:
             project = make_project("Проект 1", [DEFAULT_START_URL])
@@ -420,7 +524,7 @@ def default_news_settings() -> Dict[str, object]:
             "port": 465,
             "security": "ssl",
             "username": "",
-            "password": os.environ.get("YANDEX_SMTP_PASSWORD", "xsitasicmwhkwyqz"),
+            "password": os.environ.get("YANDEX_SMTP_PASSWORD", ""),
             "recipients": [],
         },
         "monitors": [],
@@ -578,39 +682,220 @@ def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object
     return monitors
 
 
+def group_type_from_group(group: str) -> str:
+    normalized = clean_text(group).lower()
+    return "margin" if "марж" in normalized or "margin" in normalized else "non_margin"
+
+
+def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
+    brand = row.brand
+    monitor = {
+        "id": row.id,
+        "group": brand.group_name if brand else "",
+        "brand": brand.name if brand else "Донор",
+        "site_url": row.site_url,
+        "start_urls": normalize_start_urls(row.start_urls or row.site_url or DEFAULT_START_URL),
+        "enabled": bool(row.enabled),
+        "schedule_type": row.schedule_type,
+        "scan_time": row.scan_time,
+        "weekday": max(0, min(int(row.weekday or 0), 6)),
+        "next_run_at": row.next_run_at,
+        "thread_count": parse_thread_count(row.thread_count),
+        "connection_method": normalize_connection_method(row.connection_method),
+        "auto_connection_fallback": bool(row.auto_connection_fallback),
+        "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
+        "product_url_filters": normalize_patterns(row.product_url_filters or []),
+        "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
+        "selector_settings": normalize_selector_settings(row.selector_settings or {}),
+        "seen_models": [normalize_model_key(str(value)) for value in (row.seen_models or []) if str(value).strip()],
+        "known_new_products": row.known_new_products or {},
+        "state": {**make_news_state(), **(row.state or {})},
+        "collapsed": bool(brand.collapsed) if brand else True,
+    }
+    if monitor["state"].get("status") in {"running", "queued"}:
+        monitor["state"]["status"] = "error"
+        monitor["state"]["stage"] = "Прервано"
+        monitor["state"]["error"] = "Сканирование было прервано перезапуском сервера. Запустите его снова."
+        monitor["state"]["currenturl"] = ""
+    return monitor
+
+
+def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
+    name = clean_text(str(monitor.get("brand") or "Донор"))
+    group_name = clean_text(str(monitor.get("group") or "Маржа"))
+    group_type = group_type_from_group(group_name)
+    row = session.scalar(select(Brand).where(Brand.name == name, Brand.group_type == group_type))
+    if row is None:
+        row = Brand(name=name, group_name=group_name, group_type=group_type, collapsed=bool(monitor.get("collapsed", True)))
+        session.add(row)
+        session.flush()
+    else:
+        row.group_name = group_name
+        row.collapsed = bool(monitor.get("collapsed", row.collapsed))
+    return row
+
+
+def upsert_donor_model(session, monitor: Dict[str, object]) -> None:
+    normalized = normalize_news_monitor(monitor)
+    brand = get_or_create_brand(session, normalized)
+    row = session.get(Donor, str(normalized["id"]))
+    if row is None:
+        row = Donor(id=str(normalized["id"]), brand_id=brand.id)
+        session.add(row)
+    row.brand_id = brand.id
+    row.site_url = str(normalized.get("site_url") or "")
+    row.start_urls = normalize_start_urls(normalized.get("start_urls") or normalized.get("site_url") or DEFAULT_START_URL)
+    row.enabled = bool(normalized.get("enabled", True))
+    row.schedule_type = str(normalized.get("schedule_type") or "daily")
+    row.scan_time = str(normalized.get("scan_time") or "01:00")[:5]
+    row.weekday = max(0, min(int(normalized.get("weekday", 0) or 0), 6))
+    row.next_run_at = str(normalized.get("next_run_at") or "")
+    row.thread_count = parse_thread_count(normalized.get("thread_count", 4))
+    row.connection_method = normalize_connection_method(normalized.get("connection_method"))
+    row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
+    row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
+    row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
+    row.extraction_rules = normalize_extraction_rules(normalized.get("extraction_rules", {}))
+    row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
+    row.seen_models = [normalize_model_key(str(value)) for value in normalized.get("seen_models", []) if str(value).strip()]
+    row.known_new_products = normalized.get("known_new_products", {}) if isinstance(normalized.get("known_new_products"), dict) else {}
+    row.state = dict(normalized.get("state") or make_news_state())
+
+
+def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]:
+    feed_urls = normalize_start_urls(settings.get("feed_urls") or settings.get("feed_url") or DEFAULT_FEED_URL)
+    generate_urls = normalize_start_urls(settings.get("feed_generate_urls") or settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL)
+    sites = []
+    for index, feed_url in enumerate(feed_urls):
+        generate_url = generate_urls[index] if index < len(generate_urls) else (generate_urls[0] if generate_urls else "")
+        sites.append({"feed_url": feed_url, "feed_generate_url": generate_url})
+    return sites
+
+
+def save_news_logs_to_db(session, logs: List[Dict[str, object]]) -> None:
+    session.execute(delete(LogEntry).where(LogEntry.project_id.like("news%")))
+    for item in logs:
+        if not isinstance(item, dict):
+            continue
+        session.add(
+            LogEntry(
+                time=str(item.get("time") or datetime.now().isoformat(timespec="seconds")),
+                project_id=str(item.get("project_id") or "news"),
+                project_name=str(item.get("project_name") or "Новинки"),
+                level=str(item.get("level") or "info"),
+                message=str(item.get("message") or ""),
+            )
+        )
+
+
 def save_news_settings() -> None:
     with news_lock:
-        NEWS_FILE.write_text(json.dumps(news_settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        with session_scope() as session:
+            smtp = dict(news_settings.get("smtp", {}))
+            smtp.pop("sender", None)
+            settings_payload = {
+                "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
+                "smtp": smtp,
+                "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
+            }
+            app_setting = session.get(AppSetting, "news")
+            if app_setting is None:
+                app_setting = AppSetting(key="news", value=settings_payload)
+                session.add(app_setting)
+            else:
+                app_setting.value = settings_payload
+
+            current_donor_ids = set()
+            for monitor in news_settings.get("monitors", []):
+                if not isinstance(monitor, dict):
+                    continue
+                current_donor_ids.add(str(monitor.get("id")))
+                upsert_donor_model(session, monitor)
+            if current_donor_ids:
+                session.execute(delete(Donor).where(Donor.id.not_in(current_donor_ids)))
+
+            current_feed_urls = set()
+            for site in own_sites_from_settings(news_settings):
+                current_feed_urls.add(site["feed_url"])
+                row = session.scalar(select(OwnSite).where(OwnSite.feed_url == site["feed_url"]))
+                if row is None:
+                    row = OwnSite(feed_url=site["feed_url"], feed_generate_url=site["feed_generate_url"])
+                    session.add(row)
+                else:
+                    row.feed_generate_url = site["feed_generate_url"]
+            if current_feed_urls:
+                session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
+
+            save_news_logs_to_db(session, list(news_settings.get("logs", [])) if isinstance(news_settings.get("logs"), list) else [])
 
 
 def load_news_settings() -> None:
     with news_lock:
         if news_settings:
             return
-        loaded: Dict[str, object] = {}
-        if NEWS_FILE.exists():
-            try:
-                loaded = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                loaded = {}
         settings = default_news_settings()
-        if isinstance(loaded, dict):
-            settings.update({key: value for key, value in loaded.items() if key not in {"smtp", "monitors", "logs"}})
-            smtp = settings["smtp"]
-            if isinstance(loaded.get("smtp"), dict):
-                smtp.update(loaded["smtp"])
-            smtp.pop("sender", None)
-            settings["smtp"] = smtp
-            settings["logs"] = loaded.get("logs", []) if isinstance(loaded.get("logs"), list) else []
-            monitors = loaded.get("monitors", [])
-            if isinstance(monitors, list):
-                normalized_monitors = []
-                for item in monitors:
-                    if isinstance(item, dict):
-                        normalized_monitors.extend(split_news_monitor_by_site(item))
-                settings["monitors"] = normalized_monitors
-        if not settings["monitors"]:
-            settings["monitors"] = import_news_monitors_from_excel()
+        with session_scope() as session:
+            donor_rows = session.scalars(select(Donor).join(Brand).order_by(Brand.group_name, Brand.name, Donor.id)).all()
+            if donor_rows:
+                app_setting = session.get(AppSetting, "news")
+                if app_setting and isinstance(app_setting.value, dict):
+                    saved = app_setting.value
+                    settings["auto_cleanup"] = bool(saved.get("auto_cleanup", False))
+                    if isinstance(saved.get("smtp"), dict):
+                        smtp = dict(settings["smtp"])
+                        smtp.update(saved["smtp"])
+                        smtp.pop("sender", None)
+                        settings["smtp"] = smtp
+                    if isinstance(saved.get("feed_storage"), list):
+                        settings["feed_storage"] = saved["feed_storage"]
+                own_sites = session.scalars(select(OwnSite).order_by(OwnSite.id)).all()
+                if own_sites:
+                    feed_urls = [site.feed_url for site in own_sites]
+                    generate_urls = [site.feed_generate_url for site in own_sites]
+                    settings["feed_urls"] = feed_urls
+                    settings["feed_generate_urls"] = generate_urls
+                    settings["feed_url"] = feed_urls[0]
+                    settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
+                settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
+                settings["logs"] = [
+                    {
+                        "time": row.time,
+                        "project_id": row.project_id,
+                        "project_name": row.project_name,
+                        "level": row.level,
+                        "message": row.message,
+                    }
+                    for row in session.scalars(select(LogEntry).where(LogEntry.project_id.like("news%")).order_by(LogEntry.id)).all()
+                ]
+            else:
+                loaded: Dict[str, object] = {}
+                if NEWS_FILE.exists():
+                    try:
+                        loaded = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        loaded = {}
+                if isinstance(loaded, dict):
+                    settings.update({key: value for key, value in loaded.items() if key not in {"smtp", "monitors", "logs"}})
+                    smtp = dict(settings["smtp"])
+                    if isinstance(loaded.get("smtp"), dict):
+                        smtp.update(loaded["smtp"])
+                    smtp.pop("sender", None)
+                    if not smtp.get("password"):
+                        smtp["password"] = os.environ.get("YANDEX_SMTP_PASSWORD", "")
+                    settings["smtp"] = smtp
+                    settings["logs"] = loaded.get("logs", []) if isinstance(loaded.get("logs"), list) else []
+                    monitors = loaded.get("monitors", [])
+                    if isinstance(monitors, list):
+                        normalized_monitors = []
+                        for item in monitors:
+                            if isinstance(item, dict):
+                                normalized_monitors.extend(split_news_monitor_by_site(item))
+                        settings["monitors"] = normalized_monitors
+                if not settings["monitors"]:
+                    settings["monitors"] = import_news_monitors_from_excel()
+                news_settings.update(settings)
+                save_news_settings()
+                return
         news_settings.update(settings)
         save_news_settings()
 
@@ -2930,15 +3215,25 @@ def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
     downloaded_feeds = download_feed_files()
     codes: Set[str] = set()
     feeds: List[Dict[str, object]] = []
+    parsed_by_url: Dict[str, List[Dict[str, object]]] = {}
     for feed in downloaded_feeds:
         filename = str(feed.get("filename") or "")
         path = source_feed_dir(str(feed.get("source") or "")) / filename
         try:
-            feed_codes = parse_vendor_codes_from_xml(path.read_bytes())
+            feed_products = parse_feed_products_from_xml(path.read_bytes())
+            parsed_by_url[str(feed.get("url") or "")] = feed_products
+            feed_codes = {
+                value
+                for product in feed_products
+                for value in (str(product.get("vendor_code") or ""), str(product.get("model_key") or ""))
+                if value
+            }
             codes.update(feed_codes)
             feeds.append({**feed, "codes_count": len(feed_codes)})
         except Exception as exc:
             feeds.append({**feed, "codes_count": 0, "error": str(exc)})
+    save_feed_products(parsed_by_url)
+    codes.update(load_feed_product_keys())
     with news_lock:
         news_settings["feed_storage"] = feeds
         save_news_settings()
@@ -2946,13 +3241,77 @@ def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
 
 
 def parse_vendor_codes_from_xml(content: bytes) -> Set[str]:
-    codes: Set[str] = set()
+    return {
+        value
+        for product in parse_feed_products_from_xml(content)
+        for value in (str(product.get("vendor_code") or ""), str(product.get("model_key") or ""))
+        if value
+    }
+
+
+def parse_feed_products_from_xml(content: bytes) -> List[Dict[str, object]]:
+    products: List[Dict[str, object]] = []
     root = ET.fromstring(content)
     for node in root.iter():
-        if str(node.tag).lower().endswith("vendorcode") and node.text:
-            code = normalize_model_key(node.text)
-            if code:
-                codes.add(code)
+        children = list(node)
+        if not children:
+            continue
+        values: Dict[str, str] = {}
+        for child in children:
+            key = str(child.tag).split("}")[-1].lower()
+            values[key] = clean_text(child.text or "")
+        vendor_code = normalize_model_key(values.get("vendorcode", ""))
+        model = values.get("model") or values.get("name") or values.get("title") or vendor_code
+        model_key = normalize_model_key(model)
+        if not vendor_code and not model_key:
+            continue
+        products.append(
+            {
+                "vendor_code": vendor_code,
+                "model_key": model_key,
+                "name": values.get("name") or values.get("model") or values.get("title") or "",
+                "url": values.get("url") or "",
+                "raw": values,
+            }
+        )
+    return products
+
+
+def save_feed_products(products_by_feed_url: Dict[str, List[Dict[str, object]]]) -> None:
+    if not products_by_feed_url:
+        return
+    with session_scope() as session:
+        for feed_url, products_list in products_by_feed_url.items():
+            if not feed_url:
+                continue
+            site = session.scalar(select(OwnSite).where(OwnSite.feed_url == feed_url))
+            if site is None:
+                site = OwnSite(feed_url=feed_url, feed_generate_url="")
+                session.add(site)
+                session.flush()
+            session.execute(delete(FeedProduct).where(FeedProduct.own_site_id == site.id))
+            for product in products_list:
+                session.add(
+                    FeedProduct(
+                        own_site_id=site.id,
+                        model_key=str(product.get("model_key") or ""),
+                        vendor_code=str(product.get("vendor_code") or ""),
+                        name=str(product.get("name") or ""),
+                        url=str(product.get("url") or ""),
+                        raw=product.get("raw", {}) if isinstance(product.get("raw"), dict) else {},
+                    )
+                )
+
+
+def load_feed_product_keys() -> Set[str]:
+    codes: Set[str] = set()
+    with session_scope() as session:
+        rows = session.execute(select(FeedProduct.vendor_code, FeedProduct.model_key)).all()
+        for vendor_code, model_key in rows:
+            if vendor_code:
+                codes.add(str(vendor_code))
+            if model_key:
+                codes.add(str(model_key))
     return codes
 
 
@@ -2988,6 +3347,30 @@ def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> N
                 pass
         monitor["state"] = state
         save_news_settings()
+
+
+def record_scan_run(
+    target_type: str,
+    target_id: str,
+    status: str,
+    started_at: float,
+    found_products: int = 0,
+    new_count: int = 0,
+    data: Optional[Dict[str, object]] = None,
+) -> None:
+    with session_scope() as session:
+        session.add(
+            ScanRun(
+                target_type=target_type,
+                target_id=target_id,
+                status=status,
+                started_at=datetime.fromtimestamp(started_at),
+                finished_at=datetime.utcnow(),
+                found_products=found_products,
+                new_count=new_count,
+                data=data or {},
+            )
+        )
 
 
 class NewsScanStopped(Exception):
@@ -3241,16 +3624,25 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 compared_products=index,
                 currenturl=product.get("url", ""),
             )
-            model_key = normalize_model_key(product.get("model", ""))
-            if not model_key or model_key in existing_codes or model_key in seen_models:
+            product_keys = {
+                normalize_model_key(str(product.get("model", ""))),
+                normalize_model_key(str(product.get("vendor_code", ""))),
+            }
+            product_keys.discard("")
+            if not product_keys or product_keys & existing_codes or product_keys & seen_models:
                 continue
             details = enrich_news_product(product, monitor)
             details["model"] = details.get("model") or product.get("model", "")
-            model_key = normalize_model_key(details.get("model", ""))
-            if not model_key or model_key in existing_codes or model_key in seen_models:
+            detail_keys = {
+                normalize_model_key(str(details.get("model", ""))),
+                normalize_model_key(str(details.get("vendor_code", ""))),
+            }
+            detail_keys.discard("")
+            if not detail_keys or detail_keys & existing_codes or detail_keys & seen_models:
                 continue
+            model_key = sorted(detail_keys)[0]
             new_items.append(details)
-            seen_models.add(model_key)
+            seen_models.update(detail_keys)
             known[model_key] = details
 
         update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
@@ -3279,6 +3671,15 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["next_run_at"] = "" if monitor.get("schedule_type") == "once" else compute_next_run_at(monitor)
             save_news_settings()
         add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
+        record_scan_run(
+            "donor",
+            monitor_id,
+            "completed",
+            started,
+            found_products=len(products),
+            new_count=len(new_items),
+            data={"csv": csv_path.name, "feeds": local_feeds},
+        )
         if new_items:
             send_news_email(monitor, len(new_items))
     except NewsScanStopped:
@@ -3308,6 +3709,15 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             f"Сканирование новинок приостановлено. CSV: {partial_csv}" if stop_mode == "pause" else "Сканирование новинок остановлено",
             "warning",
         )
+        record_scan_run(
+            "donor",
+            monitor_id,
+            "partial" if stop_mode == "pause" else "stopped",
+            started,
+            found_products=len(products),
+            new_count=len(new_items),
+            data={"csv": partial_csv},
+        )
     except Exception as exc:
         elapsed = int(time.time() - started)
         with news_lock:
@@ -3321,6 +3731,15 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             }
             save_news_settings()
         add_news_log(monitor, f"Ошибка сканирования новинок: {exc}", "error")
+        record_scan_run(
+            "donor",
+            monitor_id,
+            "error",
+            started,
+            found_products=len(products),
+            new_count=len(new_items),
+            data={"error": str(exc)},
+        )
     finally:
         with news_lock:
             news_stop_modes.pop(monitor_id, None)
