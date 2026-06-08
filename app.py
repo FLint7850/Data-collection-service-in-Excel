@@ -25,7 +25,7 @@ from flask import Flask, Response, g, jsonify, render_template, request, send_fi
 from sqlalchemy import delete, select
 
 from db import SessionLocal, init_db, session_scope
-from models import AppSetting, Brand, Donor, FeedProduct, LogEntry, OwnSite, Project, ScanRun
+from models import AppSetting, Brand, Donor, OwnSite, Project, ScanRun
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -353,62 +353,49 @@ def save_projects() -> None:
 
 def save_logs() -> None:
     with projects_lock:
-        with session_scope() as session:
-            session.execute(delete(LogEntry).where(LogEntry.project_id.not_like("news%")))
-            for project in projects.values():
-                for item in project.get("logs", []):
-                    session.add(
-                        LogEntry(
-                            time=str(item.get("time") or datetime.now().isoformat(timespec="seconds")),
-                            project_id=str(item.get("project_id") or project["id"]),
-                            project_name=str(item.get("project_name") or project["name"]),
-                            level=str(item.get("level") or "info"),
-                            message=str(item.get("message") or ""),
-                        )
-                    )
+        data = []
+        for project in projects.values():
+            data.extend(project.get("logs", []))
+    with news_lock:
+        data.extend(news_settings.get("logs", []) if isinstance(news_settings.get("logs"), list) else [])
+    LOGS_FILE.parent.mkdir(exist_ok=True)
+    LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_logs() -> None:
-    data: List[Dict[str, object]] = []
-    with session_scope() as session:
-        rows = session.scalars(select(LogEntry).where(LogEntry.project_id.not_like("news%")).order_by(LogEntry.id)).all()
-        if not rows:
-            source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
-            if source_file.exists():
-                try:
-                    loaded = json.loads(source_file.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    loaded = []
-                if isinstance(loaded, list):
-                    for item in loaded:
-                        if not isinstance(item, dict):
-                            continue
-                        session.add(
-                            LogEntry(
-                                time=str(item.get("time") or datetime.now().isoformat(timespec="seconds")),
-                                project_id=str(item.get("project_id") or ""),
-                                project_name=str(item.get("project_name") or ""),
-                                level=str(item.get("level") or "info"),
-                                message=str(item.get("message") or ""),
-                            )
-                        )
-                    session.flush()
-                    rows = session.scalars(select(LogEntry).where(LogEntry.project_id.not_like("news%")).order_by(LogEntry.id)).all()
-        data = [
-            {
-                "time": row.time,
-                "project_id": row.project_id,
-                "project_name": row.project_name,
-                "level": row.level,
-                "message": row.message,
-            }
-            for row in rows
-        ]
+    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
+    if not source_file.exists():
+        return
+    try:
+        data = json.loads(source_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, list):
+        return
     for item in data:
+        if not isinstance(item, dict):
+            continue
         project_id = item.get("project_id")
         project = projects.get(project_id)
         if project:
             project.setdefault("logs", []).append(item)
+
+
+def load_news_logs_from_file() -> List[Dict[str, object]]:
+    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
+    if not source_file.exists():
+        return []
+    try:
+        data = json.loads(source_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [
+        item
+        for item in data
+        if isinstance(item, dict) and str(item.get("project_id") or "").startswith("news")
+    ]
 
 
 def load_projects() -> None:
@@ -772,38 +759,18 @@ def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]
     return sites
 
 
-def save_news_logs_to_db(session, logs: List[Dict[str, object]]) -> None:
-    session.execute(delete(LogEntry).where(LogEntry.project_id.like("news%")))
-    for item in logs:
-        if not isinstance(item, dict):
-            continue
-        session.add(
-            LogEntry(
-                time=str(item.get("time") or datetime.now().isoformat(timespec="seconds")),
-                project_id=str(item.get("project_id") or "news"),
-                project_name=str(item.get("project_name") or "Новинки"),
-                level=str(item.get("level") or "info"),
-                message=str(item.get("message") or ""),
-            )
-        )
-
-
 def save_news_settings() -> None:
     with news_lock:
         with session_scope() as session:
             smtp = dict(news_settings.get("smtp", {}))
             smtp.pop("sender", None)
-            settings_payload = {
-                "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
-                "smtp": smtp,
-                "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
-            }
-            app_setting = session.get(AppSetting, "news")
+            app_setting = session.get(AppSetting, 1)
             if app_setting is None:
-                app_setting = AppSetting(key="news", value=settings_payload)
+                app_setting = AppSetting(id=1)
                 session.add(app_setting)
-            else:
-                app_setting.value = settings_payload
+            app_setting.auto_cleanup = bool(news_settings.get("auto_cleanup", False))
+            app_setting.smtp = smtp
+            app_setting.feed_storage = list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else []
 
             current_donor_ids = set()
             for monitor in news_settings.get("monitors", []):
@@ -826,8 +793,6 @@ def save_news_settings() -> None:
             if current_feed_urls:
                 session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
 
-            save_news_logs_to_db(session, list(news_settings.get("logs", [])) if isinstance(news_settings.get("logs"), list) else [])
-
 
 def load_news_settings() -> None:
     with news_lock:
@@ -837,17 +802,16 @@ def load_news_settings() -> None:
         with session_scope() as session:
             donor_rows = session.scalars(select(Donor).join(Brand).order_by(Brand.group_name, Brand.name, Donor.id)).all()
             if donor_rows:
-                app_setting = session.get(AppSetting, "news")
-                if app_setting and isinstance(app_setting.value, dict):
-                    saved = app_setting.value
-                    settings["auto_cleanup"] = bool(saved.get("auto_cleanup", False))
-                    if isinstance(saved.get("smtp"), dict):
+                app_setting = session.get(AppSetting, 1)
+                if app_setting:
+                    settings["auto_cleanup"] = bool(app_setting.auto_cleanup)
+                    if isinstance(app_setting.smtp, dict):
                         smtp = dict(settings["smtp"])
-                        smtp.update(saved["smtp"])
+                        smtp.update(app_setting.smtp)
                         smtp.pop("sender", None)
                         settings["smtp"] = smtp
-                    if isinstance(saved.get("feed_storage"), list):
-                        settings["feed_storage"] = saved["feed_storage"]
+                    if isinstance(app_setting.feed_storage, list):
+                        settings["feed_storage"] = app_setting.feed_storage
                 own_sites = session.scalars(select(OwnSite).order_by(OwnSite.id)).all()
                 if own_sites:
                     feed_urls = [site.feed_url for site in own_sites]
@@ -857,16 +821,7 @@ def load_news_settings() -> None:
                     settings["feed_url"] = feed_urls[0]
                     settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
                 settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
-                settings["logs"] = [
-                    {
-                        "time": row.time,
-                        "project_id": row.project_id,
-                        "project_name": row.project_name,
-                        "level": row.level,
-                        "message": row.message,
-                    }
-                    for row in session.scalars(select(LogEntry).where(LogEntry.project_id.like("news%")).order_by(LogEntry.id)).all()
-                ]
+                settings["logs"] = load_news_logs_from_file()
             else:
                 loaded: Dict[str, object] = {}
                 if NEWS_FILE.exists():
@@ -895,6 +850,7 @@ def load_news_settings() -> None:
                     settings["monitors"] = import_news_monitors_from_excel()
                 news_settings.update(settings)
                 save_news_settings()
+                save_logs()
                 return
         news_settings.update(settings)
         save_news_settings()
@@ -3215,13 +3171,11 @@ def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
     downloaded_feeds = download_feed_files()
     codes: Set[str] = set()
     feeds: List[Dict[str, object]] = []
-    parsed_by_url: Dict[str, List[Dict[str, object]]] = {}
     for feed in downloaded_feeds:
         filename = str(feed.get("filename") or "")
         path = source_feed_dir(str(feed.get("source") or "")) / filename
         try:
             feed_products = parse_feed_products_from_xml(path.read_bytes())
-            parsed_by_url[str(feed.get("url") or "")] = feed_products
             feed_codes = {
                 value
                 for product in feed_products
@@ -3232,11 +3186,10 @@ def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
             feeds.append({**feed, "codes_count": len(feed_codes)})
         except Exception as exc:
             feeds.append({**feed, "codes_count": 0, "error": str(exc)})
-    save_feed_products(parsed_by_url)
-    codes.update(load_feed_product_keys())
     with news_lock:
         news_settings["feed_storage"] = feeds
         save_news_settings()
+    save_logs()
     return codes, feeds
 
 
@@ -3275,44 +3228,6 @@ def parse_feed_products_from_xml(content: bytes) -> List[Dict[str, object]]:
             }
         )
     return products
-
-
-def save_feed_products(products_by_feed_url: Dict[str, List[Dict[str, object]]]) -> None:
-    if not products_by_feed_url:
-        return
-    with session_scope() as session:
-        for feed_url, products_list in products_by_feed_url.items():
-            if not feed_url:
-                continue
-            site = session.scalar(select(OwnSite).where(OwnSite.feed_url == feed_url))
-            if site is None:
-                site = OwnSite(feed_url=feed_url, feed_generate_url="")
-                session.add(site)
-                session.flush()
-            session.execute(delete(FeedProduct).where(FeedProduct.own_site_id == site.id))
-            for product in products_list:
-                session.add(
-                    FeedProduct(
-                        own_site_id=site.id,
-                        model_key=str(product.get("model_key") or ""),
-                        vendor_code=str(product.get("vendor_code") or ""),
-                        name=str(product.get("name") or ""),
-                        url=str(product.get("url") or ""),
-                        raw=product.get("raw", {}) if isinstance(product.get("raw"), dict) else {},
-                    )
-                )
-
-
-def load_feed_product_keys() -> Set[str]:
-    codes: Set[str] = set()
-    with session_scope() as session:
-        rows = session.execute(select(FeedProduct.vendor_code, FeedProduct.model_key)).all()
-        for vendor_code, model_key in rows:
-            if vendor_code:
-                codes.add(str(vendor_code))
-            if model_key:
-                codes.add(str(model_key))
-    return codes
 
 
 def validate_monitor_selectors(monitor: Dict[str, object]) -> None:

@@ -16,9 +16,11 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "app_settings",
-        sa.Column("key", sa.String(length=128), nullable=False),
-        sa.Column("value", sa.JSON(), nullable=False),
-        sa.PrimaryKeyConstraint("key"),
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("auto_cleanup", sa.Boolean(), nullable=False),
+        sa.Column("smtp", sa.JSON(), nullable=False),
+        sa.Column("feed_storage", sa.JSON(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
     )
     op.create_table(
         "brands",
@@ -74,17 +76,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_table(
-        "logs",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("time", sa.String(length=64), nullable=False),
-        sa.Column("project_id", sa.String(length=64), nullable=False),
-        sa.Column("project_name", sa.String(length=255), nullable=False),
-        sa.Column("level", sa.String(length=32), nullable=False),
-        sa.Column("message", sa.Text(), nullable=False),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_table(
         "donors",
         sa.Column("id", sa.String(length=32), nullable=False),
         sa.Column("brand_id", sa.Integer(), nullable=False),
@@ -111,30 +102,10 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_donors_brand_id", "donors", ["brand_id"])
-    op.create_table(
-        "feed_products",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("own_site_id", sa.Integer(), nullable=False),
-        sa.Column("model_key", sa.String(length=255), nullable=False),
-        sa.Column("vendor_code", sa.String(length=255), nullable=False),
-        sa.Column("name", sa.Text(), nullable=False),
-        sa.Column("url", sa.Text(), nullable=False),
-        sa.Column("raw", sa.JSON(), nullable=False),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.ForeignKeyConstraint(["own_site_id"], ["own_sites.id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_feed_products_model_key", "feed_products", ["model_key"])
-    op.create_index("ix_feed_products_vendor_code", "feed_products", ["vendor_code"])
-
 
 def downgrade() -> None:
-    op.drop_index("ix_feed_products_vendor_code", table_name="feed_products")
-    op.drop_index("ix_feed_products_model_key", table_name="feed_products")
-    op.drop_table("feed_products")
     op.drop_index("ix_donors_brand_id", table_name="donors")
     op.drop_table("donors")
-    op.drop_table("logs")
     op.drop_table("scan_runs")
     op.drop_table("projects")
     op.drop_table("own_sites")

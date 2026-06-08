@@ -85,8 +85,6 @@ class OwnSite(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    products: Mapped[list["FeedProduct"]] = relationship("FeedProduct", back_populates="own_site", cascade="all, delete-orphan")
-
     __table_args__ = (UniqueConstraint("feed_url", name="uq_own_sites_feed_url"),)
 
 
@@ -104,40 +102,10 @@ class ScanRun(Base):
     data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
-class FeedProduct(Base):
-    __tablename__ = "feed_products"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    own_site_id: Mapped[int] = mapped_column(ForeignKey("own_sites.id", ondelete="CASCADE"), nullable=False)
-    model_key: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    vendor_code: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    name: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    url: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    raw: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    own_site: Mapped[OwnSite] = relationship("OwnSite", back_populates="products")
-
-    __table_args__ = (
-        Index("ix_feed_products_model_key", "model_key"),
-        Index("ix_feed_products_vendor_code", "vendor_code"),
-    )
-
-
-class LogEntry(Base):
-    __tablename__ = "logs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    time: Mapped[str] = mapped_column(String(64), nullable=False)
-    project_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
-    project_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    level: Mapped[str] = mapped_column(String(32), default="info", nullable=False)
-    message: Mapped[Text] = mapped_column(Text, default="", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-
 class AppSetting(Base):
     __tablename__ = "app_settings"
 
-    key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    value: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    auto_cleanup: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    smtp: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    feed_storage: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
