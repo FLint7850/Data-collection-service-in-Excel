@@ -420,7 +420,6 @@ def default_news_settings() -> Dict[str, object]:
             "port": 465,
             "security": "ssl",
             "username": "",
-            "sender": "",
             "password": os.environ.get("YANDEX_SMTP_PASSWORD", "xsitasicmwhkwyqz"),
             "recipients": [],
         },
@@ -600,6 +599,7 @@ def load_news_settings() -> None:
             smtp = settings["smtp"]
             if isinstance(loaded.get("smtp"), dict):
                 smtp.update(loaded["smtp"])
+            smtp.pop("sender", None)
             settings["smtp"] = smtp
             settings["logs"] = loaded.get("logs", []) if isinstance(loaded.get("logs"), list) else []
             monitors = loaded.get("monitors", [])
@@ -649,6 +649,7 @@ def get_news_monitor(monitor_id: str) -> Optional[Dict[str, object]]:
 def public_news_settings() -> Dict[str, object]:
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
+        smtp.pop("sender", None)
         smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
         feed_urls = normalize_start_urls(news_settings.get("feed_urls") or news_settings.get("feed_url") or DEFAULT_FEED_URL)
         feed_generate_urls = normalize_start_urls(
@@ -3122,15 +3123,22 @@ def send_news_email(
     with news_lock:
         smtp_config = dict(news_settings.get("smtp", {}))
     recipients = normalize_emails(smtp_config.get("recipients", []))
-    sender = str(smtp_config.get("sender") or smtp_config.get("username") or "").strip()
-    username = str(smtp_config.get("username") or sender).strip()
+    username = str(smtp_config.get("username") or "").strip()
     password = str(smtp_config.get("password") or "").strip()
-    if not sender or not username or not password or not recipients:
-        error_message = "Email не отправлен: заполните отправителя, логин, пароль приложения и получателей SMTP"
+    sender_emails = normalize_emails(username)
+    if not username or not password or not recipients:
+        error_message = "Email не отправлен: заполните email-логин, пароль приложения и получателей SMTP"
         if error_holder is not None:
             error_holder.append(error_message)
         add_news_log(monitor, error_message, "warning")
         return False
+    if not sender_emails:
+        error_message = "Email не отправлен: email-логин должен быть адресом почты"
+        if error_holder is not None:
+            error_holder.append(error_message)
+        add_news_log(monitor, error_message, "warning")
+        return False
+    sender_email = sender_emails[0]
 
     if test:
         subject = "Тест email-уведомлений"
@@ -3142,7 +3150,7 @@ def send_news_email(
         body = f"Уведомление о новинках на сайте {brand}, всего новинок {new_count}. Ссылка на сайт {site_url}"
     message = EmailMessage()
     message["Subject"] = subject
-    message["From"] = sender
+    message["From"] = sender_email
     message["To"] = ", ".join(recipients)
     message.set_content(body)
 
@@ -3154,11 +3162,11 @@ def send_news_email(
             with smtplib.SMTP(host, port, timeout=30) as server:
                 server.starttls(context=ssl.create_default_context())
                 server.login(username, password)
-                server.send_message(message)
+                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
         else:
             with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as server:
                 server.login(username, password)
-                server.send_message(message)
+                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
     except Exception as exc:
         error_message = f"Ошибка отправки email: {exc}"
         if error_holder is not None:
@@ -3447,7 +3455,8 @@ def api_update_news_settings():
         if "smtp" in payload and isinstance(payload.get("smtp"), dict):
             smtp_payload = payload["smtp"]
             smtp = dict(news_settings.get("smtp", {}))
-            for key in ("host", "security", "username", "sender"):
+            smtp.pop("sender", None)
+            for key in ("host", "security", "username"):
                 if key in smtp_payload:
                     smtp[key] = str(smtp_payload.get(key) or "").strip()
             if "port" in smtp_payload:

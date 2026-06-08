@@ -55,7 +55,6 @@ const smtpHost = document.querySelector("#smtpHost");
 const smtpPort = document.querySelector("#smtpPort");
 const smtpSecurity = document.querySelector("#smtpSecurity");
 const smtpUsername = document.querySelector("#smtpUsername");
-const smtpSender = document.querySelector("#smtpSender");
 const smtpPassword = document.querySelector("#smtpPassword");
 const toggleSmtpPasswordButton = document.querySelector("#toggleSmtpPasswordButton");
 const smtpRecipients = document.querySelector("#smtpRecipients");
@@ -457,7 +456,6 @@ function renderNewsSettings() {
   smtpPort.value = smtp.port || 465;
   smtpSecurity.value = smtp.security || "ssl";
   smtpUsername.value = smtp.username || "";
-  smtpSender.value = smtp.sender || "";
   smtpPassword.value = smtp.password || "";
   smtpPassword.placeholder = smtp.password_set ? "Пароль приложения сохранен" : "Введите пароль приложения";
   smtpRecipients.value = (smtp.recipients || []).join("\n");
@@ -1016,7 +1014,6 @@ async function saveNewsSettings() {
       port: Number(smtpPort.value || 465),
       security: smtpSecurity.value,
       username: smtpUsername.value.trim(),
-      sender: smtpSender.value.trim(),
       password: smtpPassword.value.trim(),
       recipients: smtpRecipients.value,
     },
@@ -1245,7 +1242,6 @@ autoConnectionFallback.addEventListener("change", saveActiveProject);
   smtpPort,
   smtpSecurity,
   smtpUsername,
-  smtpSender,
   smtpPassword,
   smtpRecipients,
 ].forEach((input) => {
