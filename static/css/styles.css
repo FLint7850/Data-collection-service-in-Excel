@@ -395,9 +395,29 @@ select:focus {
   gap: 12px;
 }
 
-.selector-settings input {
+.selector-settings input,
+.selector-settings textarea {
   min-height: 40px;
   font-size: 14px;
+}
+
+.settings-details {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  margin-top: 10px;
+}
+
+.settings-details summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  color: var(--text);
+  font-weight: 700;
+  list-style-position: inside;
+}
+
+.settings-details .selector-grid {
+  padding: 0 14px 14px;
 }
 
 .exclusion-item {
@@ -1124,6 +1144,7 @@ select:focus {
 .selector-panel {
   border-top: 1px solid var(--line);
   padding-top: 12px;
+  margin-bottom: 12px;
 }
 
 .modal-actions {

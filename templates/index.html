@@ -92,32 +92,44 @@
 
           <div class="filter-block selector-settings">
             <h2>Правила извлечения</h2>
-            <div class="selector-grid">
-              <label class="field">
-                <span>Карточка товара</span>
-                <input id="productCardSelector" type="text" placeholder=".product-card">
-              </label>
-              <label class="field">
-                <span>Ссылка товара</span>
-                <input id="productUrlSelector" type="text" placeholder="a[href]">
-              </label>
-              <label class="field">
-                <span>Модель</span>
-                <input id="modelSelector" type="text" placeholder=".product-title">
-              </label>
-              <label class="field">
-                <span>Цена</span>
-                <input id="priceSelector" type="text" placeholder=".price">
-              </label>
-              <label class="field">
-                <span>Regex модели</span>
-                <input id="modelRegex" type="text" placeholder="([A-Z0-9][A-Z0-9\\s.-]+)">
-              </label>
-              <label class="field">
-                <span>Regex цены</span>
-                <input id="priceRegex" type="text" placeholder="(\\d[\\d\\s]+(?:₽|руб\\.))">
-              </label>
-            </div>
+            <details class="settings-details">
+              <summary>Селекторы</summary>
+              <div class="selector-grid">
+                <label class="field">
+                  <span>Карточка товара</span>
+                  <input id="productCardSelector" type="text" placeholder=".product-card">
+                </label>
+                <label class="field">
+                  <span>Ссылка товара</span>
+                  <input id="productUrlSelector" type="text" placeholder="a[href]">
+                </label>
+                <label class="field">
+                  <span>Модель</span>
+                  <input id="modelSelector" type="text" placeholder=".product-title">
+                </label>
+                <label class="field">
+                  <span>Цена</span>
+                  <input id="priceSelector" type="text" placeholder=".price">
+                </label>
+              </div>
+            </details>
+            <details class="settings-details">
+              <summary>Правила поиск/замены</summary>
+              <div class="selector-grid">
+                <label class="field modal-wide-field">
+                  <span>Начало парсинга модели</span>
+                  <input id="modelStartMarker" type="text" placeholder="<h1 class=&quot;detail__title&quot;>">
+                </label>
+                <label class="field modal-wide-field">
+                  <span>Конец парсинга модели</span>
+                  <input id="modelEndMarker" type="text" placeholder="</h1>">
+                </label>
+                <label class="field modal-wide-field">
+                  <span>Правила для модели</span>
+                  <textarea id="modelReplaceRules" rows="5" placeholder="{reg[#[^A-Za-z0-9./\\-\\s]#]}|&#10;{reg[#\\s{2,}#]}| "></textarea>
+                </label>
+              </div>
+            </details>
           </div>
         </div>
 

@@ -746,17 +746,22 @@ def normalize_connection_method(value: object) -> str:
 def normalize_extraction_rules(value: object) -> Dict[str, str]:
     if not isinstance(value, dict):
         value = {}
-    allowed = {
+    single_line_fields = {
         "product_card_selector",
         "product_url_selector",
         "model_selector",
         "price_selector",
-        "model_regex",
-        "price_regex",
+        "model_start_marker",
+        "model_end_marker",
     }
+    multiline_fields = {"model_replace_rules"}
     rules = {}
-    for key in allowed:
-        text = clean_text(str(value.get(key, "")))
+    for key in single_line_fields:
+        text = str(value.get(key, "")).strip()
+        if text:
+            rules[key] = text
+    for key in multiline_fields:
+        text = str(value.get(key, "")).strip()
         if text:
             rules[key] = text
     return rules
@@ -1581,6 +1586,112 @@ def apply_extract_regex(value: str, pattern: str) -> str:
     return clean_text(match.group(1) if match.groups() else match.group(0))
 
 
+def replacement_flags(flag_text: str) -> int:
+    flags = 0
+    flags_text = flag_text.lower()
+    if "i" in flags_text:
+        flags |= re.IGNORECASE
+    if "m" in flags_text:
+        flags |= re.MULTILINE
+    if "s" in flags_text:
+        flags |= re.DOTALL
+    return flags
+
+
+def wildcard_rule_to_regex(pattern: str) -> str:
+    result = []
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("{skip}", index):
+            result.append(".*?")
+            index += len("{skip}")
+        elif pattern.startswith("{.}", index):
+            result.append(".")
+            index += len("{.}")
+        else:
+            result.append(re.escape(pattern[index]))
+            index += 1
+    return "".join(result)
+
+
+def apply_replace_rules(value: str, rules_text: str) -> str:
+    text = html_lib.unescape(value or "")
+    if not rules_text:
+        return text
+
+    for raw_line in rules_text.splitlines():
+        line = raw_line.strip()
+        if not line or "|" not in line:
+            continue
+        pattern, replacement = line.split("|", 1)
+        pattern = pattern.strip()
+        replacement = replacement.strip()
+
+        try:
+            if pattern == "{br}":
+                text = re.sub(r"\r\n|\r|\n", replacement, text)
+                continue
+
+            regex_match = re.fullmatch(r"\{reg\[#(.*)#([a-zA-Z]*)\]\}", pattern)
+            if regex_match:
+                regex_pattern, flags_text = regex_match.groups()
+                text = re.sub(regex_pattern, replacement, text, flags=replacement_flags(flags_text))
+                continue
+
+            if "{skip}" in pattern or "{.}" in pattern:
+                text = re.sub(wildcard_rule_to_regex(pattern), replacement, text, flags=re.DOTALL)
+                continue
+
+            text = text.replace(pattern, replacement)
+        except re.error:
+            continue
+
+    return text
+
+
+def strip_html_to_text(value: str) -> str:
+    raw = html_lib.unescape(value or "")
+    if "<" in raw and ">" in raw:
+        return BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
+    return raw
+
+
+def extract_between_markers(source: str, start_marker: str, end_marker: str) -> str:
+    if not start_marker and not end_marker:
+        return ""
+
+    text = source or ""
+    start_index = 0
+    if start_marker:
+        found_start = text.find(start_marker)
+        if found_start < 0:
+            return ""
+        start_index = found_start + len(start_marker)
+
+    end_index = len(text)
+    if end_marker:
+        found_end = text.find(end_marker, start_index)
+        if found_end < 0:
+            return ""
+        end_index = found_end
+
+    return text[start_index:end_index]
+
+
+def extract_model_by_markers(source: str, rules: Dict[str, str]) -> str:
+    return extract_between_markers(
+        source,
+        str(rules.get("model_start_marker", "")),
+        str(rules.get("model_end_marker", "")),
+    )
+
+
+def prepare_rule_model(value: str, rules: Dict[str, str]) -> str:
+    text = apply_replace_rules(value, str(rules.get("model_replace_rules", "")))
+    text = strip_html_to_text(text)
+    return clean_text(text)
+
+
 def first_by_selector(root, selector: str) -> str:
     if not selector or not hasattr(root, "select"):
         return ""
@@ -1614,14 +1725,15 @@ def extract_listing_products_by_rules(
         if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
             continue
 
-        model = first_by_selector(card, rules.get("model_selector", ""))
+        model = extract_model_by_markers(str(card), rules)
+        if not model:
+            model = first_by_selector(card, rules.get("model_selector", ""))
         if not model:
             model = extract_model_from_card(card, "")
-        model = apply_extract_regex(model, rules.get("model_regex", ""))
+        model = prepare_rule_model(model, rules)
         model = normalize_model(model, product_url)
 
         price = first_by_selector(card, rules.get("price_selector", ""))
-        price = apply_extract_regex(price, rules.get("price_regex", ""))
         prices = extract_prices(price) or extract_prices(card.get_text(" ", strip=True))
         price = prices[-1] if prices else normalize_price_value(price)
         if not model or not price:
@@ -1689,16 +1801,18 @@ def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[s
 
 def extract_product_data_by_rules(
     url: str,
+    html: str,
     soup: BeautifulSoup,
     rules: Dict[str, str],
     fallback_price: str = "",
 ) -> Optional[Dict[str, str]]:
     if not rules:
         return None
-    model = first_by_selector(soup, rules.get("model_selector", ""))
+    model = extract_model_by_markers(html, rules)
+    if not model:
+        model = first_by_selector(soup, rules.get("model_selector", ""))
     price = first_by_selector(soup, rules.get("price_selector", ""))
-    model = apply_extract_regex(model, rules.get("model_regex", ""))
-    price = apply_extract_regex(price, rules.get("price_regex", ""))
+    model = prepare_rule_model(model, rules)
     prices = extract_prices(price) or extract_prices(soup.get_text(" ", strip=True))
     price = prices[-1] if prices else normalize_price_value(price or fallback_price)
     model = normalize_model(model, url)
@@ -1714,7 +1828,7 @@ def extract_product_data(
     rules: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
-    ruled_product = extract_product_data_by_rules(url, soup, rules or {}, fallback_price)
+    ruled_product = extract_product_data_by_rules(url, html, soup, rules or {}, fallback_price)
     if ruled_product:
         return ruled_product
     path_parts = [part for part in urlparse(url).path.split("/") if part]
@@ -1740,6 +1854,8 @@ def extract_product_data(
     if price and model and is_maunfeld_url(url) and model_from_labeled_value:
         return {"url": url, "model": clean_text(model), "price": price}
 
+    if rules:
+        model = prepare_rule_model(model, rules)
     model = normalize_model(model, url)
 
     page_text = clean_text(soup.get_text(" ", strip=True))
@@ -2773,6 +2889,7 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
 def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> Dict[str, str]:
     url = product.get("url", "")
     selector_settings = monitor.get("selector_settings", {}) if isinstance(monitor.get("selector_settings"), dict) else {}
+    extraction_rules = normalize_extraction_rules(monitor.get("extraction_rules", {}))
     details = {
         "date_found": datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S"),
         "group": str(monitor.get("group") or ""),
@@ -2798,10 +2915,15 @@ def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> 
         return details
     soup = BeautifulSoup(html, "html.parser")
     name = extract_product_name(soup, str(selector_settings.get("name_selector", "")))
-    product_data = extract_product_data(url, html, product.get("price", ""), monitor.get("extraction_rules", {}))
+    product_data = extract_product_data(url, html, product.get("price", ""), extraction_rules)
     if product_data:
         details["model"] = product_data.get("model", details["model"])
         details["price"] = product_data.get("price", details["price"])
+    else:
+        model_candidate = extract_model_by_markers(html, extraction_rules) or details["model"] or name
+        prepared_model = prepare_rule_model(model_candidate, extraction_rules)
+        if prepared_model:
+            details["model"] = normalize_model(prepared_model, url)
     details["name"] = name or details["name"]
     details["availability"] = extract_availability(soup, str(selector_settings.get("availability_selector", "")))
     details["photo_url"] = extract_photo_url(soup, url, str(selector_settings.get("photo_selector", "")))

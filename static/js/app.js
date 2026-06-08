@@ -39,8 +39,9 @@ const productCardSelector = document.querySelector("#productCardSelector");
 const productUrlSelector = document.querySelector("#productUrlSelector");
 const modelSelector = document.querySelector("#modelSelector");
 const priceSelector = document.querySelector("#priceSelector");
-const modelRegex = document.querySelector("#modelRegex");
-const priceRegex = document.querySelector("#priceRegex");
+const modelStartMarker = document.querySelector("#modelStartMarker");
+const modelEndMarker = document.querySelector("#modelEndMarker");
+const modelReplaceRules = document.querySelector("#modelReplaceRules");
 
 const logsList = document.querySelector("#logsList");
 const clearLogsButton = document.querySelector("#clearLogsButton");
@@ -89,6 +90,7 @@ const monitorSaveTimers = new Map();
 const selectedNewsSites = new Map();
 let activeNewsBrandKey = null;
 let activeNewsSelectorsOpen = false;
+let activeNewsReplaceRulesOpen = false;
 let pendingDeleteProjectId = null;
 let pendingDeleteNewsMonitorId = null;
 let pendingDeleteNewsMonitorMode = "brand";
@@ -159,8 +161,9 @@ function setControls(status) {
   productUrlSelector.disabled = isRunning;
   modelSelector.disabled = isRunning;
   priceSelector.disabled = isRunning;
-  modelRegex.disabled = isRunning;
-  priceRegex.disabled = isRunning;
+  modelStartMarker.disabled = isRunning;
+  modelEndMarker.disabled = isRunning;
+  modelReplaceRules.disabled = isRunning;
 }
 
 function renderTabs() {
@@ -346,8 +349,9 @@ function renderProjectForm(project) {
   productUrlSelector.value = rules.product_url_selector || "";
   modelSelector.value = rules.model_selector || "";
   priceSelector.value = rules.price_selector || "";
-  modelRegex.value = rules.model_regex || "";
-  priceRegex.value = rules.price_regex || "";
+  modelStartMarker.value = rules.model_start_marker || "";
+  modelEndMarker.value = rules.model_end_marker || "";
+  modelReplaceRules.value = rules.model_replace_rules || "";
   isHydratingForm = false;
   renderExclusions(project.exclusions || []);
   renderProductUrlFilters(project.product_url_filters || []);
@@ -668,6 +672,7 @@ function activeNewsMonitor() {
 function openNewsModal(brandKey) {
   activeNewsBrandKey = brandKey;
   activeNewsSelectorsOpen = false;
+  activeNewsReplaceRulesOpen = false;
   renderNewsModal();
   newsMonitorModal.classList.remove("hidden");
   newsMonitorModal.setAttribute("aria-hidden", "false");
@@ -678,6 +683,7 @@ function closeNewsModal() {
   newsMonitorModal.setAttribute("aria-hidden", "true");
   activeNewsBrandKey = null;
   activeNewsSelectorsOpen = false;
+  activeNewsReplaceRulesOpen = false;
 }
 
 function updateNewsModalProgress() {
@@ -882,14 +888,6 @@ function renderNewsModal() {
         <input data-rule="price_selector" type="text" value="${escapeHtml(monitor.extraction_rules?.price_selector || "")}">
       </label>
       <label class="field">
-        <span>Regex модели</span>
-        <input data-rule="model_regex" type="text" value="${escapeHtml(monitor.extraction_rules?.model_regex || "")}">
-      </label>
-      <label class="field">
-        <span>Regex цены</span>
-        <input data-rule="price_regex" type="text" value="${escapeHtml(monitor.extraction_rules?.price_regex || "")}">
-      </label>
-      <label class="field">
         <span>Селектор названия</span>
         <input data-selector="name_selector" type="text" value="${escapeHtml(monitor.selector_settings?.name_selector || "")}">
       </label>
@@ -900,6 +898,26 @@ function renderNewsModal() {
       <label class="field">
         <span>Селектор фото</span>
         <input data-selector="photo_selector" type="text" value="${escapeHtml(monitor.selector_settings?.photo_selector || "")}">
+      </label>
+    </div>
+
+    <div class="selector-toggle-row">
+      <button class="button secondary compact-button" data-action="toggle-modal-replace-rules" type="button">
+        ${activeNewsReplaceRulesOpen ? "Свернуть правила" : "Правила поиск/замены"}
+      </button>
+    </div>
+    <div class="modal-form-grid selector-panel ${activeNewsReplaceRulesOpen ? "" : "hidden"}">
+      <label class="field modal-wide-field">
+        <span>Начало парсинга модели</span>
+        <input data-rule="model_start_marker" type="text" value="${escapeHtml(monitor.extraction_rules?.model_start_marker || "")}" placeholder="<h1 class=&quot;detail__title&quot;>">
+      </label>
+      <label class="field modal-wide-field">
+        <span>Конец парсинга модели</span>
+        <input data-rule="model_end_marker" type="text" value="${escapeHtml(monitor.extraction_rules?.model_end_marker || "")}" placeholder="</h1>">
+      </label>
+      <label class="field modal-wide-field">
+        <span>Правила для модели</span>
+        <textarea data-rule="model_replace_rules" rows="5" placeholder="{reg[#[^A-Za-z0-9./\\-\\s]#]}|&#10;{reg[#\\s{2,}#]}| ">${escapeHtml(monitor.extraction_rules?.model_replace_rules || "")}</textarea>
       </label>
     </div>
 
@@ -1077,8 +1095,9 @@ async function saveActiveProject() {
       product_url_selector: productUrlSelector.value.trim(),
       model_selector: modelSelector.value.trim(),
       price_selector: priceSelector.value.trim(),
-      model_regex: modelRegex.value.trim(),
-      price_regex: priceRegex.value.trim(),
+      model_start_marker: modelStartMarker.value.trim(),
+      model_end_marker: modelEndMarker.value.trim(),
+      model_replace_rules: modelReplaceRules.value.trim(),
     },
     thread_count: Number(threadCount.value || 4),
     connection_method: connectionMethod.value,
@@ -1161,8 +1180,9 @@ autoConnectionFallback.addEventListener("change", saveActiveProject);
   productUrlSelector,
   modelSelector,
   priceSelector,
-  modelRegex,
-  priceRegex,
+  modelStartMarker,
+  modelEndMarker,
+  modelReplaceRules,
 ].forEach((input) => input.addEventListener("input", scheduleSaveActiveProject));
 
 [
@@ -1320,6 +1340,7 @@ newsModalContent.addEventListener("change", (event) => {
   if (!select) return;
   selectedNewsSites.set(activeNewsBrandKey, select.value);
   activeNewsSelectorsOpen = false;
+  activeNewsReplaceRulesOpen = false;
   renderNewsModal();
 });
 
@@ -1342,6 +1363,13 @@ newsModalContent.addEventListener("click", async (event) => {
   const selectorToggle = event.target.closest("[data-action='toggle-modal-selectors']");
   if (selectorToggle) {
     activeNewsSelectorsOpen = !activeNewsSelectorsOpen;
+    renderNewsModal();
+    return;
+  }
+
+  const replaceRulesToggle = event.target.closest("[data-action='toggle-modal-replace-rules']");
+  if (replaceRulesToggle) {
+    activeNewsReplaceRulesOpen = !activeNewsReplaceRulesOpen;
     renderNewsModal();
     return;
   }
@@ -1443,8 +1471,9 @@ startButton.addEventListener("click", async () => {
           product_url_selector: productUrlSelector.value.trim(),
           model_selector: modelSelector.value.trim(),
           price_selector: priceSelector.value.trim(),
-          model_regex: modelRegex.value.trim(),
-          price_regex: priceRegex.value.trim(),
+          model_start_marker: modelStartMarker.value.trim(),
+          model_end_marker: modelEndMarker.value.trim(),
+          model_replace_rules: modelReplaceRules.value.trim(),
         },
         thread_count: Number(threadCount.value || 4),
         connection_method: connectionMethod.value,
