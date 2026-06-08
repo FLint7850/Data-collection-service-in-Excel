@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Flask/local environment
+.env
+.env.*
+!.env.example
+instance/
+.webassets-cache
+
+# Runtime project data
+exports/
+output/
+error_logs/
+profiles/
+logs.json
+projects.json
+new_items.json
+exclusions.json
+
+# Logs
+*.log
+server-output*.log
+server-error*.log
+runtime/
+
+# Local tunnel/runtime tools
+tools/
+xtunnel*.exe
+xtunnel*.zip
+vs_BuildTools.exe
+
+# Generated screenshots and debug artifacts
+news-progress-*.png
+news-ui-*.png
+*.tmp
+*.temp
+
+# Spreadsheet exports and donor lists with local/customer data
+*.csv
+*.xlsx
+*.xls
+!donors.example.xlsx
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test/cache folders
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

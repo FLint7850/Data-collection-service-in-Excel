@@ -1,0 +1,9 @@
+Flask==3.0.3
+requests==2.32.3
+beautifulsoup4==4.12.3
+openpyxl==3.1.5
+botasaurus
+crawl4ai
+firecrawl-py
+scrapy
+crawlee

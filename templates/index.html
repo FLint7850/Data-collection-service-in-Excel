@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Сервис сбора данных в Excel</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/excel-service-logo.png') }}">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='img/excel-service-logo.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-title">
+          <img class="brand-logo" src="{{ url_for('static', filename='img/excel-service-logo.png') }}" alt="" width="52" height="52">
+          <h1>Сервис сбора данных в Excel</h1>
+        </div>
+        <p>Проекты парсинга с независимыми настройками, прогрессом, CSV и логами.</p>
+      </div>
+      <div class="status-pill" id="statusPill">
+        <span class="status-dot status-idle" id="statusDot"></span>
+        <span id="statusText">ожидание</span>
+      </div>
+    </header>
+
+    <nav class="tabs-bar">
+      <div class="tabs-list" id="projectTabs"></div>
+      <button class="tab-button add-tab" id="addProjectButton" type="button">+ Проект</button>
+      <button class="tab-button" id="newItemsTabButton" type="button">Новинки</button>
+      <button class="tab-button" id="logsTabButton" type="button">Логи</button>
+    </nav>
+
+    <section class="project-view" id="projectView">
+      <section class="panel control-panel project-control-panel">
+        <label class="field name-field">
+          <span>Название проекта</span>
+          <input id="projectName" type="text" autocomplete="off">
+        </label>
+        <label class="field urls-field">
+          <span>Стартовые URL</span>
+          <textarea id="startUrls" rows="4" placeholder="https://www.maunfeld.ru/catalog/sloping&#10;https://www.maunfeld.ru/catalog/electric"></textarea>
+        </label>
+        <label class="field thread-field">
+          <span>Потоки</span>
+          <input id="threadCount" type="number" min="1" max="16" value="4">
+        </label>
+        <label class="field connection-field">
+          <span>Подключение</span>
+          <select id="connectionMethod">
+            <option value="requests">Requests</option>
+            <option value="botasaurus-request">Botasaurus Request</option>
+            <option value="botasaurus-browser">Botasaurus Browser Google</option>
+            <option value="botasaurus-browser-direct">Botasaurus Browser Direct</option>
+            <option value="botasaurus-visible">Botasaurus Visible Browser</option>
+            <option value="crawl4ai">Crawl4AI</option>
+            <option value="firecrawl">Firecrawl</option>
+            <option value="scrapy">Scrapy</option>
+            <option value="crawlee">Crawlee</option>
+          </select>
+        </label>
+        <label class="toggle-field fallback-field">
+          <input id="autoConnectionFallback" type="checkbox" checked>
+          <span>Автопереключение</span>
+        </label>
+        <div class="button-row">
+          <button class="button primary" id="startButton" type="button">Запустить сбор</button>
+          <button class="button secondary" id="softPauseButton" type="button">Пауза</button>
+          <button class="button warning" id="pauseButton" type="button">Приостановить с результатом</button>
+          <button class="button secondary" id="restartButton" type="button">Перезапустить</button>
+          <button class="button danger" id="stopButton" type="button">Остановить</button>
+        </div>
+      </section>
+
+      <section class="layout-grid">
+        <div class="panel">
+          <h2>Исключения</h2>
+          <form class="exclusion-form" id="exclusionForm">
+            <input id="exclusionInput" type="text" placeholder="/catalog/rasprodazha/">
+            <button class="button secondary" type="submit">Добавить</button>
+          </form>
+          <ul class="exclusion-list" id="exclusionList"></ul>
+
+          <div class="filter-block">
+            <h2>Фильтр товарных ссылок</h2>
+            <form class="exclusion-form" id="productUrlFilterForm">
+              <input id="productUrlFilterInput" type="text" placeholder="-qyron-">
+              <button class="button secondary" type="submit">Добавить</button>
+            </form>
+            <ul class="exclusion-list" id="productUrlFilterList"></ul>
+          </div>
+
+          <div class="filter-block selector-settings">
+            <h2>Правила извлечения</h2>
+            <div class="selector-grid">
+              <label class="field">
+                <span>Карточка товара</span>
+                <input id="productCardSelector" type="text" placeholder=".product-card">
+              </label>
+              <label class="field">
+                <span>Ссылка товара</span>
+                <input id="productUrlSelector" type="text" placeholder="a[href]">
+              </label>
+              <label class="field">
+                <span>Модель</span>
+                <input id="modelSelector" type="text" placeholder=".product-title">
+              </label>
+              <label class="field">
+                <span>Цена</span>
+                <input id="priceSelector" type="text" placeholder=".price">
+              </label>
+              <label class="field">
+                <span>Regex модели</span>
+                <input id="modelRegex" type="text" placeholder="([A-Z0-9][A-Z0-9\\s.-]+)">
+              </label>
+              <label class="field">
+                <span>Regex цены</span>
+                <input id="priceRegex" type="text" placeholder="(\\d[\\d\\s]+(?:₽|руб\\.))">
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel progress-panel">
+          <div class="progress-header">
+            <h2>Прогресс</h2>
+            <a class="button download disabled" id="downloadButton" href="#" aria-disabled="true">Скачать CSV</a>
+          </div>
+
+          <div class="progress-track" aria-label="Прогресс сбора">
+            <div class="progress-fill" id="progressFill"></div>
+          </div>
+          <div class="percent-row">
+            <span id="percentText">0%</span>
+            <span id="fileName"></span>
+          </div>
+
+          <div class="time-grid">
+            <div>
+              <span class="time-label">Прошло</span>
+              <strong id="elapsedTime">00:00:00</strong>
+            </div>
+            <div>
+              <span class="time-label">До конца</span>
+              <strong id="etaTime">—</strong>
+            </div>
+          </div>
+
+          <div class="current-url" id="currentUrl">Текущий URL появится после запуска.</div>
+
+          <div class="stats-grid">
+            <div class="stat">
+              <span class="stat-value" id="processedCount">0</span>
+              <span class="stat-label">Обработано страниц</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="foundCount">0</span>
+              <span class="stat-label">Найдено товаров</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="skippedCount">0</span>
+              <span class="stat-label">Пропущено</span>
+            </div>
+          </div>
+
+          <p class="error-text" id="errorText"></p>
+        </div>
+      </section>
+    </section>
+
+    <section class="news-view hidden" id="newItemsView">
+      <section class="panel news-settings-panel">
+        <div class="section-title-row">
+          <h2>Мониторинг новинок</h2>
+          <button class="button secondary" id="addNewsMonitorButton" type="button">+ Донор</button>
+        </div>
+        <div class="news-settings-grid">
+          <label class="field">
+            <span>Фиды товаров моих сайтов</span>
+            <textarea id="newsFeedUrl" rows="2" autocomplete="off"></textarea>
+          </label>
+          <label class="field">
+            <span>Ссылки генерации фидов</span>
+            <textarea id="newsFeedGenerateUrl" rows="2" autocomplete="off"></textarea>
+          </label>
+          <label class="field">
+            <span>SMTP сервер</span>
+            <input id="smtpHost" type="text" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>SMTP порт</span>
+            <input id="smtpPort" type="number" min="1" max="65535">
+          </label>
+          <label class="field">
+            <span>Шифрование</span>
+            <select id="smtpSecurity">
+              <option value="ssl">SSL</option>
+              <option value="tls">TLS</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Email-логин</span>
+            <input id="smtpUsername" type="email" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Отправитель</span>
+            <input id="smtpSender" type="email" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>Пароль приложения</span>
+            <input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Оставьте пустым, если пароль уже задан">
+          </label>
+          <label class="field news-recipients-field">
+            <span>Email получателей</span>
+            <textarea id="smtpRecipients" rows="2" placeholder="manager@example.ru&#10;second@example.ru"></textarea>
+          </label>
+        </div>
+        <div class="news-settings-actions">
+          <button class="button primary" id="saveNewsSettingsButton" type="button">Сохранить настройки</button>
+          <span class="save-notice" id="newsSettingsNotice"></span>
+        </div>
+      </section>
+
+      <section class="news-groups" id="newsGroups"></section>
+
+      <div class="modal-backdrop hidden" id="newsMonitorModal" aria-hidden="true">
+        <div class="modal-panel news-modal-panel" role="dialog" aria-modal="true" aria-labelledby="newsModalTitle">
+          <div class="modal-head">
+            <div>
+              <h2 id="newsModalTitle">Настройки донора</h2>
+              <p id="newsModalSubtitle"></p>
+            </div>
+            <button class="remove-button modal-close" id="closeNewsModalButton" type="button" aria-label="Закрыть">×</button>
+          </div>
+          <div id="newsModalContent"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="logs-view hidden" id="logsView">
+      <div class="panel logs-panel">
+        <div class="logs-header">
+          <h2>Логи</h2>
+          <div class="logs-actions">
+            <label class="toggle-field">
+              <input id="autoCleanup" type="checkbox">
+              <span>Автоочистка 7 суток</span>
+            </label>
+            <button class="button secondary" id="refreshLogsButton" type="button">Обновить</button>
+            <button class="button danger" id="clearLogsButton" type="button">Очистить</button>
+          </div>
+        </div>
+        <div class="logs-list" id="logsList"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
