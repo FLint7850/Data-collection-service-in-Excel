@@ -870,11 +870,48 @@ def has_static_extension(url: str) -> bool:
 
 def looks_like_product_path(path: str) -> bool:
     path_parts = [part for part in path.split("/") if part]
-    if len(path_parts) < 3 or path_parts[0] != "catalog":
+    if not path_parts:
         return False
-
     slug = path_parts[-1]
-    return "-" in slug or any(char.isdigit() for char in slug)
+    if len(path_parts) >= 3 and path_parts[0] == "catalog":
+        return "-" in slug or any(char.isdigit() for char in slug)
+    if len(path_parts) >= 2 and slug.lower().endswith(".html"):
+        service_prefixes = {
+            "articles",
+            "reviews",
+            "delivery-and-payment",
+            "services",
+            "credit",
+            "guarantee",
+            "contacts",
+        }
+        if path_parts[0].lower() in service_prefixes:
+            return False
+        product_slug = slug.rsplit(".", 1)[0]
+        return "-" in product_slug and any(char.isdigit() for char in product_slug)
+    return False
+
+
+def is_obvious_service_path(path: str) -> bool:
+    first = next((part.lower() for part in path.split("/") if part), "")
+    return first in {
+        "articles",
+        "reviews",
+        "delivery-and-payment",
+        "services",
+        "credit",
+        "guarantee",
+        "contacts",
+        "favorites",
+        "compare",
+        "cart",
+        "login",
+        "personal",
+        "search",
+        "upload",
+        "bitrix",
+        "ajax",
+    }
 
 
 def looks_blocked_or_empty(html: str) -> bool:
@@ -913,6 +950,8 @@ def should_follow_project_url(url: str, start_urls: List[str], root_netloc: str)
         return False
 
     path = urlparse(url).path or "/"
+    if is_obvious_service_path(path):
+        return False
     allowed_domain = False
     for start_url in start_urls:
         start_netloc = urlparse(start_url).netloc
@@ -921,6 +960,8 @@ def should_follow_project_url(url: str, start_urls: List[str], root_netloc: str)
         allowed_domain = True
         start_path = (urlparse(start_url).path or "/").rstrip("/") or "/"
         if start_path in {"/", "/catalog"}:
+            if not is_maunfeld_url(start_url):
+                return True
             return path == "/" or path == "/catalog" or path.startswith("/catalog/")
         if path == start_path or path.startswith(start_path + "/"):
             return True
@@ -1041,6 +1082,9 @@ def model_tokens_after_brand(value: str) -> str:
             if any(char.isdigit() for char in candidate_clean) or model_parts:
                 model_parts.append(candidate_clean)
                 continue
+            if re.fullmatch(r"[A-Za-z]{1,5}", candidate_clean):
+                model_parts.append(candidate_clean)
+                continue
             break
 
         if model_parts and any(any(char.isdigit() for char in part) for part in model_parts):
@@ -1121,6 +1165,32 @@ def normalize_model(value: str, product_url: str = "") -> str:
     generic_brand_model = model_tokens_after_brand(text)
     if generic_brand_model:
         return generic_brand_model
+
+    latin_model_text = text.replace("\\", "/")
+    latin_model_tokens = re.findall(r"[A-Za-z0-9./_-]+", latin_model_text)
+    if (
+        latin_model_tokens
+        and " ".join(latin_model_tokens).strip() == re.sub(r"\s+", " ", latin_model_text).strip()
+        and 1 <= len(latin_model_tokens) <= 6
+        and any(any(char.isdigit() for char in token) for token in latin_model_tokens)
+        and any(any(char.isalpha() for char in token) for token in latin_model_tokens)
+        and latin_model_tokens[0].upper() not in {"SERIE", "SERIES"}
+        and latin_model_tokens[0].upper() not in MODEL_BRANDS
+    ):
+        return " ".join(token.strip(" .,/\\_-").upper() for token in latin_model_tokens if token.strip(" .,/\\_-"))
+
+    ascii_tokens = re.findall(r"[A-Za-z0-9]+(?:[./_-][A-Za-z0-9]+)*", text)
+    for start_index in range(max(0, len(ascii_tokens) - 6), len(ascii_tokens)):
+        candidate_tokens = [token.strip(" .,/\\_-") for token in ascii_tokens[start_index:] if token.strip(" .,/\\_-")]
+        if not (2 <= len(candidate_tokens) <= 6):
+            continue
+        if not any(any(char.isdigit() for char in token) for token in candidate_tokens):
+            continue
+        if not all(re.fullmatch(r"[A-Z0-9./_-]+", token) for token in candidate_tokens):
+            continue
+        if candidate_tokens[0].upper() in MODEL_BRANDS or candidate_tokens[0].upper() in {"SERIE", "SERIES"}:
+            continue
+        return " ".join(candidate_tokens).upper()
 
     ignored_tokens = {
         "MAUNFELD",
@@ -1745,6 +1815,68 @@ def extract_listing_products_by_rules(
     return products
 
 
+def extract_listing_products_from_common_cards(
+    soup: BeautifulSoup,
+    current_url: str,
+    rules: Dict[str, str],
+    seen_urls: Set[str],
+) -> List[Dict[str, str]]:
+    products: List[Dict[str, str]] = []
+    card_selectors = [
+        ".catalog-card.js-ecom_product-item",
+        ".js-ecom_product-item",
+        "[class*='product-item']",
+        "[class*='product-card']",
+    ]
+    cards = []
+    seen_card_ids: Set[int] = set()
+    for selector in card_selectors:
+        for card in soup.select(selector):
+            if id(card) in seen_card_ids:
+                continue
+            seen_card_ids.add(id(card))
+            cards.append(card)
+
+    for card in cards:
+        product_url = extract_product_url_from_card(card, current_url)
+        if not product_url or product_url in seen_urls or not is_probable_product_url(product_url):
+            continue
+        if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
+            continue
+
+        price_text = first_by_selector(card, rules.get("price_selector", ""))
+        if not price_text:
+            price_text = first_text(card, [".catalog-card__price", "[class*='price']"])
+        prices = extract_prices(price_text) or extract_prices(card.get_text(" ", strip=True))
+        price = prices[-1] if prices else normalize_price_value(price_text)
+        if not price:
+            continue
+
+        model = extract_model_by_markers(str(card), rules)
+        if not model:
+            model = first_by_selector(card, rules.get("model_selector", ""))
+        if not model:
+            title_link = None
+            for link in card.select("a[title][href]"):
+                if normalize_url(link.get("href", ""), current_url) == product_url:
+                    title_link = link
+                    break
+            if title_link is None:
+                title_link = card.select_one("a[title][href]")
+            model = title_link.get("title", "") if title_link else ""
+        if not model:
+            model = extract_model_from_card(card, price)
+        model = prepare_rule_model(model, rules)
+        model = normalize_model(model, product_url)
+        if not model:
+            continue
+
+        seen_urls.add(product_url)
+        products.append({"url": product_url, "model": model, "price": price})
+
+    return products
+
+
 def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
     """Собирает товары прямо со страницы категории/каталога."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1752,6 +1884,9 @@ def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[s
     price_sources = []
     seen_urls: Set[str] = {product["url"] for product in products}
     seen_source_ids: Set[int] = set()
+    rules = normalize_extraction_rules(rules or {})
+
+    products.extend(extract_listing_products_from_common_cards(soup, current_url, rules, seen_urls))
 
     for price_node in soup.find_all(string=PRICE_RE):
         price_sources.append(price_node)
@@ -1842,12 +1977,29 @@ def extract_product_data(
         if schema_product:
             return schema_product
         model = find_labeled_value(soup, ["Артикул", "Модель", "Art:"])
+    if not is_maunfeld_url(url):
+        precise_model = first_text(
+            soup,
+            [
+                ".product-description__subtitle",
+                ".product-code",
+                ".article",
+                ".articul",
+                ".sku",
+            ],
+        )
+        if precise_model:
+            model = precise_model
     model_from_labeled_value = bool(model)
 
     if not model:
-        fallback_selectors = [".product-code", ".article", ".articul", ".sku"]
-        if not is_maunfeld_url(url):
-            fallback_selectors.append(".val")
+        fallback_selectors = [
+            ".product-description__subtitle",
+            ".product-code",
+            ".article",
+            ".articul",
+            ".sku",
+        ]
         model = first_text(soup, fallback_selectors)
     if not model and h1:
         model = h1
