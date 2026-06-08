@@ -59,9 +59,11 @@ const smtpPassword = document.querySelector("#smtpPassword");
 const smtpRecipients = document.querySelector("#smtpRecipients");
 const saveNewsSettingsButton = document.querySelector("#saveNewsSettingsButton");
 const newsSettingsNotice = document.querySelector("#newsSettingsNotice");
+const newsFeedsStorage = document.querySelector("#newsFeedsStorage");
 const newsMonitorModal = document.querySelector("#newsMonitorModal");
 const newsModalTitle = document.querySelector("#newsModalTitle");
 const newsModalSubtitle = document.querySelector("#newsModalSubtitle");
+const newsModalTitleActions = document.querySelector("#newsModalTitleActions");
 const newsModalContent = document.querySelector("#newsModalContent");
 const closeNewsModalButton = document.querySelector("#closeNewsModalButton");
 const deleteProjectModal = document.querySelector("#deleteProjectModal");
@@ -69,6 +71,11 @@ const deleteProjectText = document.querySelector("#deleteProjectText");
 const confirmDeleteProjectButton = document.querySelector("#confirmDeleteProjectButton");
 const cancelDeleteProjectButton = document.querySelector("#cancelDeleteProjectButton");
 const cancelDeleteProjectIconButton = document.querySelector("#cancelDeleteProjectIconButton");
+const deleteNewsMonitorModal = document.querySelector("#deleteNewsMonitorModal");
+const deleteNewsMonitorText = document.querySelector("#deleteNewsMonitorText");
+const confirmDeleteNewsMonitorButton = document.querySelector("#confirmDeleteNewsMonitorButton");
+const cancelDeleteNewsMonitorButton = document.querySelector("#cancelDeleteNewsMonitorButton");
+const cancelDeleteNewsMonitorIconButton = document.querySelector("#cancelDeleteNewsMonitorIconButton");
 
 let projects = [];
 let newsData = null;
@@ -83,6 +90,10 @@ const selectedNewsSites = new Map();
 let activeNewsBrandKey = null;
 let activeNewsSelectorsOpen = false;
 let pendingDeleteProjectId = null;
+let pendingDeleteNewsMonitorId = null;
+let pendingDeleteNewsMonitorMode = "brand";
+let pendingDeleteNewsBrandKey = null;
+let pendingDeleteDonorBrandKey = null;
 let tabsRenderKey = "";
 
 const statusLabels = {
@@ -92,6 +103,8 @@ const statusLabels = {
   partial: "приостановлено",
   completed: "завершено",
   error: "ошибка",
+  stopping: "останавливается",
+  stopped: "остановлено",
 };
 
 function activeProject() {
@@ -227,6 +240,95 @@ async function deletePendingProject() {
   }
   closeDeleteProjectModal();
   renderAll();
+}
+
+function openDeleteNewsMonitorModal(monitorId, mode = "brand", brandKey = null) {
+  const monitor = (newsData?.monitors || []).find((item) => item.id === monitorId);
+  if (!monitor) return;
+  pendingDeleteNewsMonitorId = monitorId;
+  pendingDeleteNewsMonitorMode = mode;
+  pendingDeleteNewsBrandKey = brandKey || activeNewsBrandKey;
+  const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
+  const isDonor = mode === "donor";
+  const title = isDonor ? "Удалить донор" : "Удалить бренд";
+  deleteNewsMonitorModal.querySelector("#deleteNewsMonitorTitle").textContent = title;
+  deleteNewsMonitorText.textContent = isDonor
+    ? `Сайт-донор ${site || monitor.brand || ""} будет удален только из списка доноров текущего бренда "${monitor.brand || "бренд"}".`
+    : `Бренд "${monitor.brand || "донор"}" и все его доноры будут удалены. Это действие нельзя отменить.`;
+  deleteNewsMonitorModal.classList.remove("hidden");
+  deleteNewsMonitorModal.setAttribute("aria-hidden", "false");
+  confirmDeleteNewsMonitorButton.focus();
+}
+
+function closeDeleteNewsMonitorModal() {
+  pendingDeleteNewsMonitorId = null;
+  pendingDeleteNewsMonitorMode = "brand";
+  pendingDeleteNewsBrandKey = null;
+  pendingDeleteDonorBrandKey = null;
+  deleteNewsMonitorModal.classList.add("hidden");
+  deleteNewsMonitorModal.setAttribute("aria-hidden", "true");
+}
+
+function openDeleteSelectedDonorModal() {
+  const select = newsModalContent.querySelector("[data-action='modal-select-news-site']");
+  const monitorId = select?.value || "";
+  const monitor = (newsData?.monitors || []).find((item) => item.id === monitorId);
+  if (!monitor) {
+    errorText.textContent = "Выберите сайт-донора для удаления.";
+    return;
+  }
+  pendingDeleteNewsMonitorId = monitorId;
+  pendingDeleteNewsMonitorMode = "donor";
+  pendingDeleteNewsBrandKey = null;
+  pendingDeleteDonorBrandKey = activeNewsBrandKey;
+  const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
+  deleteNewsMonitorModal.querySelector("#deleteNewsMonitorTitle").textContent = "Удалить донор";
+  deleteNewsMonitorText.textContent = `Сайт-донор ${site || monitor.brand || ""} будет удален из списка текущего бренда.`;
+  deleteNewsMonitorModal.classList.remove("hidden");
+  deleteNewsMonitorModal.setAttribute("aria-hidden", "false");
+  confirmDeleteNewsMonitorButton.focus();
+}
+
+async function deletePendingNewsMonitor() {
+  const monitorId = pendingDeleteNewsMonitorId;
+  if (!monitorId) return;
+  const mode = pendingDeleteNewsMonitorMode;
+  const previousBrandKey = pendingDeleteDonorBrandKey || pendingDeleteNewsBrandKey || activeNewsBrandKey;
+  const previousMonitors = monitorsForBrandKey(previousBrandKey);
+  const removedIndex = previousMonitors.findIndex((item) => item.id === monitorId);
+  const idsToDelete = mode === "brand" && pendingDeleteNewsBrandKey
+    ? monitorsForBrandKey(pendingDeleteNewsBrandKey).map((item) => item.id)
+    : [monitorId];
+  let latestMonitors = null;
+  for (const id of idsToDelete) {
+    const data = await requestJson(`/api/news/monitors/${id}`, { method: "DELETE" });
+    if (Array.isArray(data.monitors)) latestMonitors = data.monitors;
+  }
+  if (mode === "donor") {
+    newsData = await requestJson("/api/news");
+  } else {
+    newsData.monitors = latestMonitors || (newsData.monitors || []).filter((item) => !idsToDelete.includes(item.id));
+  }
+  if (mode === "donor" && previousBrandKey) {
+    const nextMonitors = monitorsForBrandKey(previousBrandKey);
+    const nextMonitor = nextMonitors[Math.max(0, removedIndex - 1)] || nextMonitors[0] || null;
+    if (nextMonitor) {
+      selectedNewsSites.set(previousBrandKey, nextMonitor.id);
+      activeNewsBrandKey = previousBrandKey;
+    } else {
+      selectedNewsSites.delete(previousBrandKey);
+      closeNewsModal();
+    }
+  }
+  if (idsToDelete.includes(newsModalContent.dataset.monitorId) && mode !== "donor") {
+    closeNewsModal();
+  }
+  closeDeleteNewsMonitorModal();
+  renderFeedStorage();
+  renderNewsMonitors();
+  if (mode === "donor" && activeNewsBrandKey && !newsMonitorModal.classList.contains("hidden")) {
+    renderNewsModal();
+  }
 }
 
 function renderProjectForm(project) {
@@ -399,6 +501,7 @@ function formatDateTimeLocal(value) {
 function newsStatusClass(status) {
   if (status === "running" || status === "queued") return "status-running";
   if (status === "completed") return "status-completed";
+  if (status === "stopping" || status === "stopped") return "status-paused";
   if (status === "error") return "status-error";
   return "status-idle";
 }
@@ -406,6 +509,8 @@ function newsStatusClass(status) {
 function newsStatusText(status) {
   if (status === "running" || status === "queued") return "в работе";
   if (status === "completed") return "завершено";
+  if (status === "stopping") return "останавливается";
+  if (status === "stopped") return "остановлено";
   if (status === "error") return "ошибка";
   return "ожидание";
 }
@@ -421,6 +526,65 @@ function clampPercent(value) {
   const percent = Number(value || 0);
   if (!Number.isFinite(percent)) return 0;
   return Math.max(0, Math.min(100, Math.round(percent)));
+}
+
+function formatFileSize(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} Б`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+}
+
+function renderFeedStorage() {
+  if (!newsFeedsStorage || !newsData) return;
+  const feeds = newsData.feed_storage || [];
+  if (!feeds.length) {
+    newsFeedsStorage.innerHTML = `
+      <div class="local-feeds">
+        <span class="local-feeds-title">Локальные фиды</span>
+        <span class="local-feed-empty">Фиды еще не загружались.</span>
+      </div>
+    `;
+    return;
+  }
+  const groups = feeds.reduce((acc, feed) => {
+    const source = feed.source || "feed";
+    if (!acc[source]) {
+      acc[source] = {
+        label: feed.source_label || source,
+        feeds: [],
+      };
+    }
+    acc[source].feeds.push(feed);
+    return acc;
+  }, {});
+  newsFeedsStorage.innerHTML = `
+    <div class="local-feeds">
+      <span class="local-feeds-title">Локальные фиды</span>
+      ${Object.entries(groups)
+        .map(([source, group]) => `
+          <div class="local-feed-source">
+            <strong>${escapeHtml(group.label)}</strong>
+            ${group.feeds
+              .map((feed) => {
+                const filename = feed.filename || "";
+                const size = formatFileSize(feed.size);
+                const codes = Number(feed.codes_count || 0);
+                const meta = [size, `${codes} моделей`].filter(Boolean).join(" · ");
+                return `
+                  <a class="local-feed-link" href="/api/news/feeds/${encodeURIComponent(source)}/${encodeURIComponent(filename)}">
+                    <span>${escapeHtml(filename || "feed.xml")}</span>
+                    <small>${escapeHtml(meta || feed.kind || "")}</small>
+                  </a>
+                `;
+              })
+              .join("")}
+          </div>
+        `)
+        .join("")}
+    </div>
+  `;
 }
 
 function renderNewsMonitors() {
@@ -451,6 +615,9 @@ function renderNewsMonitors() {
       tile.dataset.action = "open-news-brand";
       tile.dataset.brandKey = brandKey;
       tile.innerHTML = `
+        <span class="news-tile-remove-wrap">
+          <button class="news-tile-remove" data-action="delete-news-monitor-card" data-monitor-id="${monitor.id}" data-brand-key="${escapeHtml(brandKey)}" type="button" aria-label="Удалить">×</button>
+        </span>
         <span class="brand-name">${escapeHtml(brand)}</span>
         <span class="brand-meta">${brandMonitors.length} сайт${brandMonitors.length > 1 ? "а" : ""}</span>
         <span class="brand-sites">${brandMonitors.map((item) => escapeHtml(item.site_url || (item.start_urls || [])[0] || "")).join("<br>")}</span>
@@ -513,18 +680,91 @@ function closeNewsModal() {
   activeNewsSelectorsOpen = false;
 }
 
+function updateNewsModalProgress() {
+  const monitor = activeNewsMonitor();
+  if (!monitor || newsModalContent.dataset.monitorId !== monitor.id) return;
+  const state = monitor.state || {};
+  const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
+  const statusNode = newsMonitorModal.querySelector("[data-role='news-status']");
+  if (statusNode) {
+    const nextClass = `news-status ${newsStatusClass(state.status)}`;
+    if (statusNode.className !== nextClass) statusNode.className = nextClass;
+    const statusTextNode = statusNode.querySelector("[data-role='status-text']");
+    if (statusTextNode) statusTextNode.textContent = newsStatusText(state.status);
+    const canStop = ["running", "queued", "stopping"].includes(state.status);
+    let stopButton = statusNode.querySelector("[data-action='stop-news']");
+    if (canStop && !stopButton) {
+      stopButton = document.createElement("button");
+      stopButton.className = "status-stop-button";
+      stopButton.dataset.action = "stop-news";
+      stopButton.type = "button";
+      stopButton.title = "Остановить выполнение";
+      stopButton.setAttribute("aria-label", "Остановить выполнение");
+      stopButton.textContent = "■";
+      statusNode.append(stopButton);
+    } else if (!canStop && stopButton) {
+      stopButton.remove();
+    }
+  }
+
+  const summaryValues = {
+    lastScan: state.last_scan_at || "—",
+    newCount: Number(state.new_count || 0),
+    csv: state.last_csv || "—",
+    stage: state.stage || "—",
+    processed: Number(state.processed || 0),
+    found: Number(state.found_products || 0),
+    compared: Number(state.compared_products || 0),
+    candidates: Number(state.candidate_products || state.found_products || 0),
+    elapsed: formatDuration(state.elapsed_seconds || 0),
+  };
+  Object.entries(summaryValues).forEach(([key, value]) => {
+    const node = newsModalContent.querySelector(`[data-summary='${key}']`);
+    if (node) node.textContent = value;
+  });
+
+  const fill = newsModalContent.querySelector("[data-role='modal-progress-fill']");
+  if (fill) fill.style.width = `${percent}%`;
+  const percentNode = newsModalContent.querySelector("[data-role='modal-percent']");
+  if (percentNode) percentNode.textContent = `${percent}%`;
+  const currentUrlNode = newsModalContent.querySelector("[data-role='modal-current-url']");
+  if (currentUrlNode) currentUrlNode.textContent = state.currenturl || "";
+
+  const scanButton = newsModalContent.querySelector("[data-action='scan-news']");
+  if (scanButton) scanButton.disabled = ["running", "queued", "stopping"].includes(state.status);
+  const downloadLink = newsModalContent.querySelector("[data-role='modal-csv-download']");
+  if (downloadLink) {
+    const ready = Boolean(state.last_csv);
+    downloadLink.classList.toggle("disabled", !ready);
+    downloadLink.setAttribute("aria-disabled", ready ? "false" : "true");
+    downloadLink.href = ready ? `/api/news/monitors/${monitor.id}/download` : "#";
+  }
+  const errorNode = newsModalContent.querySelector("[data-role='modal-error']");
+  if (errorNode) errorNode.textContent = state.error || "";
+}
+
 function renderNewsModal() {
   const monitor = activeNewsMonitor();
   const monitors = monitorsForBrandKey(activeNewsBrandKey);
   if (!monitor) return;
 
   const state = monitor.state || {};
-  const disabled = state.status === "running" || state.status === "queued";
+  const disabled = ["running", "queued", "stopping"].includes(state.status);
   const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
   const brand = monitor.brand || "Донор";
   const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
   newsModalTitle.textContent = brand;
   newsModalSubtitle.textContent = site;
+  newsModalTitleActions.innerHTML = `
+    <label class="toggle-field modal-title-toggle">
+      <input data-field="enabled" type="checkbox" ${monitor.enabled !== false ? "checked" : ""}>
+      <span>Активен</span>
+    </label>
+    <span class="news-status ${newsStatusClass(state.status)}" data-role="news-status">
+      <span data-role="status-text">${escapeHtml(newsStatusText(state.status))}</span>
+      ${disabled ? `<button class="status-stop-button" data-action="stop-news" type="button" title="Остановить выполнение" aria-label="Остановить выполнение">■</button>` : ""}
+    </span>
+  `;
   newsModalContent.dataset.monitorId = monitor.id;
   newsModalContent.innerHTML = `
     <div class="modal-site-row">
@@ -538,29 +778,29 @@ function renderNewsModal() {
             })
             .join("")}
         </select>
+        <div class="add-modal-donor-row">
+          <input data-role="new-site-donor-url" type="url" placeholder="https://site.ru/">
+          <button class="button secondary compact-button add-modal-donor-button" data-action="add-news-site-donor" type="button">Добавить</button>
+        </div>
       </label>
-      <label class="toggle-field modal-active-toggle">
-        <input data-field="enabled" type="checkbox" ${monitor.enabled !== false ? "checked" : ""}>
-        <span>Активен</span>
-      </label>
-      <span class="news-status ${newsStatusClass(state.status)}">${escapeHtml(newsStatusText(state.status))}</span>
+      <button class="button danger compact-button" data-action="delete-news-monitor" type="button" ${monitors.length ? "" : "disabled"}>Удалить донор</button>
     </div>
 
     <div class="modal-summary-row">
-      <span>Последнее сканирование: ${escapeHtml(state.last_scan_at || "—")}</span>
-      <span>Новинок: <strong>${Number(state.new_count || 0)}</strong></span>
-      <span>CSV: ${escapeHtml(state.last_csv || "—")}</span>
-      <span>Этап: ${escapeHtml(state.stage || "—")}</span>
-      <span>Ссылок/страниц: <strong>${Number(state.processed || 0)}</strong></span>
-      <span>Товаров найдено: <strong>${Number(state.found_products || 0)}</strong></span>
-      <span>Сравнено: <strong>${Number(state.compared_products || 0)}</strong> / ${Number(state.candidate_products || state.found_products || 0)}</span>
-      <span>Время: ${formatDuration(state.elapsed_seconds || 0)}</span>
+      <span>Последнее сканирование: <span data-summary="lastScan">${escapeHtml(state.last_scan_at || "—")}</span></span>
+      <span>Новинок: <strong data-summary="newCount">${Number(state.new_count || 0)}</strong></span>
+      <span>CSV: <span data-summary="csv">${escapeHtml(state.last_csv || "—")}</span></span>
+      <span>Этап: <span data-summary="stage">${escapeHtml(state.stage || "—")}</span></span>
+      <span>Ссылок/страниц: <strong data-summary="processed">${Number(state.processed || 0)}</strong></span>
+      <span>Товаров найдено: <strong data-summary="found">${Number(state.found_products || 0)}</strong></span>
+      <span>Сравнено: <strong data-summary="compared">${Number(state.compared_products || 0)}</strong> / <span data-summary="candidates">${Number(state.candidate_products || state.found_products || 0)}</span></span>
+      <span>Время: <span data-summary="elapsed">${formatDuration(state.elapsed_seconds || 0)}</span></span>
     </div>
     <div class="news-progress-block">
-      <div class="progress-track"><div class="progress-fill" style="width: ${percent}%"></div></div>
+      <div class="progress-track"><div class="progress-fill" data-role="modal-progress-fill" style="width: ${percent}%"></div></div>
       <div class="percent-row">
-        <span>${percent}%</span>
-        <span>${escapeHtml(state.currenturl || "")}</span>
+        <span data-role="modal-percent">${percent}%</span>
+        <span data-role="modal-current-url">${escapeHtml(state.currenturl || "")}</span>
       </div>
     </div>
 
@@ -666,25 +906,27 @@ function renderNewsModal() {
     <div class="modal-actions">
       <button class="button primary" data-action="save-news-monitor" type="button">Сохранить изменения</button>
       <button class="button secondary" data-action="scan-news" type="button" ${disabled ? "disabled" : ""}>Сканировать наличие новинок</button>
-      <a class="button download ${state.last_csv ? "" : "disabled"}" href="${state.last_csv ? `/api/news/monitors/${monitor.id}/download` : "#"}" aria-disabled="${state.last_csv ? "false" : "true"}">Скачать CSV</a>
+      <a class="button download ${state.last_csv ? "" : "disabled"}" data-role="modal-csv-download" href="${state.last_csv ? `/api/news/monitors/${monitor.id}/download` : "#"}" aria-disabled="${state.last_csv ? "false" : "true"}">Скачать CSV</a>
       <span class="save-notice" data-role="monitor-notice"></span>
     </div>
-    <p class="error-text">${escapeHtml(state.error || "")}</p>
+    <p class="error-text" data-role="modal-error">${escapeHtml(state.error || "")}</p>
   `;
 }
 
 function renderNews() {
   renderNewsSettings();
+  renderFeedStorage();
   renderNewsMonitors();
 }
 
 function collectMonitorPayload(root) {
+  const scope = root === newsModalContent ? newsMonitorModal : root;
   const payload = {
     collapsed: root.classList?.contains("news-monitor-card") ? root.classList.contains("collapsed") : true,
     extraction_rules: {},
     selector_settings: {},
   };
-  root.querySelectorAll("[data-field]").forEach((input) => {
+  scope.querySelectorAll("[data-field]").forEach((input) => {
     const key = input.dataset.field;
     if (input.type === "checkbox") {
       payload[key] = input.checked;
@@ -694,10 +936,10 @@ function collectMonitorPayload(root) {
       payload[key] = input.value;
     }
   });
-  root.querySelectorAll("[data-rule]").forEach((input) => {
+  scope.querySelectorAll("[data-rule]").forEach((input) => {
     payload.extraction_rules[input.dataset.rule] = input.value.trim();
   });
-  root.querySelectorAll("[data-selector]").forEach((input) => {
+  scope.querySelectorAll("[data-selector]").forEach((input) => {
     payload.selector_settings[input.dataset.selector] = input.value.trim();
   });
   return payload;
@@ -961,6 +1203,13 @@ addNewsMonitorButton.addEventListener("click", async () => {
 });
 
 newsGroups.addEventListener("click", (event) => {
+  const deleteButton = event.target.closest("[data-action='delete-news-monitor-card']");
+  if (deleteButton) {
+    event.stopPropagation();
+    openDeleteNewsMonitorModal(deleteButton.dataset.monitorId, "brand", deleteButton.dataset.brandKey);
+    return;
+  }
+
   const tile = event.target.closest("[data-action='open-news-brand']");
   if (!tile) return;
   openNewsModal(tile.dataset.brandKey);
@@ -1026,6 +1275,40 @@ deleteProjectModal.addEventListener("click", (event) => {
   }
 });
 
+cancelDeleteNewsMonitorButton.addEventListener("click", closeDeleteNewsMonitorModal);
+cancelDeleteNewsMonitorIconButton.addEventListener("click", closeDeleteNewsMonitorModal);
+async function confirmDeleteNewsMonitor() {
+  if (!pendingDeleteNewsMonitorId) {
+    deleteNewsMonitorText.textContent = "Не выбран донор для удаления.";
+    return;
+  }
+  const originalText = confirmDeleteNewsMonitorButton.textContent;
+  confirmDeleteNewsMonitorButton.disabled = true;
+  confirmDeleteNewsMonitorButton.textContent = "Удаляю...";
+  try {
+    await deletePendingNewsMonitor();
+  } catch (error) {
+    deleteNewsMonitorText.textContent = error.message;
+    errorText.textContent = error.message;
+  } finally {
+    confirmDeleteNewsMonitorButton.disabled = false;
+    confirmDeleteNewsMonitorButton.textContent = originalText;
+  }
+}
+
+deleteNewsMonitorModal.addEventListener("click", (event) => {
+  const confirmButton = event.target.closest("[data-action='confirm-delete-news-monitor']");
+  if (confirmButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    confirmDeleteNewsMonitor();
+    return;
+  }
+  if (event.target === deleteNewsMonitorModal) {
+    closeDeleteNewsMonitorModal();
+  }
+});
+
 newsMonitorModal.addEventListener("click", (event) => {
   if (event.target === newsMonitorModal) {
     closeNewsModal();
@@ -1040,11 +1323,59 @@ newsModalContent.addEventListener("change", (event) => {
   renderNewsModal();
 });
 
+newsModalTitleActions.addEventListener("click", async (event) => {
+  const stopButton = event.target.closest("[data-action='stop-news']");
+  if (!stopButton) return;
+  try {
+    const monitorId = newsModalContent.dataset.monitorId;
+    const data = await requestJson(`/api/news/monitors/${monitorId}/stop`, { method: "POST" });
+    const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
+    if (index >= 0) newsData.monitors[index] = data.monitor;
+    renderNewsMonitors();
+    updateNewsModalProgress();
+  } catch (error) {
+    errorText.textContent = error.message;
+  }
+});
+
 newsModalContent.addEventListener("click", async (event) => {
   const selectorToggle = event.target.closest("[data-action='toggle-modal-selectors']");
   if (selectorToggle) {
     activeNewsSelectorsOpen = !activeNewsSelectorsOpen;
     renderNewsModal();
+    return;
+  }
+
+  const addSiteDonorButton = event.target.closest("[data-action='add-news-site-donor']");
+  if (addSiteDonorButton) {
+    try {
+      const currentMonitor = activeNewsMonitor();
+      if (!currentMonitor) return;
+      const urlInput = newsModalContent.querySelector("[data-role='new-site-donor-url']");
+      const siteUrl = urlInput?.value.trim() || "";
+      if (!siteUrl) {
+        errorText.textContent = "Укажите сайт-донора.";
+        urlInput?.focus();
+        return;
+      }
+      await saveNewsMonitor(newsModalContent);
+      const data = await requestJson("/api/news/monitors", {
+        method: "POST",
+        body: JSON.stringify({
+          group: currentMonitor.group || "Маржа",
+          brand: currentMonitor.brand || "Новый донор",
+          site_url: siteUrl,
+          start_urls: siteUrl,
+        }),
+      });
+      if (!newsData) newsData = await requestJson("/api/news");
+      newsData.monitors.push(data.monitor);
+      selectedNewsSites.set(activeNewsBrandKey, data.monitor.id);
+      renderNewsMonitors();
+      renderNewsModal();
+    } catch (error) {
+      errorText.textContent = error.message;
+    }
     return;
   }
 
@@ -1058,6 +1389,27 @@ newsModalContent.addEventListener("click", async (event) => {
       if (notice) notice.textContent = error.message;
       errorText.textContent = error.message;
     }
+    return;
+  }
+
+  const stopButton = event.target.closest("[data-action='stop-news']");
+  if (stopButton) {
+    try {
+      const monitorId = newsModalContent.dataset.monitorId;
+      const data = await requestJson(`/api/news/monitors/${monitorId}/stop`, { method: "POST" });
+      const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
+      if (index >= 0) newsData.monitors[index] = data.monitor;
+      renderNewsMonitors();
+      renderNewsModal();
+    } catch (error) {
+      errorText.textContent = error.message;
+    }
+    return;
+  }
+
+  const deleteButton = event.target.closest("[data-action='delete-news-monitor']");
+  if (deleteButton) {
+    openDeleteSelectedDonorModal();
     return;
   }
 
@@ -1081,7 +1433,7 @@ startButton.addEventListener("click", async () => {
   if (!project) return;
   try {
     await saveActiveProject();
-    const state = await requestJson(`/api/projects/${project.id}/start`, {
+    project.state = await requestJson(`/api/projects/${project.id}/start`, {
       method: "POST",
       body: JSON.stringify({
         start_urls: startUrls.value,
@@ -1099,7 +1451,6 @@ startButton.addEventListener("click", async () => {
         auto_connection_fallback: autoConnectionFallback.checked,
       }),
     });
-    project.state = state;
     renderState(project);
   } catch (error) {
     errorText.textContent = error.message;
@@ -1233,12 +1584,10 @@ events.addEventListener("progress", (event) => {
   if (data.news) {
     newsData = data.news;
     if (activeView === "news") {
+      renderFeedStorage();
       renderNewsMonitors();
       if (activeNewsBrandKey && newsMonitorModal && !newsMonitorModal.classList.contains("hidden")) {
-        const activeTag = document.activeElement?.tagName || "";
-        if (!["INPUT", "TEXTAREA", "SELECT"].includes(activeTag)) {
-          renderNewsModal();
-        }
+        updateNewsModalProgress();
       }
     }
   }

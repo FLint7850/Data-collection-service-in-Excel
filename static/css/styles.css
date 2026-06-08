@@ -668,6 +668,7 @@ select:focus {
 }
 
 .news-brand-tile {
+  position: relative;
   display: grid;
   gap: 7px;
   min-height: 132px;
@@ -680,12 +681,39 @@ select:focus {
   cursor: pointer;
 }
 
+.news-tile-remove-wrap {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+}
+
+.news-tile-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.news-tile-remove:hover {
+  color: var(--danger);
+  background: rgba(210, 100, 95, 0.16);
+}
+
 .news-brand-tile:hover {
   border-color: var(--primary);
   background: #202a32;
 }
 
 .brand-name {
+  padding-right: 28px;
   font-weight: 700;
   overflow-wrap: anywhere;
 }
@@ -797,6 +825,10 @@ select:focus {
 }
 
 .news-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   min-width: 105px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -805,6 +837,27 @@ select:focus {
   background: #11171c;
   text-align: center;
   font-size: 13px;
+}
+
+.status-stop-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.status-stop-button:hover {
+  color: var(--warning);
+  background: rgba(255, 255, 255, 0.2);
 }
 
 .news-status.status-running {
@@ -817,6 +870,12 @@ select:focus {
   color: #dff7ea;
   border-color: #2c9c63;
   background: #17633f;
+}
+
+.news-status.status-paused {
+  color: #ffeac1;
+  border-color: var(--warning);
+  background: #694715;
 }
 
 .news-status.status-error {
@@ -833,6 +892,25 @@ select:focus {
   min-width: 110px;
   min-height: 38px;
   padding: 8px 12px;
+}
+
+.add-modal-donor-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.add-modal-donor-row input {
+  min-height: 36px;
+  padding: 7px 10px;
+}
+
+.add-modal-donor-button {
+  width: fit-content;
+  min-width: 0;
+  min-height: 36px;
+  padding: 7px 10px;
+  font-size: 13px;
 }
 
 .news-monitor-grid {
@@ -879,6 +957,10 @@ select:focus {
   display: none;
 }
 
+.confirm-backdrop {
+  z-index: 70;
+}
+
 .modal-panel {
   width: min(920px, 100%);
   max-height: min(88vh, 820px);
@@ -911,6 +993,18 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.news-modal-title-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.modal-title-toggle {
+  min-height: 36px;
+}
+
 .modal-close {
   flex: 0 0 auto;
 }
@@ -920,7 +1014,7 @@ select:focus {
 .modal-actions,
 .selector-toggle-row {
   display: flex;
-  align-items: center;
+  align-items: end;
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -947,6 +1041,67 @@ select:focus {
 
 .news-progress-block {
   margin-bottom: 14px;
+}
+
+.local-feeds {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel-soft);
+  margin-top: 14px;
+}
+
+.local-feeds-title {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.local-feed-empty {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.local-feed-source {
+  display: grid;
+  gap: 8px;
+}
+
+.local-feed-source strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.local-feed-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: #11171c;
+  text-decoration: none;
+}
+
+.local-feed-link:hover {
+  border-color: var(--primary);
+}
+
+.local-feed-link span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-feed-link small {
+  flex: 0 0 auto;
+  color: var(--muted);
 }
 
 .news-progress-block .percent-row span:last-child {

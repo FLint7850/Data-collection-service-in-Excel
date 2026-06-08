@@ -20,6 +20,7 @@ instance/
 
 # Runtime project data
 exports/
+feeds/
 output/
 error_logs/
 profiles/

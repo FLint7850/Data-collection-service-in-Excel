@@ -3,6 +3,7 @@ import os
 import csv
 import html as html_lib
 import re
+import shutil
 import smtplib
 import ssl
 import threading
@@ -25,6 +26,7 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
+FEED_DIR = BASE_DIR / "feeds"
 EXCLUSIONS_FILE = BASE_DIR / "exclusions.json"
 PROJECTS_FILE = BASE_DIR / "projects.json"
 LOGS_FILE = LOG_DIR / "logs.json"
@@ -99,6 +101,8 @@ news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
 HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(3)
+FEED_STORAGE_LOCK = threading.Lock()
+news_stop_events: Dict[str, threading.Event] = {}
 
 scan_state: Dict[str, object] = {
     "status": "idle",
@@ -142,6 +146,7 @@ def ensure_storage() -> None:
     """Создает рабочие файлы при первом запуске."""
     EXPORT_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
+    FEED_DIR.mkdir(exist_ok=True)
     if not EXCLUSIONS_FILE.exists():
         save_exclusions(DEFAULT_EXCLUSIONS)
     load_projects()
@@ -420,6 +425,7 @@ def default_news_settings() -> Dict[str, object]:
         },
         "monitors": [],
         "logs": [],
+        "feed_storage": [],
     }
 
 
@@ -550,6 +556,7 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     monitor["known_new_products"] = known if isinstance(known, dict) else {}
     state = item.get("state", {})
     monitor["state"] = {**make_news_state(), **state} if isinstance(state, dict) else make_news_state()
+    monitor["state"].pop("last_feeds", None)
     if monitor["state"].get("status") in {"running", "queued"}:
         monitor["state"]["status"] = "error"
         monitor["state"]["stage"] = "Прервано"
@@ -654,6 +661,7 @@ def public_news_settings() -> Dict[str, object]:
             "feed_generate_urls": feed_generate_urls,
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
+            "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
             "monitors": [dict(monitor) for monitor in news_settings.get("monitors", [])],
         }
 
@@ -680,6 +688,7 @@ def save_exclusions(items: Iterable[str]) -> None:
 def ensure_storage_without_exclusions_loop() -> None:
     EXPORT_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
+    FEED_DIR.mkdir(exist_ok=True)
     if not EXCLUSIONS_FILE.exists():
         EXCLUSIONS_FILE.write_text(
             json.dumps(DEFAULT_EXCLUSIONS, ensure_ascii=False, indent=2),
@@ -2548,7 +2557,52 @@ def extract_product_name(soup: BeautifulSoup, selector: str = "") -> str:
     return first_text(soup, ["h1", "[itemprop='name']", ".product-title", ".product__title"])
 
 
-def fetch_existing_vendor_codes() -> Set[str]:
+def feed_source_key(url: str) -> str:
+    hostname = urlparse(url).hostname or "feed"
+    return safe_filename(hostname.lower().removeprefix("www."))
+
+
+def feed_source_label(url: str) -> str:
+    hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if "mega-kuhnya" in hostname:
+        return "Мега-кухня"
+    if "vsya-tehnika" in hostname:
+        return "Вся техника"
+    return hostname or "Фид"
+
+
+def source_feed_dir(source: str) -> Path:
+    return FEED_DIR / safe_filename(source)
+
+
+def local_feed_filename(kind: str, index: int, url: str) -> str:
+    parsed = urlparse(url)
+    raw_name = Path(parsed.path).name or kind
+    stem = Path(raw_name).stem or kind
+    suffix = Path(raw_name).suffix.lower()
+    if suffix not in {".xml", ".yml"}:
+        suffix = ".xml"
+    return f"{index:02d}_{safe_filename(kind)}_{safe_filename(stem)}{suffix}"
+
+
+def generation_file_url(url: str) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["cron"] = "file"
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def clear_source_feeds(source: str) -> Path:
+    feed_dir = source_feed_dir(source)
+    if feed_dir.exists():
+        for path in feed_dir.glob("*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+    feed_dir.mkdir(parents=True, exist_ok=True)
+    return feed_dir
+
+
+def download_feed_files() -> List[Dict[str, object]]:
     with news_lock:
         feed_urls = normalize_start_urls(news_settings.get("feed_urls") or news_settings.get("feed_url") or DEFAULT_FEED_URL)
         generate_urls = normalize_start_urls(
@@ -2563,22 +2617,63 @@ def fetch_existing_vendor_codes() -> Set[str]:
             )
         }
     )
+    downloaded: List[Dict[str, object]] = []
+    with FEED_STORAGE_LOCK:
+        expected_sources = {feed_source_key(url) for url in feed_urls}
+        if FEED_DIR.exists():
+            for child in FEED_DIR.iterdir():
+                if child.is_dir() and child.name not in expected_sources:
+                    shutil.rmtree(child, ignore_errors=True)
+        for source in expected_sources:
+            clear_source_feeds(source)
+        for generate_url in generate_urls:
+            try:
+                response = session.get(generation_file_url(generate_url), timeout=60)
+                response.raise_for_status()
+            except Exception:
+                pass
+        for index, url in enumerate(feed_urls, start=1):
+            try:
+                response = session.get(url, timeout=60)
+                response.raise_for_status()
+                source = feed_source_key(url)
+                feed_dir = source_feed_dir(source)
+                filename = local_feed_filename("feed", index, url)
+                path = feed_dir / filename
+                path.write_bytes(response.content)
+                downloaded.append(
+                    {
+                        "kind": "feed",
+                        "source": source,
+                        "source_label": feed_source_label(url),
+                        "url": url,
+                        "filename": filename,
+                        "size": path.stat().st_size,
+                        "downloaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+                    }
+                )
+            except Exception:
+                pass
+    return downloaded
+
+
+def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
+    downloaded_feeds = download_feed_files()
     codes: Set[str] = set()
-    for generate_url in generate_urls:
+    feeds: List[Dict[str, object]] = []
+    for feed in downloaded_feeds:
+        filename = str(feed.get("filename") or "")
+        path = source_feed_dir(str(feed.get("source") or "")) / filename
         try:
-            response = session.get(generate_url, timeout=40)
-            if response.ok and b"<vendorCode" in response.content:
-                codes.update(parse_vendor_codes_from_xml(response.content))
-        except Exception:
-            pass
-    for feed_url in feed_urls:
-        try:
-            response = session.get(feed_url, timeout=60)
-            response.raise_for_status()
-            codes.update(parse_vendor_codes_from_xml(response.content))
-        except Exception:
-            continue
-    return codes
+            feed_codes = parse_vendor_codes_from_xml(path.read_bytes())
+            codes.update(feed_codes)
+            feeds.append({**feed, "codes_count": len(feed_codes)})
+        except Exception as exc:
+            feeds.append({**feed, "codes_count": 0, "error": str(exc)})
+    with news_lock:
+        news_settings["feed_storage"] = feeds
+        save_news_settings()
+    return codes, feeds
 
 
 def parse_vendor_codes_from_xml(content: bytes) -> Set[str]:
@@ -2626,11 +2721,25 @@ def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> N
         save_news_settings()
 
 
-def collect_products_for_monitor(monitor: Dict[str, object]) -> List[Dict[str, str]]:
-    stop_signal = threading.Event()
+class NewsScanStopped(Exception):
+    pass
+
+
+def get_news_stop_event(monitor_id: str) -> threading.Event:
+    with news_lock:
+        event = news_stop_events.get(monitor_id)
+        if not event:
+            event = threading.Event()
+            news_stop_events[monitor_id] = event
+        return event
+
+
+def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: threading.Event) -> List[Dict[str, str]]:
     finish_signal = threading.Event()
 
     def progress_callback(payload: Dict[str, object]) -> None:
+        if stop_signal.is_set():
+            return
         update_news_monitor_state(
             monitor,
             status="running",
@@ -2768,6 +2877,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     if not monitor:
         return
     started = time.time()
+    stop_event = get_news_stop_event(monitor_id)
+    stop_event.clear()
+
+    def check_stopped() -> None:
+        if stop_event.is_set():
+            raise NewsScanStopped()
+
     with news_lock:
         monitor["state"] = {
             **make_news_state("running"),
@@ -2786,10 +2902,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             f"method={monitor.get('connection_method')}; threads={monitor.get('thread_count')}",
             "info",
         )
-        existing_codes = fetch_existing_vendor_codes()
-        add_news_log(monitor, f"Фиды загружены. Моделей для сравнения: {len(existing_codes)}", "info")
+        check_stopped()
+        existing_codes, local_feeds = fetch_existing_vendor_codes()
+        check_stopped()
+        add_news_log(monitor, f"Фиды загружены локально: {len(local_feeds)}. Моделей для сравнения: {len(existing_codes)}", "info")
         update_news_monitor_state(monitor, stage="Сканирование сайта-донора", percent=5)
-        products = collect_products_for_monitor(monitor)
+        products = collect_products_for_monitor(monitor, stop_event)
+        check_stopped()
         add_news_log(monitor, f"Сканирование сайта завершено. Найдено товаров: {len(products)}", "info")
         update_news_monitor_state(
             monitor,
@@ -2804,6 +2923,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         seen_models = set(str(value) for value in monitor.get("seen_models", []))
         known = monitor.get("known_new_products", {}) if isinstance(monitor.get("known_new_products"), dict) else {}
         for index, product in enumerate(products, start=1):
+            check_stopped()
             update_news_monitor_state(
                 monitor,
                 stage="Сравнение с фидами",
@@ -2851,6 +2971,20 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
         if not manual and new_items:
             send_news_email(monitor, len(new_items))
+    except NewsScanStopped:
+        elapsed = int(time.time() - started)
+        with news_lock:
+            monitor["state"] = {
+                **monitor.get("state", {}),
+                "status": "stopped",
+                "stage": "Остановлено",
+                "error": "",
+                "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+                "elapsed_seconds": elapsed,
+                "currenturl": "",
+            }
+            save_news_settings()
+        add_news_log(monitor, "Сканирование новинок остановлено", "warning")
     except Exception as exc:
         elapsed = int(time.time() - started)
         with news_lock:
@@ -2864,6 +2998,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             }
             save_news_settings()
         add_news_log(monitor, f"Ошибка сканирования новинок: {exc}", "error")
+    finally:
+        stop_event.clear()
 
 
 def parse_scan_time(value: object) -> datetime_time:
@@ -3067,12 +3203,29 @@ def api_scan_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
-    if monitor.get("state", {}).get("status") == "running":
+    if monitor.get("state", {}).get("status") in {"running", "queued"}:
         return jsonify({"error": "Сканирование уже выполняется"}), 409
     threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
     with news_lock:
         monitor["state"] = {**monitor.get("state", {}), "status": "queued"}
         save_news_settings()
+    return jsonify({"monitor": dict(monitor)})
+
+
+@app.post("/api/news/monitors/<monitor_id>/stop")
+def api_stop_news_monitor(monitor_id: str):
+    monitor = get_news_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Монитор не найден"}), 404
+    get_news_stop_event(monitor_id).set()
+    with news_lock:
+        monitor["state"] = {
+            **monitor.get("state", {}),
+            "status": "stopping",
+            "stage": "Остановка",
+        }
+        save_news_settings()
+    add_news_log(monitor, "Запрошена остановка сканирования новинок", "warning")
     return jsonify({"monitor": dict(monitor)})
 
 
@@ -3093,6 +3246,25 @@ def api_create_news_monitor():
     return jsonify({"monitor": dict(monitor)})
 
 
+@app.delete("/api/news/monitors/<monitor_id>")
+def api_delete_news_monitor(monitor_id: str):
+    monitor = get_news_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Монитор не найден"}), 404
+    get_news_stop_event(monitor_id).set()
+    with news_lock:
+        monitors = news_settings.get("monitors", [])
+        news_settings["monitors"] = [
+            item
+            for item in monitors
+            if isinstance(item, dict) and str(item.get("id")) != monitor_id
+        ]
+        news_stop_events.pop(monitor_id, None)
+        save_news_settings()
+    add_news_log(monitor, "Монитор новинок удален", "warning")
+    return jsonify({"ok": True, "monitors": [dict(item) for item in news_settings.get("monitors", []) if isinstance(item, dict)]})
+
+
 @app.get("/api/news/monitors/<monitor_id>/download")
 def api_download_news_csv(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
@@ -3102,6 +3274,24 @@ def api_download_news_csv(monitor_id: str):
     path = EXPORT_DIR / filename
     if not filename or not path.exists():
         return jsonify({"error": "CSV еще не готов"}), 404
+    return send_file(path, as_attachment=True, download_name=filename)
+
+
+@app.get("/api/news/feeds/<source>/<path:filename>")
+def api_download_news_feed(source: str, filename: str):
+    ensure_storage()
+    allowed_names = {
+        str(feed.get("filename") or "")
+        for feed in news_settings.get("feed_storage", [])
+        if isinstance(feed, dict)
+        and str(feed.get("source") or "") == source
+    }
+    if filename not in allowed_names:
+        return jsonify({"error": "Фид не найден"}), 404
+    feed_dir = source_feed_dir(source).resolve()
+    path = (feed_dir / filename).resolve()
+    if feed_dir not in path.parents or not path.exists():
+        return jsonify({"error": "Фид не найден"}), 404
     return send_file(path, as_attachment=True, download_name=filename)
 
 

@@ -172,7 +172,7 @@
       <section class="panel news-settings-panel">
         <div class="section-title-row">
           <h2>Мониторинг новинок</h2>
-          <button class="button secondary" id="addNewsMonitorButton" type="button">+ Донор</button>
+          <button class="button secondary" id="addNewsMonitorButton" type="button">+ Бренд</button>
         </div>
         <div class="news-settings-grid">
           <label class="field">
@@ -219,6 +219,7 @@
           <button class="button primary" id="saveNewsSettingsButton" type="button">Сохранить настройки</button>
           <span class="save-notice" id="newsSettingsNotice"></span>
         </div>
+        <div id="newsFeedsStorage"></div>
       </section>
 
       <section class="news-groups" id="newsGroups"></section>
@@ -229,6 +230,7 @@
             <div>
               <h2 id="newsModalTitle">Настройки донора</h2>
               <p id="newsModalSubtitle"></p>
+              <div class="news-modal-title-actions" id="newsModalTitleActions"></div>
             </div>
             <button class="remove-button modal-close" id="closeNewsModalButton" type="button" aria-label="Закрыть">×</button>
           </div>
@@ -237,7 +239,7 @@
       </div>
     </section>
 
-    <div class="modal-backdrop hidden" id="deleteProjectModal" aria-hidden="true">
+    <div class="modal-backdrop confirm-backdrop hidden" id="deleteProjectModal" aria-hidden="true">
       <div class="modal-panel confirm-modal-panel" role="dialog" aria-modal="true" aria-labelledby="deleteProjectTitle">
         <div class="modal-head">
           <div>
@@ -249,6 +251,22 @@
         <div class="modal-actions">
           <button class="button danger" id="confirmDeleteProjectButton" type="button">Удалить</button>
           <button class="button secondary" id="cancelDeleteProjectButton" type="button">Отмена</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop confirm-backdrop hidden" id="deleteNewsMonitorModal" aria-hidden="true">
+      <div class="modal-panel confirm-modal-panel" role="dialog" aria-modal="true" aria-labelledby="deleteNewsMonitorTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="deleteNewsMonitorTitle">Удалить бренд</h2>
+            <p id="deleteNewsMonitorText"></p>
+          </div>
+          <button class="remove-button modal-close" id="cancelDeleteNewsMonitorIconButton" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <div class="modal-actions">
+          <button class="button danger" id="confirmDeleteNewsMonitorButton" data-action="confirm-delete-news-monitor" type="button">Удалить</button>
+          <button class="button secondary" id="cancelDeleteNewsMonitorButton" type="button">Отмена</button>
         </div>
       </div>
     </div>
