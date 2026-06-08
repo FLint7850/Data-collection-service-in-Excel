@@ -29,6 +29,7 @@ new_items.json
 exclusions.json
 
 # Logs
+/logs
 *.log
 server-output*.log
 server-error*.log

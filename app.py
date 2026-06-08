@@ -24,9 +24,11 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 
 
 BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
 EXCLUSIONS_FILE = BASE_DIR / "exclusions.json"
 PROJECTS_FILE = BASE_DIR / "projects.json"
-LOGS_FILE = BASE_DIR / "logs.json"
+LOGS_FILE = LOG_DIR / "logs.json"
+LEGACY_LOGS_FILE = BASE_DIR / "logs.json"
 NEWS_FILE = BASE_DIR / "new_items.json"
 DONORS_XLSX = BASE_DIR / "donors.xlsx"
 EXPORT_DIR = BASE_DIR / "exports"
@@ -139,6 +141,7 @@ def make_state(thread_count: int = 4) -> Dict[str, object]:
 def ensure_storage() -> None:
     """Создает рабочие файлы при первом запуске."""
     EXPORT_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
     if not EXCLUSIONS_FILE.exists():
         save_exclusions(DEFAULT_EXCLUSIONS)
     load_projects()
@@ -274,14 +277,16 @@ def save_logs() -> None:
         data = []
         for project in projects.values():
             data.extend(project.get("logs", []))
+        LOGS_FILE.parent.mkdir(exist_ok=True)
         LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_logs() -> None:
-    if not LOGS_FILE.exists():
+    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
+    if not source_file.exists():
         return
     try:
-        data = json.loads(LOGS_FILE.read_text(encoding="utf-8"))
+        data = json.loads(source_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
     if not isinstance(data, list):
@@ -293,6 +298,8 @@ def load_logs() -> None:
         project = projects.get(project_id)
         if project:
             project.setdefault("logs", []).append(item)
+    if source_file == LEGACY_LOGS_FILE:
+        save_logs()
 
 
 def load_projects() -> None:
@@ -672,6 +679,7 @@ def save_exclusions(items: Iterable[str]) -> None:
 
 def ensure_storage_without_exclusions_loop() -> None:
     EXPORT_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
     if not EXCLUSIONS_FILE.exists():
         EXCLUSIONS_FILE.write_text(
             json.dumps(DEFAULT_EXCLUSIONS, ensure_ascii=False, indent=2),

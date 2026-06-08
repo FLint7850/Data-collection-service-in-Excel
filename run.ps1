@@ -102,8 +102,13 @@ if (Test-PortBusy -PortToCheck $Port) {
 }
 
 $LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$OutLog = Join-Path $PSScriptRoot "server-output-$Port-$LogStamp.log"
-$ErrLog = Join-Path $PSScriptRoot "server-error-$Port-$LogStamp.log"
+$LogDir = Join-Path $PSScriptRoot "logs"
+$OutLogDir = Join-Path $LogDir "server-output"
+$ErrLogDir = Join-Path $LogDir "server-error"
+New-Item -ItemType Directory -Force -Path $OutLogDir | Out-Null
+New-Item -ItemType Directory -Force -Path $ErrLogDir | Out-Null
+$OutLog = Join-Path $OutLogDir "server-output-$Port-$LogStamp.log"
+$ErrLog = Join-Path $ErrLogDir "server-error-$Port-$LogStamp.log"
 
 Write-Host "Starting Flask app..." -ForegroundColor Green
 $env:PORT = "$Port"
@@ -133,12 +138,12 @@ if (-not $ready) {
     Write-Host "The app did not start correctly." -ForegroundColor Red
     if (Test-Path $ErrLog) {
         Write-Host ""
-        Write-Host "server-error.log:" -ForegroundColor Yellow
+        Write-Host "${ErrLog}:" -ForegroundColor Yellow
         Get-Content $ErrLog -Tail 80
     }
     if (Test-Path $OutLog) {
         Write-Host ""
-        Write-Host "server-output.log:" -ForegroundColor Yellow
+        Write-Host "${OutLog}:" -ForegroundColor Yellow
         Get-Content $OutLog -Tail 80
     }
     Write-Host ""

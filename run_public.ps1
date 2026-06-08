@@ -141,8 +141,13 @@ else {
     }
 
     $LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $OutLog = Join-Path $PSScriptRoot "server-output-public-$Port-$LogStamp.log"
-    $ErrLog = Join-Path $PSScriptRoot "server-error-public-$Port-$LogStamp.log"
+    $LogDir = Join-Path $PSScriptRoot "logs"
+    $OutLogDir = Join-Path $LogDir "server-output"
+    $ErrLogDir = Join-Path $LogDir "server-error"
+    New-Item -ItemType Directory -Force -Path $OutLogDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $ErrLogDir | Out-Null
+    $OutLog = Join-Path $OutLogDir "server-output-public-$Port-$LogStamp.log"
+    $ErrLog = Join-Path $ErrLogDir "server-error-public-$Port-$LogStamp.log"
 
     Write-Host "Starting Flask app..." -ForegroundColor Green
     $env:PORT = "$Port"
@@ -172,7 +177,7 @@ else {
         Write-Host "The app did not start correctly." -ForegroundColor Red
         if (Test-Path $ErrLog) {
             Write-Host ""
-            Write-Host "server-error log:" -ForegroundColor Yellow
+            Write-Host "${ErrLog}:" -ForegroundColor Yellow
             Get-Content $ErrLog -Tail 80
         }
         Stop-StartedProcess $appProcess
