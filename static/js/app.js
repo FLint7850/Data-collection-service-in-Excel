@@ -521,10 +521,40 @@ function newsStatusText(status) {
   return "ожидание";
 }
 
+
+function newsStatusActionsHtml(status) {
+  if (status === "running" || status === "queued") {
+    return `
+      <button class="status-action-button status-action-button--pause" data-action="pause-news" type="button" title="Приостановить" aria-label="Приостановить">⏸</button>
+      <button class="status-action-button status-action-button--stop" data-action="stop-news" type="button" title="Стоп" aria-label="Стоп">■</button>
+    `;
+  }
+
+  if (status === "partial") {
+    return `
+      <button class="status-action-button status-action-button--resume" data-action="resume-news" type="button" title="Продолжить" aria-label="Продолжить">▶</button>
+    `;
+  }
+
+  return "";
+}
+
+function newsStatusHtml(status) {
+  return `
+    <span class="news-status ${newsStatusClass(status)}" data-role="news-status">
+      <span data-role="status-text">${escapeHtml(newsStatusText(status))}</span>
+      ${newsStatusActionsHtml(status)}
+    </span>
+  `;
+}
+
 function aggregateNewsStatus(states) {
   if (states.some((state) => state.status === "error")) return "error";
-  if (states.some((state) => ["running", "queued", "pausing", "stopping"].includes(state.status))) return "running";
-  if (states.some((state) => state.status === "partial" || state.status === "stopped")) return "partial";
+  if (states.some((state) => ["running", "queued"].includes(state.status))) return "running";
+  if (states.some((state) => state.status === "stopping")) return "stopping";
+  if (states.some((state) => state.status === "pausing")) return "pausing";
+  if (states.some((state) => state.status === "partial")) return "partial";
+  if (states.some((state) => state.status === "stopped")) return "stopped";
   if (states.some((state) => state.status === "completed")) return "completed";
   return "idle";
 }
@@ -629,7 +659,7 @@ function renderNewsMonitors() {
         <span class="brand-meta">${brandMonitors.length} сайт${brandMonitors.length > 1 ? "а" : ""}</span>
         <span class="brand-sites">${brandMonitors.map((item) => escapeHtml(item.site_url || (item.start_urls || [])[0] || "")).join("<br>")}</span>
         <span class="brand-row">
-          <span class="news-status ${newsStatusClass(status)}">${escapeHtml(newsStatusText(status))}</span>
+          ${newsStatusHtml(status)}
           <span>Новинок: <strong>${newCount}</strong></span>
         </span>
         <span class="mini-progress-track"><span class="mini-progress-fill" style="width: ${percent}%"></span></span>
@@ -696,10 +726,10 @@ function updateNewsModalProgress() {
   const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
   const statusNode = newsMonitorModal.querySelector("[data-role='news-status']");
   if (statusNode) {
-    const nextClass = `news-status ${newsStatusClass(state.status)}`;
-    if (statusNode.className !== nextClass) statusNode.className = nextClass;
-    const statusTextNode = statusNode.querySelector("[data-role='status-text']");
-    if (statusTextNode) statusTextNode.textContent = newsStatusText(state.status);
+    const nextHtml = newsStatusHtml(state.status).trim();
+    if (statusNode.outerHTML !== nextHtml) {
+      statusNode.outerHTML = nextHtml;
+    }
   }
 
   const summaryValues = {
@@ -757,9 +787,7 @@ function renderNewsModal() {
   newsModalTitle.textContent = brand;
   newsModalSubtitle.textContent = site;
   newsModalTitleActions.innerHTML = `
-  <span class="news-status ${newsStatusClass(state.status)}" data-role="news-status">
-    <span data-role="status-text">${escapeHtml(newsStatusText(state.status))}</span>
-  </span>
+  ${newsStatusHtml(state.status)}
     <label class="toggle-field modal-title-toggle">
     <input
       class="toggle-field__input"
@@ -774,9 +802,6 @@ function renderNewsModal() {
       ${monitor.enabled !== false ? "Активен" : "Неактивен"}
     </span>
   </label>
-  <button class="button warning compact-button" data-action="pause-news" type="button" ${["running", "queued"].includes(state.status) ? "" : "disabled"}>Приостановить</button>
-  <button class="button danger compact-button" data-action="stop-news" type="button" ${["running", "queued", "pausing", "stopping"].includes(state.status) ? "" : "disabled"}>Стоп</button>
-  <button class="button secondary compact-button" data-action="resume-news" type="button" ${state.status === "partial" ? "" : "disabled"}>Продолжить</button>
 `
 
   const enabledInput = newsModalTitleActions.querySelector('[data-field="enabled"]')

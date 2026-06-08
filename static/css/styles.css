@@ -930,25 +930,36 @@ select:focus {
   font-size: 13px;
 }
 
-.status-stop-button {
+.status-action-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  min-width: 20px;
-  height: 20px;
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
   border: 0;
   border-radius: 6px;
   color: inherit;
   background: rgba(255, 255, 255, 0.12);
   cursor: pointer;
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1;
 }
 
-.status-stop-button:hover {
-  color: var(--warning);
+.status-action-button:hover {
   background: rgba(255, 255, 255, 0.2);
+}
+
+.status-action-button--stop:hover {
+  color: var(--danger);
+}
+
+.status-action-button--pause:hover {
+  color: var(--warning);
+}
+
+.status-action-button--resume:hover {
+  color: var(--success);
 }
 
 .news-status.status-running {
