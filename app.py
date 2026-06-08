@@ -103,6 +103,7 @@ VISIBLE_BROWSER_LOCK = threading.Lock()
 HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(3)
 FEED_STORAGE_LOCK = threading.Lock()
 news_stop_events: Dict[str, threading.Event] = {}
+news_stop_modes: Dict[str, str] = {}
 
 scan_state: Dict[str, object] = {
     "status": "idle",
@@ -2850,6 +2851,14 @@ def get_news_stop_event(monitor_id: str) -> threading.Event:
         return event
 
 
+def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
+    event = get_news_stop_event(monitor_id)
+    with news_lock:
+        news_stop_modes[monitor_id] = mode
+    event.set()
+    return event
+
+
 def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: threading.Event) -> List[Dict[str, str]]:
     finish_signal = threading.Event()
 
@@ -2930,8 +2939,9 @@ def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> 
     return details
 
 
-def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object]) -> Path:
-    filename = f"Новинки_{safe_filename(str(monitor.get('brand') or 'donor'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], filename: str = "") -> Path:
+    if not filename:
+        filename = f"Новинки_{safe_filename(str(monitor.get('brand') or 'donor'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
     path = EXPORT_DIR / filename
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file, delimiter=";")
@@ -3001,6 +3011,12 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     started = time.time()
     stop_event = get_news_stop_event(monitor_id)
     stop_event.clear()
+    with news_lock:
+        news_stop_modes.pop(monitor_id, None)
+    new_items: List[Dict[str, str]] = []
+    products: List[Dict[str, str]] = []
+    local_feeds: List[Dict[str, object]] = []
+    previous_csv = str(monitor.get("state", {}).get("last_csv") or "")
 
     def check_stopped() -> None:
         if stop_event.is_set():
@@ -3041,7 +3057,6 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             compared_products=0,
             currenturl="",
         )
-        new_items: List[Dict[str, str]] = []
         seen_models = set(str(value) for value in monitor.get("seen_models", []))
         known = monitor.get("known_new_products", {}) if isinstance(monitor.get("known_new_products"), dict) else {}
         for index, product in enumerate(products, start=1):
@@ -3066,7 +3081,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             known[model_key] = details
 
         update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
-        csv_path = create_news_csv(new_items, monitor)
+        csv_path = create_news_csv(new_items, monitor, previous_csv)
         elapsed = int(time.time() - started)
         with news_lock:
             monitor["seen_models"] = sorted(seen_models)
@@ -3096,17 +3111,30 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     except NewsScanStopped:
         elapsed = int(time.time() - started)
         with news_lock:
+            stop_mode = news_stop_modes.get(monitor_id, "stop")
+        partial_csv = ""
+        if stop_mode == "pause" and new_items:
+            partial_csv = create_news_csv(new_items, monitor, previous_csv).name
+        with news_lock:
             monitor["state"] = {
                 **monitor.get("state", {}),
-                "status": "stopped",
-                "stage": "Остановлено",
+                "status": "partial" if stop_mode == "pause" else "stopped",
+                "stage": "Приостановлено" if stop_mode == "pause" else "Остановлено",
                 "error": "",
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
                 "currenturl": "",
+                "last_csv": partial_csv or monitor.get("state", {}).get("last_csv", ""),
+                "new_count": len(new_items),
+                "processed": len(products),
+                "found_products": len(products),
             }
             save_news_settings()
-        add_news_log(monitor, "Сканирование новинок остановлено", "warning")
+        add_news_log(
+            monitor,
+            f"Сканирование новинок приостановлено. CSV: {partial_csv}" if stop_mode == "pause" else "Сканирование новинок остановлено",
+            "warning",
+        )
     except Exception as exc:
         elapsed = int(time.time() - started)
         with news_lock:
@@ -3121,6 +3149,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             save_news_settings()
         add_news_log(monitor, f"Ошибка сканирования новинок: {exc}", "error")
     finally:
+        with news_lock:
+            news_stop_modes.pop(monitor_id, None)
         stop_event.clear()
 
 
@@ -3339,7 +3369,7 @@ def api_stop_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
-    get_news_stop_event(monitor_id).set()
+    request_news_stop(monitor_id, "stop")
     with news_lock:
         monitor["state"] = {
             **monitor.get("state", {}),
@@ -3348,6 +3378,38 @@ def api_stop_news_monitor(monitor_id: str):
         }
         save_news_settings()
     add_news_log(monitor, "Запрошена остановка сканирования новинок", "warning")
+    return jsonify({"monitor": dict(monitor)})
+
+
+@app.post("/api/news/monitors/<monitor_id>/pause")
+def api_pause_news_monitor(monitor_id: str):
+    monitor = get_news_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Монитор не найден"}), 404
+    request_news_stop(monitor_id, "pause")
+    with news_lock:
+        monitor["state"] = {
+            **monitor.get("state", {}),
+            "status": "pausing",
+            "stage": "Приостановка",
+        }
+        save_news_settings()
+    add_news_log(monitor, "Запрошена приостановка сканирования новинок с сохранением результата", "warning")
+    return jsonify({"monitor": dict(monitor)})
+
+
+@app.post("/api/news/monitors/<monitor_id>/resume")
+def api_resume_news_monitor(monitor_id: str):
+    monitor = get_news_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Монитор не найден"}), 404
+    if monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}:
+        return jsonify({"error": "Сканирование уже выполняется"}), 409
+    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
+    with news_lock:
+        monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "Продолжение"}
+        save_news_settings()
+    add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
     return jsonify({"monitor": dict(monitor)})
 
 
@@ -3373,7 +3435,7 @@ def api_delete_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
-    get_news_stop_event(monitor_id).set()
+    request_news_stop(monitor_id, "stop")
     with news_lock:
         monitors = news_settings.get("monitors", [])
         news_settings["monitors"] = [

@@ -102,11 +102,12 @@ const statusLabels = {
   idle: "ожидание",
   running: "выполняется",
   paused: "пауза",
-  partial: "приостановлено",
   completed: "завершено",
   error: "ошибка",
   stopping: "останавливается",
   stopped: "остановлено",
+  pausing: "приостанавливается",
+  partial: "приостановлено",
 };
 
 function activeProject() {
@@ -253,8 +254,7 @@ function openDeleteNewsMonitorModal(monitorId, mode = "brand", brandKey = null) 
   pendingDeleteNewsBrandKey = brandKey || activeNewsBrandKey;
   const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
   const isDonor = mode === "donor";
-  const title = isDonor ? "Удалить донор" : "Удалить бренд";
-  deleteNewsMonitorModal.querySelector("#deleteNewsMonitorTitle").textContent = title;
+  deleteNewsMonitorModal.querySelector("#deleteNewsMonitorTitle").textContent = isDonor ? "Удалить донор" : "Удалить бренд";
   deleteNewsMonitorText.textContent = isDonor
     ? `Сайт-донор ${site || monitor.brand || ""} будет удален только из списка доноров текущего бренда "${monitor.brand || "бренд"}".`
     : `Бренд "${monitor.brand || "донор"}" и все его доноры будут удалены. Это действие нельзя отменить.`;
@@ -505,7 +505,7 @@ function formatDateTimeLocal(value) {
 function newsStatusClass(status) {
   if (status === "running" || status === "queued") return "status-running";
   if (status === "completed") return "status-completed";
-  if (status === "stopping" || status === "stopped") return "status-paused";
+  if (status === "stopping" || status === "stopped" || status === "pausing" || status === "partial") return "status-paused";
   if (status === "error") return "status-error";
   return "status-idle";
 }
@@ -515,13 +515,16 @@ function newsStatusText(status) {
   if (status === "completed") return "завершено";
   if (status === "stopping") return "останавливается";
   if (status === "stopped") return "остановлено";
+  if (status === "pausing") return "приостанавливается";
+  if (status === "partial") return "приостановлено";
   if (status === "error") return "ошибка";
   return "ожидание";
 }
 
 function aggregateNewsStatus(states) {
   if (states.some((state) => state.status === "error")) return "error";
-  if (states.some((state) => state.status === "running" || state.status === "queued")) return "running";
+  if (states.some((state) => ["running", "queued", "pausing", "stopping"].includes(state.status))) return "running";
+  if (states.some((state) => state.status === "partial" || state.status === "stopped")) return "partial";
   if (states.some((state) => state.status === "completed")) return "completed";
   return "idle";
 }
@@ -697,20 +700,6 @@ function updateNewsModalProgress() {
     if (statusNode.className !== nextClass) statusNode.className = nextClass;
     const statusTextNode = statusNode.querySelector("[data-role='status-text']");
     if (statusTextNode) statusTextNode.textContent = newsStatusText(state.status);
-    const canStop = ["running", "queued", "stopping"].includes(state.status);
-    let stopButton = statusNode.querySelector("[data-action='stop-news']");
-    if (canStop && !stopButton) {
-      stopButton = document.createElement("button");
-      stopButton.className = "status-stop-button";
-      stopButton.dataset.action = "stop-news";
-      stopButton.type = "button";
-      stopButton.title = "Остановить выполнение";
-      stopButton.setAttribute("aria-label", "Остановить выполнение");
-      stopButton.textContent = "■";
-      statusNode.append(stopButton);
-    } else if (!canStop && stopButton) {
-      stopButton.remove();
-    }
   }
 
   const summaryValues = {
@@ -737,7 +726,13 @@ function updateNewsModalProgress() {
   if (currentUrlNode) currentUrlNode.textContent = state.currenturl || "";
 
   const scanButton = newsModalContent.querySelector("[data-action='scan-news']");
-  if (scanButton) scanButton.disabled = ["running", "queued", "stopping"].includes(state.status);
+  if (scanButton) scanButton.disabled = ["running", "queued", "pausing", "stopping"].includes(state.status);
+  const pauseButton = newsModalTitleActions.querySelector("[data-action='pause-news']");
+  if (pauseButton) pauseButton.disabled = !["running", "queued"].includes(state.status);
+  const stopButton = newsModalTitleActions.querySelector("[data-action='stop-news']");
+  if (stopButton) stopButton.disabled = !["running", "queued", "pausing", "stopping"].includes(state.status);
+  const resumeButton = newsModalTitleActions.querySelector("[data-action='resume-news']");
+  if (resumeButton) resumeButton.disabled = state.status !== "partial";
   const downloadLink = newsModalContent.querySelector("[data-role='modal-csv-download']");
   if (downloadLink) {
     const ready = Boolean(state.last_csv);
@@ -764,11 +759,6 @@ function renderNewsModal() {
   newsModalTitleActions.innerHTML = `
   <span class="news-status ${newsStatusClass(state.status)}" data-role="news-status">
     <span data-role="status-text">${escapeHtml(newsStatusText(state.status))}</span>
-    ${
-      disabled
-          ? `<button class="status-stop-button" data-action="stop-news" type="button" title="Остановить выполнение" aria-label="Остановить выполнение">■</button>`
-          : ""
-  }
   </span>
     <label class="toggle-field modal-title-toggle">
     <input
@@ -784,6 +774,9 @@ function renderNewsModal() {
       ${monitor.enabled !== false ? "Активен" : "Неактивен"}
     </span>
   </label>
+  <button class="button warning compact-button" data-action="pause-news" type="button" ${["running", "queued"].includes(state.status) ? "" : "disabled"}>Приостановить</button>
+  <button class="button danger compact-button" data-action="stop-news" type="button" ${["running", "queued", "pausing", "stopping"].includes(state.status) ? "" : "disabled"}>Стоп</button>
+  <button class="button secondary compact-button" data-action="resume-news" type="button" ${state.status === "partial" ? "" : "disabled"}>Продолжить</button>
 `
 
   const enabledInput = newsModalTitleActions.querySelector('[data-field="enabled"]')
@@ -1367,11 +1360,13 @@ newsModalContent.addEventListener("change", (event) => {
 });
 
 newsModalTitleActions.addEventListener("click", async (event) => {
-  const stopButton = event.target.closest("[data-action='stop-news']");
-  if (!stopButton) return;
+  const actionButton = event.target.closest("[data-action='pause-news'], [data-action='stop-news'], [data-action='resume-news']");
+  if (!actionButton) return;
+  const action = actionButton.dataset.action;
+  const endpoint = action === "pause-news" ? "pause" : action === "resume-news" ? "resume" : "stop";
   try {
     const monitorId = newsModalContent.dataset.monitorId;
-    const data = await requestJson(`/api/news/monitors/${monitorId}/stop`, { method: "POST" });
+    const data = await requestJson(`/api/news/monitors/${monitorId}/${endpoint}`, { method: "POST" });
     const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
     if (index >= 0) newsData.monitors[index] = data.monitor;
     renderNewsMonitors();
