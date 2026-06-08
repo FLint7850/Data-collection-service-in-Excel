@@ -737,7 +737,6 @@ select:focus {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 16px;
 }
 
 .section-title-row h2 {
@@ -768,8 +767,48 @@ select:focus {
 
 .news-settings-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
+}
+
+.settings-view {
+  display: grid;
+  gap: 18px;
+}
+
+.settings-view.hidden {
+  display: none;
+}
+
+.own-sites-list {
+  display: grid;
+  gap: 12px;
+}
+
+.own-site-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.own-site-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.own-site-actions {
+  margin-top: 12px;
+}
+
+.own-site-empty {
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  color: #64748b;
+  padding: 16px;
 }
 
 .news-recipients-field {
@@ -1188,9 +1227,14 @@ select:focus {
   margin-top: 14px;
 }
 
+.local-feeds-in-card {
+  margin-bottom: 0;
+}
+
 .local-feeds-title {
-  color: var(--muted);
-  font-size: 13px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
 }
 
 .local-feed-empty {

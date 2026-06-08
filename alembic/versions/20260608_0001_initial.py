@@ -38,6 +38,7 @@ def upgrade() -> None:
     op.create_table(
         "own_sites",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
         sa.Column("feed_url", sa.Text(), nullable=False),
         sa.Column("feed_generate_url", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),

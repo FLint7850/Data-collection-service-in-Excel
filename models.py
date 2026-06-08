@@ -80,6 +80,7 @@ class OwnSite(Base):
     __tablename__ = "own_sites"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     feed_url: Mapped[str] = mapped_column(Text, nullable=False)
     feed_generate_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

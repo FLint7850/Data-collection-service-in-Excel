@@ -28,6 +28,7 @@
       <div class="tabs-list" id="projectTabs"></div>
       <button class="tab-button add-tab" id="addProjectButton" type="button">+ Проект</button>
       <button class="tab-button" id="newItemsTabButton" type="button">Новинки</button>
+      <button class="tab-button" id="settingsTabButton" type="button">Настройки</button>
       <button class="tab-button" id="logsTabButton" type="button">Логи</button>
     </nav>
 
@@ -186,15 +187,45 @@
           <h2>Мониторинг новинок</h2>
           <button class="button secondary" id="addNewsMonitorButton" type="button">+ Бренд</button>
         </div>
+      </section>
+
+      <section class="news-groups" id="newsGroups"></section>
+
+      <div class="modal-backdrop hidden" id="newsMonitorModal" aria-hidden="true">
+        <div class="modal-panel news-modal-panel" role="dialog" aria-modal="true" aria-labelledby="newsModalTitle">
+          <div class="modal-head">
+            <div>
+              <div style="display: flex; gap: 18px; align-items: center">
+                <h2 id="newsModalTitle">Настройки донора</h2>
+                <div class="news-modal-title-actions" id="newsModalTitleActions"></div>
+              </div>
+              <p id="newsModalSubtitle"></p>
+            </div>
+            <button class="remove-button modal-close" id="closeNewsModalButton" type="button" aria-label="Закрыть">×</button>
+          </div>
+          <div id="newsModalContent"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-view hidden" id="settingsView">
+      <section class="panel news-settings-panel">
+        <div class="section-title-row">
+          <h2>Фиды</h2>
+          <button class="button secondary" id="addOwnSiteButton" type="button">+ Фид</button>
+        </div>
+        <div>
+          <div class="own-sites-list" id="ownSitesList"></div>
+          <div id="newsFeedsStorage"></div>
+        </div>
+
+      </section>
+
+      <section class="panel news-settings-panel">
+        <div class="section-title-row">
+          <h2>Настройка почты</h2>
+        </div>
         <div class="news-settings-grid">
-          <label class="field">
-            <span>Фиды товаров моих сайтов</span>
-            <textarea id="newsFeedUrl" rows="2" autocomplete="off"></textarea>
-          </label>
-          <label class="field">
-            <span>Ссылки генерации фидов</span>
-            <textarea id="newsFeedGenerateUrl" rows="2" autocomplete="off"></textarea>
-          </label>
           <label class="field">
             <span>SMTP сервер</span>
             <input id="smtpHost" type="text" autocomplete="off">
@@ -233,27 +264,37 @@
           <button class="button secondary" id="testNewsEmailButton" type="button">Тест email</button>
           <span class="save-notice" id="newsSettingsNotice"></span>
         </div>
-        <div id="newsFeedsStorage"></div>
       </section>
+    </section>
 
-      <section class="news-groups" id="newsGroups"></section>
-
-      <div class="modal-backdrop hidden" id="newsMonitorModal" aria-hidden="true">
-        <div class="modal-panel news-modal-panel" role="dialog" aria-modal="true" aria-labelledby="newsModalTitle">
-          <div class="modal-head">
-            <div>
-              <div style="display: flex; gap: 18px; align-items: center">
-                <h2 id="newsModalTitle">Настройки донора</h2>
-                <div class="news-modal-title-actions" id="newsModalTitleActions"></div>
-              </div>
-              <p id="newsModalSubtitle"></p>
-            </div>
-            <button class="remove-button modal-close" id="closeNewsModalButton" type="button" aria-label="Закрыть">×</button>
+    <div class="modal-backdrop confirm-backdrop hidden" id="addFeedModal" aria-hidden="true">
+      <div class="modal-panel confirm-modal-panel" role="dialog" aria-modal="true" aria-labelledby="addFeedTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="addFeedTitle">Добавить фид</h2>
           </div>
-          <div id="newsModalContent"></div>
+          <button class="remove-button modal-close" id="cancelAddFeedIconButton" type="button" aria-label="Закрыть">×</button>
+        </div>
+        <div class="news-settings-grid">
+          <label class="field">
+            <span>Название фида</span>
+            <input id="newFeedName" type="text" autocomplete="off" placeholder="Мега-кухня">
+          </label>
+          <label class="field">
+            <span>Фид товаров моего сайта</span>
+            <input id="newFeedUrl" type="url" autocomplete="off" placeholder="https://example.ru/price/new_product.xml">
+          </label>
+          <label class="field">
+            <span>Ссылка генерации фида</span>
+            <input id="newFeedGenerateUrl" type="url" autocomplete="off" placeholder="https://example.ru/index.php">
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button class="button primary" id="confirmAddFeedButton" type="button">Добавить</button>
+          <button class="button secondary" id="cancelAddFeedButton" type="button">Отмена</button>
         </div>
       </div>
-    </section>
+    </div>
 
     <div class="modal-backdrop confirm-backdrop hidden" id="deleteProjectModal" aria-hidden="true">
       <div class="modal-panel confirm-modal-panel" role="dialog" aria-modal="true" aria-labelledby="deleteProjectTitle">

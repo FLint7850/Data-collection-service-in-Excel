@@ -1,9 +1,11 @@
 const projectTabs = document.querySelector("#projectTabs");
 const addProjectButton = document.querySelector("#addProjectButton");
 const newItemsTabButton = document.querySelector("#newItemsTabButton");
+const settingsTabButton = document.querySelector("#settingsTabButton");
 const logsTabButton = document.querySelector("#logsTabButton");
 const projectView = document.querySelector("#projectView");
 const newItemsView = document.querySelector("#newItemsView");
+const settingsView = document.querySelector("#settingsView");
 const logsView = document.querySelector("#logsView");
 
 const statusText = document.querySelector("#statusText");
@@ -49,8 +51,8 @@ const refreshLogsButton = document.querySelector("#refreshLogsButton");
 const autoCleanup = document.querySelector("#autoCleanup");
 const newsGroups = document.querySelector("#newsGroups");
 const addNewsMonitorButton = document.querySelector("#addNewsMonitorButton");
-const newsFeedUrl = document.querySelector("#newsFeedUrl");
-const newsFeedGenerateUrl = document.querySelector("#newsFeedGenerateUrl");
+const ownSitesList = document.querySelector("#ownSitesList");
+const addOwnSiteButton = document.querySelector("#addOwnSiteButton");
 const smtpHost = document.querySelector("#smtpHost");
 const smtpPort = document.querySelector("#smtpPort");
 const smtpSecurity = document.querySelector("#smtpSecurity");
@@ -78,6 +80,13 @@ const deleteNewsMonitorText = document.querySelector("#deleteNewsMonitorText");
 const confirmDeleteNewsMonitorButton = document.querySelector("#confirmDeleteNewsMonitorButton");
 const cancelDeleteNewsMonitorButton = document.querySelector("#cancelDeleteNewsMonitorButton");
 const cancelDeleteNewsMonitorIconButton = document.querySelector("#cancelDeleteNewsMonitorIconButton");
+const addFeedModal = document.querySelector("#addFeedModal");
+const newFeedName = document.querySelector("#newFeedName");
+const newFeedUrl = document.querySelector("#newFeedUrl");
+const newFeedGenerateUrl = document.querySelector("#newFeedGenerateUrl");
+const confirmAddFeedButton = document.querySelector("#confirmAddFeedButton");
+const cancelAddFeedButton = document.querySelector("#cancelAddFeedButton");
+const cancelAddFeedIconButton = document.querySelector("#cancelAddFeedIconButton");
 
 let projects = [];
 let newsData = null;
@@ -213,6 +222,7 @@ function renderTabs() {
     projectTabs.append(tab);
   });
   newItemsTabButton.classList.toggle("active", activeView === "news");
+  settingsTabButton.classList.toggle("active", activeView === "settings");
   logsTabButton.classList.toggle("active", activeView === "logs");
 }
 
@@ -450,8 +460,7 @@ function renderNewsSettings() {
   if (!newsData) return;
   isHydratingNews = true;
   const smtp = newsData.smtp || {};
-  newsFeedUrl.value = (newsData.feed_urls || (newsData.feed_url ? [newsData.feed_url] : [])).join("\n");
-  newsFeedGenerateUrl.value = (newsData.feed_generate_urls || (newsData.feed_generate_url ? [newsData.feed_generate_url] : [])).join("\n");
+  renderOwnSites();
   smtpHost.value = smtp.host || "smtp.yandex.ru";
   smtpPort.value = smtp.port || 465;
   smtpSecurity.value = smtp.security || "ssl";
@@ -460,6 +469,124 @@ function renderNewsSettings() {
   smtpPassword.placeholder = smtp.password_set ? "Пароль приложения сохранен" : "Введите пароль приложения";
   smtpRecipients.value = (smtp.recipients || []).join("\n");
   isHydratingNews = false;
+}
+
+function ownSitesFromNewsData() {
+  if (Array.isArray(newsData?.own_sites) && newsData.own_sites.length) {
+    return newsData.own_sites.map((site, index) => ({
+      name: site.name || `Фид ${index + 1}`,
+      feed_url: site.feed_url || "",
+      feed_generate_url: site.feed_generate_url || "",
+    }));
+  }
+  const feedUrls = newsData?.feed_urls || (newsData?.feed_url ? [newsData.feed_url] : []);
+  const generateUrls = newsData?.feed_generate_urls || (newsData?.feed_generate_url ? [newsData.feed_generate_url] : []);
+  return feedUrls.map((feedUrl, index) => ({
+    name: `Фид ${index + 1}`,
+    feed_url: feedUrl || "",
+    feed_generate_url: generateUrls[index] || generateUrls[0] || "",
+  }));
+}
+
+function localFeedsHtmlForSite(site) {
+  const feeds = (newsData?.feed_storage || []).filter((feed) => feed.url === site.feed_url);
+  if (!feeds.length) {
+    return `
+      <div class="local-feeds local-feeds-in-card">
+        <span class="local-feeds-title">Локальный фид ${escapeHtml(site.name || "Фид")}</span>
+        <span class="local-feed-empty">Фид еще не загружался.</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="local-feeds local-feeds-in-card">
+      <span class="local-feeds-title">Локальный фид ${escapeHtml(site.name || feeds[0]?.source_label || "Фид")}</span>
+      ${feeds
+        .map((feed) => {
+          const filename = feed.filename || "";
+          const size = formatFileSize(feed.size);
+          const codes = Number(feed.codes_count || 0);
+          const meta = [size, `${codes} моделей`].filter(Boolean).join(" · ");
+          const source = feed.source || "feed";
+          return `
+            <a class="local-feed-link" href="/api/news/feeds/${encodeURIComponent(source)}/${encodeURIComponent(filename)}">
+              <span>${escapeHtml(filename || "feed.xml")}</span>
+              <small>${escapeHtml(meta || feed.kind || "")}</small>
+            </a>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderOwnSites() {
+  if (!ownSitesList || !newsData) return;
+  const sites = ownSitesFromNewsData();
+  if (!sites.length) {
+    ownSitesList.innerHTML = `<div class="own-site-empty">Фиды не добавлены.</div>`;
+    return;
+  }
+  ownSitesList.innerHTML = sites
+    .map(
+      (site, index) => `
+        <div class="own-site-card" data-own-site-index="${index}">
+          <div class="own-site-card-head">
+            <strong>${escapeHtml(site.name || `Фид ${index + 1}`)}</strong>
+            <button class="remove-button" data-action="remove-own-site" type="button" aria-label="Удалить фид">×</button>
+          </div>
+          <div class="news-settings-grid">
+            <label class="field">
+              <span>Название фида</span>
+              <input data-own-site-field="name" type="text" autocomplete="off" value="${escapeHtml(site.name || `Фид ${index + 1}`)}">
+            </label>
+            <label class="field">
+              <span>Фид товаров моего сайта</span>
+              <input data-own-site-field="feed_url" type="url" autocomplete="off" value="${escapeHtml(site.feed_url)}">
+            </label>
+            <label class="field">
+              <span>Ссылка генерации фида</span>
+              <input data-own-site-field="feed_generate_url" type="url" autocomplete="off" value="${escapeHtml(site.feed_generate_url)}">
+            </label>
+          </div>
+          <div class="news-settings-actions own-site-actions">
+            <button class="button primary" data-action="save-own-site" type="button">Сохранить изменения</button>
+            <span class="save-notice" data-role="own-site-notice"></span>
+          </div>
+          ${localFeedsHtmlForSite(site)}
+        </div>
+      `
+    )
+    .join("");
+}
+
+function updateLocalFeedBlocks() {
+  if (!ownSitesList || !newsData) return;
+  Array.from(ownSitesList.querySelectorAll("[data-own-site-index]")).forEach((card) => {
+    const site = {
+      name: card.querySelector('[data-own-site-field="name"]')?.value.trim() || "",
+      feed_url: card.querySelector('[data-own-site-field="feed_url"]')?.value.trim() || "",
+      feed_generate_url: card.querySelector('[data-own-site-field="feed_generate_url"]')?.value.trim() || "",
+    };
+    const nextHtml = localFeedsHtmlForSite(site);
+    const current = card.querySelector(".local-feeds-in-card");
+    if (current) {
+      current.outerHTML = nextHtml;
+    } else {
+      card.insertAdjacentHTML("beforeend", nextHtml);
+    }
+  });
+}
+
+function collectOwnSites() {
+  if (!ownSitesList) return [];
+  return Array.from(ownSitesList.querySelectorAll("[data-own-site-index]"))
+    .map((card) => ({
+      name: card.querySelector('[data-own-site-field="name"]')?.value.trim() || "",
+      feed_url: card.querySelector('[data-own-site-field="feed_url"]')?.value.trim() || "",
+      feed_generate_url: card.querySelector('[data-own-site-field="feed_generate_url"]')?.value.trim() || "",
+    }))
+    .filter((site) => site.feed_url || site.feed_generate_url);
 }
 
 function connectionOptionsHtml(current) {
@@ -575,6 +702,11 @@ function formatFileSize(value) {
 
 function renderFeedStorage() {
   if (!newsFeedsStorage || !newsData) return;
+  if (ownSitesList) {
+    updateLocalFeedBlocks();
+    newsFeedsStorage.innerHTML = "";
+    return;
+  }
   const feeds = newsData.feed_storage || [];
   if (!feeds.length) {
     newsFeedsStorage.innerHTML = `
@@ -598,11 +730,10 @@ function renderFeedStorage() {
   }, {});
   newsFeedsStorage.innerHTML = `
     <div class="local-feeds">
-      <span class="local-feeds-title">Локальные фиды</span>
       ${Object.entries(groups)
         .map(([source, group]) => `
           <div class="local-feed-source">
-            <strong>${escapeHtml(group.label)}</strong>
+            <span class="local-feeds-title">Локальный фид ${escapeHtml(group.label)}</span>
             ${group.feeds
               .map((feed) => {
                 const filename = feed.filename || "";
@@ -1006,9 +1137,11 @@ function collectMonitorPayload(root) {
 async function saveNewsSettings() {
   if (isHydratingNews || !newsData) return;
   if (newsSettingsNotice) newsSettingsNotice.textContent = "Сохраняю...";
+  const ownSites = collectOwnSites();
   const payload = {
-    feed_urls: newsFeedUrl.value.trim(),
-    feed_generate_urls: newsFeedGenerateUrl.value.trim(),
+    own_sites: ownSites,
+    feed_urls: ownSites.map((site) => site.feed_url).join("\n"),
+    feed_generate_urls: ownSites.map((site) => site.feed_generate_url).join("\n"),
     smtp: {
       host: smtpHost.value.trim(),
       port: Number(smtpPort.value || 465),
@@ -1102,6 +1235,7 @@ function renderAll() {
   const project = activeProject();
   projectView.classList.toggle("hidden", activeView !== "project");
   newItemsView.classList.toggle("hidden", activeView !== "news");
+  settingsView.classList.toggle("hidden", activeView !== "settings");
   logsView.classList.toggle("hidden", activeView !== "logs");
   if (activeView === "project") {
     renderProjectForm(project);
@@ -1109,6 +1243,15 @@ function renderAll() {
   } else if (activeView === "news") {
     if (newsData) {
       renderNews();
+    } else {
+      loadNews().catch((error) => {
+        errorText.textContent = error.message;
+      });
+    }
+  } else if (activeView === "settings") {
+    if (newsData) {
+      renderNewsSettings();
+      renderFeedStorage();
     } else {
       loadNews().catch((error) => {
         errorText.textContent = error.message;
@@ -1219,6 +1362,14 @@ newItemsTabButton.addEventListener("click", () => {
   renderAll();
 });
 
+settingsTabButton.addEventListener("click", () => {
+  activeView = "settings";
+  loadNews().catch((error) => {
+    errorText.textContent = error.message;
+  });
+  renderAll();
+});
+
 projectName.addEventListener("input", scheduleSaveActiveProject);
 startUrls.addEventListener("input", scheduleSaveActiveProject);
 threadCount.addEventListener("input", scheduleSaveActiveProject);
@@ -1236,8 +1387,6 @@ autoConnectionFallback.addEventListener("change", saveActiveProject);
 ].forEach((input) => input.addEventListener("input", scheduleSaveActiveProject));
 
 [
-  newsFeedUrl,
-  newsFeedGenerateUrl,
   smtpHost,
   smtpPort,
   smtpSecurity,
@@ -1248,6 +1397,88 @@ autoConnectionFallback.addEventListener("change", saveActiveProject);
   input.addEventListener("input", () => {
     if (newsSettingsNotice) newsSettingsNotice.textContent = "";
   });
+});
+
+ownSitesList.addEventListener("input", () => {
+  if (newsSettingsNotice) newsSettingsNotice.textContent = "";
+});
+
+ownSitesList.addEventListener("click", (event) => {
+  const removeButton = event.target.closest("[data-action='remove-own-site']");
+  if (removeButton) {
+    removeButton.closest("[data-own-site-index]")?.remove();
+    if (!ownSitesList.querySelector("[data-own-site-index]")) {
+      ownSitesList.innerHTML = `<div class="own-site-empty">Фиды не добавлены.</div>`;
+    }
+    if (newsSettingsNotice) newsSettingsNotice.textContent = "";
+    return;
+  }
+
+  const saveButton = event.target.closest("[data-action='save-own-site']");
+  if (saveButton) {
+    const card = saveButton.closest("[data-own-site-index]");
+    const notice = card?.querySelector("[data-role='own-site-notice']");
+    if (notice) notice.textContent = "Сохраняю...";
+    saveNewsSettings()
+      .then(() => {
+        if (notice) {
+          notice.textContent = "Изменения сохранены";
+          window.setTimeout(() => {
+            notice.textContent = "";
+          }, 2500);
+        }
+      })
+      .catch((error) => {
+        if (notice) notice.textContent = error.message;
+        errorText.textContent = error.message;
+      });
+  }
+});
+
+function openAddFeedModal() {
+  newFeedName.value = "";
+  newFeedUrl.value = "";
+  newFeedGenerateUrl.value = "";
+  addFeedModal.classList.remove("hidden");
+  addFeedModal.setAttribute("aria-hidden", "false");
+  newFeedUrl.focus();
+}
+
+function closeAddFeedModal() {
+  addFeedModal.classList.add("hidden");
+  addFeedModal.setAttribute("aria-hidden", "true");
+}
+
+function appendOwnSiteCard(name, feedUrl, feedGenerateUrl) {
+  const current = collectOwnSites();
+  current.push({ name: name || `Фид ${current.length + 1}`, feed_url: feedUrl, feed_generate_url: feedGenerateUrl });
+  newsData = {
+    ...(newsData || {}),
+    own_sites: current,
+    feed_urls: current.map((site) => site.feed_url),
+    feed_generate_urls: current.map((site) => site.feed_generate_url),
+  };
+  renderOwnSites();
+}
+
+addOwnSiteButton.addEventListener("click", openAddFeedModal);
+
+confirmAddFeedButton.addEventListener("click", () => {
+  const name = newFeedName.value.trim();
+  const feedUrl = newFeedUrl.value.trim();
+  const feedGenerateUrl = newFeedGenerateUrl.value.trim();
+  if (!feedUrl && !feedGenerateUrl) return;
+  appendOwnSiteCard(name, feedUrl, feedGenerateUrl);
+  closeAddFeedModal();
+  if (newsSettingsNotice) newsSettingsNotice.textContent = "";
+});
+
+[cancelAddFeedButton, cancelAddFeedIconButton].forEach((button) => {
+  button.addEventListener("click", closeAddFeedModal);
+});
+
+addFeedModal.addEventListener("click", (event) => {
+  if (event.target === addFeedModal) closeAddFeedModal();
 });
 
 saveNewsSettingsButton.addEventListener("click", () => {
@@ -1683,6 +1914,8 @@ events.addEventListener("progress", (event) => {
       if (activeNewsBrandKey && newsMonitorModal && !newsMonitorModal.classList.contains("hidden")) {
         updateNewsModalProgress();
       }
+    } else if (activeView === "settings") {
+      renderFeedStorage();
     }
   }
 });

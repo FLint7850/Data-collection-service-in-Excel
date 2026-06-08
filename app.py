@@ -750,12 +750,29 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> None:
 
 
 def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]:
+    if isinstance(settings.get("own_sites"), list):
+        sites = []
+        for index, item in enumerate(settings.get("own_sites", []), start=1):
+            if not isinstance(item, dict):
+                continue
+            feed_url = str(item.get("feed_url") or "").strip()
+            if not feed_url:
+                continue
+            sites.append(
+                {
+                    "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
+                    "feed_url": feed_url,
+                    "feed_generate_url": str(item.get("feed_generate_url") or "").strip(),
+                }
+            )
+        if sites:
+            return sites
     feed_urls = normalize_start_urls(settings.get("feed_urls") or settings.get("feed_url") or DEFAULT_FEED_URL)
     generate_urls = normalize_start_urls(settings.get("feed_generate_urls") or settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL)
     sites = []
     for index, feed_url in enumerate(feed_urls):
         generate_url = generate_urls[index] if index < len(generate_urls) else (generate_urls[0] if generate_urls else "")
-        sites.append({"feed_url": feed_url, "feed_generate_url": generate_url})
+        sites.append({"name": feed_source_label(feed_url), "feed_url": feed_url, "feed_generate_url": generate_url})
     return sites
 
 
@@ -786,9 +803,10 @@ def save_news_settings() -> None:
                 current_feed_urls.add(site["feed_url"])
                 row = session.scalar(select(OwnSite).where(OwnSite.feed_url == site["feed_url"]))
                 if row is None:
-                    row = OwnSite(feed_url=site["feed_url"], feed_generate_url=site["feed_generate_url"])
+                    row = OwnSite(name=site["name"], feed_url=site["feed_url"], feed_generate_url=site["feed_generate_url"])
                     session.add(row)
                 else:
+                    row.name = site["name"]
                     row.feed_generate_url = site["feed_generate_url"]
             if current_feed_urls:
                 session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
@@ -814,6 +832,14 @@ def load_news_settings() -> None:
                         settings["feed_storage"] = app_setting.feed_storage
                 own_sites = session.scalars(select(OwnSite).order_by(OwnSite.id)).all()
                 if own_sites:
+                    settings["own_sites"] = [
+                        {
+                            "name": site.name or feed_source_label(site.feed_url),
+                            "feed_url": site.feed_url,
+                            "feed_generate_url": site.feed_generate_url,
+                        }
+                        for site in own_sites
+                    ]
                     feed_urls = [site.feed_url for site in own_sites]
                     generate_urls = [site.feed_generate_url for site in own_sites]
                     settings["feed_urls"] = feed_urls
@@ -892,15 +918,15 @@ def public_news_settings() -> Dict[str, object]:
         smtp = dict(news_settings.get("smtp", {}))
         smtp.pop("sender", None)
         smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
-        feed_urls = normalize_start_urls(news_settings.get("feed_urls") or news_settings.get("feed_url") or DEFAULT_FEED_URL)
-        feed_generate_urls = normalize_start_urls(
-            news_settings.get("feed_generate_urls") or news_settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL
-        )
+        own_sites = own_sites_from_settings(news_settings)
+        feed_urls = [site["feed_url"] for site in own_sites]
+        feed_generate_urls = [site["feed_generate_url"] for site in own_sites]
         return {
             "feed_url": feed_urls[0] if feed_urls else DEFAULT_FEED_URL,
             "feed_generate_url": feed_generate_urls[0] if feed_generate_urls else DEFAULT_FEED_GENERATE_URL,
             "feed_urls": feed_urls,
             "feed_generate_urls": feed_generate_urls,
+            "own_sites": own_sites,
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
@@ -3114,10 +3140,9 @@ def clear_source_feeds(source: str) -> Path:
 
 def download_feed_files() -> List[Dict[str, object]]:
     with news_lock:
-        feed_urls = normalize_start_urls(news_settings.get("feed_urls") or news_settings.get("feed_url") or DEFAULT_FEED_URL)
-        generate_urls = normalize_start_urls(
-            news_settings.get("feed_generate_urls") or news_settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL
-        )
+        own_sites = own_sites_from_settings(news_settings)
+        feed_urls = [site["feed_url"] for site in own_sites]
+        generate_urls = [site["feed_generate_url"] for site in own_sites if site.get("feed_generate_url")]
     session = requests.Session()
     session.headers.update(
         {
@@ -3142,7 +3167,8 @@ def download_feed_files() -> List[Dict[str, object]]:
                 response.raise_for_status()
             except Exception:
                 pass
-        for index, url in enumerate(feed_urls, start=1):
+        for index, site in enumerate(own_sites, start=1):
+            url = site["feed_url"]
             try:
                 response = session.get(url, timeout=60)
                 response.raise_for_status()
@@ -3155,7 +3181,7 @@ def download_feed_files() -> List[Dict[str, object]]:
                     {
                         "kind": "feed",
                         "source": source,
-                        "source_label": feed_source_label(url),
+                        "source_label": site.get("name") or feed_source_label(url),
                         "url": url,
                         "filename": filename,
                         "size": path.stat().st_size,
@@ -3772,6 +3798,39 @@ def api_update_news_settings():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
     with news_lock:
+        if "own_sites" in payload and isinstance(payload.get("own_sites"), list):
+            own_sites_payload = [item for item in payload.get("own_sites", []) if isinstance(item, dict)]
+            own_sites = []
+            for index, item in enumerate(own_sites_payload, start=1):
+                raw_feed_url = str(item.get("feed_url") or "").strip()
+                feed_url = normalize_url(raw_feed_url, raw_feed_url)
+                if not feed_url:
+                    continue
+                raw_generate_url = str(item.get("feed_generate_url") or "").strip()
+                feed_generate_url = normalize_url(raw_generate_url, raw_generate_url) if raw_generate_url else ""
+                own_sites.append(
+                    {
+                        "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
+                        "feed_url": feed_url,
+                        "feed_generate_url": feed_generate_url,
+                    }
+                )
+            feed_urls = [
+                item["feed_url"]
+                for item in own_sites
+            ]
+            feed_generate_urls = [
+                item["feed_generate_url"]
+                for item in own_sites
+                if item.get("feed_generate_url")
+            ]
+            feed_urls = feed_urls or [DEFAULT_FEED_URL]
+            feed_generate_urls = feed_generate_urls or [DEFAULT_FEED_GENERATE_URL]
+            news_settings["own_sites"] = own_sites or [{"name": feed_source_label(DEFAULT_FEED_URL), "feed_url": DEFAULT_FEED_URL, "feed_generate_url": DEFAULT_FEED_GENERATE_URL}]
+            news_settings["feed_urls"] = feed_urls
+            news_settings["feed_url"] = feed_urls[0] if feed_urls else DEFAULT_FEED_URL
+            news_settings["feed_generate_urls"] = feed_generate_urls
+            news_settings["feed_generate_url"] = feed_generate_urls[0] if feed_generate_urls else DEFAULT_FEED_GENERATE_URL
         if "feed_url" in payload:
             news_settings["feed_url"] = str(payload.get("feed_url") or DEFAULT_FEED_URL).strip()
         if "feed_generate_url" in payload:
