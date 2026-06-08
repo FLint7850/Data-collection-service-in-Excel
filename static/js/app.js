@@ -762,15 +762,37 @@ function renderNewsModal() {
   newsModalTitle.textContent = brand;
   newsModalSubtitle.textContent = site;
   newsModalTitleActions.innerHTML = `
+  <span class="news-status ${newsStatusClass(state.status)}" data-role="news-status">
+    <span data-role="status-text">${escapeHtml(newsStatusText(state.status))}</span>
+    ${
+      disabled
+          ? `<button class="status-stop-button" data-action="stop-news" type="button" title="Остановить выполнение" aria-label="Остановить выполнение">■</button>`
+          : ""
+  }
+  </span>
     <label class="toggle-field modal-title-toggle">
-      <input data-field="enabled" type="checkbox" ${monitor.enabled !== false ? "checked" : ""}>
-      <span>Активен</span>
-    </label>
-    <span class="news-status ${newsStatusClass(state.status)}" data-role="news-status">
-      <span data-role="status-text">${escapeHtml(newsStatusText(state.status))}</span>
-      ${disabled ? `<button class="status-stop-button" data-action="stop-news" type="button" title="Остановить выполнение" aria-label="Остановить выполнение">■</button>` : ""}
+    <input
+      class="toggle-field__input"
+      data-field="enabled"
+      type="checkbox"
+      ${monitor.enabled !== false ? "checked" : ""}
+    >
+
+    <span class="toggle-field__switch"></span>
+
+    <span class="toggle-field__text">
+      ${monitor.enabled !== false ? "Активен" : "Неактивен"}
     </span>
-  `;
+  </label>
+`
+
+  const enabledInput = newsModalTitleActions.querySelector('[data-field="enabled"]')
+  const enabledText = newsModalTitleActions.querySelector('.toggle-field__text')
+
+  enabledInput.addEventListener('change', () => {
+    enabledText.textContent = enabledInput.checked ? 'Активен' : 'Неактивен'
+  })
+
   newsModalContent.dataset.monitorId = monitor.id;
   newsModalContent.innerHTML = `
     <div class="modal-site-row">
