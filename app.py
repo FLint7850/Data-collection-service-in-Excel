@@ -649,7 +649,6 @@ def get_news_monitor(monitor_id: str) -> Optional[Dict[str, object]]:
 def public_news_settings() -> Dict[str, object]:
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
-        smtp["password"] = ""
         smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
         feed_urls = normalize_start_urls(news_settings.get("feed_urls") or news_settings.get("feed_url") or DEFAULT_FEED_URL)
         feed_generate_urls = normalize_start_urls(
@@ -3114,7 +3113,12 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
     return path
 
 
-def send_news_email(monitor: Dict[str, object], new_count: int) -> bool:
+def send_news_email(
+    monitor: Optional[Dict[str, object]],
+    new_count: int,
+    test: bool = False,
+    error_holder: Optional[List[str]] = None,
+) -> bool:
     with news_lock:
         smtp_config = dict(news_settings.get("smtp", {}))
     recipients = normalize_emails(smtp_config.get("recipients", []))
@@ -3122,14 +3126,20 @@ def send_news_email(monitor: Dict[str, object], new_count: int) -> bool:
     username = str(smtp_config.get("username") or sender).strip()
     password = str(smtp_config.get("password") or "").strip()
     if not sender or not username or not password or not recipients:
-        add_news_log(monitor, "Email не отправлен: заполните отправителя, логин и получателей SMTP", "warning")
+        error_message = "Email не отправлен: заполните отправителя, логин, пароль приложения и получателей SMTP"
+        if error_holder is not None:
+            error_holder.append(error_message)
+        add_news_log(monitor, error_message, "warning")
         return False
 
-    subject = f"Уведомление о новинках на сайте {monitor.get('brand')}"
-    body = (
-        f"Уведомление о новинках на сайте {monitor.get('brand')}, всего новинок {new_count}. "
-        f"Ссылка на сайт {monitor.get('site_url')}"
-    )
+    if test:
+        subject = "Тест email-уведомлений"
+        body = "Тестовое письмо отправлено из мониторинга новинок. SMTP-настройки работают."
+    else:
+        brand = str((monitor or {}).get("brand") or "донор")
+        site_url = str((monitor or {}).get("site_url") or "")
+        subject = f"Уведомление о новинках на сайте {brand}"
+        body = f"Уведомление о новинках на сайте {brand}, всего новинок {new_count}. Ссылка на сайт {site_url}"
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = sender
@@ -3150,9 +3160,12 @@ def send_news_email(monitor: Dict[str, object], new_count: int) -> bool:
                 server.login(username, password)
                 server.send_message(message)
     except Exception as exc:
-        add_news_log(monitor, f"Ошибка отправки email: {exc}", "error")
+        error_message = f"Ошибка отправки email: {exc}"
+        if error_holder is not None:
+            error_holder.append(error_message)
+        add_news_log(monitor, error_message, "error")
         return False
-    add_news_log(monitor, f"Email-уведомление отправлено. Новинок: {new_count}", "success")
+    add_news_log(monitor, "Тестовое email-сообщение отправлено" if test else f"Email-уведомление отправлено. Новинок: {new_count}", "success")
     return True
 
 
@@ -3258,7 +3271,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["next_run_at"] = "" if monitor.get("schedule_type") == "once" else compute_next_run_at(monitor)
             save_news_settings()
         add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
-        if not manual and new_items:
+        if new_items:
             send_news_email(monitor, len(new_items))
     except NewsScanStopped:
         elapsed = int(time.time() - started)
@@ -3449,6 +3462,15 @@ def api_update_news_settings():
             news_settings["smtp"] = smtp
         save_news_settings()
     return jsonify(public_news_settings())
+
+
+@app.post("/api/news/email/test")
+def api_test_news_email():
+    ensure_storage()
+    errors: List[str] = []
+    if not send_news_email(None, 0, test=True, error_holder=errors):
+        return jsonify({"error": errors[-1] if errors else "Email не отправлен. Проверьте SMTP-настройки и логи мониторинга."}), 500
+    return jsonify({"ok": True})
 
 
 @app.patch("/api/news/monitors/<monitor_id>")

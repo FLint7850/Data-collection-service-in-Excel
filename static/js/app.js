@@ -57,8 +57,10 @@ const smtpSecurity = document.querySelector("#smtpSecurity");
 const smtpUsername = document.querySelector("#smtpUsername");
 const smtpSender = document.querySelector("#smtpSender");
 const smtpPassword = document.querySelector("#smtpPassword");
+const toggleSmtpPasswordButton = document.querySelector("#toggleSmtpPasswordButton");
 const smtpRecipients = document.querySelector("#smtpRecipients");
 const saveNewsSettingsButton = document.querySelector("#saveNewsSettingsButton");
+const testNewsEmailButton = document.querySelector("#testNewsEmailButton");
 const newsSettingsNotice = document.querySelector("#newsSettingsNotice");
 const newsFeedsStorage = document.querySelector("#newsFeedsStorage");
 const newsMonitorModal = document.querySelector("#newsMonitorModal");
@@ -456,8 +458,8 @@ function renderNewsSettings() {
   smtpSecurity.value = smtp.security || "ssl";
   smtpUsername.value = smtp.username || "";
   smtpSender.value = smtp.sender || "";
-  smtpPassword.value = "";
-  smtpPassword.placeholder = smtp.password_set ? "Пароль уже задан" : "Введите пароль приложения";
+  smtpPassword.value = smtp.password || "";
+  smtpPassword.placeholder = smtp.password_set ? "Пароль приложения сохранен" : "Введите пароль приложения";
   smtpRecipients.value = (smtp.recipients || []).join("\n");
   isHydratingNews = false;
 }
@@ -1023,13 +1025,24 @@ async function saveNewsSettings() {
     method: "PATCH",
     body: JSON.stringify(payload),
   });
-  smtpPassword.value = "";
   renderNewsSettings();
   if (newsSettingsNotice) {
     newsSettingsNotice.textContent = "Настройки сохранены";
     window.setTimeout(() => {
       newsSettingsNotice.textContent = "";
     }, 2500);
+  }
+}
+
+async function testNewsEmail() {
+  if (newsSettingsNotice) newsSettingsNotice.textContent = "Проверяю email...";
+  await saveNewsSettings();
+  await requestJson("/api/news/email/test", { method: "POST" });
+  if (newsSettingsNotice) {
+    newsSettingsNotice.textContent = "Тестовое письмо отправлено";
+    window.setTimeout(() => {
+      newsSettingsNotice.textContent = "";
+    }, 3000);
   }
 }
 
@@ -1243,6 +1256,20 @@ autoConnectionFallback.addEventListener("change", saveActiveProject);
 
 saveNewsSettingsButton.addEventListener("click", () => {
   saveNewsSettings().catch((error) => {
+    if (newsSettingsNotice) newsSettingsNotice.textContent = error.message;
+    errorText.textContent = error.message;
+  });
+});
+
+toggleSmtpPasswordButton.addEventListener("click", () => {
+  const isHidden = smtpPassword.type === "password";
+  smtpPassword.type = isHidden ? "text" : "password";
+  toggleSmtpPasswordButton.title = isHidden ? "Скрыть пароль" : "Показать пароль";
+  toggleSmtpPasswordButton.setAttribute("aria-label", toggleSmtpPasswordButton.title);
+});
+
+testNewsEmailButton.addEventListener("click", () => {
+  testNewsEmail().catch((error) => {
     if (newsSettingsNotice) newsSettingsNotice.textContent = error.message;
     errorText.textContent = error.message;
   });

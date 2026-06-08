@@ -220,7 +220,12 @@
           </label>
           <label class="field">
             <span>Пароль приложения</span>
-            <input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Оставьте пустым, если пароль уже задан">
+            <span class="password-input-wrap">
+              <input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Пароль приложения">
+              <button class="password-visibility-button" id="toggleSmtpPasswordButton" type="button" title="Показать пароль" aria-label="Показать пароль">
+                &#128065;
+              </button>
+            </span>
           </label>
           <label class="field news-recipients-field">
             <span>Email получателей</span>
@@ -229,6 +234,7 @@
         </div>
         <div class="news-settings-actions">
           <button class="button primary" id="saveNewsSettingsButton" type="button">Сохранить настройки</button>
+          <button class="button secondary" id="testNewsEmailButton" type="button">Тест email</button>
           <span class="save-notice" id="newsSettingsNotice"></span>
         </div>
         <div id="newsFeedsStorage"></div>
