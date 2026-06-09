@@ -576,6 +576,7 @@ def make_news_monitor(group: str, brand: str, urls: List[str]) -> Dict[str, obje
         "id": monitor_id,
         "group": group,
         "brand": brand,
+        "created_at": datetime.now().isoformat(timespec="milliseconds"),
         "site_url": site_url,
         "start_urls": [site_url] if site_url else [],
         "enabled": True,
@@ -661,6 +662,7 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
         normalize_start_urls(item.get("start_urls") or item.get("site_url") or DEFAULT_START_URL),
     )
     monitor["id"] = str(item.get("id") or monitor["id"])
+    monitor["created_at"] = str(item.get("created_at") or monitor["created_at"])
     monitor["site_url"] = str(item.get("site_url") or monitor["start_urls"][0])
     monitor["enabled"] = bool(item.get("enabled", True))
     monitor["schedule_type"] = str(item.get("schedule_type") or "daily")
@@ -703,7 +705,27 @@ def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object
 
 def group_type_from_group(group: str) -> str:
     normalized = clean_text(group).lower()
+    if "немарж" in normalized or "не марж" in normalized or "non_margin" in normalized or "non-margin" in normalized:
+        return "non_margin"
     return "margin" if "марж" in normalized or "margin" in normalized else "non_margin"
+
+
+def unique_news_brand_name(group: str, base_name: str = "Новый бренд") -> str:
+    base_name = clean_text(base_name) or "Новый бренд"
+    group_type = group_type_from_group(group)
+    names = {
+        clean_text(str(item.get("brand") or ""))
+        for item in news_settings.get("monitors", [])
+        if isinstance(item, dict) and group_type_from_group(str(item.get("group") or "")) == group_type
+    }
+    if base_name not in names:
+        return base_name
+    index = 2
+    while True:
+        candidate = f"{base_name} {index}"
+        if candidate not in names:
+            return candidate
+        index += 1
 
 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
@@ -712,6 +734,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "id": row.id,
         "group": brand.group_name if brand else "",
         "brand": brand.name if brand else "Донор",
+        "created_at": row.created_at.isoformat(timespec="milliseconds") if row.created_at else "",
         "site_url": row.site_url,
         "start_urls": normalize_start_urls(row.start_urls or row.site_url or DEFAULT_START_URL),
         "enabled": bool(row.enabled),
@@ -4085,9 +4108,14 @@ def api_create_news_monitor():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
     urls = normalize_start_urls(payload.get("start_urls") or payload.get("site_url") or DEFAULT_START_URL)
+    group = clean_text(str(payload.get("group") or "Маржа"))
+    brand = clean_text(str(payload.get("brand") or "Новый донор"))
+    if payload.get("create_new_brand"):
+        with news_lock:
+            brand = unique_news_brand_name(group, brand if brand and brand != "Новый донор" else "Новый бренд")
     monitor = make_news_monitor(
-        clean_text(str(payload.get("group") or "Маржа")),
-        clean_text(str(payload.get("brand") or "Новый донор")),
+        group,
+        brand,
         urls,
     )
     with news_lock:

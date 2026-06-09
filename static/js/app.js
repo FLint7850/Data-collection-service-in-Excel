@@ -795,7 +795,8 @@ function sortedBrandEntries(brands) {
   return Object.entries(brands).sort((left, right) => {
     const leftCreated = Math.max(...left[1].map((monitor) => createdTimestamp(monitor.created_at)));
     const rightCreated = Math.max(...right[1].map((monitor) => createdTimestamp(monitor.created_at)));
-    return rightCreated - leftCreated;
+    if (rightCreated !== leftCreated) return rightCreated - leftCreated;
+    return String(right[0]).localeCompare(String(left[0]), "ru");
   });
 }
 
@@ -1624,7 +1625,12 @@ async function addNewsMonitorToGroup(group) {
   try {
     const data = await requestJson("/api/news/monitors", {
       method: "POST",
-      body: JSON.stringify({ brand: "Новый донор", group, start_urls: "https://example.com/" }),
+      body: JSON.stringify({
+        brand: "Новый бренд",
+        group,
+        start_urls: "https://example.com/",
+        create_new_brand: true,
+      }),
     });
     if (!newsData) newsData = await requestJson("/api/news");
     newsData.monitors.push(data.monitor);
@@ -1669,49 +1675,6 @@ newsGroups.addEventListener("click", (event) => {
   const tile = event.target.closest("[data-action='open-news-brand']");
   if (!tile) return;
   openNewsModal(tile.dataset.brandKey);
-});
-
-newsGroups.addEventListener("click", async (event) => {
-  return;
-  const toggleButton = event.target.closest("[data-action='toggle-news-settings']");
-  if (toggleButton) {
-    const card = toggleButton.closest(".news-monitor-card");
-    if (!card) return;
-    const grid = card.querySelector(".news-monitor-grid");
-    const collapsed = !card.classList.contains("collapsed");
-    card.classList.toggle("collapsed", collapsed);
-    grid?.classList.toggle("hidden", collapsed);
-    toggleButton.textContent = collapsed ? "Настройки" : "Свернуть";
-    return;
-  }
-
-  const saveButton = event.target.closest("[data-action='save-news-monitor']");
-  if (saveButton) {
-    const card = saveButton.closest(".news-monitor-card");
-    if (!card) return;
-    try {
-      await saveNewsMonitor(card);
-    } catch (error) {
-      const notice = card.querySelector("[data-role='monitor-notice']");
-      if (notice) notice.textContent = error.message;
-      errorText.textContent = error.message;
-    }
-    return;
-  }
-
-  const button = event.target.closest("[data-action='scan-news']");
-  if (!button) return;
-  const card = button.closest(".news-monitor-card");
-  if (!card) return;
-  try {
-    await saveNewsMonitor(card);
-    const data = await requestJson(`/api/news/monitors/${card.dataset.monitorId}/scan`, { method: "POST" });
-    const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === card.dataset.monitorId);
-    if (index >= 0) newsData.monitors[index] = data.monitor;
-    renderNewsMonitors();
-  } catch (error) {
-    errorText.textContent = error.message;
-  }
 });
 
 closeNewsModalButton.addEventListener("click", closeNewsModal);
