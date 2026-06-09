@@ -950,11 +950,22 @@ select:focus {
 
 .brand-counters,
 .brand-stage,
-.brand-error {
+.brand-error,
+.brand-warning {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.brand-counters-secondary,
+.brand-warning {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.brand-warning {
+  color: var(--warning);
 }
 
 .brand-error {
@@ -1257,6 +1268,23 @@ select:focus {
   color: var(--muted);
   background: var(--panel-soft);
   font-size: 13px;
+}
+
+.modal-summary-row--diagnostics {
+  margin-top: -8px;
+}
+
+.active-url-list {
+  max-height: 86px;
+  margin-top: 8px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--muted);
+  background: var(--bg);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .news-progress-block {

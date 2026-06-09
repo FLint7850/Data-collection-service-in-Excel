@@ -846,6 +846,10 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
   const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
   const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
   const newCount = states.reduce((sum, state) => sum + Number(state.new_count || 0), 0);
+  const inMemoryProducts = Number(activeState.in_memory_products || activeState.found_products || 0);
+  const queueSize = Number(activeState.queue_size || 0);
+  const activeTasks = Number(activeState.active_tasks || 0);
+  const stallSeconds = Number(activeState.stall_seconds || 0);
   const missingSummary = aggregateMissingByFeed(states);
   const lastScan = states.map((state) => state.last_scan_at || "").filter(Boolean).sort().pop() || "—";
   return `
@@ -865,7 +869,13 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
     <span class="brand-counters">
       Стр: ${Number(activeState.processed || 0)} · Тов: ${Number(activeState.found_products || 0)} · Сравнено: ${Number(activeState.compared_products || 0)}
     </span>
+    <span class="brand-counters brand-counters-secondary">
+      В памяти: ${inMemoryProducts} В· Очередь: ${queueSize} В· Активно: ${activeTasks}
+    </span>
+    ${stallSeconds ? `<span class="brand-stage">Без прогресса: ${formatDuration(stallSeconds)}</span>` : ""}
     <span class="brand-stage">${escapeHtml(activeState.stage || "")}</span>
+    ${activeState.last_warning ? `<span class="brand-warning">${escapeHtml(activeState.last_warning)}</span>` : ""}
+    ${activeState.last_event && !activeState.last_warning ? `<span class="brand-stage">${escapeHtml(activeState.last_event)}</span>` : ""}
     ${activeState.error ? `<span class="brand-error">${escapeHtml(activeState.error)}</span>` : ""}
     <span class="brand-last">Последнее: ${escapeHtml(lastScan)}</span>
   `;
@@ -1003,9 +1013,16 @@ function updateNewsModalProgress() {
     stage: state.stage || "—",
     processed: Number(state.processed || 0),
     found: Number(state.found_products || 0),
+    memory: Number(state.in_memory_products || state.found_products || 0),
     compared: Number(state.compared_products || 0),
     candidates: Number(state.candidate_products || state.found_products || 0),
+    queue: Number(state.queue_size || 0),
+    active: Number(state.active_tasks || 0),
+    failed: Number(state.failed_pages || 0),
+    stall: formatDuration(state.stall_seconds || 0),
     elapsed: formatDuration(state.elapsed_seconds || 0),
+    lastEvent: state.last_event || "—",
+    lastWarning: state.last_warning || "",
   };
   Object.entries(summaryValues).forEach(([key, value]) => {
     const node = newsModalContent.querySelector(`[data-summary='${key}']`);
@@ -1030,6 +1047,12 @@ function updateNewsModalProgress() {
   if (percentNode) percentNode.textContent = `${percent}%`;
   const currentUrlNode = newsModalContent.querySelector("[data-role='modal-current-url']");
   if (currentUrlNode) currentUrlNode.textContent = state.currenturl || "";
+  const activeUrlsNode = newsModalContent.querySelector("[data-role='modal-active-urls']");
+  if (activeUrlsNode) {
+    const activeUrls = Array.isArray(state.active_urls) ? state.active_urls.filter(Boolean).slice(0, 8) : [];
+    activeUrlsNode.innerHTML = activeUrls.length ? activeUrls.map((url) => escapeHtml(url)).join("<br>") : "";
+    activeUrlsNode.classList.toggle("hidden", !activeUrls.length);
+  }
 
   const scanButton = newsModalContent.querySelector("[data-action='scan-news']");
   if (scanButton) scanButton.disabled = ["running", "queued", "pausing", "stopping"].includes(state.status);
@@ -1118,6 +1141,15 @@ function renderNewsModal() {
       <span>Сравнено: <strong data-summary="compared">${Number(state.compared_products || 0)}</strong> / <span data-summary="candidates">${Number(state.candidate_products || state.found_products || 0)}</span></span>
       <span>Время: <span data-summary="elapsed">${formatDuration(state.elapsed_seconds || 0)}</span></span>
     </div>
+    <div class="modal-summary-row modal-summary-row--diagnostics">
+      <span>В памяти: <strong data-summary="memory">${Number(state.in_memory_products || state.found_products || 0)}</strong></span>
+      <span>Очередь: <strong data-summary="queue">${Number(state.queue_size || 0)}</strong></span>
+      <span>Активно: <strong data-summary="active">${Number(state.active_tasks || 0)}</strong></span>
+      <span>Ошибок страниц: <strong data-summary="failed">${Number(state.failed_pages || 0)}</strong></span>
+      <span>Без прогресса: <span data-summary="stall">${formatDuration(state.stall_seconds || 0)}</span></span>
+      <span>Событие: <span data-summary="lastEvent">${escapeHtml(state.last_event || "—")}</span></span>
+      <span>Предупреждение: <span data-summary="lastWarning">${escapeHtml(state.last_warning || "")}</span></span>
+    </div>
     <div class="missing-summary-panel" data-role="modal-missing-summary">
       ${missingSummaryHtml(aggregateMissingByFeed([state]), Number(state.new_count || 0))}
     </div>
@@ -1126,6 +1158,9 @@ function renderNewsModal() {
       <div class="percent-row">
         <span data-role="modal-percent">${percent}%</span>
         <span data-role="modal-current-url">${escapeHtml(state.currenturl || "")}</span>
+      </div>
+      <div class="active-url-list ${Array.isArray(state.active_urls) && state.active_urls.length ? "" : "hidden"}" data-role="modal-active-urls">
+        ${(Array.isArray(state.active_urls) ? state.active_urls.slice(0, 8) : []).map((url) => escapeHtml(url)).join("<br>")}
       </div>
     </div>
 

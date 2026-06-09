@@ -49,6 +49,7 @@ DEFAULT_EXCLUSIONS = [
 REQUEST_TIMEOUT = 20
 REQUEST_DELAY_SECONDS = 0.25
 MAX_RETRIES = 3
+NEWS_SCAN_STALL_TIMEOUT = int(os.environ.get("NEWS_SCAN_STALL_TIMEOUT", "180") or 180)
 CONNECTION_METHODS = (
     "requests",
     "botasaurus-request",
@@ -62,11 +63,6 @@ CONNECTION_METHODS = (
 )
 GENERIC_FALLBACK_METHODS = (
     "requests",
-    "botasaurus-request",
-    "botasaurus-browser-direct",
-    "botasaurus-browser",
-    "crawl4ai",
-    "firecrawl",
     "scrapy",
     "crawlee",
 )
@@ -599,6 +595,14 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "found_products": 0,
         "candidate_products": 0,
         "compared_products": 0,
+        "queue_size": 0,
+        "active_tasks": 0,
+        "active_urls": [],
+        "in_memory_products": 0,
+        "failed_pages": 0,
+        "stall_seconds": 0,
+        "last_event": "",
+        "last_warning": "",
         "new_count": 0,
         "missing_by_feed": [],
         "skipped": 0,
@@ -721,6 +725,10 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         monitor["state"]["stage"] = "Прервано"
         monitor["state"]["error"] = "Сканирование было прервано перезапуском сервера. Запустите его снова."
         monitor["state"]["currenturl"] = ""
+        monitor["state"]["queue_size"] = 0
+        monitor["state"]["active_tasks"] = 0
+        monitor["state"]["active_urls"] = []
+        monitor["state"]["in_memory_products"] = 0
         monitor["brand_state"] = dict(monitor["state"])
     return monitor
 
@@ -790,8 +798,6 @@ def aggregate_brand_state(monitors: List[Dict[str, object]]) -> Dict[str, object
     priority = ["running", "queued", "pausing", "stopping", "error", "partial", "stopped", "completed"]
     selected = next((state for status in priority for state in states if state.get("status") == status), states[0])
     result = {**make_news_state(), **selected}
-    result["found_products"] = sum(int(state.get("found_products", 0) or 0) for state in states)
-    result["new_count"] = sum(int(state.get("new_count", 0) or 0) for state in states)
     last_scan_at = max((str(state.get("last_scan_at") or state.get("finished_at") or "") for state in states), default="")
     if last_scan_at:
         result["last_scan_at"] = last_scan_at
@@ -2673,6 +2679,9 @@ class MaunfeldCrawler:
         self.excel_finalized = False
         self.started_at = 0.0
         self.elapsed_before_resume = 0.0
+        self.last_progress_at = time.time()
+        self.last_progress_signature: tuple = ()
+        self.fatal_error = ""
 
     def update_state(self, **kwargs: object) -> None:
         if self.project is not None:
@@ -2873,6 +2882,9 @@ class MaunfeldCrawler:
                 "visited": len(self.visited),
                 "results": len(self.results),
                 "skipped": len(self.skipped_urls),
+                "queued": self.queue.qsize(),
+                "active": len(self.in_progress),
+                "failed": len(self.failed_attempts),
             }
 
     def snapshot_results(self) -> List[Dict[str, str]]:
@@ -2895,11 +2907,56 @@ class MaunfeldCrawler:
             totalprocessed=processed,
             processed_products=counts["results"],
             found_products=counts["results"],
+            in_memory_products=counts["results"],
+            queue_size=remaining,
+            active_tasks=counts["active"],
+            active_urls=sorted(self.in_progress)[:8],
+            failed_pages=counts["failed"],
+            stall_seconds=max(0, int(time.time() - self.last_progress_at)),
             skipped=counts["skipped"],
             thread_count=self.thread_count,
             elapsed_seconds=int(elapsed),
             eta_seconds=eta,
         )
+
+    def progress_signature(self, pending_urls: Iterable[str]) -> tuple:
+        counts = self.snapshot_counts()
+        return (
+            counts["visited"],
+            counts["results"],
+            counts["skipped"],
+            self.queue.qsize(),
+            tuple(sorted(pending_urls)),
+        )
+
+    def note_progress_activity(self, pending_urls: Iterable[str]) -> None:
+        signature = self.progress_signature(pending_urls)
+        if signature != self.last_progress_signature:
+            self.last_progress_signature = signature
+            self.last_progress_at = time.time()
+
+    def mark_stalled(self, pending_urls: Iterable[str]) -> None:
+        active_urls = list(pending_urls)
+        counts = self.snapshot_counts()
+        message = (
+            f"Сбор не двигается {NEWS_SCAN_STALL_TIMEOUT} секунд. "
+            f"Активных задач: {len(active_urls)}; очередь: {self.queue.qsize()}; "
+            f"товаров в памяти: {counts['results']}. "
+            f"Активные URL: {', '.join(active_urls[:5])}"
+        )
+        self.fatal_error = message
+        self.update_state(
+            status="error",
+            error=message,
+            currenturl=active_urls[0] if active_urls else "",
+            active_urls=active_urls[:8],
+            active_tasks=len(active_urls),
+            queue_size=self.queue.qsize(),
+            in_memory_products=counts["results"],
+            stall_seconds=NEWS_SCAN_STALL_TIMEOUT,
+        )
+        self.log(message, "error")
+        self.stop_signal.set()
 
     def elapsed_seconds(self) -> float:
         if self.started_at:
@@ -2997,6 +3054,7 @@ class MaunfeldCrawler:
         executor = ThreadPoolExecutor(max_workers=self.thread_count)
         pending = {}
         pending_urls_to_requeue = []
+        self.note_progress_activity([])
 
         try:
             while not self.stop_signal.is_set():
@@ -3013,8 +3071,14 @@ class MaunfeldCrawler:
                         if url in self.result_urls and is_probable_product_url(url):
                             continue
                     self.in_progress.add(url)
-                    self.update_state(currenturl=url)
+                    self.update_state(
+                        currenturl=url,
+                        active_urls=sorted(self.in_progress)[:8],
+                        active_tasks=len(self.in_progress),
+                        queue_size=self.queue.qsize(),
+                    )
                     pending[executor.submit(self.fetch, url)] = url
+                    self.note_progress_activity(pending.values())
                     time.sleep(REQUEST_DELAY_SECONDS)
 
                 if not pending:
@@ -3025,10 +3089,14 @@ class MaunfeldCrawler:
                 done, _pending = wait(pending.keys(), timeout=0.5, return_when=FIRST_COMPLETED)
                 if not done:
                     self.refresh_progress()
+                    self.note_progress_activity(pending.values())
+                    if pending and time.time() - self.last_progress_at >= NEWS_SCAN_STALL_TIMEOUT:
+                        self.mark_stalled(pending.values())
                     continue
 
                 for future in done:
                     url = pending.pop(future)
+                    self.note_progress_activity(pending.values())
                     with self.data_lock:
                         self.in_progress.discard(url)
                         self.visited.add(url)
@@ -3111,7 +3179,13 @@ class CollectOnlyCrawler(MaunfeldCrawler):
             self.progress_callback(kwargs)
 
     def log(self, message: str, level: str = "info") -> None:
-        return
+        if self.progress_callback:
+            self.progress_callback(
+                {
+                    "log_message": message,
+                    "log_level": level,
+                }
+            )
 
     def finish_with_excel(self, partial: bool = False) -> None:
         with self.data_lock:
@@ -3541,6 +3615,18 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
     finish_signal = threading.Event()
 
     def progress_callback(payload: Dict[str, object]) -> None:
+        log_message = str(payload.get("log_message") or "").strip()
+        log_level = str(payload.get("log_level") or "info").strip() or "info"
+        if log_message:
+            add_news_log(monitor, log_message, log_level)
+            event_state = {"last_event": log_message}
+            if log_level == "warning":
+                event_state["last_warning"] = log_message
+            elif log_level == "error":
+                event_state["error"] = log_message
+            update_news_monitor_state(monitor, **event_state)
+            if not any(key in payload for key in ("percent", "currenturl", "totalprocessed", "found_products")):
+                return
         if stop_signal.is_set():
             return
         update_news_monitor_state(
@@ -3551,6 +3637,12 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
             currenturl=str(payload.get("currenturl", "")),
             processed=int(payload.get("totalprocessed", 0) or 0),
             found_products=int(payload.get("found_products", 0) or 0),
+            in_memory_products=int(payload.get("in_memory_products", payload.get("found_products", 0)) or 0),
+            queue_size=int(payload.get("queue_size", 0) or 0),
+            active_tasks=int(payload.get("active_tasks", 0) or 0),
+            active_urls=list(payload.get("active_urls", []) or [])[:8],
+            failed_pages=int(payload.get("failed_pages", 0) or 0),
+            stall_seconds=int(payload.get("stall_seconds", 0) or 0),
             skipped=int(payload.get("skipped", 0) or 0),
             error=str(payload.get("error", "") or ""),
         )
@@ -3570,7 +3662,19 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
         progress_callback=progress_callback,
     )
     crawler.run()
-    return crawler.snapshot_results()
+    products = crawler.snapshot_results()
+    if crawler.fatal_error:
+        message = f"{crawler.fatal_error}. Промежуточно хранится в памяти товаров: {len(products)}."
+        update_news_monitor_state(
+            monitor,
+            status="error",
+            error=message,
+            found_products=len(products),
+            in_memory_products=len(products),
+            currenturl="",
+        )
+        raise RuntimeError(message)
+    return products
 
 
 def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> Dict[str, str]:
@@ -3821,6 +3925,10 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "found_products": len(products),
                 "candidate_products": len(products),
                 "compared_products": len(products),
+                "in_memory_products": len(products),
+                "queue_size": 0,
+                "active_tasks": 0,
+                "active_urls": [],
                 "new_count": len(new_items),
                 "missing_by_feed": missing_summary,
                 "last_scan_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
@@ -3867,6 +3975,10 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "missing_by_feed": missing_summary,
                 "processed": len(products),
                 "found_products": len(products),
+                "in_memory_products": len(products),
+                "queue_size": int(monitor.get("state", {}).get("queue_size", 0) or 0),
+                "active_tasks": 0,
+                "active_urls": [],
             }
             monitor["brand_state"] = dict(monitor["state"])
             save_news_settings()
@@ -3894,6 +4006,10 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "error": str(exc),
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
+                "found_products": len(products),
+                "in_memory_products": len(products),
+                "active_tasks": 0,
+                "active_urls": [],
             }
             monitor["brand_state"] = dict(monitor["state"])
             save_news_settings()
@@ -4169,7 +4285,12 @@ def api_scan_news_monitor(monitor_id: str):
         return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
     threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
     with news_lock:
-        monitor["state"] = {**monitor.get("state", {}), "status": "queued"}
+        monitor["state"] = {
+            **make_news_state("queued"),
+            "stage": "В очереди запуска",
+            "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            "last_csv": str(monitor.get("state", {}).get("last_csv") or ""),
+        }
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     return jsonify({"monitor": dict(monitor)})
