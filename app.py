@@ -393,6 +393,17 @@ def save_logs() -> None:
     LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def logs_signature() -> str:
+    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
+    if not source_file.exists():
+        return "missing"
+    try:
+        stat = source_file.stat()
+    except OSError:
+        return "unavailable"
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
 def load_logs() -> None:
     source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
     if not source_file.exists():
@@ -4549,6 +4560,7 @@ def api_logs():
                 "logs": all_logs,
                 "auto_cleanup": any(bool(project.get("auto_cleanup")) for project in projects.values())
                 or bool(news_settings.get("auto_cleanup")),
+                "logs_signature": logs_signature(),
             }
         )
 
@@ -4702,6 +4714,7 @@ def progress_stream():
                     {
                         "projects": [public_project(project) for project in projects.values()],
                         "news": public_news_settings(),
+                        "logs_signature": logs_signature(),
                     },
                     ensure_ascii=False,
                 )

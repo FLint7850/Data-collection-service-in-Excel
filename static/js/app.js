@@ -108,6 +108,7 @@ let pendingDeleteDonorBrandKey = null;
 let tabsRenderKey = "";
 const collapsedNewsGroups = new Set();
 let newsMonitorsStructureKey = "";
+let logsSignature = null;
 
 const statusLabels = {
   idle: "ожидание",
@@ -383,7 +384,11 @@ function renderState(project) {
   statusDot.className = `status-dot status-${status}`;
   progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
   percentText.textContent = `${percent}%`;
-  currentUrl.textContent = state.currenturl || "Текущий URL появится после запуска.";
+  const nextCurrentUrl = state.currenturl || (["running", "queued"].includes(status) ? "" : "Текущий URL появится после запуска.");
+  if (currentUrl.dataset.value !== nextCurrentUrl) {
+    currentUrl.textContent = nextCurrentUrl;
+    currentUrl.dataset.value = nextCurrentUrl;
+  }
   processedCount.textContent = state.totalprocessed || 0;
   foundCount.textContent = state.found_products || 0;
   skippedCount.textContent = state.skipped || 0;
@@ -649,6 +654,10 @@ function newsStatusClass(status) {
   return "status-idle";
 }
 
+function isNewsScanningStatus(status) {
+  return ["running", "queued", "pausing", "stopping"].includes(status);
+}
+
 function newsStatusText(status) {
   if (status === "running" || status === "queued") return "в работе";
   if (status === "completed") return "завершено";
@@ -860,10 +869,15 @@ function updateNewsBrandTiles() {
       const brandKey = `${group}::${brand}`;
       const tile = Array.from(newsGroups.querySelectorAll("[data-action='open-news-brand']")).find((node) => node.dataset.brandKey === brandKey);
       if (!tile) return;
+      const status = aggregateNewsStatus(brandMonitors.map((item) => item.state || {}));
+      if (!isNewsScanningStatus(status) && tile.dataset.newsStatus === status) {
+        return;
+      }
       const nextHtml = newsBrandTileHtml(group, brand, brandMonitors);
       if (tile.innerHTML.trim() !== nextHtml.trim()) {
         tile.innerHTML = nextHtml;
       }
+      tile.dataset.newsStatus = status;
     });
   });
 }
@@ -910,6 +924,7 @@ function renderNewsMonitors() {
       tile.dataset.action = "open-news-brand";
       tile.dataset.brandKey = brandKey;
       tile.innerHTML = newsBrandTileHtml(group, brand, brandMonitors);
+      tile.dataset.newsStatus = aggregateNewsStatus(brandMonitors.map((item) => item.state || {}));
       list.append(tile);
     });
     section.append(list);
@@ -989,10 +1004,15 @@ function updateNewsModalProgress() {
   });
   const missingNode = newsModalContent.querySelector("[data-role='modal-missing-summary']");
   if (missingNode) {
-    missingNode.innerHTML = missingSummaryHtml(
-      aggregateMissingByFeed([state]),
-      Number(state.new_count || 0)
-    );
+    const isScanning = isNewsScanningStatus(state.status);
+    const wasScanning = missingNode.dataset.wasScanning === "true";
+    if (isScanning || wasScanning) {
+      missingNode.innerHTML = missingSummaryHtml(
+        aggregateMissingByFeed([state]),
+        Number(state.new_count || 0)
+      );
+    }
+    missingNode.dataset.wasScanning = isScanning ? "true" : "false";
   }
 
   const fill = newsModalContent.querySelector("[data-role='modal-progress-fill']");
@@ -1434,9 +1454,14 @@ function scheduleSaveActiveProject() {
   }, 350);
 }
 
-async function loadLogs() {
+async function loadLogs(force = false) {
   const data = await requestJson("/api/logs");
   autoCleanup.checked = Boolean(data.auto_cleanup);
+  const nextSignature = data.logs_signature || "";
+  if (!force && logsSignature && nextSignature && nextSignature === logsSignature) {
+    return;
+  }
+  logsSignature = nextSignature;
   logsList.innerHTML = "";
   const logs = data.logs || [];
   if (!logs.length) {
@@ -1982,11 +2007,11 @@ downloadButton.addEventListener("click", (event) => {
   }
 });
 
-refreshLogsButton.addEventListener("click", loadLogs);
+refreshLogsButton.addEventListener("click", () => loadLogs(true));
 
 clearLogsButton.addEventListener("click", async () => {
   await requestJson("/api/logs", { method: "DELETE" });
-  loadLogs();
+  loadLogs(true);
 });
 
 autoCleanup.addEventListener("change", async () => {
@@ -1994,7 +2019,7 @@ autoCleanup.addEventListener("change", async () => {
     method: "POST",
     body: JSON.stringify({ auto_cleanup: autoCleanup.checked }),
   });
-  loadLogs();
+  loadLogs(true);
 });
 
 const events = new EventSource("/progress");
@@ -2007,7 +2032,7 @@ events.addEventListener("progress", (event) => {
       renderTabs();
       renderState(activeProject());
     }
-    if (activeView === "logs") {
+    if (activeView === "logs" && data.logs_signature && data.logs_signature !== logsSignature) {
       loadLogs();
     }
   }

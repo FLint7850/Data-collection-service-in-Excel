@@ -834,7 +834,6 @@ select:focus {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
   gap: 10px;
-  max-height: 3000px;
   opacity: 1;
   overflow: hidden;
   transform: translateY(0);

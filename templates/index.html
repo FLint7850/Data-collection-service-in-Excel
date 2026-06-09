@@ -76,19 +76,23 @@
       <section class="layout-grid">
         <div class="panel">
           <h2>Исключения</h2>
-          <form class="exclusion-form" id="exclusionForm">
-            <input id="exclusionInput" type="text" placeholder="/catalog/rasprodazha/">
-            <button class="button secondary" type="submit">Добавить</button>
-          </form>
-          <ul class="exclusion-list" id="exclusionList"></ul>
+          <div class="main-block-wrapper">
+            <form class="exclusion-form" id="exclusionForm">
+              <input id="exclusionInput" type="text" placeholder="/catalog/rasprodazha/">
+              <button class="button secondary" type="submit">Добавить</button>
+            </form>
+            <ul class="exclusion-list" id="exclusionList"></ul>
+          </div>
 
           <div class="filter-block">
             <h2>Фильтр товарных ссылок</h2>
-            <form class="exclusion-form" id="productUrlFilterForm">
-              <input id="productUrlFilterInput" type="text" placeholder="-qyron-">
-              <button class="button secondary" type="submit">Добавить</button>
-            </form>
-            <ul class="exclusion-list" id="productUrlFilterList"></ul>
+            <div class="main-block-wrapper">
+              <form class="exclusion-form" id="productUrlFilterForm">
+                <input id="productUrlFilterInput" type="text" placeholder="-qyron-">
+                <button class="button secondary" type="submit">Добавить</button>
+              </form>
+              <ul class="exclusion-list" id="productUrlFilterList"></ul>
+            </div>
           </div>
 
           <div class="filter-block selector-settings">
@@ -140,43 +144,45 @@
             <a class="button download disabled" id="downloadButton" href="#" aria-disabled="true">Скачать CSV</a>
           </div>
 
-          <div class="progress-track" aria-label="Прогресс сбора">
-            <div class="progress-fill" id="progressFill"></div>
-          </div>
-          <div class="percent-row">
-            <span id="percentText">0%</span>
-            <span id="fileName"></span>
-          </div>
+          <div class="main-block-wrapper">
+            <div class="progress-track" aria-label="Прогресс сбора">
+              <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="percent-row">
+              <span id="percentText">0%</span>
+              <span id="fileName"></span>
+            </div>
 
-          <div class="time-grid">
-            <div>
-              <span class="time-label">Прошло</span>
-              <strong id="elapsedTime">00:00:00</strong>
+            <div class="time-grid">
+              <div>
+                <span class="time-label">Прошло</span>
+                <strong id="elapsedTime">00:00:00</strong>
+              </div>
+              <div>
+                <span class="time-label">До конца</span>
+                <strong id="etaTime">—</strong>
+              </div>
             </div>
-            <div>
-              <span class="time-label">До конца</span>
-              <strong id="etaTime">—</strong>
+
+            <div class="current-url" id="currentUrl">Текущий URL появится после запуска.</div>
+
+            <div class="stats-grid">
+              <div class="stat">
+                <span class="stat-value" id="processedCount">0</span>
+                <span class="stat-label">Обработано страниц</span>
+              </div>
+              <div class="stat">
+                <span class="stat-value" id="foundCount">0</span>
+                <span class="stat-label">Найдено товаров</span>
+              </div>
+              <div class="stat">
+                <span class="stat-value" id="skippedCount">0</span>
+                <span class="stat-label">Пропущено</span>
+              </div>
             </div>
+
+            <p class="error-text" id="errorText"></p>
           </div>
-
-          <div class="current-url" id="currentUrl">Текущий URL появится после запуска.</div>
-
-          <div class="stats-grid">
-            <div class="stat">
-              <span class="stat-value" id="processedCount">0</span>
-              <span class="stat-label">Обработано страниц</span>
-            </div>
-            <div class="stat">
-              <span class="stat-value" id="foundCount">0</span>
-              <span class="stat-label">Найдено товаров</span>
-            </div>
-            <div class="stat">
-              <span class="stat-value" id="skippedCount">0</span>
-              <span class="stat-label">Пропущено</span>
-            </div>
-          </div>
-
-          <p class="error-text" id="errorText"></p>
         </div>
       </section>
     </section>
@@ -207,7 +213,7 @@
           <h2>Фиды</h2>
           <button class="button secondary" id="addOwnSiteButton" type="button">+ Фид</button>
         </div>
-        <div>
+        <div class="main-block-wrapper">
           <div class="own-sites-list" id="ownSitesList"></div>
           <div id="newsFeedsStorage"></div>
         </div>
@@ -334,7 +340,7 @@
             <button class="button danger" id="clearLogsButton" type="button">Очистить</button>
           </div>
         </div>
-        <div class="logs-list" id="logsList"></div>
+        <div class="logs-list main-block-wrapper" id="logsList"></div>
       </div>
     </section>
   </main>
