@@ -2,6 +2,7 @@ import json
 import os
 import csv
 import html as html_lib
+import faulthandler
 import re
 import shutil
 import smtplib
@@ -607,6 +608,7 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "candidate_products": 0,
         "compared_products": 0,
         "new_count": 0,
+        "missing_by_feed": [],
         "skipped": 0,
         "last_scan_at": "",
         "last_csv": "",
@@ -3224,9 +3226,15 @@ def download_feed_files() -> List[Dict[str, object]]:
 
 
 def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
+    codes, feeds, _feed_code_sets = fetch_existing_vendor_code_sets()
+    return codes, feeds
+
+
+def fetch_existing_vendor_code_sets() -> tuple[Set[str], List[Dict[str, object]], List[Dict[str, object]]]:
     downloaded_feeds = download_feed_files()
     codes: Set[str] = set()
     feeds: List[Dict[str, object]] = []
+    feed_code_sets: List[Dict[str, object]] = []
     for feed in downloaded_feeds:
         filename = str(feed.get("filename") or "")
         path = source_feed_dir(str(feed.get("source") or "")) / filename
@@ -3240,13 +3248,48 @@ def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
             }
             codes.update(feed_codes)
             feeds.append({**feed, "codes_count": len(feed_codes)})
+            feed_code_sets.append({**feed, "codes_count": len(feed_codes), "codes": feed_codes})
         except Exception as exc:
             feeds.append({**feed, "codes_count": 0, "error": str(exc)})
+            feed_code_sets.append({**feed, "codes_count": 0, "codes": set(), "error": str(exc)})
     with news_lock:
         news_settings["feed_storage"] = feeds
         save_news_settings()
     save_logs()
-    return codes, feeds
+    return codes, feeds, feed_code_sets
+
+
+def product_compare_keys(product: Dict[str, str]) -> Set[str]:
+    keys = {
+        normalize_model_key(str(product.get("model", ""))),
+        normalize_model_key(str(product.get("vendor_code", ""))),
+    }
+    keys.discard("")
+    return keys
+
+
+def build_missing_summary(new_items: List[Dict[str, str]], feed_code_sets: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    summary: List[Dict[str, object]] = []
+    for feed in feed_code_sets:
+        feed_codes = feed.get("codes", set())
+        if not isinstance(feed_codes, set):
+            feed_codes = set(feed_codes) if isinstance(feed_codes, list) else set()
+        count = 0
+        for item in new_items:
+            keys = product_compare_keys(item)
+            if keys and not (keys & feed_codes):
+                count += 1
+        summary.append(
+            {
+                "source": str(feed.get("source") or ""),
+                "source_label": str(feed.get("source_label") or feed.get("url") or "Фид"),
+                "url": str(feed.get("url") or ""),
+                "count": count,
+                "codes_count": int(feed.get("codes_count") or 0),
+                "error": str(feed.get("error") or ""),
+            }
+        )
+    return summary
 
 
 def parse_vendor_codes_from_xml(content: bytes) -> Set[str]:
@@ -3451,7 +3494,7 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
     path = EXPORT_DIR / filename
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file, delimiter=";")
-        writer.writerow(["Дата появления", "Группа", "Сайт/бренд", "Наименование", "Модель", "Цена", "Наличие", "URL товара"])
+        writer.writerow(["Дата появления", "Группа", "Сайт/бренд", "Наименование", "Модель", "Цена", "Наличие", "Нет на сайтах", "URL товара"])
         for row in rows:
             writer.writerow(
                 [
@@ -3462,6 +3505,7 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
                     row.get("model", ""),
                     row.get("price", ""),
                     row.get("availability", ""),
+                    row.get("missing_on", ""),
                     row.get("url", ""),
                 ]
             )
@@ -3473,6 +3517,7 @@ def send_news_email(
     new_count: int,
     test: bool = False,
     error_holder: Optional[List[str]] = None,
+    missing_summary: Optional[List[Dict[str, object]]] = None,
 ) -> bool:
     with news_lock:
         smtp_config = dict(news_settings.get("smtp", {}))
@@ -3501,7 +3546,12 @@ def send_news_email(
         brand = str((monitor or {}).get("brand") or "донор")
         site_url = str((monitor or {}).get("site_url") or "")
         subject = f"Уведомление о новинках на сайте {brand}"
-        body = f"Уведомление о новинках на сайте {brand}, всего новинок {new_count}. Ссылка на сайт {site_url}"
+        lines = [f"На {site_url or brand} найдено всего: {new_count}"]
+        for item in missing_summary or []:
+            count = int(item.get("count") or 0)
+            label = str(item.get("source_label") or item.get("url") or "сайт")
+            lines.append(f"На сайте {label} не было найдено {count} новинок.")
+        body = "\n".join(lines)
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = sender_email
@@ -3543,6 +3593,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     new_items: List[Dict[str, str]] = []
     products: List[Dict[str, str]] = []
     local_feeds: List[Dict[str, object]] = []
+    feed_code_sets: List[Dict[str, object]] = []
+    missing_summary: List[Dict[str, object]] = []
     previous_csv = str(monitor.get("state", {}).get("last_csv") or "")
 
     def check_stopped() -> None:
@@ -3559,7 +3611,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     add_news_log(monitor, "Ручное сканирование новинок запущено" if manual else "Плановое сканирование новинок запущено", "info")
 
     try:
-        update_news_monitor_state(monitor, stage="Загрузка фидов ваших сайтов", percent=2)
+        update_news_monitor_state(monitor, stage="Подготовка", percent=2)
         validate_monitor_selectors(monitor)
         add_news_log(
             monitor,
@@ -3567,14 +3619,18 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             f"method={monitor.get('connection_method')}; threads={monitor.get('thread_count')}",
             "info",
         )
-        check_stopped()
-        existing_codes, local_feeds = fetch_existing_vendor_codes()
-        check_stopped()
-        add_news_log(monitor, f"Фиды загружены локально: {len(local_feeds)}. Моделей для сравнения: {len(existing_codes)}", "info")
         update_news_monitor_state(monitor, stage="Сканирование сайта-донора", percent=5)
         products = collect_products_for_monitor(monitor, stop_event)
         check_stopped()
         add_news_log(monitor, f"Сканирование сайта завершено. Найдено товаров: {len(products)}", "info")
+        update_news_monitor_state(monitor, stage="Генерация и загрузка фидов ваших сайтов", percent=84, currenturl="")
+        all_existing_codes, local_feeds, feed_code_sets = fetch_existing_vendor_code_sets()
+        check_stopped()
+        add_news_log(
+            monitor,
+            f"Фиды обновлены после сбора донора: {len(local_feeds)}. Моделей всего: {len(all_existing_codes)}",
+            "info",
+        )
         update_news_monitor_state(
             monitor,
             stage="Сравнение с фидами",
@@ -3584,7 +3640,6 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             compared_products=0,
             currenturl="",
         )
-        seen_models = set(str(value) for value in monitor.get("seen_models", []))
         known = monitor.get("known_new_products", {}) if isinstance(monitor.get("known_new_products"), dict) else {}
         for index, product in enumerate(products, start=1):
             check_stopped()
@@ -3595,32 +3650,37 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 compared_products=index,
                 currenturl=product.get("url", ""),
             )
-            product_keys = {
-                normalize_model_key(str(product.get("model", ""))),
-                normalize_model_key(str(product.get("vendor_code", ""))),
-            }
-            product_keys.discard("")
-            if not product_keys or product_keys & existing_codes or product_keys & seen_models:
-                continue
             details = enrich_news_product(product, monitor)
             details["model"] = details.get("model") or product.get("model", "")
-            detail_keys = {
-                normalize_model_key(str(details.get("model", ""))),
-                normalize_model_key(str(details.get("vendor_code", ""))),
-            }
-            detail_keys.discard("")
-            if not detail_keys or detail_keys & existing_codes or detail_keys & seen_models:
+            detail_keys = product_compare_keys(details) | product_compare_keys(product)
+            if not detail_keys:
+                continue
+            missing_feeds = []
+            for feed in feed_code_sets:
+                feed_codes = feed.get("codes", set())
+                if not isinstance(feed_codes, set):
+                    feed_codes = set(feed_codes) if isinstance(feed_codes, list) else set()
+                if not (detail_keys & feed_codes):
+                    missing_feeds.append(str(feed.get("source_label") or feed.get("url") or "Фид"))
+            if not missing_feeds:
                 continue
             model_key = sorted(detail_keys)[0]
+            details["missing_on"] = ", ".join(missing_feeds)
+            details["missing_on_count"] = len(missing_feeds)
             new_items.append(details)
-            seen_models.update(detail_keys)
             known[model_key] = details
+        missing_summary = build_missing_summary(new_items, feed_code_sets)
+        for item in missing_summary:
+            add_news_log(
+                monitor,
+                f"Нет на {item.get('source_label')}: {int(item.get('count') or 0)}",
+                "info",
+            )
 
         update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
         csv_path = create_news_csv(new_items, monitor, previous_csv)
         elapsed = int(time.time() - started)
         with news_lock:
-            monitor["seen_models"] = sorted(seen_models)
             monitor["known_new_products"] = known
             monitor["state"] = {
                 **monitor.get("state", {}),
@@ -3632,6 +3692,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "candidate_products": len(products),
                 "compared_products": len(products),
                 "new_count": len(new_items),
+                "missing_by_feed": missing_summary,
                 "last_scan_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "last_csv": csv_path.name,
                 "error": "",
@@ -3649,10 +3710,10 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             started,
             found_products=len(products),
             new_count=len(new_items),
-            data={"csv": csv_path.name, "feeds": local_feeds},
+            data={"csv": csv_path.name, "feeds": local_feeds, "missing_by_feed": missing_summary},
         )
         if new_items:
-            send_news_email(monitor, len(new_items))
+            send_news_email(monitor, len(new_items), missing_summary=missing_summary)
     except NewsScanStopped:
         elapsed = int(time.time() - started)
         with news_lock:
@@ -3660,6 +3721,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         partial_csv = ""
         if stop_mode == "pause" and new_items:
             partial_csv = create_news_csv(new_items, monitor, previous_csv).name
+        missing_summary = build_missing_summary(new_items, feed_code_sets) if feed_code_sets else []
         with news_lock:
             monitor["state"] = {
                 **monitor.get("state", {}),
@@ -3671,6 +3733,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "currenturl": "",
                 "last_csv": partial_csv or monitor.get("state", {}).get("last_csv", ""),
                 "new_count": len(new_items),
+                "missing_by_feed": missing_summary,
                 "processed": len(products),
                 "found_products": len(products),
             }
@@ -4633,4 +4696,14 @@ def download_project_csv(project_id: str):
 if __name__ == "__main__":
     ensure_storage()
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="127.0.0.1", port=port, debug=True, threaded=True, use_reloader=False)
+    if os.environ.get("DEBUG_HANG_DUMP") == "1":
+        faulthandler.dump_traceback_later(10, repeat=True)
+    from socketserver import ThreadingMixIn
+    from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
+
+    class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+        daemon_threads = True
+
+    with make_server("127.0.0.1", port, app, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
+        print(f"Serving on http://127.0.0.1:{port}", flush=True)
+        server.serve_forever()

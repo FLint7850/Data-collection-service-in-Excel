@@ -891,6 +891,31 @@ select:focus {
   font-size: 12px;
 }
 
+.brand-missing-summary,
+.missing-summary-panel {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.brand-missing-summary strong,
+.missing-summary-panel strong {
+  color: var(--text);
+}
+
+.missing-summary-empty {
+  color: var(--success);
+}
+
+.missing-summary-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #11171c;
+}
+
 .brand-sites {
   max-height: 34px;
   overflow: hidden;

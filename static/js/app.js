@@ -675,6 +675,30 @@ function newsStatusHtml(status) {
   `;
 }
 
+function aggregateMissingByFeed(states) {
+  const byLabel = new Map();
+  states.forEach((state) => {
+    (state.missing_by_feed || []).forEach((item) => {
+      const label = item.source_label || item.url || "Сайт";
+      const current = byLabel.get(label) || 0;
+      byLabel.set(label, current + Number(item.count || 0));
+    });
+  });
+  return Array.from(byLabel.entries()).map(([label, count]) => ({ label, count }));
+}
+
+function missingSummaryHtml(summary, total) {
+  if (!total) {
+    return `<span class="missing-summary-empty">Новинок не найдено</span>`;
+  }
+  return `
+    <span>Всего новинок: <strong>${Number(total || 0)}</strong></span>
+    ${summary
+      .map((item) => `<span>Нет на ${escapeHtml(item.label)}: <strong>${Number(item.count || 0)}</strong></span>`)
+      .join("")}
+  `;
+}
+
 function aggregateNewsStatus(states) {
   if (states.some((state) => state.status === "error")) return "error";
   if (states.some((state) => ["running", "queued"].includes(state.status))) return "running";
@@ -776,6 +800,7 @@ function renderNewsMonitors() {
       const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
       const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
       const newCount = states.reduce((sum, state) => sum + Number(state.new_count || 0), 0);
+      const missingSummary = aggregateMissingByFeed(states);
       const lastScan = states.map((state) => state.last_scan_at || "").filter(Boolean).sort().pop() || "—";
       const tile = document.createElement("button");
       tile.className = "news-brand-tile";
@@ -791,7 +816,9 @@ function renderNewsMonitors() {
         <span class="brand-sites">${brandMonitors.map((item) => escapeHtml(item.site_url || (item.start_urls || [])[0] || "")).join("<br>")}</span>
         <span class="brand-row">
           ${newsStatusHtml(status)}
-          <span>Новинок: <strong>${newCount}</strong></span>
+        </span>
+        <span class="brand-missing-summary">
+          ${missingSummaryHtml(missingSummary, newCount)}
         </span>
         <span class="mini-progress-track"><span class="mini-progress-fill" style="width: ${percent}%"></span></span>
         <span class="brand-counters">
@@ -878,6 +905,13 @@ function updateNewsModalProgress() {
     const node = newsModalContent.querySelector(`[data-summary='${key}']`);
     if (node) node.textContent = value;
   });
+  const missingNode = newsModalContent.querySelector("[data-role='modal-missing-summary']");
+  if (missingNode) {
+    missingNode.innerHTML = missingSummaryHtml(
+      aggregateMissingByFeed([state]),
+      Number(state.new_count || 0)
+    );
+  }
 
   const fill = newsModalContent.querySelector("[data-role='modal-progress-fill']");
   if (fill) fill.style.width = `${percent}%`;
@@ -972,6 +1006,9 @@ function renderNewsModal() {
       <span>Товаров найдено: <strong data-summary="found">${Number(state.found_products || 0)}</strong></span>
       <span>Сравнено: <strong data-summary="compared">${Number(state.compared_products || 0)}</strong> / <span data-summary="candidates">${Number(state.candidate_products || state.found_products || 0)}</span></span>
       <span>Время: <span data-summary="elapsed">${formatDuration(state.elapsed_seconds || 0)}</span></span>
+    </div>
+    <div class="missing-summary-panel" data-role="modal-missing-summary">
+      ${missingSummaryHtml(aggregateMissingByFeed([state]), Number(state.new_count || 0))}
     </div>
     <div class="news-progress-block">
       <div class="progress-track"><div class="progress-fill" data-role="modal-progress-fill" style="width: ${percent}%"></div></div>
