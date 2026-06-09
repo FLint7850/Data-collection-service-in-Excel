@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import csv
 import html as html_lib
@@ -306,6 +306,10 @@ def make_project(name: str = "РџСЂРѕРµРєС‚ 1", start_urls: Optional
 
 
 def public_project(project: Dict[str, object]) -> Dict[str, object]:
+    state = dict(project["state"])
+    filename = str(state.get("filename") or "")
+    if filename and (EXPORT_DIR / filename).exists():
+        state["download_ready"] = True
     return {
         "id": project["id"],
         "name": project["name"],
@@ -314,7 +318,7 @@ def public_project(project: Dict[str, object]) -> Dict[str, object]:
         "exclusions": project["exclusions"],
         "product_url_filters": project.get("product_url_filters", []),
         "extraction_rules": project.get("extraction_rules", {}),
-        "state": project["state"],
+        "state": state,
         "auto_cleanup": project.get("auto_cleanup", False),
         "connection_method": project.get("connection_method", "requests"),
         "auto_connection_fallback": project.get("auto_connection_fallback", True),
@@ -512,7 +516,25 @@ def normalize_model_key(value: str) -> str:
 def repair_mojibake_text(value: object) -> object:
     if not isinstance(value, str) or not value:
         return value
-    markers = ("\u0402", "\u0405", "\u0406", "\u040e", "\u0451", "\u0452", "\u0455", "\u045f", "\u20ac", "РЎ", "Рџ", "Рћ", "Рњ")
+    markers = (
+        "\u0402",
+        "\u0405",
+        "\u0406",
+        "\u040e",
+        "\u0451",
+        "\u0452",
+        "\u0455",
+        "\u045f",
+        "\u20ac",
+        "РЎ",
+        "Рџ",
+        "Рћ",
+        "Рњ",
+        "Рќ",
+        "Р”",
+        "Р“",
+        "Р¦",
+    )
     text = value
     for _ in range(3):
         if not any(marker in text for marker in markers):
@@ -666,10 +688,17 @@ def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object
 
 
 def group_type_from_group(group: str) -> str:
-    normalized = clean_text(group).lower()
-    if "РЅРµРјР°СЂР¶" in normalized or "РЅРµ РјР°СЂР¶" in normalized or "non_margin" in normalized or "non-margin" in normalized:
+    normalized = repair_mojibake_text(clean_text(group)).lower().replace("ё", "е")
+    if (
+        "немарж" in normalized
+        or "не марж" in normalized
+        or "non_margin" in normalized
+        or "non-margin" in normalized
+    ):
         return "non_margin"
-    return "margin" if "РјР°СЂР¶" in normalized or "margin" in normalized else "non_margin"
+    if "марж" in normalized or "margin" in normalized:
+        return "margin"
+    return "non_margin"
 
 
 def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ Р±СЂРµРЅРґ") -> str:
@@ -945,7 +974,7 @@ def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str 
                 for item in logs
                 if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
             ]
-        save_logs()
+    save_logs()
 
 
 def get_news_monitor(monitor_id: str) -> Optional[Dict[str, object]]:
@@ -955,6 +984,52 @@ def get_news_monitor(monitor_id: str) -> Optional[Dict[str, object]]:
             if str(monitor.get("id")) == str(monitor_id):
                 return monitor
     return None
+
+
+def resolve_export_file(filename: str) -> Optional[Path]:
+    if not filename:
+        return None
+    candidates = [filename]
+    repaired = repair_mojibake_text(filename)
+    if isinstance(repaired, str) and repaired and repaired not in candidates:
+        candidates.append(repaired)
+    for candidate in candidates:
+        path = (EXPORT_DIR / candidate).resolve()
+        if EXPORT_DIR.resolve() in path.parents and path.exists():
+            return path
+    return None
+
+
+def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
+    public_monitor = repair_mojibake(dict(monitor))
+    state = dict(public_monitor.get("state") or make_news_state())
+    original_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+    original_data = original_state.get("data", {}) if isinstance(original_state.get("data"), dict) else {}
+    public_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
+    filename = str(
+        original_state.get("last_csv")
+        or state.get("last_csv")
+        or original_data.get("csv")
+        or public_data.get("csv")
+        or ""
+    )
+    if filename and not state.get("last_csv"):
+        state["last_csv"] = str(repair_mojibake_text(filename) or filename)
+    state["csv_ready"] = bool(resolve_export_file(filename))
+    if state.get("last_csv"):
+        state["last_csv"] = str(repair_mojibake_text(state["last_csv"]) or state["last_csv"])
+    public_monitor["state"] = state
+    if isinstance(public_monitor.get("brand_state"), dict):
+        brand_state = dict(public_monitor["brand_state"])
+        brand_data = brand_state.get("data", {}) if isinstance(brand_state.get("data"), dict) else {}
+        brand_filename = str(brand_state.get("last_csv") or brand_data.get("csv") or filename)
+        if brand_filename and not brand_state.get("last_csv"):
+            brand_state["last_csv"] = str(repair_mojibake_text(brand_filename) or brand_filename)
+        brand_state["csv_ready"] = bool(resolve_export_file(brand_filename))
+        if brand_state.get("last_csv"):
+            brand_state["last_csv"] = str(repair_mojibake_text(brand_state["last_csv"]) or brand_state["last_csv"])
+        public_monitor["brand_state"] = brand_state
+    return public_monitor
 
 
 def public_news_settings() -> Dict[str, object]:
@@ -974,7 +1049,7 @@ def public_news_settings() -> Dict[str, object]:
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
-            "monitors": [repair_mojibake(dict(monitor)) for monitor in news_settings.get("monitors", [])],
+            "monitors": [public_news_monitor(monitor) for monitor in news_settings.get("monitors", [])],
         }
 
 
@@ -3036,6 +3111,8 @@ class MaunfeldCrawler:
             paused_with_result=partial,
         )
         self.log(f"CSV СЃС„РѕСЂРјРёСЂРѕРІР°РЅ: {filename.name}. РўРѕРІР°СЂРѕРІ: {counts['results']}", "success")
+        if self.project is not None:
+            save_projects()
 
     def run(self, resume: bool = False) -> None:
         if not self.started_at:
@@ -3552,22 +3629,36 @@ def update_brand_scan_state(
 ) -> None:
     if target_type not in {"news", "donor"}:
         return
+    data = data or {}
+    existing_state: Dict[str, object] = {}
+    with news_lock:
+        monitor = next((item for item in news_settings.get("monitors", []) if str(item.get("id")) == str(target_id)), None)
+        if monitor and isinstance(monitor.get("state"), dict):
+            existing_state = dict(monitor.get("state") or {})
+    finished_at = datetime.now(MSK_TZ).isoformat(timespec="seconds")
     state = {
         **make_news_state(),
+        **existing_state,
         "status": status or "idle",
-        "started_at": datetime.fromtimestamp(started_at, MSK_TZ).isoformat(timespec="seconds"),
-        "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        "started_at": existing_state.get("started_at") or datetime.fromtimestamp(started_at, MSK_TZ).isoformat(timespec="seconds"),
+        "finished_at": finished_at,
+        "last_scan_at": existing_state.get("last_scan_at") or finished_at,
         "found_products": found_products,
         "new_count": new_count,
-        "data": data or {},
+        "data": data,
     }
+    if data.get("csv"):
+        state["last_csv"] = str(data.get("csv") or "")
+    if data.get("missing_by_feed"):
+        state["missing_by_feed"] = data.get("missing_by_feed")
+    if data.get("error"):
+        state["error"] = str(data.get("error") or "")
     state = repair_mojibake(state)
     with session_scope() as session:
         donor = get_donor_row(session, target_id)
         if donor and donor.brand:
             donor.brand.state = state
     with news_lock:
-        monitor = next((item for item in news_settings.get("monitors", []) if str(item.get("id")) == str(target_id)), None)
         if monitor:
             group = clean_text(str(monitor.get("group") or ""))
             brand = clean_text(str(monitor.get("brand") or ""))
@@ -3728,6 +3819,43 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file, delimiter=";")
         writer.writerow(["Р”Р°С‚Р° РїРѕСЏРІР»РµРЅРёСЏ", "Р“СЂСѓРїРїР°", "РЎР°Р№С‚/Р±СЂРµРЅРґ", "РќР°РёРјРµРЅРѕРІР°РЅРёРµ", "РњРѕРґРµР»СЊ", "Р¦РµРЅР°", "РќР°Р»РёС‡РёРµ", "РќРµС‚ РЅР° СЃР°Р№С‚Р°С…", "URL С‚РѕРІР°СЂР°"])
+        for row in rows:
+            writer.writerow(
+                [
+                    row.get("date_found", ""),
+                    row.get("group", ""),
+                    row.get("brand", ""),
+                    row.get("name", ""),
+                    row.get("model", ""),
+                    row.get("price", ""),
+                    row.get("availability", ""),
+                    row.get("missing_on", ""),
+                    row.get("url", ""),
+                ]
+            )
+    return path
+
+
+def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], filename: str = "") -> Path:
+    if not filename:
+        filename = f"Новинки_{safe_filename(str(monitor.get('brand') or 'donor'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+    filename = str(repair_mojibake_text(filename) or filename)
+    path = EXPORT_DIR / filename
+    with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.writer(csv_file, delimiter=";")
+        writer.writerow(
+            [
+                "Дата появления",
+                "Группа",
+                "Сайт/бренд",
+                "Наименование",
+                "Модель",
+                "Цена",
+                "Наличие",
+                "Нет на сайтах",
+                "URL товара",
+            ]
+        )
         for row in rows:
             writer.writerow(
                 [
@@ -4283,7 +4411,6 @@ def api_scan_news_monitor(monitor_id: str):
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     if monitor.get("state", {}).get("status") in {"running", "queued"}:
         return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
-    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
     with news_lock:
         monitor["state"] = {
             **make_news_state("queued"),
@@ -4293,7 +4420,9 @@ def api_scan_news_monitor(monitor_id: str):
         }
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
-    return jsonify({"monitor": dict(monitor)})
+        response_monitor = dict(monitor)
+    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
+    return jsonify({"monitor": response_monitor})
 
 
 @app.post("/api/news/monitors/<monitor_id>/stop")
@@ -4339,13 +4468,14 @@ def api_resume_news_monitor(monitor_id: str):
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     if monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}:
         return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
-    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
     with news_lock:
-        monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "РџСЂРѕРґРѕР»Р¶РµРЅРёРµ"}
+        monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "Продолжение"}
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
-    add_news_log(monitor, "РџСЂРѕРґРѕР»Р¶РµРЅРёРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє РїРѕСЃС‚Р°РІР»РµРЅРѕ РІ РѕС‡РµСЂРµРґСЊ", "info")
-    return jsonify({"monitor": dict(monitor)})
+        response_monitor = dict(monitor)
+    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
+    add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
+    return jsonify({"monitor": response_monitor})
 
 
 @app.post("/api/news/monitors")
@@ -4407,11 +4537,14 @@ def api_download_news_csv(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
-    filename = str(monitor.get("state", {}).get("last_csv") or "")
-    path = EXPORT_DIR / filename
-    if not filename or not path.exists():
+    state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+    state_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
+    filename = str(state.get("last_csv") or state_data.get("csv") or "")
+    path = resolve_export_file(filename)
+    if not path:
         return jsonify({"error": "CSV РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
-    return send_file(path, as_attachment=True, download_name=filename)
+    download_name = str(repair_mojibake_text(path.name) or path.name)
+    return send_file(path, as_attachment=True, download_name=download_name)
 
 
 @app.get("/api/news/feeds/<source>/<path:filename>")

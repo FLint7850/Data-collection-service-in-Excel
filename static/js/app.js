@@ -397,7 +397,7 @@ function renderState(project) {
   errorText.textContent = state.error || "";
   fileName.textContent = state.filename || "";
 
-  const ready = Boolean(state.download_ready);
+  const ready = Boolean(state.download_ready || state.filename);
   downloadButton.classList.toggle("disabled", !ready);
   downloadButton.setAttribute("aria-disabled", ready ? "false" : "true");
   downloadButton.href = ready && project ? `/api/projects/${project.id}/download` : "#";
@@ -689,7 +689,7 @@ function newsStatusActionsHtml(status) {
 
 function newsStatusHtml(status) {
   return `
-    <span class="news-status ${newsStatusClass(status)}" data-role="news-status">
+    <span class="news-status ${newsStatusClass(status)}" data-role="news-status" data-status="${escapeHtml(status || "idle")}">
       <span data-role="status-text">${escapeHtml(newsStatusText(status))}</span>
       ${newsStatusActionsHtml(status)}
     </span>
@@ -725,8 +725,8 @@ function aggregateNewsStatus(states) {
   if (states.some((state) => ["running", "queued"].includes(state.status))) return "running";
   if (states.some((state) => state.status === "stopping")) return "stopping";
   if (states.some((state) => state.status === "pausing")) return "pausing";
-  if (states.some((state) => state.status === "partial")) return "partial";
   if (states.some((state) => state.status === "stopped")) return "stopped";
+  if (states.some((state) => state.status === "partial")) return "partial";
   if (states.some((state) => state.status === "completed")) return "completed";
   return "idle";
 }
@@ -997,15 +997,11 @@ function updateNewsModalProgress() {
   const monitor = activeNewsMonitor();
   if (!monitor || newsModalContent.dataset.monitorId !== monitor.id) return;
   const state = monitor.state || {};
-  const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
-  const statusNode = newsMonitorModal.querySelector("[data-role='news-status']");
-  if (statusNode) {
-    const nextHtml = newsStatusHtml(state.status).trim();
-    if (statusNode.outerHTML !== nextHtml) {
-      statusNode.outerHTML = nextHtml;
-    }
+  const statusNode = newsModalTitleActions.querySelector("[data-role='news-status']");
+  if (statusNode && statusNode.dataset.status !== (state.status || "idle")) {
+    statusNode.outerHTML = newsStatusHtml(state.status);
   }
-
+  const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
   const summaryValues = {
     lastScan: state.last_scan_at || "—",
     newCount: Number(state.new_count || 0),
@@ -1064,7 +1060,7 @@ function updateNewsModalProgress() {
   if (resumeButton) resumeButton.disabled = state.status !== "partial";
   const downloadLink = newsModalContent.querySelector("[data-role='modal-csv-download']");
   if (downloadLink) {
-    const ready = Boolean(state.last_csv);
+    const ready = Boolean(state.csv_ready || state.last_csv);
     downloadLink.classList.toggle("disabled", !ready);
     downloadLink.setAttribute("aria-disabled", ready ? "false" : "true");
     downloadLink.href = ready ? `/api/news/monitors/${monitor.id}/download` : "#";
@@ -1278,7 +1274,7 @@ function renderNewsModal() {
     <div class="modal-actions">
       <button class="button primary" data-action="save-news-monitor" type="button">Сохранить изменения</button>
       <button class="button secondary" data-action="scan-news" type="button" ${disabled ? "disabled" : ""}>Сканировать наличие новинок</button>
-      <a class="button download ${state.last_csv ? "" : "disabled"}" data-role="modal-csv-download" href="${state.last_csv ? `/api/news/monitors/${monitor.id}/download` : "#"}" aria-disabled="${state.last_csv ? "false" : "true"}">Скачать CSV</a>
+      <a class="button download ${state.csv_ready || state.last_csv ? "" : "disabled"}" data-role="modal-csv-download" href="${state.csv_ready || state.last_csv ? `/api/news/monitors/${monitor.id}/download` : "#"}" aria-disabled="${state.csv_ready || state.last_csv ? "false" : "true"}">Скачать CSV</a>
       <span class="save-notice" data-role="monitor-notice"></span>
     </div>
     <p class="error-text" data-role="modal-error">${escapeHtml(state.error || "")}</p>
@@ -1709,7 +1705,46 @@ async function addNewsMonitorToGroup(group) {
   }
 }
 
+async function runNewsAction(monitorId, endpoint) {
+  const data = await requestJson(`/api/news/monitors/${monitorId}/${endpoint}`, { method: "POST" });
+  const index = (newsData?.monitors || []).findIndex((monitor) => monitor.id === monitorId);
+  if (index >= 0) newsData.monitors[index] = data.monitor;
+  return data.monitor;
+}
+
+function selectedMonitorIdForBrandKey(brandKey, action = "") {
+  const monitors = monitorsForBrandKey(brandKey);
+  if (!monitors.length) return null;
+  if (action === "pause-news" || action === "stop-news") {
+    const active = monitors.find((monitor) => ["running", "queued", "pausing", "stopping"].includes(monitor.state?.status));
+    if (active) return active.id;
+  }
+  if (action === "resume-news") {
+    const partial = monitors.find((monitor) => monitor.state?.status === "partial");
+    if (partial) return partial.id;
+  }
+  const selectedId = selectedNewsSites.get(brandKey);
+  return monitors.find((monitor) => monitor.id === selectedId)?.id || monitors[0].id;
+}
+
 newsGroups.addEventListener("click", (event) => {
+  const actionButton = event.target.closest("[data-action='pause-news'], [data-action='stop-news'], [data-action='resume-news']");
+  if (actionButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const tile = actionButton.closest("[data-action='open-news-brand']");
+    const action = actionButton.dataset.action;
+    const monitorId = selectedMonitorIdForBrandKey(tile?.dataset.brandKey || "", action);
+    if (!monitorId) return;
+    const endpoint = action === "pause-news" ? "pause" : action === "resume-news" ? "resume" : "stop";
+    runNewsAction(monitorId, endpoint)
+      .then(() => renderNewsMonitors())
+      .catch((error) => {
+        errorText.textContent = error.message;
+      });
+    return;
+  }
+
   const toggleButton = event.target.closest("[data-action='toggle-news-group']");
   if (toggleButton) {
     const group = toggleButton.dataset.group || "";
@@ -1823,7 +1858,7 @@ newsModalTitleActions.addEventListener("click", async (event) => {
     const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
     if (index >= 0) newsData.monitors[index] = data.monitor;
     renderNewsMonitors();
-    updateNewsModalProgress();
+    renderNewsModal();
   } catch (error) {
     errorText.textContent = error.message;
   }
