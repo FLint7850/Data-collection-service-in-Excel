@@ -29,6 +29,8 @@ def upgrade() -> None:
         sa.Column("group_name", sa.String(length=255), nullable=False),
         sa.Column("group_type", sa.String(length=32), nullable=False),
         sa.Column("collapsed", sa.Boolean(), nullable=False),
+        sa.Column("exclusions", sa.JSON(), nullable=False),
+        sa.Column("state", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
@@ -64,19 +66,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_table(
-        "scan_runs",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("target_type", sa.String(length=32), nullable=False),
-        sa.Column("target_id", sa.String(length=32), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("started_at", sa.DateTime(), nullable=False),
-        sa.Column("finished_at", sa.DateTime(), nullable=True),
-        sa.Column("found_products", sa.Integer(), nullable=False),
-        sa.Column("new_count", sa.Integer(), nullable=False),
-        sa.Column("data", sa.JSON(), nullable=False),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_table(
         "donors",
         sa.Column("id", sa.String(length=32), nullable=False),
         sa.Column("brand_id", sa.Integer(), nullable=False),
@@ -107,7 +96,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_donors_brand_id", table_name="donors")
     op.drop_table("donors")
-    op.drop_table("scan_runs")
     op.drop_table("projects")
     op.drop_table("own_sites")
     op.drop_index("ix_brands_name", table_name="brands")

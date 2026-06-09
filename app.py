@@ -26,17 +26,14 @@ from flask import Flask, Response, g, jsonify, render_template, request, send_fi
 from sqlalchemy import delete, select
 
 from db import SessionLocal, init_db, session_scope
-from models import AppSetting, Brand, Donor, OwnSite, Project, ScanRun
+from models import AppSetting, Brand, Donor, OwnSite, Project
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 FEED_DIR = BASE_DIR / "feeds"
 EXCLUSIONS_FILE = BASE_DIR / "exclusions.json"
-PROJECTS_FILE = BASE_DIR / "projects.json"
 LOGS_FILE = LOG_DIR / "logs.json"
 LEGACY_LOGS_FILE = BASE_DIR / "logs.json"
-NEWS_FILE = BASE_DIR / "new_items.json"
-DONORS_XLSX = BASE_DIR / "donors.xlsx"
 EXPORT_DIR = BASE_DIR / "exports"
 DEFAULT_START_URL = "https://www.maunfeld.ru/"
 DEFAULT_FEED_URL = "https://mega-kuhnya.ru/price/last_modified.xml"
@@ -382,6 +379,24 @@ def save_projects() -> None:
                 session.execute(delete(Project).where(Project.id.not_in(current_ids)))
 
 
+def write_logs_file(data: List[Dict[str, object]]) -> None:
+    LOGS_FILE.parent.mkdir(exist_ok=True)
+    LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_logs_file() -> List[Dict[str, object]]:
+    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
+    if not source_file.exists():
+        return []
+    try:
+        data = json.loads(source_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
 def save_logs() -> None:
     with projects_lock:
         data = []
@@ -389,8 +404,7 @@ def save_logs() -> None:
             data.extend(project.get("logs", []))
     with news_lock:
         data.extend(news_settings.get("logs", []) if isinstance(news_settings.get("logs"), list) else [])
-    LOGS_FILE.parent.mkdir(exist_ok=True)
-    LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_logs_file(data)
 
 
 def logs_signature() -> str:
@@ -405,18 +419,7 @@ def logs_signature() -> str:
 
 
 def load_logs() -> None:
-    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
-    if not source_file.exists():
-        return
-    try:
-        data = json.loads(source_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(data, list):
-        return
-    for item in data:
-        if not isinstance(item, dict):
-            continue
+    for item in read_logs_file():
         project_id = item.get("project_id")
         project = projects.get(project_id)
         if project:
@@ -424,19 +427,10 @@ def load_logs() -> None:
 
 
 def load_news_logs_from_file() -> List[Dict[str, object]]:
-    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
-    if not source_file.exists():
-        return []
-    try:
-        data = json.loads(source_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, list):
-        return []
     return [
         item
-        for item in data
-        if isinstance(item, dict) and str(item.get("project_id") or "").startswith("news")
+        for item in read_logs_file()
+        if str(item.get("project_id") or "").startswith("news")
     ]
 
 
@@ -448,41 +442,8 @@ def load_projects() -> None:
             rows = session.scalars(select(Project).order_by(Project.created_at, Project.id)).all()
 
         if not rows:
-            loaded = []
-            if PROJECTS_FILE.exists():
-                try:
-                    loaded = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    loaded = []
-            if isinstance(loaded, list) and loaded:
-                for item in loaded:
-                    if not isinstance(item, dict):
-                        continue
-                    project_id = str(item.get("id") or uuid.uuid4().hex[:10])
-                    thread_count = parse_thread_count(item.get("thread_count", 4))
-                    project = {
-                        "id": project_id,
-                        "name": str(item.get("name") or "Проект"),
-                        "start_urls": normalize_start_urls(item.get("start_urls") or [DEFAULT_START_URL]),
-                        "thread_count": thread_count,
-                        "exclusions": normalize_patterns(item.get("exclusions", DEFAULT_EXCLUSIONS)),
-                        "product_url_filters": normalize_patterns(item.get("product_url_filters", [])),
-                        "extraction_rules": normalize_extraction_rules(item.get("extraction_rules", {})),
-                        "state": make_state(thread_count),
-                        "logs": [],
-                        "auto_cleanup": bool(item.get("auto_cleanup", False)),
-                        "connection_method": normalize_connection_method(item.get("connection_method")),
-                        "auto_connection_fallback": bool(item.get("auto_connection_fallback", True)),
-                        "worker_thread": None,
-                        "stop_event": threading.Event(),
-                        "finish_event": threading.Event(),
-                        "crawler": None,
-                        "run_id": 0,
-                    }
-                    projects[project_id] = project
-            else:
-                project = make_project("Проект 1", [DEFAULT_START_URL])
-                projects[project["id"]] = project
+            project = make_project("Проект 1", [DEFAULT_START_URL])
+            projects[project["id"]] = project
             save_projects()
         else:
             for row in rows:
@@ -562,24 +523,6 @@ def default_news_settings() -> Dict[str, object]:
     }
 
 
-def extract_urls_from_cell(value: str) -> List[str]:
-    urls = []
-    for match in re.finditer(r"(https?://[^\s,]+|www\.[^\s,]+|[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:/[^\s,]*)?)", value):
-        url = match.group(0).strip().rstrip(".,;")
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        if url not in urls:
-            urls.append(url)
-    return urls
-
-
-def brand_from_donor_cell(value: str) -> str:
-    first_url = re.search(r"(https?://|www\.|[A-Za-z0-9.-]+\.[A-Za-z]{2,})", value)
-    brand = value[: first_url.start()] if first_url else value
-    brand = re.sub(r"\s*[-–—]\s*$", "", clean_text(brand)).strip(" -–—")
-    return brand or "Донор"
-
-
 def make_news_monitor(group: str, brand: str, urls: List[str]) -> Dict[str, object]:
     monitor_id = uuid.uuid4().hex[:10]
     site_url = urls[0] if urls else ""
@@ -630,40 +573,6 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "elapsed_seconds": 0,
         "next_run_at": "",
     }
-
-
-def import_news_monitors_from_excel() -> List[Dict[str, object]]:
-    if not DONORS_XLSX.exists():
-        return []
-    try:
-        import openpyxl
-    except ImportError:
-        return []
-
-    monitors = []
-    try:
-        workbook = openpyxl.load_workbook(DONORS_XLSX, data_only=True)
-    except Exception:
-        return []
-
-    for sheet in workbook.worksheets:
-        rows = list(sheet.iter_rows(values_only=True))
-        if not rows:
-            continue
-        headers = [clean_text(str(value or "")) for value in rows[0]]
-        for row in rows[1:]:
-            for column_index, cell in enumerate(row):
-                text = clean_text(str(cell or ""))
-                if not text:
-                    continue
-                urls = extract_urls_from_cell(text)
-                if not urls:
-                    continue
-                group = headers[column_index] if column_index < len(headers) and headers[column_index] else sheet.title
-                brand = brand_from_donor_cell(text)
-                for url in urls:
-                    monitors.append(make_news_monitor(group, brand, [url]))
-    return monitors
 
 
 def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
@@ -741,10 +650,14 @@ def unique_news_brand_name(group: str, base_name: str = "Новый бренд")
 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
+    brand_exclusions = normalize_patterns(brand.exclusions or DEFAULT_EXCLUSIONS) if brand else DEFAULT_EXCLUSIONS
+    brand_state = {**make_news_state(), **(brand.state or {})} if brand else make_news_state()
     monitor = {
         "id": row.id,
         "group": brand.group_name if brand else "",
         "brand": brand.name if brand else "Донор",
+        "brand_id": brand.id if brand else None,
+        "brand_state": brand_state,
         "created_at": row.created_at.isoformat(timespec="milliseconds") if row.created_at else "",
         "site_url": row.site_url,
         "start_urls": normalize_start_urls(row.start_urls or row.site_url or DEFAULT_START_URL),
@@ -756,7 +669,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "thread_count": parse_thread_count(row.thread_count),
         "connection_method": normalize_connection_method(row.connection_method),
         "auto_connection_fallback": bool(row.auto_connection_fallback),
-        "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
+        "exclusions": brand_exclusions,
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "selector_settings": normalize_selector_settings(row.selector_settings or {}),
@@ -779,12 +692,21 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
     group_type = group_type_from_group(group_name)
     row = session.scalar(select(Brand).where(Brand.name == name, Brand.group_type == group_type))
     if row is None:
-        row = Brand(name=name, group_name=group_name, group_type=group_type, collapsed=bool(monitor.get("collapsed", True)))
+        row = Brand(
+            name=name,
+            group_name=group_name,
+            group_type=group_type,
+            collapsed=bool(monitor.get("collapsed", True)),
+            exclusions=normalize_patterns(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
+            state=dict(monitor.get("brand_state") or make_news_state()),
+        )
         session.add(row)
         session.flush()
     else:
         row.group_name = group_name
         row.collapsed = bool(monitor.get("collapsed", row.collapsed))
+        row.exclusions = normalize_patterns(monitor.get("exclusions", row.exclusions or DEFAULT_EXCLUSIONS))
+        row.state = {**make_news_state(), **(monitor.get("brand_state") or row.state or {})}
     return row
 
 
@@ -806,13 +728,28 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> None:
     row.thread_count = parse_thread_count(normalized.get("thread_count", 4))
     row.connection_method = normalize_connection_method(normalized.get("connection_method"))
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
-    row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
+    row.exclusions = normalize_patterns(brand.exclusions or normalized.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
     row.extraction_rules = normalize_extraction_rules(normalized.get("extraction_rules", {}))
     row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
     row.seen_models = [normalize_model_key(str(value)) for value in normalized.get("seen_models", []) if str(value).strip()]
     row.known_new_products = normalized.get("known_new_products", {}) if isinstance(normalized.get("known_new_products"), dict) else {}
     row.state = dict(normalized.get("state") or make_news_state())
+
+
+def aggregate_brand_state(monitors: List[Dict[str, object]]) -> Dict[str, object]:
+    states = [{**make_news_state(), **(monitor.get("state") or {})} for monitor in monitors if isinstance(monitor, dict)]
+    if not states:
+        return make_news_state()
+    priority = ["running", "queued", "pausing", "stopping", "error", "partial", "stopped", "completed"]
+    selected = next((state for status in priority for state in states if state.get("status") == status), states[0])
+    result = {**make_news_state(), **selected}
+    result["found_products"] = sum(int(state.get("found_products", 0) or 0) for state in states)
+    result["new_count"] = sum(int(state.get("new_count", 0) or 0) for state in states)
+    last_scan_at = max((str(state.get("last_scan_at") or state.get("finished_at") or "") for state in states), default="")
+    if last_scan_at:
+        result["last_scan_at"] = last_scan_at
+    return result
 
 
 def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]:
@@ -861,8 +798,22 @@ def save_news_settings() -> None:
                     continue
                 current_donor_ids.add(str(monitor.get("id")))
                 upsert_donor_model(session, monitor)
+            grouped_monitors: Dict[tuple[str, str], List[Dict[str, object]]] = {}
+            for monitor in news_settings.get("monitors", []):
+                if not isinstance(monitor, dict):
+                    continue
+                group_name = clean_text(str(monitor.get("group") or "Маржа"))
+                brand_name = clean_text(str(monitor.get("brand") or "Донор"))
+                grouped_monitors.setdefault((brand_name, group_type_from_group(group_name)), []).append(monitor)
+            for (brand_name, group_type), brand_monitors in grouped_monitors.items():
+                brand_row = session.scalar(select(Brand).where(Brand.name == brand_name, Brand.group_type == group_type))
+                if brand_row:
+                    brand_row.state = aggregate_brand_state(brand_monitors)
             if current_donor_ids:
                 session.execute(delete(Donor).where(Donor.id.not_in(current_donor_ids)))
+            else:
+                session.execute(delete(Donor))
+            session.execute(delete(Brand).where(~Brand.donors.any()))
 
             current_feed_urls = set()
             for site in own_sites_from_settings(news_settings):
@@ -884,66 +835,39 @@ def load_news_settings() -> None:
             return
         settings = default_news_settings()
         with session_scope() as session:
-            donor_rows = session.scalars(select(Donor).join(Brand).order_by(Brand.group_name, Brand.name, Donor.id)).all()
-            if donor_rows:
-                app_setting = session.get(AppSetting, 1)
-                if app_setting:
-                    settings["auto_cleanup"] = bool(app_setting.auto_cleanup)
-                    if isinstance(app_setting.smtp, dict):
-                        smtp = dict(settings["smtp"])
-                        smtp.update(app_setting.smtp)
-                        smtp.pop("sender", None)
-                        settings["smtp"] = smtp
-                    if isinstance(app_setting.feed_storage, list):
-                        settings["feed_storage"] = app_setting.feed_storage
-                own_sites = session.scalars(select(OwnSite).order_by(OwnSite.id)).all()
-                if own_sites:
-                    settings["own_sites"] = [
-                        {
-                            "name": site.name or feed_source_label(site.feed_url),
-                            "feed_url": site.feed_url,
-                            "feed_generate_url": site.feed_generate_url,
-                        }
-                        for site in own_sites
-                    ]
-                    feed_urls = [site.feed_url for site in own_sites]
-                    generate_urls = [site.feed_generate_url for site in own_sites]
-                    settings["feed_urls"] = feed_urls
-                    settings["feed_generate_urls"] = generate_urls
-                    settings["feed_url"] = feed_urls[0]
-                    settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
-                settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
-                settings["logs"] = load_news_logs_from_file()
-            else:
-                loaded: Dict[str, object] = {}
-                if NEWS_FILE.exists():
-                    try:
-                        loaded = json.loads(NEWS_FILE.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError):
-                        loaded = {}
-                if isinstance(loaded, dict):
-                    settings.update({key: value for key, value in loaded.items() if key not in {"smtp", "monitors", "logs"}})
+            donor_rows = session.scalars(
+                select(Donor)
+                .join(Brand)
+                .order_by(Brand.group_name, Brand.name, Donor.id)
+            ).all()
+            app_setting = session.get(AppSetting, 1)
+            if app_setting:
+                settings["auto_cleanup"] = bool(app_setting.auto_cleanup)
+                if isinstance(app_setting.smtp, dict):
                     smtp = dict(settings["smtp"])
-                    if isinstance(loaded.get("smtp"), dict):
-                        smtp.update(loaded["smtp"])
+                    smtp.update(app_setting.smtp)
                     smtp.pop("sender", None)
-                    if not smtp.get("password"):
-                        smtp["password"] = os.environ.get("YANDEX_SMTP_PASSWORD", "")
                     settings["smtp"] = smtp
-                    settings["logs"] = loaded.get("logs", []) if isinstance(loaded.get("logs"), list) else []
-                    monitors = loaded.get("monitors", [])
-                    if isinstance(monitors, list):
-                        normalized_monitors = []
-                        for item in monitors:
-                            if isinstance(item, dict):
-                                normalized_monitors.extend(split_news_monitor_by_site(item))
-                        settings["monitors"] = normalized_monitors
-                if not settings["monitors"]:
-                    settings["monitors"] = import_news_monitors_from_excel()
-                news_settings.update(settings)
-                save_news_settings()
-                save_logs()
-                return
+                if isinstance(app_setting.feed_storage, list):
+                    settings["feed_storage"] = app_setting.feed_storage
+            own_sites = session.scalars(select(OwnSite).order_by(OwnSite.id)).all()
+            if own_sites:
+                settings["own_sites"] = [
+                    {
+                        "name": site.name or feed_source_label(site.feed_url),
+                        "feed_url": site.feed_url,
+                        "feed_generate_url": site.feed_generate_url,
+                    }
+                    for site in own_sites
+                ]
+                feed_urls = [site.feed_url for site in own_sites]
+                generate_urls = [site.feed_generate_url for site in own_sites]
+                settings["feed_urls"] = feed_urls
+                settings["feed_generate_urls"] = generate_urls
+                settings["feed_url"] = feed_urls[0]
+                settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
+            settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
+            settings["logs"] = load_news_logs_from_file()
         news_settings.update(settings)
         save_news_settings()
 
@@ -968,6 +892,7 @@ def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str 
                 if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
             ]
         save_news_settings()
+        save_logs()
 
 
 def get_news_monitor(monitor_id: str) -> Optional[Dict[str, object]]:
@@ -3397,7 +3322,7 @@ def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> N
         save_news_settings()
 
 
-def record_scan_run(
+def update_brand_scan_state(
     target_type: str,
     target_id: str,
     status: str,
@@ -3406,19 +3331,33 @@ def record_scan_run(
     new_count: int = 0,
     data: Optional[Dict[str, object]] = None,
 ) -> None:
+    if target_type not in {"news", "donor"}:
+        return
+    state = {
+        **make_news_state(),
+        "status": status or "idle",
+        "started_at": datetime.fromtimestamp(started_at, MSK_TZ).isoformat(timespec="seconds"),
+        "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        "found_products": found_products,
+        "new_count": new_count,
+        "data": data or {},
+    }
     with session_scope() as session:
-        session.add(
-            ScanRun(
-                target_type=target_type,
-                target_id=target_id,
-                status=status,
-                started_at=datetime.fromtimestamp(started_at),
-                finished_at=datetime.utcnow(),
-                found_products=found_products,
-                new_count=new_count,
-                data=data or {},
-            )
-        )
+        donor = session.get(Donor, str(target_id))
+        if donor and donor.brand:
+            donor.brand.state = state
+    with news_lock:
+        monitor = next((item for item in news_settings.get("monitors", []) if str(item.get("id")) == str(target_id)), None)
+        if monitor:
+            group = clean_text(str(monitor.get("group") or ""))
+            brand = clean_text(str(monitor.get("brand") or ""))
+            for item in news_settings.get("monitors", []):
+                if (
+                    isinstance(item, dict)
+                    and clean_text(str(item.get("group") or "")) == group
+                    and clean_text(str(item.get("brand") or "")) == brand
+                ):
+                    item["brand_state"] = dict(state)
 
 
 class NewsScanStopped(Exception):
@@ -3737,7 +3676,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["next_run_at"] = "" if monitor.get("schedule_type") == "once" else compute_next_run_at(monitor)
             save_news_settings()
         add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
-        record_scan_run(
+        update_brand_scan_state(
             "donor",
             monitor_id,
             "completed",
@@ -3777,7 +3716,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             f"Сканирование новинок приостановлено. CSV: {partial_csv}" if stop_mode == "pause" else "Сканирование новинок остановлено",
             "warning",
         )
-        record_scan_run(
+        update_brand_scan_state(
             "donor",
             monitor_id,
             "partial" if stop_mode == "pause" else "stopped",
@@ -3799,7 +3738,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             }
             save_news_settings()
         add_news_log(monitor, f"Ошибка сканирования новинок: {exc}", "error")
-        record_scan_run(
+        update_brand_scan_state(
             "donor",
             monitor_id,
             "error",
@@ -4037,7 +3976,17 @@ def api_update_news_monitor(monitor_id: str):
         if "auto_connection_fallback" in payload:
             monitor["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
         if "exclusions" in payload:
-            monitor["exclusions"] = normalize_patterns(payload.get("exclusions"))
+            exclusions = normalize_patterns(payload.get("exclusions"))
+            monitor["exclusions"] = exclusions
+            group = clean_text(str(monitor.get("group") or ""))
+            brand = clean_text(str(monitor.get("brand") or ""))
+            for item in news_settings.get("monitors", []):
+                if (
+                    isinstance(item, dict)
+                    and clean_text(str(item.get("group") or "")) == group
+                    and clean_text(str(item.get("brand") or "")) == brand
+                ):
+                    item["exclusions"] = list(exclusions)
         if "product_url_filters" in payload:
             monitor["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
         if "extraction_rules" in payload:
@@ -4524,46 +4473,47 @@ def api_project_restart(project_id: str):
 @app.get("/api/logs")
 def api_logs():
     ensure_storage()
+    auto_cleanup = False
     with projects_lock:
-        changed = False
+        auto_cleanup = any(bool(project.get("auto_cleanup")) for project in projects.values())
+    with news_lock:
+        auto_cleanup = auto_cleanup or bool(news_settings.get("auto_cleanup"))
+
+    all_logs = read_logs_file()
+    if auto_cleanup:
         cutoff = time.time() - 7 * 24 * 60 * 60
-        for project in projects.values():
-            if project.get("auto_cleanup"):
+        filtered_logs = [
+            item
+            for item in all_logs
+            if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
+        ]
+        if len(filtered_logs) != len(all_logs):
+            all_logs = filtered_logs
+            write_logs_file(all_logs)
+        with projects_lock:
+            for project in projects.values():
                 logs = project.get("logs", [])
-                before = len(logs)
                 project["logs"] = [
                     item
                     for item in logs
                     if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
                 ]
-                changed = changed or before != len(project["logs"])
-        if changed:
-            save_logs()
-        all_logs = []
-        for project in projects.values():
-            all_logs.extend(project.get("logs", []))
         with news_lock:
-            if news_settings.get("auto_cleanup"):
-                logs = news_settings.get("logs", [])
-                before = len(logs)
-                news_settings["logs"] = [
-                    item
-                    for item in logs
-                    if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
-                ]
-                if before != len(news_settings["logs"]):
-                    save_news_settings()
-            all_logs.extend(news_settings.get("logs", []))
-        all_logs.sort(key=lambda item: item.get("time", ""))
-        return jsonify(
-            {
-                "logs": all_logs,
-                "auto_cleanup": any(bool(project.get("auto_cleanup")) for project in projects.values())
-                or bool(news_settings.get("auto_cleanup")),
-                "logs_signature": logs_signature(),
-            }
-        )
+            logs = news_settings.get("logs", [])
+            news_settings["logs"] = [
+                item
+                for item in logs
+                if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
+            ]
 
+    all_logs.sort(key=lambda item: item.get("time", ""))
+    return jsonify(
+        {
+            "logs": all_logs,
+            "auto_cleanup": auto_cleanup,
+            "logs_signature": logs_signature(),
+        }
+    )
 
 @app.delete("/api/logs")
 def api_clear_logs():
@@ -4571,10 +4521,10 @@ def api_clear_logs():
     with projects_lock:
         for project in projects.values():
             project["logs"] = []
-        save_logs()
     with news_lock:
         news_settings["logs"] = []
         save_news_settings()
+    write_logs_file([])
     return jsonify({"ok": True})
 
 

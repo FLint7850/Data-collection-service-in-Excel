@@ -35,6 +35,8 @@ class Brand(Base):
     group_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     group_type: Mapped[str] = mapped_column(String(32), default="non_margin", nullable=False)
     collapsed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -87,20 +89,6 @@ class OwnSite(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     __table_args__ = (UniqueConstraint("feed_url", name="uq_own_sites_feed_url"),)
-
-
-class ScanRun(Base):
-    __tablename__ = "scan_runs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    target_id: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    found_products: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    new_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class AppSetting(Base):

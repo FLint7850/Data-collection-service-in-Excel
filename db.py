@@ -38,9 +38,15 @@ def init_db() -> None:
         connection.execute(text("PRAGMA busy_timeout=5000"))
         connection.execute(text("DROP TABLE IF EXISTS feed_products"))
         connection.execute(text("DROP TABLE IF EXISTS logs"))
+        connection.execute(text("DROP TABLE IF EXISTS scan_runs"))
         own_site_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(own_sites)")).fetchall()}
         if own_site_columns and "name" not in own_site_columns:
             connection.execute(text("ALTER TABLE own_sites ADD COLUMN name VARCHAR(255) NOT NULL DEFAULT ''"))
+        brand_columns = {row[1] for row in connection.execute(text("PRAGMA table_info(brands)")).fetchall()}
+        if brand_columns and "exclusions" not in brand_columns:
+            connection.execute(text("ALTER TABLE brands ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
+        if brand_columns and "state" not in brand_columns:
+            connection.execute(text("ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{\"status\":\"idle\"}'"))
         connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
         current_revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
         if not current_revision:

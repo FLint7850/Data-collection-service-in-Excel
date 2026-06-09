@@ -731,6 +731,15 @@ function aggregateNewsStatus(states) {
   return "idle";
 }
 
+function stateWithBrandState(monitor) {
+  const state = { ...(monitor.state || {}) };
+  const brandState = monitor.brand_state || null;
+  if (brandState && (!state.status || state.status === "idle")) {
+    return { ...state, ...brandState };
+  }
+  return state;
+}
+
 function clampPercent(value) {
   const percent = Number(value || 0);
   if (!Number.isFinite(percent)) return 0;
@@ -832,7 +841,7 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
   const selectedId = selectedNewsSites.get(brandKey);
   const monitor = brandMonitors.find((item) => item.id === selectedId) || brandMonitors[0];
   selectedNewsSites.set(brandKey, monitor.id);
-  const states = brandMonitors.map((item) => item.state || {});
+  const states = brandMonitors.map((item) => stateWithBrandState(item));
   const status = aggregateNewsStatus(states);
   const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
   const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
@@ -869,7 +878,7 @@ function updateNewsBrandTiles() {
       const brandKey = `${group}::${brand}`;
       const tile = Array.from(newsGroups.querySelectorAll("[data-action='open-news-brand']")).find((node) => node.dataset.brandKey === brandKey);
       if (!tile) return;
-      const status = aggregateNewsStatus(brandMonitors.map((item) => item.state || {}));
+      const status = aggregateNewsStatus(brandMonitors.map((item) => stateWithBrandState(item)));
       if (!isNewsScanningStatus(status) && tile.dataset.newsStatus === status) {
         return;
       }
@@ -924,7 +933,7 @@ function renderNewsMonitors() {
       tile.dataset.action = "open-news-brand";
       tile.dataset.brandKey = brandKey;
       tile.innerHTML = newsBrandTileHtml(group, brand, brandMonitors);
-      tile.dataset.newsStatus = aggregateNewsStatus(brandMonitors.map((item) => item.state || {}));
+      tile.dataset.newsStatus = aggregateNewsStatus(brandMonitors.map((item) => stateWithBrandState(item)));
       list.append(tile);
     });
     section.append(list);
