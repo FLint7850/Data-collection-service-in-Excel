@@ -50,7 +50,6 @@ const clearLogsButton = document.querySelector("#clearLogsButton");
 const refreshLogsButton = document.querySelector("#refreshLogsButton");
 const autoCleanup = document.querySelector("#autoCleanup");
 const newsGroups = document.querySelector("#newsGroups");
-const addNewsMonitorButton = document.querySelector("#addNewsMonitorButton");
 const ownSitesList = document.querySelector("#ownSitesList");
 const addOwnSiteButton = document.querySelector("#addOwnSiteButton");
 const smtpHost = document.querySelector("#smtpHost");
@@ -107,6 +106,8 @@ let pendingDeleteNewsMonitorMode = "brand";
 let pendingDeleteNewsBrandKey = null;
 let pendingDeleteDonorBrandKey = null;
 let tabsRenderKey = "";
+const collapsedNewsGroups = new Set();
+let newsMonitorsStructureKey = "";
 
 const statusLabels = {
   idle: "ожидание",
@@ -291,6 +292,11 @@ function openDeleteSelectedDonorModal() {
     errorText.textContent = "Выберите сайт-донора для удаления.";
     return;
   }
+  if (monitorsForBrandKey(activeNewsBrandKey).length < 2) {
+    errorText.textContent = "Нельзя удалить единственного донора бренда.";
+    renderNewsModal();
+    return;
+  }
   pendingDeleteNewsMonitorId = monitorId;
   pendingDeleteNewsMonitorMode = "donor";
   pendingDeleteNewsBrandKey = null;
@@ -315,7 +321,8 @@ async function deletePendingNewsMonitor() {
     : [monitorId];
   let latestMonitors = null;
   for (const id of idsToDelete) {
-    const data = await requestJson(`/api/news/monitors/${id}`, { method: "DELETE" });
+    const url = mode === "brand" ? `/api/news/monitors/${id}?mode=brand` : `/api/news/monitors/${id}`;
+    const data = await requestJson(url, { method: "DELETE" });
     if (Array.isArray(data.monitors)) latestMonitors = data.monitors;
   }
   if (mode === "donor") {
@@ -629,6 +636,11 @@ function formatDateTimeLocal(value) {
   return String(value).slice(0, 16);
 }
 
+function createdTimestamp(value) {
+  const time = Date.parse(String(value || ""));
+  return Number.isFinite(time) ? time : 0;
+}
+
 function newsStatusClass(status) {
   if (status === "running" || status === "queued") return "status-running";
   if (status === "completed") return "status-completed";
@@ -779,55 +791,124 @@ function renderFeedStorage() {
   `;
 }
 
+function sortedBrandEntries(brands) {
+  return Object.entries(brands).sort((left, right) => {
+    const leftCreated = Math.max(...left[1].map((monitor) => createdTimestamp(monitor.created_at)));
+    const rightCreated = Math.max(...right[1].map((monitor) => createdTimestamp(monitor.created_at)));
+    return rightCreated - leftCreated;
+  });
+}
+
+function newsMonitorsStructureSignature() {
+  const grouped = groupNewsMonitors();
+  return JSON.stringify(
+    ["Маржа", "Немаржа"].map((group) => [
+      group,
+      sortedBrandEntries(grouped[group] || {}).map(([brand, brandMonitors]) => [
+        brand,
+        brandMonitors.map((monitor) => ({
+          id: monitor.id,
+          created_at: monitor.created_at || "",
+          site_url: monitor.site_url || "",
+          start_urls: monitor.start_urls || [],
+        })),
+      ]),
+    ])
+  );
+}
+
+function newsBrandTileHtml(group, brand, brandMonitors) {
+  const brandKey = `${group}::${brand}`;
+  const selectedId = selectedNewsSites.get(brandKey);
+  const monitor = brandMonitors.find((item) => item.id === selectedId) || brandMonitors[0];
+  selectedNewsSites.set(brandKey, monitor.id);
+  const states = brandMonitors.map((item) => item.state || {});
+  const status = aggregateNewsStatus(states);
+  const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
+  const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
+  const newCount = states.reduce((sum, state) => sum + Number(state.new_count || 0), 0);
+  const missingSummary = aggregateMissingByFeed(states);
+  const lastScan = states.map((state) => state.last_scan_at || "").filter(Boolean).sort().pop() || "—";
+  return `
+    <span class="news-tile-remove-wrap">
+      <button class="news-tile-remove" data-action="delete-news-monitor-card" data-monitor-id="${monitor.id}" data-brand-key="${escapeHtml(brandKey)}" type="button" aria-label="Удалить">×</button>
+    </span>
+    <span class="brand-name">${escapeHtml(brand)}</span>
+    <span class="brand-meta">${brandMonitors.length} сайт${brandMonitors.length > 1 ? "а" : ""}</span>
+    <span class="brand-sites">${brandMonitors.map((item) => escapeHtml(item.site_url || (item.start_urls || [])[0] || "")).join("<br>")}</span>
+    <span class="brand-row">
+      ${newsStatusHtml(status)}
+    </span>
+    <span class="brand-missing-summary">
+      ${missingSummaryHtml(missingSummary, newCount)}
+    </span>
+    <span class="mini-progress-track"><span class="mini-progress-fill" style="width: ${percent}%"></span></span>
+    <span class="brand-counters">
+      Стр: ${Number(activeState.processed || 0)} · Тов: ${Number(activeState.found_products || 0)} · Сравнено: ${Number(activeState.compared_products || 0)}
+    </span>
+    <span class="brand-stage">${escapeHtml(activeState.stage || "")}</span>
+    ${activeState.error ? `<span class="brand-error">${escapeHtml(activeState.error)}</span>` : ""}
+    <span class="brand-last">Последнее: ${escapeHtml(lastScan)}</span>
+  `;
+}
+
+function updateNewsBrandTiles() {
+  const grouped = groupNewsMonitors();
+  ["Маржа", "Немаржа"].forEach((group) => {
+    sortedBrandEntries(grouped[group] || {}).forEach(([brand, brandMonitors]) => {
+      const brandKey = `${group}::${brand}`;
+      const tile = Array.from(newsGroups.querySelectorAll("[data-action='open-news-brand']")).find((node) => node.dataset.brandKey === brandKey);
+      if (!tile) return;
+      const nextHtml = newsBrandTileHtml(group, brand, brandMonitors);
+      if (tile.innerHTML.trim() !== nextHtml.trim()) {
+        tile.innerHTML = nextHtml;
+      }
+    });
+  });
+}
+
+function renderNewsList() {
+  if (!newsData || !newsGroups) return;
+  const nextStructureKey = newsMonitorsStructureSignature();
+  if (nextStructureKey !== newsMonitorsStructureKey || !newsGroups.children.length) {
+    renderNewsMonitors();
+  } else {
+    updateNewsBrandTiles();
+  }
+}
+
 function renderNewsMonitors() {
   if (!newsData || !newsGroups) return;
   const grouped = groupNewsMonitors();
+  newsMonitorsStructureKey = newsMonitorsStructureSignature();
   newsGroups.innerHTML = "";
   ["Маржа", "Немаржа"].forEach((group) => {
     const brands = grouped[group] || {};
     const section = document.createElement("section");
     section.className = "panel news-group-panel";
-    section.innerHTML = `<h2>${escapeHtml(group)}</h2>`;
+    const isCollapsed = collapsedNewsGroups.has(group);
+    section.innerHTML = `
+      <div class="section-title-row">
+        <button class="news-group-toggle" data-action="toggle-news-group" data-group="${escapeHtml(group)}" type="button" aria-expanded="${isCollapsed ? "false" : "true"}">
+          <span class="news-group-toggle-icon">${isCollapsed ? "▸" : "▾"}</span>
+          <span>${escapeHtml(group)}</span>
+        </button>
+        <button class="button secondary" data-action="add-news-monitor-group" data-group="${escapeHtml(group)}" type="button">+ Бренд</button>
+      </div>
+    `;
     const list = document.createElement("div");
-    list.className = "news-brand-grid";
-    Object.entries(brands).forEach(([brand, brandMonitors]) => {
+    list.className = "news-brand-grid main-block-wrapper";
+    if (isCollapsed) {
+      list.classList.add("news-brand-grid--collapsed");
+    }
+    sortedBrandEntries(brands).forEach(([brand, brandMonitors]) => {
       const brandKey = `${group}::${brand}`;
-      const selectedId = selectedNewsSites.get(brandKey);
-      const monitor = brandMonitors.find((item) => item.id === selectedId) || brandMonitors[0];
-      selectedNewsSites.set(brandKey, monitor.id);
-      const states = brandMonitors.map((item) => item.state || {});
-      const status = aggregateNewsStatus(states);
-      const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
-      const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
-      const newCount = states.reduce((sum, state) => sum + Number(state.new_count || 0), 0);
-      const missingSummary = aggregateMissingByFeed(states);
-      const lastScan = states.map((state) => state.last_scan_at || "").filter(Boolean).sort().pop() || "—";
       const tile = document.createElement("button");
       tile.className = "news-brand-tile";
       tile.type = "button";
       tile.dataset.action = "open-news-brand";
       tile.dataset.brandKey = brandKey;
-      tile.innerHTML = `
-        <span class="news-tile-remove-wrap">
-          <button class="news-tile-remove" data-action="delete-news-monitor-card" data-monitor-id="${monitor.id}" data-brand-key="${escapeHtml(brandKey)}" type="button" aria-label="Удалить">×</button>
-        </span>
-        <span class="brand-name">${escapeHtml(brand)}</span>
-        <span class="brand-meta">${brandMonitors.length} сайт${brandMonitors.length > 1 ? "а" : ""}</span>
-        <span class="brand-sites">${brandMonitors.map((item) => escapeHtml(item.site_url || (item.start_urls || [])[0] || "")).join("<br>")}</span>
-        <span class="brand-row">
-          ${newsStatusHtml(status)}
-        </span>
-        <span class="brand-missing-summary">
-          ${missingSummaryHtml(missingSummary, newCount)}
-        </span>
-        <span class="mini-progress-track"><span class="mini-progress-fill" style="width: ${percent}%"></span></span>
-        <span class="brand-counters">
-          Стр: ${Number(activeState.processed || 0)} · Тов: ${Number(activeState.found_products || 0)} · Сравнено: ${Number(activeState.compared_products || 0)}
-        </span>
-        <span class="brand-stage">${escapeHtml(activeState.stage || "")}</span>
-        ${activeState.error ? `<span class="brand-error">${escapeHtml(activeState.error)}</span>` : ""}
-        <span class="brand-last">Последнее: ${escapeHtml(lastScan)}</span>
-      `;
+      tile.innerHTML = newsBrandTileHtml(group, brand, brandMonitors);
       list.append(tile);
     });
     section.append(list);
@@ -992,9 +1073,9 @@ function renderNewsModal() {
         <div class="add-modal-donor-row">
           <input data-role="new-site-donor-url" type="url" placeholder="https://site.ru/">
           <button class="button secondary compact-button add-modal-donor-button" data-action="add-news-site-donor" type="button">Добавить</button>
+          <button class="button danger compact-button delete-modal-donor-button" data-action="delete-news-monitor" type="button" ${monitors.length < 2 ? "disabled" : ""}>Удалить донор</button>
         </div>
       </label>
-      <button class="button danger compact-button" data-action="delete-news-monitor" type="button" ${monitors.length ? "" : "disabled"}>Удалить донор</button>
     </div>
 
     <div class="modal-summary-row">
@@ -1539,11 +1620,11 @@ testNewsEmailButton.addEventListener("click", () => {
   });
 });
 
-addNewsMonitorButton.addEventListener("click", async () => {
+async function addNewsMonitorToGroup(group) {
   try {
     const data = await requestJson("/api/news/monitors", {
       method: "POST",
-      body: JSON.stringify({ brand: "Новый донор", group: "Маржа", start_urls: "https://example.com/" }),
+      body: JSON.stringify({ brand: "Новый донор", group, start_urls: "https://example.com/" }),
     });
     if (!newsData) newsData = await requestJson("/api/news");
     newsData.monitors.push(data.monitor);
@@ -1551,9 +1632,33 @@ addNewsMonitorButton.addEventListener("click", async () => {
   } catch (error) {
     errorText.textContent = error.message;
   }
-});
+}
 
 newsGroups.addEventListener("click", (event) => {
+  const toggleButton = event.target.closest("[data-action='toggle-news-group']");
+  if (toggleButton) {
+    const group = toggleButton.dataset.group || "";
+    const section = toggleButton.closest(".news-group-panel");
+    const list = section?.querySelector(".news-brand-grid");
+    const icon = toggleButton.querySelector(".news-group-toggle-icon");
+    const nextCollapsed = !collapsedNewsGroups.has(group);
+    if (collapsedNewsGroups.has(group)) {
+      collapsedNewsGroups.delete(group);
+    } else {
+      collapsedNewsGroups.add(group);
+    }
+    list?.classList.toggle("news-brand-grid--collapsed", nextCollapsed);
+    toggleButton.setAttribute("aria-expanded", nextCollapsed ? "false" : "true");
+    if (icon) icon.textContent = nextCollapsed ? "▸" : "▾";
+    return;
+  }
+
+  const addButton = event.target.closest("[data-action='add-news-monitor-group']");
+  if (addButton) {
+    addNewsMonitorToGroup(addButton.dataset.group || "Маржа");
+    return;
+  }
+
   const deleteButton = event.target.closest("[data-action='delete-news-monitor-card']");
   if (deleteButton) {
     event.stopPropagation();
@@ -1946,8 +2051,7 @@ events.addEventListener("progress", (event) => {
   if (data.news) {
     newsData = data.news;
     if (activeView === "news") {
-      renderFeedStorage();
-      renderNewsMonitors();
+      renderNewsList();
       if (activeNewsBrandKey && newsMonitorModal && !newsMonitorModal.classList.contains("hidden")) {
         updateNewsModalProgress();
       }

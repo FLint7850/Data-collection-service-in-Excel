@@ -4102,6 +4102,19 @@ def api_delete_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
+    if request.args.get("mode") != "brand":
+        group = clean_text(str(monitor.get("group") or ""))
+        brand = clean_text(str(monitor.get("brand") or ""))
+        with news_lock:
+            brand_monitors = [
+                item
+                for item in news_settings.get("monitors", [])
+                if isinstance(item, dict)
+                and clean_text(str(item.get("group") or "")) == group
+                and clean_text(str(item.get("brand") or "")) == brand
+            ]
+        if len(brand_monitors) < 2:
+            return jsonify({"error": "Нельзя удалить единственного донора бренда"}), 409
     request_news_stop(monitor_id, "stop")
     with news_lock:
         monitors = news_settings.get("monitors", [])
