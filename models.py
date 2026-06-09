@@ -12,7 +12,8 @@ class Base(DeclarativeBase):
 class Project(Base):
     __tablename__ = "projects"
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    legacy_id: Mapped[str] = mapped_column(String(32), default="", nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     start_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     thread_count: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
@@ -51,7 +52,8 @@ class Brand(Base):
 class Donor(Base):
     __tablename__ = "donors"
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    legacy_id: Mapped[str] = mapped_column(String(32), default="", nullable=False, unique=True)
     brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"), nullable=False)
     site_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
     start_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
@@ -59,9 +61,10 @@ class Donor(Base):
     schedule_type: Mapped[str] = mapped_column(String(32), default="daily", nullable=False)
     scan_time: Mapped[str] = mapped_column(String(8), default="01:00", nullable=False)
     weekday: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    next_run_at: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     thread_count: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     connection_method: Mapped[str] = mapped_column(String(64), default="requests", nullable=False)
+    connection_method_id: Mapped[int | None] = mapped_column(ForeignKey("connection_methods.id"), nullable=True)
     auto_connection_fallback: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     product_url_filters: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
@@ -74,8 +77,18 @@ class Donor(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     brand: Mapped[Brand] = relationship("Brand", back_populates="donors")
+    connection_method_row: Mapped["ConnectionMethod | None"] = relationship("ConnectionMethod")
 
     __table_args__ = (Index("ix_donors_brand_id", "brand_id"),)
+
+
+class ConnectionMethod(Base):
+    __tablename__ = "connection_methods"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class OwnSite(Base):
