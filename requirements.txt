@@ -1,7 +1,8 @@
 Flask==3.0.3
-SQLAlchemy==2.0.30
+SQLAlchemy>=2.0.41
 alembic==1.13.1
 requests==2.32.3
+chardet>=5.2.0,<6
 beautifulsoup4==4.12.3
 openpyxl==3.1.5
 botasaurus
