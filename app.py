@@ -513,6 +513,32 @@ def normalize_model_key(value: str) -> str:
     return re.sub(r"\s+", " ", clean_text(value)).upper()
 
 
+def repair_mojibake_text(value: object) -> object:
+    if not isinstance(value, str) or not value:
+        return value
+    markers = ("\u0402", "\u0405", "\u0406", "\u040e", "\u0451", "\u0452", "\u0455", "\u045f", "\u20ac", "РЎ", "Рџ", "Рћ", "Рњ")
+    text = value
+    for _ in range(3):
+        if not any(marker in text for marker in markers):
+            break
+        try:
+            repaired = text.encode("cp1251").decode("utf-8")
+        except UnicodeError:
+            break
+        if repaired == text:
+            break
+        text = repaired
+    return text
+
+
+def repair_mojibake(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: repair_mojibake(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [repair_mojibake(item) for item in value]
+    return repair_mojibake_text(value)
+
+
 def default_news_settings() -> Dict[str, object]:
     return {
         "feed_url": DEFAULT_FEED_URL,
@@ -615,9 +641,10 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     monitor["state"].pop("last_feeds", None)
     if monitor["state"].get("status") in {"running", "queued", "pausing", "stopping"}:
         monitor["state"]["status"] = "error"
-        monitor["state"]["stage"] = "РџСЂРµСЂРІР°РЅРѕ"
-        monitor["state"]["error"] = "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ Р±С‹Р»Рѕ РїСЂРµСЂРІР°РЅРѕ РїРµСЂРµР·Р°РїСѓСЃРєРѕРј СЃРµСЂРІРµСЂР°. Р—Р°РїСѓСЃС‚РёС‚Рµ РµРіРѕ СЃРЅРѕРІР°."
+        monitor["state"]["stage"] = "Прервано"
+        monitor["state"]["error"] = "Сканирование было прервано перезапуском сервера. Запустите его снова."
         monitor["state"]["currenturl"] = ""
+    monitor["brand_state"] = dict(monitor["state"])
     monitor["collapsed"] = bool(item.get("collapsed", True))
     return monitor
 
@@ -662,7 +689,7 @@ def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
     brand_exclusions = normalize_patterns(brand.exclusions or DEFAULT_EXCLUSIONS) if brand else DEFAULT_EXCLUSIONS
-    brand_state = {**make_news_state(), **(brand.state or {})} if brand else make_news_state()
+    brand_state = repair_mojibake({**make_news_state(), **(brand.state or {})}) if brand else make_news_state()
     monitor = {
         "id": str(row.id),
         "group": brand.group_name if brand else "",
@@ -686,14 +713,15 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "selector_settings": normalize_selector_settings(row.selector_settings or {}),
         "seen_models": [normalize_model_key(str(value)) for value in (row.seen_models or []) if str(value).strip()],
         "known_new_products": row.known_new_products or {},
-        "state": {**make_news_state(), **(row.state or {})},
+        "state": dict(brand_state),
         "collapsed": bool(brand.collapsed) if brand else True,
     }
-    if monitor["state"].get("status") in {"running", "queued"}:
+    if monitor["state"].get("status") in {"running", "queued", "pausing", "stopping"}:
         monitor["state"]["status"] = "error"
-        monitor["state"]["stage"] = "РџСЂРµСЂРІР°РЅРѕ"
-        monitor["state"]["error"] = "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ Р±С‹Р»Рѕ РїСЂРµСЂРІР°РЅРѕ РїРµСЂРµР·Р°РїСѓСЃРєРѕРј СЃРµСЂРІРµСЂР°. Р—Р°РїСѓСЃС‚РёС‚Рµ РµРіРѕ СЃРЅРѕРІР°."
+        monitor["state"]["stage"] = "Прервано"
+        monitor["state"]["error"] = "Сканирование было прервано перезапуском сервера. Запустите его снова."
         monitor["state"]["currenturl"] = ""
+        monitor["brand_state"] = dict(monitor["state"])
     return monitor
 
 
@@ -750,7 +778,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
     row.seen_models = [normalize_model_key(str(value)) for value in normalized.get("seen_models", []) if str(value).strip()]
     row.known_new_products = normalized.get("known_new_products", {}) if isinstance(normalized.get("known_new_products"), dict) else {}
-    row.state = dict(normalized.get("state") or make_news_state())
+    brand.state = {**make_news_state(), **(normalized.get("brand_state") or normalized.get("state") or brand.state or {})}
     session.flush()
     return int(row.id)
 
@@ -899,9 +927,9 @@ def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str 
             {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "project_id": f"news:{monitor.get('id')}" if monitor else "news",
-                "project_name": f"РќРѕРІРёРЅРєРё: {monitor.get('brand')}" if monitor else "РќРѕРІРёРЅРєРё",
+                "project_name": repair_mojibake_text(f"РќРѕРІРёРЅРєРё: {monitor.get('brand')}") if monitor else "Новинки",
                 "level": level,
-                "message": message,
+                "message": repair_mojibake_text(message),
             }
         )
         if news_settings.get("auto_cleanup"):
@@ -940,7 +968,7 @@ def public_news_settings() -> Dict[str, object]:
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
-            "monitors": [dict(monitor) for monitor in news_settings.get("monitors", [])],
+            "monitors": [repair_mojibake(dict(monitor)) for monitor in news_settings.get("monitors", [])],
         }
 
 
@@ -1405,7 +1433,7 @@ MODEL_COLOR_WORDS = {
 
 
 def model_tokens_after_brand(value: str) -> str:
-    tokens = re.findall(r"[A-Za-zРђ-РЇР°-СЏРЃС‘0-9]+(?:[./_-][A-Za-zРђ-РЇР°-СЏРЃС‘0-9]+)*", clean_text(value))
+    tokens = re.findall(r"[A-Za-z\u0400-\u04FF0-9]+(?:[./_-][A-Za-z\u0400-\u04FF0-9]+)*", clean_text(value))
     if not tokens:
         return ""
 
@@ -1544,7 +1572,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
         "РќРћР’РРќРљРђ",
     }
     code_tokens = []
-    for token in re.findall(r"[A-ZРђ-РЇ0-9][A-ZРђ-РЇ0-9./\\_-]{2,}", text, flags=re.IGNORECASE):
+    for token in re.findall(r"[A-Z\u0400-\u04FF0-9][A-Z\u0400-\u04FF0-9./\\_-]{2,}", text, flags=re.IGNORECASE):
         cleaned = token.strip(" .,/\\_-")
         if cleaned.upper() in ignored_tokens:
             continue
@@ -1684,7 +1712,7 @@ def find_labeled_value(soup: BeautifulSoup, labels: Iterable[str]) -> str:
             return value
 
     page_text = clean_text(soup.get_text(" ", strip=True))
-    match = re.search(r"(?:РђСЂС‚РёРєСѓР»|РњРѕРґРµР»СЊ|Art:)\s*[:\-]?\s*([A-Za-zРђ-РЇР°-СЏ0-9][^|]{1,80})", page_text)
+    match = re.search(r"(?:Артикул|Модель|Art:)\s*[:\-]?\s*([A-Za-z\u0400-\u04FF0-9][^|]{1,80})", page_text)
     if match:
         return clean_text(match.group(1)).split(" Р’ РЅР°Р»РёС‡РёРё")[0].strip()
 
@@ -1842,7 +1870,7 @@ def is_good_model_text(text: str) -> bool:
         return False
     if PRICE_RE.search(text):
         return False
-    return "maunfeld" in lowered or bool(re.search(r"[A-ZРђ-РЇ]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
+    return "maunfeld" in lowered or bool(re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
 
 
 def extract_product_url_from_card(card, current_url: str) -> str:
@@ -3053,7 +3081,7 @@ class MaunfeldCrawler:
 
 
 def safe_filename(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-zРђ-РЇР°-СЏ0-9_-]+", "_", value, flags=re.IGNORECASE).strip("_")
+    cleaned = re.sub(r"[^A-Za-z\u0400-\u04FF0-9_-]+", "_", value, flags=re.IGNORECASE).strip("_")
     return cleaned or "project"
 
 
@@ -3394,6 +3422,7 @@ def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> N
     with news_lock:
         state = dict(monitor.get("state", make_news_state()))
         state.update(kwargs)
+        state = repair_mojibake(state)
         if state.get("started_at") and state.get("status") in {"running", "queued"}:
             try:
                 started_at = datetime.fromisoformat(str(state.get("started_at")))
@@ -3403,6 +3432,17 @@ def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> N
             except ValueError:
                 pass
         monitor["state"] = state
+        monitor["brand_state"] = dict(state)
+        group = clean_text(str(monitor.get("group") or ""))
+        brand = clean_text(str(monitor.get("brand") or ""))
+        for item in news_settings.get("monitors", []):
+            if (
+                isinstance(item, dict)
+                and clean_text(str(item.get("group") or "")) == group
+                and clean_text(str(item.get("brand") or "")) == brand
+            ):
+                item["state"] = dict(state)
+                item["brand_state"] = dict(state)
         persist_news_monitor_state(monitor)
 
 
@@ -3414,25 +3454,15 @@ def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) 
     if not force and now - news_state_persisted_at.get(monitor_id, 0) < 1:
         return
     news_state_persisted_at[monitor_id] = now
-    state = {**make_news_state(), **(monitor.get("state") or {})}
+    state = repair_mojibake({**make_news_state(), **(monitor.get("state") or {})})
     try:
         with session_scope() as session:
             donor = get_donor_row(session, monitor_id)
             if donor is None:
                 return
-            donor.state = state
             donor.updated_at = datetime.utcnow()
             if donor.brand:
-                group = clean_text(str(monitor.get("group") or ""))
-                brand = clean_text(str(monitor.get("brand") or ""))
-                brand_monitors = [
-                    item
-                    for item in news_settings.get("monitors", [])
-                    if isinstance(item, dict)
-                    and clean_text(str(item.get("group") or "")) == group
-                    and clean_text(str(item.get("brand") or "")) == brand
-                ]
-                donor.brand.state = aggregate_brand_state(brand_monitors or [monitor])
+                donor.brand.state = state
     except Exception as exc:
         print(f"Failed to persist news monitor state {monitor_id}: {exc}", flush=True)
 
@@ -3457,6 +3487,7 @@ def update_brand_scan_state(
         "new_count": new_count,
         "data": data or {},
     }
+    state = repair_mojibake(state)
     with session_scope() as session:
         donor = get_donor_row(session, target_id)
         if donor and donor.brand:
@@ -3473,6 +3504,7 @@ def update_brand_scan_state(
                     and clean_text(str(item.get("brand") or "")) == brand
                 ):
                     item["brand_state"] = dict(state)
+                    item["state"] = dict(state)
 
 
 class NewsScanStopped(Exception):
@@ -3494,12 +3526,12 @@ def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
         news_stop_modes[monitor_id] = mode
         monitor = get_news_monitor(monitor_id)
         if monitor:
-            monitor["state"] = {
-                **monitor.get("state", {}),
-                "status": "pausing" if mode == "pause" else "stopping",
-                "stage": "Приостановка" if mode == "pause" else "Остановка",
-                "currenturl": "",
-            }
+            update_news_monitor_state(
+                monitor,
+                status="pausing" if mode == "pause" else "stopping",
+                stage="Приостановка" if mode == "pause" else "Остановка",
+                currenturl="",
+            )
             persist_news_monitor_state(monitor, force=True)
     event.set()
     return event
@@ -3704,6 +3736,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             "stage": "РџРѕРґРіРѕС‚РѕРІРєР°",
             "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         }
+        monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     add_news_log(monitor, "Р СѓС‡РЅРѕРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє Р·Р°РїСѓС‰РµРЅРѕ" if manual else "РџР»Р°РЅРѕРІРѕРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє Р·Р°РїСѓС‰РµРЅРѕ", "info")
 
@@ -3797,6 +3830,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "elapsed_seconds": elapsed,
                 "currenturl": "",
             }
+            monitor["brand_state"] = dict(monitor["state"])
             monitor["next_run_at"] = "" if monitor.get("schedule_type") == "once" else compute_next_run_at(monitor)
             save_news_settings()
         add_news_log(monitor, f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ Р·Р°РІРµСЂС€РµРЅРѕ. РќР°Р№РґРµРЅРѕ РЅРѕРІРёРЅРѕРє: {len(new_items)}. CSV: {csv_path.name}", "success")
@@ -3834,6 +3868,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "processed": len(products),
                 "found_products": len(products),
             }
+            monitor["brand_state"] = dict(monitor["state"])
             save_news_settings()
         add_news_log(
             monitor,
@@ -3860,6 +3895,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
             }
+            monitor["brand_state"] = dict(monitor["state"])
             save_news_settings()
         add_news_log(monitor, f"РћС€РёР±РєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє: {exc}", "error")
         update_brand_scan_state(
@@ -4134,6 +4170,7 @@ def api_scan_news_monitor(monitor_id: str):
     threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
     with news_lock:
         monitor["state"] = {**monitor.get("state", {}), "status": "queued"}
+        monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     return jsonify({"monitor": dict(monitor)})
 
@@ -4150,6 +4187,7 @@ def api_stop_news_monitor(monitor_id: str):
             "status": "stopping",
             "stage": "РћСЃС‚Р°РЅРѕРІРєР°",
         }
+        monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     add_news_log(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє", "warning")
     return jsonify({"monitor": dict(monitor)})
@@ -4167,6 +4205,7 @@ def api_pause_news_monitor(monitor_id: str):
             "status": "pausing",
             "stage": "РџСЂРёРѕСЃС‚Р°РЅРѕРІРєР°",
         }
+        monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     add_news_log(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РїСЂРёРѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє СЃ СЃРѕС…СЂР°РЅРµРЅРёРµРј СЂРµР·СѓР»СЊС‚Р°С‚Р°", "warning")
     return jsonify({"monitor": dict(monitor)})
@@ -4182,6 +4221,7 @@ def api_resume_news_monitor(monitor_id: str):
     threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
     with news_lock:
         monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "РџСЂРѕРґРѕР»Р¶РµРЅРёРµ"}
+        monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     add_news_log(monitor, "РџСЂРѕРґРѕР»Р¶РµРЅРёРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє РїРѕСЃС‚Р°РІР»РµРЅРѕ РІ РѕС‡РµСЂРµРґСЊ", "info")
     return jsonify({"monitor": dict(monitor)})

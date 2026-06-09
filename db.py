@@ -177,6 +177,7 @@ def migrate_donors_table(connection) -> None:
         or columns.get("next_run_at") != "DATETIME"
         or "legacy_id" not in columns
         or "connection_method_id" not in columns
+        or "state" in columns
     )
     if not needs_rebuild:
         return
@@ -205,7 +206,6 @@ def migrate_donors_table(connection) -> None:
             "selector_settings JSON NOT NULL, "
             "seen_models JSON NOT NULL, "
             "known_new_products JSON NOT NULL, "
-            "state JSON NOT NULL, "
             "created_at DATETIME NOT NULL, "
             "updated_at DATETIME NOT NULL, "
             "FOREIGN KEY(brand_id) REFERENCES brands (id) ON DELETE CASCADE, "
@@ -219,7 +219,7 @@ def migrate_donors_table(connection) -> None:
             "INSERT INTO donors_migration_tmp (legacy_id, brand_id, site_url, start_urls, enabled, "
             "schedule_type, scan_time, weekday, next_run_at, thread_count, connection_method, "
             "connection_method_id, auto_connection_fallback, exclusions, product_url_filters, "
-            "extraction_rules, selector_settings, seen_models, known_new_products, state, created_at, updated_at) "
+            "extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
             f"SELECT {id_expr}, brand_id, COALESCE(site_url, ''), {safe_json_expr('start_urls', '[]')}, "
             "COALESCE(enabled, 1), COALESCE(NULLIF(schedule_type, ''), 'daily'), "
             "COALESCE(NULLIF(scan_time, ''), '01:00'), CAST(COALESCE(NULLIF(weekday, ''), 0) AS INTEGER), "
@@ -234,7 +234,6 @@ def migrate_donors_table(connection) -> None:
             f"{safe_json_expr('selector_settings', '{}')}, "
             f"{safe_json_expr('seen_models', '[]')}, "
             f"{safe_json_expr('known_new_products', '{}')}, "
-            f"{safe_json_expr('state', '{}')}, "
             "COALESCE(created_at, CURRENT_TIMESTAMP), COALESCE(updated_at, CURRENT_TIMESTAMP) "
             "FROM donors ORDER BY brand_id, created_at, rowid"
         )

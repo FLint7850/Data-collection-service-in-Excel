@@ -72,7 +72,6 @@ class Donor(Base):
     selector_settings: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     seen_models: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     known_new_products: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
