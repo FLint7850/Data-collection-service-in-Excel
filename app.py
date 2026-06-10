@@ -31,12 +31,9 @@ from models import AppSetting, Brand, ConnectionMethod, Donor, OwnSite, Project
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 FEED_DIR = BASE_DIR / "feeds"
-EXCLUSIONS_FILE = BASE_DIR / "exclusions.json"
 LOGS_FILE = LOG_DIR / "logs.json"
 UNIFIED_LOG_FILE = LOG_DIR / "app.log"
-LEGACY_LOGS_FILE = BASE_DIR / "logs.json"
 EXPORT_DIR = BASE_DIR / "exports"
-BOTASAURUS_FETCH_OUTPUT_FILE = BASE_DIR / "output" / "_fetch_html.json"
 DEFAULT_START_URL = "https://www.maunfeld.ru/"
 DEFAULT_FEED_URL = "https://mega-kuhnya.ru/price/last_modified.xml"
 DEFAULT_FEED_GENERATE_URL = "https://mega-kuhnya.ru/index.php?route=extension/feed/unixml/new_product"
@@ -83,24 +80,6 @@ BLOCKED_PAGE_MARKERS = (
 )
 
 app = Flask(__name__)
-
-
-def load_env_file() -> None:
-    env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-load_env_file()
 
 
 @app.before_request
@@ -185,8 +164,6 @@ def ensure_storage() -> None:
     LOG_DIR.mkdir(exist_ok=True)
     FEED_DIR.mkdir(exist_ok=True)
     init_db()
-    if not EXCLUSIONS_FILE.exists():
-        save_exclusions(DEFAULT_EXCLUSIONS)
     load_projects()
     load_news_settings()
     start_news_scheduler()
@@ -395,10 +372,11 @@ def save_projects() -> None:
 
 def write_logs_file(data: List[Dict[str, object]]) -> None:
     LOGS_FILE.parent.mkdir(exist_ok=True)
-    LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOGS_FILE.write_text(json.dumps(repair_mojibake(data), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def append_unified_log(item: Dict[str, object]) -> None:
+    item = repair_mojibake(item)
     LOG_DIR.mkdir(exist_ok=True)
     timestamp = str(item.get("time") or datetime.now(MSK_TZ).isoformat(timespec="seconds"))
     level = str(item.get("level") or "info").upper()
@@ -412,24 +390,16 @@ def append_unified_log(item: Dict[str, object]) -> None:
         print(line, end="", flush=True)
 
 
-def cleanup_botasaurus_fetch_output() -> None:
-    try:
-        BOTASAURUS_FETCH_OUTPUT_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def read_logs_file() -> List[Dict[str, object]]:
-    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
-    if not source_file.exists():
+    if not LOGS_FILE.exists():
         return []
     try:
-        data = json.loads(source_file.read_text(encoding="utf-8"))
+        data = json.loads(LOGS_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
     if not isinstance(data, list):
         return []
-    return [item for item in data if isinstance(item, dict)]
+    return [repair_mojibake(item) for item in data if isinstance(item, dict)]
 
 
 def save_logs() -> None:
@@ -443,11 +413,10 @@ def save_logs() -> None:
 
 
 def logs_signature() -> str:
-    source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
-    if not source_file.exists():
+    if not LOGS_FILE.exists():
         return "missing"
     try:
-        stat = source_file.stat()
+        stat = LOGS_FILE.stat()
     except OSError:
         return "unavailable"
     return f"{stat.st_mtime_ns}:{stat.st_size}"
@@ -517,9 +486,9 @@ def add_project_log(project: Dict[str, object], message: str, level: str = "info
         item = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "project_id": project["id"],
-            "project_name": project["name"],
+            "project_name": repair_mojibake_text(project["name"]),
             "level": level,
-            "message": message,
+            "message": repair_mojibake_text(message),
         }
         logs.append(item)
         append_unified_log(item)
@@ -558,7 +527,10 @@ def repair_mojibake_text(value: object) -> object:
         "Р”",
         "Р“",
         "Р¦",
+        "Р",
+        "С",
     )
+    markers = markers + ("\u0420", "\u0421")
     text = value
     for _ in range(3):
         if not any(marker in text for marker in markers):
@@ -745,7 +717,6 @@ def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ 
 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
-    brand_exclusions = normalize_patterns(brand.exclusions or DEFAULT_EXCLUSIONS) if brand else DEFAULT_EXCLUSIONS
     brand_state = repair_mojibake({**make_news_state(), **(brand.state or {})}) if brand else make_news_state()
     monitor = {
         "id": str(row.id),
@@ -764,7 +735,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "thread_count": parse_thread_count(row.thread_count),
         "connection_method": normalize_connection_method(row.connection_method),
         "auto_connection_fallback": bool(row.auto_connection_fallback),
-        "exclusions": brand_exclusions,
+        "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "selector_settings": normalize_selector_settings(row.selector_settings or {}),
@@ -797,7 +768,6 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
             group_name=group_name,
             group_type=group_type,
             collapsed=bool(monitor.get("collapsed", True)),
-            exclusions=normalize_patterns(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
             state=dict(monitor.get("brand_state") or make_news_state()),
         )
         session.add(row)
@@ -805,7 +775,6 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
     else:
         row.group_name = group_name
         row.collapsed = bool(monitor.get("collapsed", row.collapsed))
-        row.exclusions = normalize_patterns(monitor.get("exclusions", row.exclusions or DEFAULT_EXCLUSIONS))
         row.state = {**make_news_state(), **(monitor.get("brand_state") or row.state or {})}
     return row
 
@@ -833,7 +802,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.connection_method = normalize_connection_method(normalized.get("connection_method"))
     row.connection_method_id = connection_method_id_for(session, row.connection_method)
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
-    row.exclusions = normalize_patterns(brand.exclusions or normalized.get("exclusions", DEFAULT_EXCLUSIONS))
+    row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
     row.extraction_rules = normalize_extraction_rules(normalized.get("extraction_rules", {}))
     row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
@@ -1080,32 +1049,17 @@ def public_news_settings() -> Dict[str, object]:
 
 
 def load_exclusions() -> List[str]:
-    ensure_storage_without_exclusions_loop()
-    try:
-        data = json.loads(EXCLUSIONS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = DEFAULT_EXCLUSIONS
-    if not isinstance(data, list):
-        return DEFAULT_EXCLUSIONS.copy()
-    return [str(item).strip() for item in data if str(item).strip()]
+    return DEFAULT_EXCLUSIONS.copy()
 
 
 def save_exclusions(items: Iterable[str]) -> None:
-    EXCLUSIONS_FILE.write_text(
-        json.dumps(list(items), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    return None
 
 
 def ensure_storage_without_exclusions_loop() -> None:
     EXPORT_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     FEED_DIR.mkdir(exist_ok=True)
-    if not EXCLUSIONS_FILE.exists():
-        EXCLUSIONS_FILE.write_text(
-            json.dumps(DEFAULT_EXCLUSIONS, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
 
 def reset_state(status: str = "idle", run_id: Optional[int] = None, thread_count: Optional[int] = None) -> None:
@@ -2526,8 +2480,6 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
         result = _fetch_html(url)
     except Exception:
         return None
-    finally:
-        cleanup_botasaurus_fetch_output()
 
     if isinstance(result, list):
         result = result[0] if result else None
@@ -3915,12 +3867,14 @@ def send_news_email_legacy(
     sender_emails = normalize_emails(username)
     if not username or not password or not recipients:
         error_message = "Email РЅРµ РѕС‚РїСЂР°РІР»РµРЅ: Р·Р°РїРѕР»РЅРёС‚Рµ email-Р»РѕРіРёРЅ, РїР°СЂРѕР»СЊ РїСЂРёР»РѕР¶РµРЅРёСЏ Рё РїРѕР»СѓС‡Р°С‚РµР»РµР№ SMTP"
+        error_message = str(repair_mojibake_text(error_message))
         if error_holder is not None:
             error_holder.append(error_message)
         add_news_log(monitor, error_message, "warning")
         return False
     if not sender_emails:
         error_message = "Email РЅРµ РѕС‚РїСЂР°РІР»РµРЅ: email-Р»РѕРіРёРЅ РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ Р°РґСЂРµСЃРѕРј РїРѕС‡С‚С‹"
+        error_message = str(repair_mojibake_text(error_message))
         if error_holder is not None:
             error_holder.append(error_message)
         add_news_log(monitor, error_message, "warning")
@@ -3941,6 +3895,8 @@ def send_news_email_legacy(
             lines.append(f"РќР° СЃР°Р№С‚Рµ {label} РЅРµ Р±С‹Р»Рѕ РЅР°Р№РґРµРЅРѕ {count} РЅРѕРІРёРЅРѕРє.")
         body = "\n".join(lines)
     message = EmailMessage()
+    subject = str(repair_mojibake_text(subject))
+    body = str(repair_mojibake_text(body))
     message["Subject"] = subject
     message["From"] = sender_email
     message["To"] = ", ".join(recipients)
@@ -3961,6 +3917,7 @@ def send_news_email_legacy(
                 server.send_message(message, from_addr=sender_email, to_addrs=recipients)
     except Exception as exc:
         error_message = f"РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё email: {exc}"
+        error_message = str(repair_mojibake_text(error_message))
         if error_holder is not None:
             error_holder.append(error_message)
         add_news_log(monitor, error_message, "error")

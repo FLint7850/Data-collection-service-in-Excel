@@ -104,19 +104,57 @@ def migrate_schema(connection) -> None:
         connection.execute(text("ALTER TABLE own_sites ADD COLUMN name VARCHAR(255) NOT NULL DEFAULT ''"))
 
     brand_columns = table_columns(connection, "brands")
-    if brand_columns and "exclusions" not in brand_columns:
-        connection.execute(text("ALTER TABLE brands ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
     if brand_columns and "state" not in brand_columns:
         connection.execute(text("ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{\"status\":\"idle\"}'"))
 
+    migrate_app_settings_current_table(connection)
+    migrate_brands_table(connection)
     migrate_projects_table(connection)
     migrate_donors_table(connection)
+
+
+def migrate_app_settings_current_table(connection) -> None:
+    columns = table_columns(connection, "app_settings")
+    if not columns or "exclusions" not in columns or "key" in columns:
+        return
+    connection.execute(text("DROP TABLE IF EXISTS app_settings_migration_tmp"))
+    connection.execute(
+        text(
+            "CREATE TABLE app_settings_migration_tmp ("
+            "id INTEGER NOT NULL PRIMARY KEY, "
+            "auto_cleanup BOOLEAN NOT NULL, "
+            "smtp JSON NOT NULL, "
+            "feed_storage JSON NOT NULL"
+            ")"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO app_settings_migration_tmp (id, auto_cleanup, smtp, feed_storage) "
+            "SELECT id, COALESCE(auto_cleanup, 0), "
+            f"{safe_json_expr('smtp', '{}')}, "
+            f"{safe_json_expr('feed_storage', '[]')} "
+            "FROM app_settings"
+        )
+    )
+    connection.execute(text("DROP TABLE app_settings"))
+    connection.execute(text("ALTER TABLE app_settings_migration_tmp RENAME TO app_settings"))
+
+
+def migrate_brands_table(connection) -> None:
+    columns = table_columns(connection, "brands")
+    if not columns or "exclusions" not in columns:
+        return
+    connection.execute(text("ALTER TABLE brands DROP COLUMN exclusions"))
 
 
 def migrate_projects_table(connection) -> None:
     columns = table_columns(connection, "projects")
     if not columns:
         return
+    if "exclusions" not in columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
+        columns = table_columns(connection, "projects")
     needs_rebuild = columns.get("id") != "INTEGER" or "legacy_id" not in columns
     if not needs_rebuild:
         return

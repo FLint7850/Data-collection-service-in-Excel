@@ -36,7 +36,6 @@ class Brand(Base):
     group_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     group_type: Mapped[str] = mapped_column(String(32), default="non_margin", nullable=False)
     collapsed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
