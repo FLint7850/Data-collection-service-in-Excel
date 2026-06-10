@@ -1414,17 +1414,10 @@ def canonicalize_product_url_by_filters(url: str, filters: Iterable[str]) -> str
         return ""
     parsed = urlparse(url)
     path = parsed.path or "/"
-    lower_path = path.lower()
-    for raw_pattern in filters:
-        pattern = str(raw_pattern or "").strip()
-        if not pattern or any(char in pattern for char in "*?"):
-            continue
-        if not pattern.startswith("/"):
-            continue
-        index = lower_path.find(pattern.lower())
-        if index > 0:
-            return urlunparse((parsed.scheme, parsed.netloc, path[index:], "", parsed.query, ""))
-    return url
+    product_anchor = re.search(r"/goods?_\d+", path, flags=re.IGNORECASE)
+    if product_anchor and product_anchor.start() > 0:
+        path = path[product_anchor.start():]
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, ""))
 
 
 def is_product_url_for_filters(url: str, filters: Iterable[str]) -> bool:
@@ -2438,7 +2431,7 @@ def extract_product_data(
         return ruled_product
     path_parts = [part for part in urlparse(url).path.split("/") if part]
     h1 = first_text(soup, ["h1"])
-    price = extract_price(soup) or fallback_price
+    price = fallback_price or extract_price(soup)
     if is_maunfeld_url(url):
         model = extract_maunfeld_article(soup)
     else:
@@ -2479,6 +2472,9 @@ def extract_product_data(
     if rules:
         model = prepare_rule_model(model, rules)
     model = normalize_model(model, url)
+
+    if price and model and assume_product:
+        return {"url": url, "model": model, "price": price}
 
     page_text = clean_text(soup.get_text(" ", strip=True))
     has_product_signal = any(
@@ -2768,6 +2764,7 @@ class MaunfeldCrawler:
         self.pending_prices: Dict[str, str] = {}
         self.results: List[Dict[str, str]] = []
         self.failed_attempts: Dict[str, int] = {}
+        self.permanent_failures: Set[str] = set()
         self.data_lock = threading.Lock()
         self.excel_finalized = False
         self.started_at = 0.0
@@ -2825,6 +2822,11 @@ class MaunfeldCrawler:
                     break
                 except requests.RequestException as exc:
                     last_error = str(exc)
+                    if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in {404, 410}:
+                        with self.data_lock:
+                            self.permanent_failures.add(url)
+                        self.log(f"URL пропущен: страница вернула {exc.response.status_code}: {url}", "warning")
+                        return None
                     if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in {401, 403}:
                         continue
                     break
@@ -2888,6 +2890,9 @@ class MaunfeldCrawler:
                 if method != self.connection_method:
                     self.log(f"РђРІС‚РѕРїРµСЂРµРєР»СЋС‡РµРЅРёРµ РїРѕРґРєР»СЋС‡РµРЅРёСЏ: {method} РґР»СЏ {url}", "warning")
                 return html
+            with self.data_lock:
+                if url in self.permanent_failures:
+                    break
             self.log(f"РњРµС‚РѕРґ РїРѕРґРєР»СЋС‡РµРЅРёСЏ {method} РЅРµ СЃСЂР°Р±РѕС‚Р°Р» РґР»СЏ {url}", "warning")
 
         self.update_state(error=f"РћР±С‹С‡РЅС‹Р№ Р·Р°РїСЂРѕСЃ РЅРµ СЃСЂР°Р±РѕС‚Р°Р» РґР»СЏ {url}. РџСЂРѕР±СѓСЋ Botasaurus...")
@@ -2919,6 +2924,21 @@ class MaunfeldCrawler:
 
     def is_product_url(self, url: str) -> bool:
         return is_product_url_for_filters(url, self.product_url_filters)
+
+    def is_start_url_path(self, url: str) -> bool:
+        parsed = urlparse(url)
+        normalized_path = (parsed.path or "/").rstrip("/") or "/"
+        for start_url in self.start_urls:
+            start_parsed = urlparse(start_url)
+            if not same_site(url, start_parsed.netloc or self.root_netloc):
+                continue
+            start_path = (start_parsed.path or "/").rstrip("/") or "/"
+            if normalized_path == start_path:
+                return True
+        return False
+
+    def is_current_product_page(self, url: str) -> bool:
+        return self.is_product_url(url) and not self.is_start_url_path(url)
 
     def remember_listing_price(self, product_url: str, price: str) -> None:
         product_url = canonicalize_product_url_by_filters(product_url, self.product_url_filters)
@@ -3072,9 +3092,45 @@ class MaunfeldCrawler:
         return self.elapsed_before_resume
 
     def process_page(self, url: str, html: str) -> None:
+        current_is_product = self.is_current_product_page(url)
+        listing_products: List[Dict[str, str]] = []
+        listing_price = self.get_listing_price(url)
+
+        if current_is_product and listing_price:
+            product = extract_product_data(
+                url,
+                html,
+                listing_price,
+                self.extraction_rules,
+                assume_product=True,
+            )
+            if product:
+                self.add_products([product])
+                if is_technopark_url(url):
+                    self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: 1", "info")
+                return
+
+            current_is_product = False
+
         listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
 
-        if not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)) and not PRICE_RE.search(html):
+        if current_is_product and not listing_products:
+            product = extract_product_data(
+                url,
+                html,
+                listing_price,
+                self.extraction_rules,
+                assume_product=True,
+            )
+            if product:
+                self.add_products([product])
+                if is_technopark_url(url):
+                    self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: 1", "info")
+                return
+
+            current_is_product = False
+
+        if not current_is_product and not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)) and not PRICE_RE.search(html):
             self.update_state(
                 error=f"РќР° СЃС‚СЂР°РЅРёС†Рµ РєР°С‚Р°Р»РѕРіР° РЅРµС‚ С†РµРЅ РІ HTML. Р РµРЅРґРµСЂСЋ С‡РµСЂРµР· Botasaurus: {url}",
             )
@@ -3100,7 +3156,11 @@ class MaunfeldCrawler:
             if not self.product_url_filters:
                 self.add_products(listing_products)
 
-        product = extract_product_data(
+        should_extract_current_product = (
+            not self.is_start_url_path(url)
+            and (not listing_products or bool(self.get_listing_price(url)))
+        )
+        product = None if not should_extract_current_product else extract_product_data(
             url,
             html,
             self.get_listing_price(url),
@@ -3113,7 +3173,7 @@ class MaunfeldCrawler:
         if is_technopark_url(url):
             self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: {len(listing_products)}", "info")
 
-        if not self.is_product_url(url):
+        if not current_is_product:
             self.extract_links(html, url)
 
     def finish_with_excel(self, partial: bool = False) -> None:
@@ -3229,6 +3289,12 @@ class MaunfeldCrawler:
                     if html and not self.stop_signal.is_set():
                         self.process_page(url, html)
                     elif not self.stop_signal.is_set():
+                        with self.data_lock:
+                            permanent_failure = url in self.permanent_failures
+                        if permanent_failure:
+                            self.log(f"URL пропущен без повторов: {url}", "warning")
+                            self.refresh_progress(url)
+                            continue
                         retry_count = self.failed_attempts.get(url, 0) + 1
                         self.failed_attempts[url] = retry_count
                         if retry_count <= 2:
