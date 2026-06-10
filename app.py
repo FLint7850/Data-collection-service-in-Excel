@@ -1288,6 +1288,8 @@ def looks_like_product_path(path: str) -> bool:
         if path_parts[0].lower() in service_prefixes:
             return False
         product_slug = slug.rsplit(".", 1)[0]
+        if re.search(r"(?:^|/)goods?_\d+", path, flags=re.IGNORECASE):
+            return True
         return "-" in product_slug and any(char.isdigit() for char in product_slug)
     return False
 
@@ -1405,6 +1407,31 @@ def product_url_matches_filters(url: str, filters: Iterable[str]) -> bool:
     parsed = urlparse(url)
     haystack = f"{url} {parsed.path}".lower()
     return any(pattern in haystack or fnmatch(haystack, pattern) for pattern in patterns)
+
+
+def canonicalize_product_url_by_filters(url: str, filters: Iterable[str]) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    lower_path = path.lower()
+    for raw_pattern in filters:
+        pattern = str(raw_pattern or "").strip()
+        if not pattern or any(char in pattern for char in "*?"):
+            continue
+        if not pattern.startswith("/"):
+            continue
+        index = lower_path.find(pattern.lower())
+        if index > 0:
+            return urlunparse((parsed.scheme, parsed.netloc, path[index:], "", parsed.query, ""))
+    return url
+
+
+def is_product_url_for_filters(url: str, filters: Iterable[str]) -> bool:
+    return is_probable_product_url(url) or (
+        bool([pattern for pattern in filters if str(pattern).strip()])
+        and product_url_matches_filters(url, filters)
+    )
 
 
 def clean_text(value: str) -> str:
@@ -1903,18 +1930,20 @@ def is_good_model_text(text: str) -> bool:
     return "maunfeld" in lowered or bool(re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
 
 
-def extract_product_url_from_card(card, current_url: str) -> str:
+def extract_product_url_from_card(card, current_url: str, product_url_filters: Optional[Iterable[str]] = None) -> str:
+    filters = list(product_url_filters or [])
     for link in card.select("a[href]"):
-        normalized = normalize_url(link.get("href", ""), current_url)
-        if normalized and is_probable_product_url(normalized):
+        normalized = canonicalize_product_url_by_filters(normalize_url(link.get("href", ""), current_url), filters)
+        if normalized and is_product_url_for_filters(normalized, filters):
             return normalized
     return current_url
 
 
-def find_card_container_from_link(link, current_url: str) -> Optional[object]:
+def find_card_container_from_link(link, current_url: str, product_url_filters: Optional[Iterable[str]] = None) -> Optional[object]:
     node = link
     best = None
-    target_url = normalize_url(link.get("href", ""), current_url)
+    filters = list(product_url_filters or [])
+    target_url = canonicalize_product_url_by_filters(normalize_url(link.get("href", ""), current_url), filters)
     for _ in range(10):
         if not node or getattr(node, "name", None) in {"body", "html"}:
             break
@@ -1926,17 +1955,20 @@ def find_card_container_from_link(link, current_url: str) -> Optional[object]:
         links = [
             item
             for item in node.select("a[href]")
-            if is_probable_product_url(normalize_url(item.get("href", ""), current_url) or "")
+            if is_product_url_for_filters(
+                canonicalize_product_url_by_filters(normalize_url(item.get("href", ""), current_url), filters),
+                filters,
+            )
         ]
         same_product_links = [
             item
             for item in links
-            if normalize_url(item.get("href", ""), current_url) == target_url
+            if canonicalize_product_url_by_filters(normalize_url(item.get("href", ""), current_url), filters) == target_url
         ]
         class_text = " ".join(node.get("class", [])) if hasattr(node, "get") else ""
         if same_product_links and (getattr(node, "name", None) == "article" or "product-card" in class_text):
             return node
-        if PRICE_RE.search(text) and len(text) <= 2200 and links:
+        if extract_price_from_container(node) and len(text) <= 2200 and links:
             best = node
             if same_product_links and len({normalize_url(item.get("href", ""), current_url) for item in links}) <= 3:
                 break
@@ -1944,24 +1976,28 @@ def find_card_container_from_link(link, current_url: str) -> Optional[object]:
     return best
 
 
-def extract_listing_products_from_links(soup: BeautifulSoup, current_url: str, seen_urls: Set[str]) -> List[Dict[str, str]]:
+def extract_listing_products_from_links(
+    soup: BeautifulSoup,
+    current_url: str,
+    seen_urls: Set[str],
+    product_url_filters: Optional[Iterable[str]] = None,
+) -> List[Dict[str, str]]:
+    filters = list(product_url_filters or [])
     products: List[Dict[str, str]] = []
     for link in soup.select("a[href]"):
-        product_url = normalize_url(link.get("href", ""), current_url)
-        if not product_url or not is_probable_product_url(product_url) or product_url in seen_urls:
+        product_url = canonicalize_product_url_by_filters(normalize_url(link.get("href", ""), current_url), filters)
+        if not product_url or not is_product_url_for_filters(product_url, filters) or product_url in seen_urls:
             continue
         if not matches_listing_brand(current_url, product_url, link.get_text(" ", strip=True)):
             continue
 
-        card = find_card_container_from_link(link, current_url)
+        card = find_card_container_from_link(link, current_url, filters)
         if not card:
             continue
         text = card.get_text(" ", strip=True)
-        price_match = PRICE_RE.search(text)
-        if not price_match:
+        price = extract_price_from_container(card)
+        if not price:
             continue
-
-        price = clean_text(price_match.group(0))
         model_source = clean_text(link.get_text(" ", strip=True)) or extract_model_from_card(card, price)
         model = normalize_model(model_source, product_url)
         if not model:
@@ -2176,22 +2212,45 @@ def extract_prices(value: str) -> List[str]:
     return [clean_text(match.group(0)) for match in PRICE_RE.finditer(value or "")]
 
 
+def extract_price_from_container(container, selector: str = "") -> str:
+    if not container or not hasattr(container, "select"):
+        return ""
+    if selector:
+        selected = first_by_selector(container, selector)
+        selected_price = (extract_prices(selected) or [normalize_price_value(selected)])[0]
+        if selected_price:
+            return selected_price
+
+    for node in container.select("[class*='price'], [class*='cost'], [itemprop='price']"):
+        text = clean_text(node.get("content") or node.get("value") or node.get_text(" ", strip=True))
+        if not text or len(text) > 120:
+            continue
+        price = (extract_prices(text) or [normalize_price_value(text)])[0]
+        if price:
+            return price
+
+    prices = extract_prices(container.get_text(" ", strip=True))
+    return prices[-1] if prices else ""
+
+
 def extract_listing_products_by_rules(
     soup: BeautifulSoup,
     current_url: str,
     rules: Dict[str, str],
     seen_urls: Set[str],
+    product_url_filters: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, str]]:
     card_selector = rules.get("product_card_selector", "")
     if not card_selector:
         return []
+    filters = list(product_url_filters or [])
     products: List[Dict[str, str]] = []
     for card in soup.select(card_selector):
         link_node = card.select_one(rules.get("product_url_selector", "")) if rules.get("product_url_selector") else None
         if not link_node:
             link_node = card.select_one("a[href]")
-        product_url = normalize_url(link_node.get("href", "") if link_node else "", current_url)
-        if not product_url or product_url in seen_urls or not is_probable_product_url(product_url):
+        product_url = canonicalize_product_url_by_filters(normalize_url(link_node.get("href", "") if link_node else "", current_url), filters)
+        if not product_url or product_url in seen_urls or not is_product_url_for_filters(product_url, filters):
             continue
         if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
             continue
@@ -2204,9 +2263,7 @@ def extract_listing_products_by_rules(
         model = prepare_rule_model(model, rules)
         model = normalize_model(model, product_url)
 
-        price = first_by_selector(card, rules.get("price_selector", ""))
-        prices = extract_prices(price) or extract_prices(card.get_text(" ", strip=True))
-        price = prices[-1] if prices else normalize_price_value(price)
+        price = extract_price_from_container(card, rules.get("price_selector", ""))
         if not model or not price:
             continue
 
@@ -2220,8 +2277,10 @@ def extract_listing_products_from_common_cards(
     current_url: str,
     rules: Dict[str, str],
     seen_urls: Set[str],
+    product_url_filters: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, str]]:
     products: List[Dict[str, str]] = []
+    filters = list(product_url_filters or [])
     card_selectors = [
         ".catalog-card.js-ecom_product-item",
         ".js-ecom_product-item",
@@ -2238,17 +2297,13 @@ def extract_listing_products_from_common_cards(
             cards.append(card)
 
     for card in cards:
-        product_url = extract_product_url_from_card(card, current_url)
-        if not product_url or product_url in seen_urls or not is_probable_product_url(product_url):
+        product_url = extract_product_url_from_card(card, current_url, filters)
+        if not product_url or product_url in seen_urls or not is_product_url_for_filters(product_url, filters):
             continue
         if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
             continue
 
-        price_text = first_by_selector(card, rules.get("price_selector", ""))
-        if not price_text:
-            price_text = first_text(card, [".catalog-card__price", "[class*='price']"])
-        prices = extract_prices(price_text) or extract_prices(card.get_text(" ", strip=True))
-        price = prices[-1] if prices else normalize_price_value(price_text)
+        price = extract_price_from_container(card, rules.get("price_selector", ""))
         if not price:
             continue
 
@@ -2277,7 +2332,12 @@ def extract_listing_products_from_common_cards(
     return products
 
 
-def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+def extract_listing_products(
+    current_url: str,
+    html: str,
+    rules: Optional[Dict[str, str]] = None,
+    product_url_filters: Optional[Iterable[str]] = None,
+) -> List[Dict[str, str]]:
     """РЎРѕР±РёСЂР°РµС‚ С‚РѕРІР°СЂС‹ РїСЂСЏРјРѕ СЃРѕ СЃС‚СЂР°РЅРёС†С‹ РєР°С‚РµРіРѕСЂРёРё/РєР°С‚Р°Р»РѕРіР°."""
     soup = BeautifulSoup(html, "html.parser")
     products: List[Dict[str, str]] = extract_schema_listing_products(soup, current_url)
@@ -2285,8 +2345,9 @@ def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[s
     seen_urls: Set[str] = {product["url"] for product in products}
     seen_source_ids: Set[int] = set()
     rules = normalize_extraction_rules(rules or {})
+    filters = list(product_url_filters or [])
 
-    products.extend(extract_listing_products_from_common_cards(soup, current_url, rules, seen_urls))
+    products.extend(extract_listing_products_from_common_cards(soup, current_url, rules, seen_urls, filters))
 
     for price_node in soup.find_all(string=PRICE_RE):
         price_sources.append(price_node)
@@ -2315,8 +2376,8 @@ def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[s
             if card_prices:
                 price = card_prices[-1]
 
-        product_url = extract_product_url_from_card(card, current_url)
-        if product_url == current_url and not is_probable_product_url(current_url):
+        product_url = extract_product_url_from_card(card, current_url, filters)
+        if product_url == current_url and not is_product_url_for_filters(current_url, filters):
             continue
         if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
             continue
@@ -2328,10 +2389,10 @@ def extract_listing_products(current_url: str, html: str, rules: Optional[Dict[s
         seen_urls.add(product_url)
         products.append({"url": product_url, "model": model, "price": price})
 
-    products.extend(extract_listing_products_from_links(soup, current_url, seen_urls))
+    products.extend(extract_listing_products_from_links(soup, current_url, seen_urls, filters))
     products.extend(extract_listing_products_from_scripts(soup, current_url, seen_urls))
     if rules:
-        products.extend(extract_listing_products_by_rules(soup, current_url, rules, seen_urls))
+        products.extend(extract_listing_products_by_rules(soup, current_url, rules, seen_urls, filters))
     return products
 
 
@@ -2341,6 +2402,7 @@ def extract_product_data_by_rules(
     soup: BeautifulSoup,
     rules: Dict[str, str],
     fallback_price: str = "",
+    assume_product: bool = False,
 ) -> Optional[Dict[str, str]]:
     if not rules:
         return None
@@ -2349,10 +2411,16 @@ def extract_product_data_by_rules(
         model = first_by_selector(soup, rules.get("model_selector", ""))
     price = first_by_selector(soup, rules.get("price_selector", ""))
     model = prepare_rule_model(model, rules)
-    prices = extract_prices(price) or extract_prices(soup.get_text(" ", strip=True))
-    price = prices[-1] if prices else normalize_price_value(price or fallback_price)
+    prices = extract_prices(price)
+    if prices:
+        price = prices[-1]
+    else:
+        price = normalize_price_value(price or fallback_price)
+    if not price:
+        prices = extract_prices(soup.get_text(" ", strip=True))
+        price = prices[-1] if prices else ""
     model = normalize_model(model, url)
-    if model and price and is_probable_product_url(url):
+    if model and price and (assume_product or is_probable_product_url(url)):
         return {"url": url, "model": model, "price": price}
     return None
 
@@ -2362,9 +2430,10 @@ def extract_product_data(
     html: str,
     fallback_price: str = "",
     rules: Optional[Dict[str, str]] = None,
+    assume_product: bool = False,
 ) -> Optional[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
-    ruled_product = extract_product_data_by_rules(url, html, soup, rules or {}, fallback_price)
+    ruled_product = extract_product_data_by_rules(url, html, soup, rules or {}, fallback_price, assume_product)
     if ruled_product:
         return ruled_product
     path_parts = [part for part in urlparse(url).path.split("/") if part]
@@ -2845,25 +2914,39 @@ class MaunfeldCrawler:
     def is_product_allowed(self, url: str) -> bool:
         return product_url_matches_filters(url, self.product_url_filters)
 
+    def is_filter_marked_product(self, url: str) -> bool:
+        return bool(self.product_url_filters) and product_url_matches_filters(url, self.product_url_filters)
+
+    def is_product_url(self, url: str) -> bool:
+        return is_product_url_for_filters(url, self.product_url_filters)
+
     def remember_listing_price(self, product_url: str, price: str) -> None:
+        product_url = canonicalize_product_url_by_filters(product_url, self.product_url_filters)
         with self.data_lock:
             if product_url and price:
                 self.pending_prices[product_url] = price
 
     def get_listing_price(self, product_url: str) -> str:
+        product_url = canonicalize_product_url_by_filters(product_url, self.product_url_filters)
         with self.data_lock:
             return self.pending_prices.get(product_url, "")
 
     def enqueue(self, url: Optional[str], force: bool = False) -> None:
+        url = canonicalize_product_url_by_filters(url or "", self.product_url_filters)
         if not url or url in self.visited or url in self.queued or url in self.in_progress:
             return
-        if is_probable_product_url(url) and not self.is_product_allowed(url):
+        is_product = self.is_product_url(url)
+        if is_product and not self.is_product_allowed(url):
             return
         with self.data_lock:
             if url in self.result_urls:
                 return
-        if not force and not should_follow_project_url(url, self.start_urls, self.root_netloc):
-            return
+        if not force:
+            if is_product:
+                if not same_site(url, self.root_netloc) or has_static_extension(url):
+                    return
+            elif not should_follow_project_url(url, self.start_urls, self.root_netloc):
+                return
         if force and (not same_site(url, self.root_netloc) or has_static_extension(url)):
             return
         if self.is_excluded(url):
@@ -2888,13 +2971,14 @@ class MaunfeldCrawler:
         added = 0
         with self.data_lock:
             for product in products:
-                product_url = product.get("url", "")
+                product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
                 model = product.get("model", "")
                 price = product.get("price", "")
                 if product_url and not self.is_product_allowed(product_url):
                     continue
                 if not product_url or not model or not price or product_url in self.result_urls:
                     continue
+                product["url"] = product_url
                 self.result_urls.add(product_url)
                 self.results.append(product)
                 added += 1
@@ -2988,7 +3072,7 @@ class MaunfeldCrawler:
         return self.elapsed_before_resume
 
     def process_page(self, url: str, html: str) -> None:
-        listing_products = extract_listing_products(url, html, self.extraction_rules)
+        listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
 
         if not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)) and not PRICE_RE.search(html):
             self.update_state(
@@ -2998,29 +3082,38 @@ class MaunfeldCrawler:
             rendered_html = fetch_with_botasaurus_browser(url)
             if rendered_html and not looks_blocked_or_empty(rendered_html):
                 html = rendered_html
-                listing_products = extract_listing_products(url, html, self.extraction_rules)
+                listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
                 self.update_state(error="")
 
         if is_maunfeld_url(url):
             for product in listing_products:
-                product_url = product.get("url", "")
+                product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
+                product["url"] = product_url
                 self.remember_listing_price(product_url, product.get("price", ""))
                 self.enqueue(product_url, force=True)
         else:
             for product in listing_products:
-                product_url = product.get("url", "")
+                product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
+                product["url"] = product_url
                 self.remember_listing_price(product_url, product.get("price", ""))
                 self.enqueue(product_url, force=True)
-            self.add_products(listing_products)
+            if not self.product_url_filters:
+                self.add_products(listing_products)
 
-        product = extract_product_data(url, html, self.get_listing_price(url), self.extraction_rules)
+        product = extract_product_data(
+            url,
+            html,
+            self.get_listing_price(url),
+            self.extraction_rules,
+            assume_product=self.is_product_url(url),
+        )
         if product:
             self.add_products([product])
 
         if is_technopark_url(url):
             self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: {len(listing_products)}", "info")
 
-        if not is_probable_product_url(url):
+        if not self.is_product_url(url):
             self.extract_links(html, url)
 
     def finish_with_excel(self, partial: bool = False) -> None:
