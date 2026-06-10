@@ -117,7 +117,6 @@ const statusLabels = {
   completed: "завершено",
   error: "ошибка",
   stopping: "останавливается",
-  stopped: "остановлено",
   pausing: "приостанавливается",
   partial: "приостановлено",
 };
@@ -649,7 +648,7 @@ function createdTimestamp(value) {
 function newsStatusClass(status) {
   if (status === "running" || status === "queued") return "status-running";
   if (status === "completed") return "status-completed";
-  if (status === "stopping" || status === "stopped" || status === "pausing" || status === "partial") return "status-paused";
+  if (status === "stopping" || status === "pausing" || status === "partial") return "status-paused";
   if (status === "error") return "status-error";
   return "status-idle";
 }
@@ -662,7 +661,6 @@ function newsStatusText(status) {
   if (status === "running" || status === "queued") return "в работе";
   if (status === "completed") return "завершено";
   if (status === "stopping") return "останавливается";
-  if (status === "stopped") return "остановлено";
   if (status === "pausing") return "приостанавливается";
   if (status === "partial") return "приостановлено";
   if (status === "error") return "ошибка";
@@ -725,7 +723,6 @@ function aggregateNewsStatus(states) {
   if (states.some((state) => ["running", "queued"].includes(state.status))) return "running";
   if (states.some((state) => state.status === "stopping")) return "stopping";
   if (states.some((state) => state.status === "pausing")) return "pausing";
-  if (states.some((state) => state.status === "stopped")) return "stopped";
   if (states.some((state) => state.status === "partial")) return "partial";
   if (states.some((state) => state.status === "completed")) return "completed";
   return "idle";
@@ -1162,10 +1159,6 @@ function renderNewsModal() {
 
     <div class="modal-form-grid">
       <label class="field">
-        <span>Группа</span>
-        <input data-field="group" type="text" value="${escapeHtml(monitor.group || "")}">
-      </label>
-      <label class="field">
         <span>Название бренда</span>
         <input data-field="brand" type="text" value="${escapeHtml(monitor.brand || "")}">
       </label>
@@ -1481,6 +1474,7 @@ async function saveActiveProject() {
   });
   Object.assign(project, data.project);
   renderTabs();
+  renderState(project);
   return project;
 }
 

@@ -1,3 +1,4 @@
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -11,6 +12,35 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+DEFAULT_BRAND_STATE = {
+    "status": "idle",
+    "stage": "",
+    "percent": 0,
+    "currenturl": "",
+    "processed": 0,
+    "found_products": 0,
+    "candidate_products": 0,
+    "compared_products": 0,
+    "queue_size": 0,
+    "active_tasks": 0,
+    "active_urls": [],
+    "in_memory_products": 0,
+    "failed_pages": 0,
+    "stall_seconds": 0,
+    "last_event": "",
+    "last_warning": "",
+    "new_count": 0,
+    "missing_by_feed": [],
+    "skipped": 0,
+    "last_scan_at": "",
+    "last_csv": "",
+    "error": "",
+    "started_at": "",
+    "finished_at": "",
+    "elapsed_seconds": 0,
+    "next_run_at": "",
+}
+DEFAULT_BRAND_STATE_JSON = json.dumps(DEFAULT_BRAND_STATE, ensure_ascii=False, separators=(",", ":"))
 
 engine = create_engine(
     DATABASE_URL,
@@ -110,12 +140,23 @@ def migrate_schema(connection) -> None:
 
     brand_columns = table_columns(connection, "brands")
     if brand_columns and "state" not in brand_columns:
-        connection.execute(text("ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{\"status\":\"idle\"}'"))
+        connection.execute(text(f"ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'"))
 
     migrate_app_settings_current_table(connection)
     migrate_brands_table(connection)
     migrate_projects_table(connection)
     migrate_donors_table(connection)
+    reset_brand_states(connection)
+
+
+def reset_brand_states(connection) -> None:
+    columns = table_columns(connection, "brands")
+    if not columns or "state" not in columns:
+        return
+    connection.execute(
+        text("UPDATE brands SET state = json(:state)"),
+        {"state": DEFAULT_BRAND_STATE_JSON},
+    )
 
 
 def migrate_app_settings_current_table(connection) -> None:
@@ -164,7 +205,7 @@ def migrate_brands_table(connection) -> None:
             else "json('[]')"
         )
     )
-    state_expr = safe_json_expr("brands.state", '{"status":"idle"}') if "state" in columns else "json('{\"status\":\"idle\"}')"
+    state_expr = safe_json_expr("brands.state", DEFAULT_BRAND_STATE_JSON) if "state" in columns else f"json('{DEFAULT_BRAND_STATE_JSON}')"
 
     connection.execute(text("DROP TABLE IF EXISTS brand_id_map"))
     connection.execute(
@@ -194,7 +235,7 @@ def migrate_brands_table(connection) -> None:
             "group_name VARCHAR(255) NOT NULL DEFAULT '', "
             "collapsed BOOLEAN NOT NULL DEFAULT 1, "
             "exclusions JSON NOT NULL DEFAULT '[]', "
-            "state JSON NOT NULL DEFAULT '{\"status\":\"idle\"}', "
+            f"state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}', "
             "created_at DATETIME NOT NULL, "
             "updated_at DATETIME NOT NULL, "
             "CONSTRAINT uq_brands_name_group_name UNIQUE (name, group_name)"

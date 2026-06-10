@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, Response, g, jsonify, render_template, request, send_file
+from flask import Flask, Response, g, jsonify as flask_jsonify, render_template, request, send_file
 from sqlalchemy import delete, select
 
 from db import SessionLocal, init_db, session_scope
@@ -49,6 +49,7 @@ REQUEST_TIMEOUT = 20
 REQUEST_DELAY_SECONDS = 0.25
 MAX_RETRIES = 3
 NEWS_SCAN_STALL_TIMEOUT = int(os.environ.get("NEWS_SCAN_STALL_TIMEOUT", "180") or 180)
+SCHEDULE_DUE_GRACE_SECONDS = 90
 CONNECTION_METHODS = (
     "requests",
     "botasaurus-request",
@@ -117,7 +118,9 @@ FEED_STORAGE_LOCK = threading.Lock()
 UNIFIED_LOG_LOCK = threading.Lock()
 news_stop_events: Dict[str, threading.Event] = {}
 news_stop_modes: Dict[str, str] = {}
+news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
+NEWS_TRANSITION_TIMEOUT_SECONDS = 180
 
 scan_state: Dict[str, object] = {
     "status": "idle",
@@ -479,6 +482,22 @@ def reset_project_state(project: Dict[str, object], status: str = "idle") -> Non
     project["state"] = state
 
 
+def project_worker_alive(project: Dict[str, object]) -> bool:
+    worker = project.get("worker_thread")
+    return isinstance(worker, threading.Thread) and worker.is_alive()
+
+
+def reset_project_state_after_form_save(project: Dict[str, object]) -> None:
+    if project_worker_alive(project):
+        return
+    status = str((project.get("state") or {}).get("status") or "idle")
+    if status in {"running", "queued", "stopping"}:
+        return
+    project["crawler"] = None
+    project["stop_mode"] = ""
+    reset_project_state(project, "idle")
+
+
 def add_project_log(project: Dict[str, object], message: str, level: str = "info") -> None:
     with projects_lock:
         logs = project.setdefault("logs", [])
@@ -550,6 +569,18 @@ def repair_mojibake(value: object) -> object:
     if isinstance(value, list):
         return [repair_mojibake(item) for item in value]
     return repair_mojibake_text(value)
+
+
+def jsonify(*args: object, **kwargs: object):
+    repaired_args = tuple(repair_mojibake(item) for item in args)
+    repaired_kwargs = repair_mojibake(kwargs) if kwargs else {}
+    return flask_jsonify(*repaired_args, **repaired_kwargs)
+
+
+def output_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(repair_mojibake_text(str(value)) or "")
 
 
 def default_news_settings() -> Dict[str, object]:
@@ -803,7 +834,7 @@ def aggregate_brand_state(monitors: List[Dict[str, object]]) -> Dict[str, object
     states = [{**make_news_state(), **(monitor.get("state") or {})} for monitor in monitors if isinstance(monitor, dict)]
     if not states:
         return make_news_state()
-    priority = ["running", "queued", "pausing", "stopping", "error", "partial", "stopped", "completed"]
+    priority = ["running", "queued", "pausing", "stopping", "error", "partial", "completed"]
     selected = next((state for status in priority for state in states if state.get("status") == status), states[0])
     result = {**make_news_state(), **selected}
     last_scan_at = max((str(state.get("last_scan_at") or state.get("finished_at") or "") for state in states), default="")
@@ -934,6 +965,31 @@ def load_news_settings() -> None:
         save_news_settings()
 
 
+def reload_news_monitors_from_db() -> None:
+    load_news_settings()
+    cleanup_stale_news_transitions()
+    with news_lock:
+        active_by_id = {
+            str(monitor.get("id")): monitor
+            for monitor in news_settings.get("monitors", [])
+            if isinstance(monitor, dict)
+            and monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}
+            and not is_stale_news_transition(monitor)
+        }
+    with session_scope() as session:
+        donor_rows = session.scalars(
+            select(Donor)
+            .join(Brand)
+            .order_by(Brand.group_name, Brand.name, Donor.id)
+        ).all()
+        monitors = [donor_model_to_monitor(row) for row in donor_rows]
+    with news_lock:
+        news_settings["monitors"] = [
+            active_by_id.get(str(monitor.get("id")), monitor)
+            for monitor in monitors
+        ]
+
+
 def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str = "info") -> None:
     with news_lock:
         logs = news_settings.setdefault("logs", [])
@@ -1013,6 +1069,7 @@ def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
 
 
 def public_news_settings() -> Dict[str, object]:
+    cleanup_stale_news_transitions()
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
         smtp.pop("sender", None)
@@ -2783,12 +2840,16 @@ class MaunfeldCrawler:
 
     def reset_state(self, status: str = "idle") -> None:
         if self.project is not None:
+            if self.run_id != int(self.project.get("run_id", self.run_id)):
+                return
             reset_project_state(self.project, status)
         else:
             reset_state(status, self.run_id, self.thread_count)
 
     def log(self, message: str, level: str = "info") -> None:
         if self.project is not None:
+            if self.run_id != int(self.project.get("run_id", self.run_id)):
+                return
             add_project_log(self.project, message, level)
 
     def get_session(self) -> requests.Session:
@@ -3315,17 +3376,33 @@ class MaunfeldCrawler:
         if self.stop_signal.is_set():
             self.elapsed_before_resume = self.elapsed_seconds()
             self.started_at = 0.0
+            stop_mode = str((self.project or {}).get("stop_mode") or "")
             if self.finish_signal.is_set():
                 self.finish_with_excel(partial=True)
-            else:
+            elif stop_mode == "pause":
                 self.update_state(
                     status="paused",
                     currenturl="",
                     elapsed_seconds=int(self.elapsed_before_resume),
                     eta_seconds=None,
-                    error="РЎР±РѕСЂ РЅР° РїР°СѓР·Рµ",
+                    error="Сбор на паузе",
                 )
-                self.log("РЎР±РѕСЂ РїРѕСЃС‚Р°РІР»РµРЅ РЅР° РїР°СѓР·Сѓ", "warning")
+                if (self.project or {}).get("state", {}).get("status") == "paused":
+                    self.log("Сбор поставлен на паузу", "warning")
+            else:
+                self.update_state(
+                    status="idle",
+                    currenturl="",
+                    active_urls=[],
+                    active_tasks=0,
+                    queue_size=0,
+                    elapsed_seconds=int(self.elapsed_before_resume),
+                    eta_seconds=None,
+                    error="",
+                    paused_with_result=False,
+                )
+                if stop_mode == "stop":
+                    self.log("Сбор остановлен", "warning")
             return
 
         self.elapsed_before_resume = self.elapsed_seconds()
@@ -3334,6 +3411,7 @@ class MaunfeldCrawler:
 
 
 def safe_filename(value: str) -> str:
+    value = output_text(value)
     cleaned = re.sub(r"[^A-Za-z\u0400-\u04FF0-9_-]+", "_", value, flags=re.IGNORECASE).strip("_")
     return cleaned or "project"
 
@@ -3347,9 +3425,9 @@ def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, o
 
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file, delimiter=";")
-        writer.writerow(["URL С‚РѕРІР°СЂР°", "_MODEL_", "_PRICE_"])
+        writer.writerow(["URL товара", "_MODEL_", "_PRICE_"])
         for row in rows:
-            writer.writerow([row.get("url", ""), row.get("model", ""), row.get("price", "")])
+            writer.writerow([output_text(row.get("url", "")), output_text(row.get("model", "")), output_text(row.get("price", ""))])
 
     return path
 
@@ -3677,7 +3755,7 @@ def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
             raise ValueError(f"РћС€РёР±РєР° CSS-СЃРµР»РµРєС‚РѕСЂР° {key}: {selector}. {exc}") from exc
 
 
-def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> None:
+def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, **kwargs: object) -> None:
     with news_lock:
         state = dict(monitor.get("state", make_news_state()))
         state.update(kwargs)
@@ -3702,6 +3780,7 @@ def update_news_monitor_state(monitor: Dict[str, object], **kwargs: object) -> N
             ):
                 item["state"] = dict(state)
                 item["brand_state"] = dict(state)
+    if persist:
         persist_news_monitor_state(monitor)
 
 
@@ -3724,6 +3803,64 @@ def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) 
                 donor.brand.state = state
     except Exception as exc:
         print(f"Failed to persist news monitor state {monitor_id}: {exc}", flush=True)
+
+
+def news_monitor_thread_alive(monitor_id: object) -> bool:
+    thread = news_scan_threads.get(str(monitor_id))
+    return isinstance(thread, threading.Thread) and thread.is_alive()
+
+
+def transition_requested_at(monitor: Dict[str, object]) -> Optional[datetime]:
+    state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+    for key in ("stop_requested_at", "finished_at", "started_at"):
+        parsed = parse_schedule_datetime(state.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def is_stale_news_transition(monitor: Dict[str, object]) -> bool:
+    state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+    status = str(state.get("status") or "")
+    if status not in {"pausing", "stopping"}:
+        return False
+    requested_at = transition_requested_at(monitor)
+    timed_out = bool(requested_at and (datetime.now(MSK_TZ) - requested_at).total_seconds() >= NEWS_TRANSITION_TIMEOUT_SECONDS)
+    return timed_out or not news_monitor_thread_alive(monitor.get("id"))
+
+
+def finalize_stale_news_transition(monitor: Dict[str, object]) -> bool:
+    if not is_stale_news_transition(monitor):
+        return False
+    state = dict(monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {})
+    was_pausing = state.get("status") == "pausing"
+    state.update(
+        {
+            "status": "partial" if was_pausing else "idle",
+            "stage": "Приостановлено" if was_pausing else "Ожидание",
+            "error": "",
+            "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            "currenturl": "",
+            "queue_size": 0,
+            "active_tasks": 0,
+            "active_urls": [],
+        }
+    )
+    with news_lock:
+        monitor["state"] = state
+        monitor["brand_state"] = dict(state)
+    return True
+
+
+def cleanup_stale_news_transitions() -> None:
+    changed: List[Dict[str, object]] = []
+    with news_lock:
+        monitors = [item for item in news_settings.get("monitors", []) if isinstance(item, dict)]
+    for monitor in monitors:
+        if finalize_stale_news_transition(monitor):
+            changed.append(monitor)
+    for monitor in changed:
+        threading.Thread(target=persist_news_monitor_state, args=(monitor, True), daemon=True).start()
 
 
 def update_brand_scan_state(
@@ -3795,18 +3932,22 @@ def get_news_stop_event(monitor_id: str) -> threading.Event:
 
 def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
     event = get_news_stop_event(monitor_id)
+    monitor: Optional[Dict[str, object]] = None
     with news_lock:
         news_stop_modes[monitor_id] = mode
-        monitor = get_news_monitor(monitor_id)
-        if monitor:
-            update_news_monitor_state(
-                monitor,
-                status="pausing" if mode == "pause" else "stopping",
-                stage="Приостановка" if mode == "pause" else "Остановка",
-                currenturl="",
-            )
-            persist_news_monitor_state(monitor, force=True)
+    monitor = get_news_monitor(monitor_id)
+    if monitor:
+        update_news_monitor_state(
+            monitor,
+            persist=False,
+            status="pausing" if mode == "pause" else "stopping",
+            stage="Приостановка" if mode == "pause" else "Остановка",
+            currenturl="",
+            stop_requested_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        )
     event.set()
+    if monitor:
+        threading.Thread(target=persist_news_monitor_state, args=(monitor, True), daemon=True).start()
     return event
 
 
@@ -3922,32 +4063,8 @@ def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> 
 
 def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], filename: str = "") -> Path:
     if not filename:
-        filename = f"РќРѕРІРёРЅРєРё_{safe_filename(str(monitor.get('brand') or 'donor'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
-    path = EXPORT_DIR / filename
-    with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
-        writer = csv.writer(csv_file, delimiter=";")
-        writer.writerow(["Р”Р°С‚Р° РїРѕСЏРІР»РµРЅРёСЏ", "Р“СЂСѓРїРїР°", "РЎР°Р№С‚/Р±СЂРµРЅРґ", "РќР°РёРјРµРЅРѕРІР°РЅРёРµ", "РњРѕРґРµР»СЊ", "Р¦РµРЅР°", "РќР°Р»РёС‡РёРµ", "РќРµС‚ РЅР° СЃР°Р№С‚Р°С…", "URL С‚РѕРІР°СЂР°"])
-        for row in rows:
-            writer.writerow(
-                [
-                    row.get("date_found", ""),
-                    row.get("group", ""),
-                    row.get("brand", ""),
-                    row.get("name", ""),
-                    row.get("model", ""),
-                    row.get("price", ""),
-                    row.get("availability", ""),
-                    row.get("missing_on", ""),
-                    row.get("url", ""),
-                ]
-            )
-    return path
-
-
-def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], filename: str = "") -> Path:
-    if not filename:
         filename = f"Новинки_{safe_filename(str(monitor.get('brand') or 'donor'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
-    filename = str(repair_mojibake_text(filename) or filename)
+    filename = output_text(filename)
     path = EXPORT_DIR / filename
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.writer(csv_file, delimiter=";")
@@ -3967,15 +4084,15 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
         for row in rows:
             writer.writerow(
                 [
-                    row.get("date_found", ""),
-                    row.get("group", ""),
-                    row.get("brand", ""),
-                    row.get("name", ""),
-                    row.get("model", ""),
-                    row.get("price", ""),
-                    row.get("availability", ""),
-                    row.get("missing_on", ""),
-                    row.get("url", ""),
+                    output_text(row.get("date_found", "")),
+                    output_text(row.get("group", "")),
+                    output_text(row.get("brand", "")),
+                    output_text(row.get("name", "")),
+                    output_text(row.get("model", "")),
+                    output_text(row.get("price", "")),
+                    output_text(row.get("availability", "")),
+                    output_text(row.get("missing_on", "")),
+                    output_text(row.get("url", "")),
                 ]
             )
     return path
@@ -4159,7 +4276,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     missing_summary: List[Dict[str, object]] = []
     previous_csv = str(monitor.get("state", {}).get("last_csv") or "")
 
-    def check_stopped() -> None:
+    def check_stop_requested() -> None:
         if stop_event.is_set():
             raise NewsScanStopped()
 
@@ -4185,13 +4302,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         )
         update_news_monitor_state(monitor, stage="РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р°-РґРѕРЅРѕСЂР°", percent=5)
         products = collect_products_for_monitor(monitor, stop_event)
-        check_stopped()
+        check_stop_requested()
         add_news_log(monitor, "Сбор закончил", "info")
         add_news_log(monitor, f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р° Р·Р°РІРµСЂС€РµРЅРѕ. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ: {len(products)}", "info")
         update_news_monitor_state(monitor, stage="Р“РµРЅРµСЂР°С†РёСЏ Рё Р·Р°РіСЂСѓР·РєР° С„РёРґРѕРІ РІР°С€РёС… СЃР°Р№С‚РѕРІ", percent=84, currenturl="")
         add_news_log(monitor, "Скачивание фида", "info")
         all_existing_codes, local_feeds, feed_code_sets = fetch_existing_vendor_code_sets()
-        check_stopped()
+        check_stop_requested()
         add_news_log(monitor, "Фид скачался", "info")
         add_news_log(
             monitor,
@@ -4210,7 +4327,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         add_news_log(monitor, "Началось сравнение", "info")
         known = monitor.get("known_new_products", {}) if isinstance(monitor.get("known_new_products"), dict) else {}
         for index, product in enumerate(products, start=1):
-            check_stopped()
+            check_stop_requested()
             update_news_monitor_state(
                 monitor,
                 stage="РЎСЂР°РІРЅРµРЅРёРµ СЃ С„РёРґР°РјРё",
@@ -4274,7 +4391,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "currenturl": "",
             }
             monitor["brand_state"] = dict(monitor["state"])
-            monitor["next_run_at"] = "" if monitor.get("schedule_type") == "once" else compute_next_run_at(monitor)
+            if monitor.get("schedule_type") != "once":
+                monitor["next_run_at"] = compute_next_run_at(monitor)
             save_news_settings()
         add_news_log(monitor, f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ Р·Р°РІРµСЂС€РµРЅРѕ. РќР°Р№РґРµРЅРѕ РЅРѕРІРёРЅРѕРє: {len(new_items)}. CSV: {csv_path.name}", "success")
         update_brand_scan_state(
@@ -4299,8 +4417,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         with news_lock:
             monitor["state"] = {
                 **monitor.get("state", {}),
-                "status": "partial" if stop_mode == "pause" else "stopped",
-                "stage": "РџСЂРёРѕСЃС‚Р°РЅРѕРІР»РµРЅРѕ" if stop_mode == "pause" else "РћСЃС‚Р°РЅРѕРІР»РµРЅРѕ",
+                "status": "partial" if stop_mode == "pause" else "idle",
+                "stage": "РџСЂРёРѕСЃС‚Р°РЅРѕРІР»РµРЅРѕ" if stop_mode == "pause" else "Ожидание",
                 "error": "",
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
@@ -4325,7 +4443,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         update_brand_scan_state(
             "donor",
             monitor_id,
-            "partial" if stop_mode == "pause" else "stopped",
+            "partial" if stop_mode == "pause" else "idle",
             started,
             found_products=len(products),
             new_count=len(new_items),
@@ -4361,6 +4479,9 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     finally:
         with news_lock:
             news_stop_modes.pop(monitor_id, None)
+            thread = news_scan_threads.get(monitor_id)
+            if thread is threading.current_thread():
+                news_scan_threads.pop(monitor_id, None)
         stop_event.clear()
 
 
@@ -4371,6 +4492,17 @@ def parse_scan_time(value: object) -> datetime_time:
         return datetime_time(max(0, min(hour, 23)), max(0, min(minute, 59)), tzinfo=MSK_TZ)
     except Exception:
         return datetime_time(1, 0, tzinfo=MSK_TZ)
+
+
+def parse_schedule_datetime(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed.astimezone(MSK_TZ) if parsed.tzinfo else parsed.replace(tzinfo=MSK_TZ)
 
 
 def compute_next_run_at(monitor: Dict[str, object]) -> str:
@@ -4392,32 +4524,45 @@ def compute_next_run_at(monitor: Dict[str, object]) -> str:
     return candidate.isoformat(timespec="minutes")
 
 
+def scheduled_run_at_for_period(monitor: Dict[str, object], now: Optional[datetime] = None) -> Optional[datetime]:
+    now = now or datetime.now(MSK_TZ)
+    schedule_type = str(monitor.get("schedule_type") or "daily")
+    if schedule_type == "once":
+        return parse_schedule_datetime(monitor.get("next_run_at"))
+    if schedule_type not in {"daily", "weekly"}:
+        return None
+    run_time = parse_scan_time(monitor.get("scan_time"))
+    candidate = now.replace(hour=run_time.hour, minute=run_time.minute, second=0, microsecond=0)
+    if schedule_type == "weekly":
+        weekday = int(monitor.get("weekday", 0) or 0)
+        candidate += timedelta(days=weekday - now.weekday())
+    return candidate
+
+
 def is_monitor_due(monitor: Dict[str, object]) -> bool:
     if not monitor.get("enabled", True):
         return False
-    if monitor.get("state", {}).get("status") == "running":
+    if monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}:
         return False
     now = datetime.now(MSK_TZ)
     schedule_type = str(monitor.get("schedule_type") or "daily")
-    if schedule_type == "once":
-        raw_next = str(monitor.get("next_run_at") or "")
-        if not raw_next:
-            return False
-        try:
-            due_at = datetime.fromisoformat(raw_next)
-            if due_at.tzinfo is None:
-                due_at = due_at.replace(tzinfo=MSK_TZ)
-        except ValueError:
-            return False
-        return now >= due_at
-
-    run_time = parse_scan_time(monitor.get("scan_time"))
-    if now.hour != run_time.hour or now.minute != run_time.minute:
+    if schedule_type not in {"daily", "weekly", "once"}:
         return False
-    if schedule_type == "weekly" and now.weekday() != int(monitor.get("weekday", 0) or 0):
+    due_at = scheduled_run_at_for_period(monitor, now)
+    if not due_at:
+        return False
+    if schedule_type in {"daily", "weekly"}:
+        seconds_after_due = (now - due_at).total_seconds()
+        if seconds_after_due < 0 or seconds_after_due >= SCHEDULE_DUE_GRACE_SECONDS:
+            return False
+    elif now < due_at:
         return False
     last_scan = str(monitor.get("state", {}).get("last_scan_at") or "")
-    return not last_scan.startswith(now.date().isoformat())
+    if last_scan:
+        last_scan_at = parse_schedule_datetime(last_scan)
+        if last_scan_at and last_scan_at >= due_at:
+            return False
+    return True
 
 
 def start_news_scheduler() -> None:
@@ -4428,7 +4573,7 @@ def start_news_scheduler() -> None:
     def scheduler_loop() -> None:
         while True:
             try:
-                load_news_settings()
+                reload_news_monitors_from_db()
                 due_ids = []
                 with news_lock:
                     for monitor in news_settings.get("monitors", []):
@@ -4438,7 +4583,10 @@ def start_news_scheduler() -> None:
                     if due_ids:
                         save_news_settings()
                 for monitor_id in due_ids:
-                    threading.Thread(target=scan_news_monitor, args=(monitor_id, False), daemon=True).start()
+                    thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, False), daemon=True)
+                    with news_lock:
+                        news_scan_threads[monitor_id] = thread
+                    thread.start()
             except Exception:
                 pass
             time.sleep(30)
@@ -4551,8 +4699,6 @@ def api_update_news_monitor(monitor_id: str):
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     payload = request.get_json(silent=True) or {}
     with news_lock:
-        if "group" in payload:
-            monitor["group"] = clean_text(str(payload.get("group") or monitor.get("group") or ""))
         if "brand" in payload:
             monitor["brand"] = clean_text(str(payload.get("brand") or monitor.get("brand") or ""))
         if "site_url" in payload:
@@ -4600,7 +4746,6 @@ def api_update_news_monitor(monitor_id: str):
             monitor["selector_settings"] = normalize_selector_settings(payload.get("selector_settings"))
         if "collapsed" in payload:
             monitor["collapsed"] = bool(payload.get("collapsed"))
-        monitor["next_run_at"] = compute_next_run_at(monitor) if monitor.get("schedule_type") != "once" else str(monitor.get("next_run_at") or "")
         save_news_settings()
     return jsonify({"monitor": dict(monitor)})
 
@@ -4622,7 +4767,10 @@ def api_scan_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
-    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
+    thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True)
+    with news_lock:
+        news_scan_threads[monitor_id] = thread
+    thread.start()
     return jsonify({"monitor": response_monitor})
 
 
@@ -4633,15 +4781,13 @@ def api_stop_news_monitor(monitor_id: str):
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     request_news_stop(monitor_id, "stop")
     with news_lock:
-        monitor["state"] = {
-            **monitor.get("state", {}),
-            "status": "stopping",
-            "stage": "РћСЃС‚Р°РЅРѕРІРєР°",
-        }
-        monitor["brand_state"] = dict(monitor["state"])
-        persist_news_monitor_state(monitor, force=True)
-    add_news_log(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє", "warning")
-    return jsonify({"monitor": dict(monitor)})
+        response_monitor = dict(monitor)
+    threading.Thread(
+        target=add_news_log,
+        args=(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє", "warning"),
+        daemon=True,
+    ).start()
+    return jsonify({"monitor": response_monitor})
 
 
 @app.post("/api/news/monitors/<monitor_id>/pause")
@@ -4651,15 +4797,13 @@ def api_pause_news_monitor(monitor_id: str):
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     request_news_stop(monitor_id, "pause")
     with news_lock:
-        monitor["state"] = {
-            **monitor.get("state", {}),
-            "status": "pausing",
-            "stage": "РџСЂРёРѕСЃС‚Р°РЅРѕРІРєР°",
-        }
-        monitor["brand_state"] = dict(monitor["state"])
-        persist_news_monitor_state(monitor, force=True)
-    add_news_log(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РїСЂРёРѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє СЃ СЃРѕС…СЂР°РЅРµРЅРёРµРј СЂРµР·СѓР»СЊС‚Р°С‚Р°", "warning")
-    return jsonify({"monitor": dict(monitor)})
+        response_monitor = dict(monitor)
+    threading.Thread(
+        target=add_news_log,
+        args=(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РїСЂРёРѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє СЃ СЃРѕС…СЂР°РЅРµРЅРёРµРј СЂРµР·СѓР»СЊС‚Р°С‚Р°", "warning"),
+        daemon=True,
+    ).start()
+    return jsonify({"monitor": response_monitor})
 
 
 @app.post("/api/news/monitors/<monitor_id>/resume")
@@ -4674,7 +4818,10 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
-    threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True).start()
+    thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True)
+    with news_lock:
+        news_scan_threads[monitor_id] = thread
+    thread.start()
     add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
     return jsonify({"monitor": response_monitor})
 
@@ -4744,7 +4891,7 @@ def api_download_news_csv(monitor_id: str):
     path = resolve_export_file(filename)
     if not path:
         return jsonify({"error": "CSV РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
-    download_name = str(repair_mojibake_text(path.name) or path.name)
+    download_name = output_text(path.name)
     return send_file(path, as_attachment=True, download_name=download_name)
 
 
@@ -4763,7 +4910,7 @@ def api_download_news_feed(source: str, filename: str):
     path = (feed_dir / filename).resolve()
     if feed_dir not in path.parents or not path.exists():
         return jsonify({"error": "Р¤РёРґ РЅРµ РЅР°Р№РґРµРЅ"}), 404
-    return send_file(path, as_attachment=True, download_name=filename)
+    return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
 @app.get("/api/projects")
@@ -4815,6 +4962,7 @@ def api_update_project(project_id: str):
             project["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
         if "auto_cleanup" in payload:
             project["auto_cleanup"] = bool(payload.get("auto_cleanup"))
+        reset_project_state_after_form_save(project)
         save_projects()
     return jsonify({"project": public_project(project)})
 
@@ -4925,6 +5073,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
 
     project["stop_event"] = threading.Event()
     project["finish_event"] = threading.Event()
+    project["stop_mode"] = ""
     project["run_id"] = int(project.get("run_id", 0)) + 1
 
     crawler = project.get("crawler") if resume else None
@@ -5009,6 +5158,7 @@ def api_project_pause(project_id: str):
         return jsonify({"error": "РЎР±РѕСЂ РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
     finish_event = project.get("finish_event")
     stop_event = project.get("stop_event")
+    project["stop_mode"] = "pause"
     if isinstance(finish_event, threading.Event):
         finish_event.set()
     if status == "running" and isinstance(stop_event, threading.Event):
@@ -5028,6 +5178,7 @@ def api_project_soft_pause(project_id: str):
     if project.get("state", {}).get("status") != "running":
         return jsonify({"error": "РЎР±РѕСЂ РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
     stop_event = project.get("stop_event")
+    project["stop_mode"] = "pause"
     if isinstance(stop_event, threading.Event):
         stop_event.set()
     update_project_state(project, error="РЎС‚Р°РІР»СЋ СЃР±РѕСЂ РЅР° РїР°СѓР·Сѓ...", currenturl="")
@@ -5059,9 +5210,25 @@ def api_project_stop(project_id: str):
     if isinstance(stop_event, threading.Event):
         stop_event.set()
     with projects_lock:
+        project["stop_mode"] = "stop"
         project["run_id"] = int(project.get("run_id", 0)) + 1
         project["crawler"] = None
-    reset_project_state(project, "idle")
+        state = dict(project.get("state") or make_state(parse_thread_count(project.get("thread_count", 4))))
+        state.update(
+            {
+                "status": "idle",
+                "currenturl": "",
+                "active_urls": [],
+                "active_tasks": 0,
+                "queue_size": 0,
+                "error": "",
+                "eta_seconds": None,
+                "finished_at": now_iso(),
+                "paused_with_result": False,
+            }
+        )
+        project["state"] = state
+        save_projects()
     add_project_log(project, "РЎР±РѕСЂ РѕСЃС‚Р°РЅРѕРІР»РµРЅ", "warning")
     return jsonify(project["state"])
 
@@ -5077,6 +5244,7 @@ def api_project_restart(project_id: str):
     worker = project.get("worker_thread")
     if isinstance(worker, threading.Thread) and worker.is_alive():
         with projects_lock:
+            project["stop_mode"] = "stop"
             project["run_id"] = int(project.get("run_id", 0)) + 1
             project["crawler"] = None
         worker.join(timeout=3)
@@ -5274,7 +5442,7 @@ def download_excel():
     path = EXPORT_DIR / filename
     if not filename or not path.exists():
         return jsonify({"error": "Р¤Р°Р№Р» РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
-    return send_file(path, as_attachment=True, download_name=filename)
+    return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
 @app.get("/api/projects/<project_id>/download")
@@ -5287,7 +5455,7 @@ def download_project_csv(project_id: str):
     path = EXPORT_DIR / filename
     if not filename or not path.exists():
         return jsonify({"error": "Р¤Р°Р№Р» РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
-    return send_file(path, as_attachment=True, download_name=filename)
+    return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
 if __name__ == "__main__":
