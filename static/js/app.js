@@ -100,6 +100,7 @@ const selectedNewsSites = new Map();
 let activeNewsBrandKey = null;
 let activeNewsSelectorsOpen = false;
 let activeNewsReplaceRulesOpen = false;
+let activeNewsBrandNameEditing = false;
 let pendingDeleteProjectId = null;
 let pendingDeleteNewsMonitorId = null;
 let pendingDeleteNewsMonitorMode = "brand";
@@ -977,6 +978,7 @@ function openNewsModal(brandKey) {
   activeNewsBrandKey = brandKey;
   activeNewsSelectorsOpen = false;
   activeNewsReplaceRulesOpen = false;
+  activeNewsBrandNameEditing = false;
   renderNewsModal();
   newsMonitorModal.classList.remove("hidden");
   newsMonitorModal.setAttribute("aria-hidden", "false");
@@ -988,6 +990,7 @@ function closeNewsModal() {
   activeNewsBrandKey = null;
   activeNewsSelectorsOpen = false;
   activeNewsReplaceRulesOpen = false;
+  activeNewsBrandNameEditing = false;
 }
 
 function updateNewsModalProgress() {
@@ -1076,7 +1079,19 @@ function renderNewsModal() {
   const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
   const brand = monitor.brand || "Донор";
   const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
-  newsModalTitle.textContent = brand;
+  const isDraftBrand = !brand || /^Новый бренд(?:\s+\d+)?$/i.test(brand);
+  const editingTitle = activeNewsBrandNameEditing || isDraftBrand;
+  newsModalTitle.innerHTML = editingTitle
+    ? `
+      <span class="modal-title-editor">
+        <input data-role="brand-title-input" type="text" value="${isDraftBrand ? "" : escapeHtml(brand)}" placeholder="Введите название бренда">
+        <button class="title-icon-button title-icon-button--save" data-action="save-brand-title" type="button" title="Принять название" aria-label="Принять название">✓</button>
+      </span>
+    `
+    : `
+      <span class="modal-title-text">${escapeHtml(brand)}</span>
+      <button class="title-icon-button" data-action="edit-brand-title" type="button" title="Редактировать название" aria-label="Редактировать название">✎</button>
+    `;
   newsModalSubtitle.textContent = site;
   newsModalTitleActions.innerHTML = `
   ${newsStatusHtml(state.status)}
@@ -1157,19 +1172,11 @@ function renderNewsModal() {
       </div>
     </div>
 
-    <div class="modal-form-grid">
-      <label class="field">
-        <span>Название бренда</span>
-        <input data-field="brand" type="text" value="${escapeHtml(monitor.brand || "")}">
-      </label>
-      <label class="field">
-        <span>Основной сайт</span>
-        <input data-field="site_url" type="text" value="${escapeHtml(monitor.site_url || "")}">
-      </label>
-      <label class="field modal-wide-field">
-        <span>Стартовые URL</span>
-        <textarea data-field="start_urls" rows="2">${escapeHtml((monitor.start_urls || []).join("\n"))}</textarea>
-      </label>
+    <div class="modal-settings-section modal-settings-section--scheduler">
+      <div class="modal-settings-section__head">
+        <h3>Настройки планировщика</h3>
+      </div>
+      <div class="modal-form-grid">
       <label class="field">
         <span>Расписание</span>
         <select data-field="schedule_type">${scheduleTypeOptionsHtml(monitor.schedule_type || "daily")}</select>
@@ -1185,6 +1192,22 @@ function renderNewsModal() {
       <label class="field">
         <span>Разовый запуск</span>
         <input data-field="next_run_at" type="datetime-local" value="${escapeHtml(formatDateTimeLocal(monitor.next_run_at || ""))}">
+      </label>
+      </div>
+    </div>
+
+    <div class="modal-settings-section">
+      <div class="modal-settings-section__head">
+        <h3>Настройки выбранного донора</h3>
+      </div>
+      <div class="modal-form-grid">
+      <label class="field">
+        <span>Основной сайт</span>
+        <input data-field="site_url" type="text" value="${escapeHtml(monitor.site_url || "")}">
+      </label>
+      <label class="field modal-wide-field">
+        <span>Стартовые URL</span>
+        <textarea data-field="start_urls" rows="2">${escapeHtml((monitor.start_urls || []).join("\n"))}</textarea>
       </label>
       <label class="field">
         <span>Потоки</span>
@@ -1210,14 +1233,16 @@ function renderNewsModal() {
         <span>Фильтр товарных ссылок</span>
         <textarea data-field="product_url_filters" rows="2">${escapeHtml((monitor.product_url_filters || []).join("\n"))}</textarea>
       </label>
+      </div>
     </div>
 
-    <div class="selector-toggle-row">
-      <button class="button secondary compact-button" data-action="toggle-modal-selectors" type="button">
-        ${activeNewsSelectorsOpen ? "Свернуть селекторы" : "Селекторы"}
-      </button>
-    </div>
-    <div class="modal-form-grid selector-panel ${activeNewsSelectorsOpen ? "" : "hidden"}">
+    <div class="modal-settings-section">
+      <div class="selector-toggle-row">
+        <button class="button secondary compact-button" data-action="toggle-modal-selectors" type="button">
+          ${activeNewsSelectorsOpen ? "Свернуть селекторы" : "Селекторы"}
+        </button>
+      </div>
+      <div class="modal-form-grid selector-panel ${activeNewsSelectorsOpen ? "" : "hidden"}">
       <label class="field">
         <span>Селектор карточки</span>
         <input data-rule="product_card_selector" type="text" value="${escapeHtml(monitor.extraction_rules?.product_card_selector || "")}">
@@ -1246,14 +1271,16 @@ function renderNewsModal() {
         <span>Селектор фото</span>
         <input data-selector="photo_selector" type="text" value="${escapeHtml(monitor.selector_settings?.photo_selector || "")}">
       </label>
+      </div>
     </div>
 
-    <div class="selector-toggle-row">
-      <button class="button secondary compact-button" data-action="toggle-modal-replace-rules" type="button">
-        ${activeNewsReplaceRulesOpen ? "Свернуть правила" : "Правила поиск/замены"}
-      </button>
-    </div>
-    <div class="modal-form-grid selector-panel ${activeNewsReplaceRulesOpen ? "" : "hidden"}">
+    <div class="modal-settings-section">
+      <div class="selector-toggle-row">
+        <button class="button secondary compact-button" data-action="toggle-modal-replace-rules" type="button">
+          ${activeNewsReplaceRulesOpen ? "Свернуть правила" : "Правила поиск/замены"}
+        </button>
+      </div>
+      <div class="modal-form-grid selector-panel ${activeNewsReplaceRulesOpen ? "" : "hidden"}">
       <label class="field modal-wide-field">
         <span>Начало парсинга модели</span>
         <input data-rule="model_start_marker" type="text" value="${escapeHtml(monitor.extraction_rules?.model_start_marker || "")}" placeholder="<h1 class=&quot;detail__title&quot;>">
@@ -1266,6 +1293,7 @@ function renderNewsModal() {
         <span>Правила для модели</span>
         <textarea data-rule="model_replace_rules" rows="5" placeholder="{reg[#[^A-Za-z0-9./\\-\\s]#]}|&#10;{reg[#\\s{2,}#]}| ">${escapeHtml(monitor.extraction_rules?.model_replace_rules || "")}</textarea>
       </label>
+      </div>
     </div>
 
     <div class="modal-actions">
@@ -1386,19 +1414,64 @@ async function saveNewsMonitor(root) {
   const monitorId = root.dataset.monitorId;
   const notice = root.querySelector("[data-role='monitor-notice']");
   if (notice) notice.textContent = "Сохраняю...";
-  const data = await requestJson(`/api/news/monitors/${monitorId}`, {
-    method: "PATCH",
-    body: JSON.stringify(collectMonitorPayload(root)),
-  });
-  const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
-  if (index >= 0) newsData.monitors[index] = data.monitor;
-  if (notice) {
-    notice.textContent = "Настройки сохранены";
-    window.setTimeout(() => {
-      notice.textContent = "";
-    }, 2500);
+  try {
+    const data = await requestJson(`/api/news/monitors/${monitorId}`, {
+      method: "PATCH",
+      body: JSON.stringify(collectMonitorPayload(root)),
+    });
+    const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
+    if (index >= 0) newsData.monitors[index] = data.monitor;
+    if (notice) {
+      notice.textContent = "Настройки сохранены";
+      window.setTimeout(() => {
+        notice.textContent = "";
+      }, 2500);
+    }
+    return data.monitor;
+  } catch (error) {
+    if (notice) notice.textContent = error.message;
+    throw error;
   }
-  return data.monitor;
+}
+
+async function saveNewsBrandTitle() {
+  const monitor = activeNewsMonitor();
+  if (!monitor) return;
+  const input = newsModalTitle.querySelector("[data-role='brand-title-input']");
+  const brand = input?.value.trim() || "";
+  if (!brand) {
+    input?.focus();
+    return;
+  }
+  const data = await requestJson(`/api/news/monitors/${monitor.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ brand }),
+  });
+  newsData = await requestJson("/api/news");
+  const updated = data.monitor || monitor;
+  activeNewsBrandKey = `${updated.group || monitor.group || "Маржа"}::${updated.brand || brand}`;
+  selectedNewsSites.set(activeNewsBrandKey, updated.id || monitor.id);
+  activeNewsBrandNameEditing = false;
+  renderNewsMonitors();
+  renderNewsModal();
+}
+
+async function persistPendingNewsBrandTitle() {
+  const monitor = activeNewsMonitor();
+  if (!monitor) return null;
+  const input = newsModalTitle.querySelector("[data-role='brand-title-input']");
+  const brand = input?.value.trim() || "";
+  if (!brand) return monitor;
+  const data = await requestJson(`/api/news/monitors/${monitor.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ brand }),
+  });
+  newsData = await requestJson("/api/news");
+  const updated = data.monitor || monitor;
+  activeNewsBrandKey = `${updated.group || monitor.group || "Маржа"}::${updated.brand || brand}`;
+  selectedNewsSites.set(activeNewsBrandKey, updated.id || monitor.id);
+  activeNewsBrandNameEditing = false;
+  return updated;
 }
 
 async function loadNews() {
@@ -1691,13 +1764,17 @@ async function addNewsMonitorToGroup(group) {
       body: JSON.stringify({
         brand: "Новый бренд",
         group,
-        start_urls: "https://example.com/",
+        start_urls: "",
         create_new_brand: true,
       }),
     });
     if (!newsData) newsData = await requestJson("/api/news");
     newsData.monitors.push(data.monitor);
     renderNewsMonitors();
+    selectedNewsSites.set(`${data.monitor.group}::${data.monitor.brand}`, data.monitor.id);
+    openNewsModal(`${data.monitor.group}::${data.monitor.brand}`);
+    activeNewsBrandNameEditing = true;
+    renderNewsModal();
   } catch (error) {
     errorText.textContent = error.message;
   }
@@ -1862,6 +1939,31 @@ newsModalTitleActions.addEventListener("click", async (event) => {
   }
 });
 
+newsModalTitle.addEventListener("click", (event) => {
+  const editButton = event.target.closest("[data-action='edit-brand-title']");
+  if (editButton) {
+    activeNewsBrandNameEditing = true;
+    renderNewsModal();
+    newsModalTitle.querySelector("[data-role='brand-title-input']")?.focus();
+    return;
+  }
+
+  const saveButton = event.target.closest("[data-action='save-brand-title']");
+  if (saveButton) {
+    saveNewsBrandTitle().catch((error) => {
+      errorText.textContent = error.message;
+    });
+  }
+});
+
+newsModalTitle.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || !event.target.closest("[data-role='brand-title-input']")) return;
+  event.preventDefault();
+  saveNewsBrandTitle().catch((error) => {
+    errorText.textContent = error.message;
+  });
+});
+
 newsModalContent.addEventListener("click", async (event) => {
   const selectorToggle = event.target.closest("[data-action='toggle-modal-selectors']");
   if (selectorToggle) {
@@ -1879,32 +1981,59 @@ newsModalContent.addEventListener("click", async (event) => {
 
   const addSiteDonorButton = event.target.closest("[data-action='add-news-site-donor']");
   if (addSiteDonorButton) {
+    const notice = newsModalContent.querySelector("[data-role='monitor-notice']");
     try {
-      const currentMonitor = activeNewsMonitor();
+      let currentMonitor = await persistPendingNewsBrandTitle();
+      currentMonitor = activeNewsMonitor() || currentMonitor;
       if (!currentMonitor) return;
       const urlInput = newsModalContent.querySelector("[data-role='new-site-donor-url']");
       const siteUrl = urlInput?.value.trim() || "";
       if (!siteUrl) {
         errorText.textContent = "Укажите сайт-донора.";
+        if (notice) notice.textContent = "Укажите сайт-донора.";
         urlInput?.focus();
         return;
       }
-      await saveNewsMonitor(newsModalContent);
-      const data = await requestJson("/api/news/monitors", {
-        method: "POST",
-        body: JSON.stringify({
-          group: currentMonitor.group || "Маржа",
-          brand: currentMonitor.brand || "Новый донор",
-          site_url: siteUrl,
-          start_urls: siteUrl,
-        }),
-      });
+      if (notice) notice.textContent = "Сохраняю...";
       if (!newsData) newsData = await requestJson("/api/news");
-      newsData.monitors.push(data.monitor);
-      selectedNewsSites.set(activeNewsBrandKey, data.monitor.id);
+      const currentSite = currentMonitor.site_url || (currentMonitor.start_urls || [])[0] || "";
+      if (!currentSite) {
+        const payload = collectMonitorPayload(newsModalContent);
+        payload.site_url = siteUrl;
+        payload.start_urls = siteUrl;
+        const data = await requestJson(`/api/news/monitors/${currentMonitor.id}`, {
+          method: "PATCH",
+          body: JSON.stringify(payload),
+        });
+        newsData = await requestJson("/api/news");
+        const updated = data.monitor || currentMonitor;
+        activeNewsBrandKey = `${updated.group || currentMonitor.group || "Маржа"}::${updated.brand || currentMonitor.brand || "Новый донор"}`;
+        selectedNewsSites.set(activeNewsBrandKey, updated.id);
+        if (notice) {
+          notice.textContent = "Сайт-донор сохранен";
+          window.setTimeout(() => {
+            notice.textContent = "";
+          }, 2500);
+        }
+      } else {
+        await saveNewsMonitor(newsModalContent);
+        const data = await requestJson("/api/news/monitors", {
+          method: "POST",
+          body: JSON.stringify({
+            group: currentMonitor.group || "Маржа",
+            brand: currentMonitor.brand || "Новый донор",
+            site_url: siteUrl,
+            start_urls: siteUrl,
+          }),
+        });
+        newsData = await requestJson("/api/news");
+        selectedNewsSites.set(activeNewsBrandKey, data.monitor.id);
+      }
+      urlInput.value = "";
       renderNewsMonitors();
       renderNewsModal();
     } catch (error) {
+      if (notice) notice.textContent = error.message;
       errorText.textContent = error.message;
     }
     return;

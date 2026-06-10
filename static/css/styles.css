@@ -1217,7 +1217,55 @@ select:focus {
 }
 
 .modal-head h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 4px;
+}
+
+.modal-title-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.modal-title-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(520px, 70vw);
+}
+
+.modal-title-editor input {
+  min-width: 260px;
+  height: 38px;
+  padding: 7px 10px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.title-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+
+.title-icon-button:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.title-icon-button--save {
+  border-color: var(--primary);
+  color: #e8fffb;
+  background: var(--primary);
 }
 
 .modal-head p {
@@ -1272,6 +1320,46 @@ select:focus {
 
 .modal-summary-row--diagnostics {
   margin-top: -8px;
+}
+
+.modal-settings-section {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.modal-settings-section--scheduler {
+  border-color: rgba(47, 180, 168, 0.4);
+  background: rgba(47, 180, 168, 0.055);
+}
+
+.modal-settings-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.modal-settings-section__head h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.modal-settings-section .modal-form-grid {
+  margin-top: 0;
+}
+
+.modal-settings-section .selector-toggle-row {
+  margin-bottom: 0;
+}
+
+.modal-settings-section .selector-panel {
+  margin-top: 10px;
 }
 
 .active-url-list {

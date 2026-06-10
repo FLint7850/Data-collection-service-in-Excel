@@ -9,6 +9,7 @@ import smtplib
 import ssl
 import threading
 import time
+import traceback
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, time as datetime_time, timedelta, timezone
@@ -81,6 +82,15 @@ BLOCKED_PAGE_MARKERS = (
 )
 
 app = Flask(__name__)
+
+
+@app.errorhandler(Exception)
+def log_unhandled_exception(error: Exception):
+    LOG_DIR.mkdir(exist_ok=True)
+    with (LOG_DIR / "flask-error.log").open("a", encoding="utf-8") as error_file:
+        error_file.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {request.method} {request.path}\n")
+        error_file.write("".join(traceback.format_exception(type(error), error, error.__traceback__)))
+    raise error
 
 
 @app.before_request
@@ -171,13 +181,13 @@ def ensure_storage() -> None:
     start_news_scheduler()
 
 
-def normalize_start_urls(value: object) -> List[str]:
+def normalize_start_urls(value: object, allow_empty: bool = False) -> List[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\n,]+", value)
     elif isinstance(value, list):
         raw_items = [str(item) for item in value]
     else:
-        raw_items = [DEFAULT_START_URL]
+        raw_items = [] if allow_empty else [DEFAULT_START_URL]
 
     urls = []
     for item in raw_items:
@@ -187,7 +197,7 @@ def normalize_start_urls(value: object) -> List[str]:
         normalized = normalize_url(item, item)
         if normalized and normalized not in urls:
             urls.append(normalized)
-    return urls or [DEFAULT_START_URL]
+    return urls or ([] if allow_empty else [DEFAULT_START_URL])
 
 
 def normalize_feed_url(raw_url: str) -> str:
@@ -668,11 +678,11 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     monitor = make_news_monitor(
         clean_text(str(item.get("group") or "РњР°СЂР¶Р°")),
         clean_text(str(item.get("brand") or "Р”РѕРЅРѕСЂ")),
-        normalize_start_urls(item.get("start_urls") or item.get("site_url") or DEFAULT_START_URL),
+        normalize_start_urls(item.get("start_urls") or item.get("site_url") or "", allow_empty=True),
     )
     monitor["id"] = str(item.get("id") or monitor["id"])
     monitor["created_at"] = str(item.get("created_at") or monitor["created_at"])
-    monitor["site_url"] = str(item.get("site_url") or monitor["start_urls"][0])
+    monitor["site_url"] = str(item.get("site_url") or (monitor["start_urls"][0] if monitor["start_urls"] else ""))
     monitor["enabled"] = bool(item.get("enabled", True))
     monitor["schedule_type"] = str(item.get("schedule_type") or "daily")
     monitor["scan_time"] = str(item.get("scan_time") or "01:00")[:5]
@@ -702,8 +712,10 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
 
 
 def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object]]:
-    urls = normalize_start_urls(item.get("start_urls") or item.get("site_url") or DEFAULT_START_URL)
+    urls = normalize_start_urls(item.get("start_urls") or item.get("site_url") or "", allow_empty=True)
     monitors = []
+    if not urls:
+        return [normalize_news_monitor({**item, "site_url": "", "start_urls": []})]
     for index, url in enumerate(urls):
         copy_item = dict(item)
         copy_item["id"] = str(item.get("id") or uuid.uuid4().hex[:10]) if index == 0 else uuid.uuid4().hex[:10]
@@ -824,7 +836,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.brand_id = brand.id
     site_url = str(normalized.get("site_url") or "").strip()
     if not site_url:
-        site_url = (normalize_start_urls(normalized.get("start_urls") or DEFAULT_START_URL) or [""])[0]
+        site_url = (normalize_start_urls(normalized.get("start_urls") or "", allow_empty=True) or [""])[0]
     row.site_url = site_url
     row.thread_count = parse_thread_count(normalized.get("thread_count", 4))
     row.connection_id = connection_method_id_for(session, normalized.get("connection_method"))
@@ -4628,10 +4640,37 @@ def start_news_scheduler() -> None:
                 reload_news_monitors_from_db()
                 due_ids = []
                 with news_lock:
+                    grouped_monitors: Dict[tuple[str, str], List[Dict[str, object]]] = {}
                     for monitor in news_settings.get("monitors", []):
-                        if is_monitor_due(monitor):
-                            monitor["state"] = {**monitor.get("state", {}), "status": "queued"}
-                            due_ids.append(str(monitor.get("id")))
+                        if not isinstance(monitor, dict):
+                            continue
+                        key = (
+                            clean_text(str(monitor.get("group") or "")),
+                            clean_text(str(monitor.get("brand") or "")),
+                        )
+                        grouped_monitors.setdefault(key, []).append(monitor)
+                    for brand_monitors in grouped_monitors.values():
+                        reference = brand_monitors[0]
+                        if not is_monitor_due(reference):
+                            continue
+                        primary_id = str(reference.get("primary_donor_id") or "")
+                        selected = next((item for item in brand_monitors if str(item.get("id")) == primary_id), None)
+                        if selected is None:
+                            selected = next(
+                                (
+                                    item
+                                    for item in brand_monitors
+                                    if normalize_start_urls(item.get("start_urls") or item.get("site_url") or "", allow_empty=True)
+                                ),
+                                brand_monitors[0],
+                            )
+                        if not normalize_start_urls(selected.get("start_urls") or selected.get("site_url") or "", allow_empty=True):
+                            add_news_log(selected, "Плановый запуск пропущен: у основного донора бренда не указан сайт.", "warning")
+                            continue
+                        selected["state"] = {**selected.get("state", {}), "status": "queued"}
+                        selected["brand_state"] = dict(selected["state"])
+                        sync_brand_runtime_fields(selected)
+                        due_ids.append(str(selected.get("id")))
                     if due_ids:
                         save_news_settings()
                 for monitor_id in due_ids:
@@ -4750,14 +4789,30 @@ def api_update_news_monitor(monitor_id: str):
     if not monitor:
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     payload = request.get_json(silent=True) or {}
+    if ("site_url" in payload or "start_urls" in payload) and not normalize_start_urls(
+        payload.get("start_urls") or payload.get("site_url") or "",
+        allow_empty=True,
+    ):
+        return jsonify({"error": "Укажите сайт-донор или стартовый URL перед сохранением настроек донора."}), 400
     with news_lock:
+        old_group = clean_text(str(monitor.get("group") or ""))
+        old_brand = clean_text(str(monitor.get("brand") or ""))
         if "brand" in payload:
-            monitor["brand"] = clean_text(str(payload.get("brand") or monitor.get("brand") or ""))
+            new_brand = clean_text(str(payload.get("brand") or monitor.get("brand") or ""))
+            if new_brand:
+                for item in news_settings.get("monitors", []):
+                    if (
+                        isinstance(item, dict)
+                        and clean_text(str(item.get("group") or "")) == old_group
+                        and clean_text(str(item.get("brand") or "")) == old_brand
+                    ):
+                        item["brand"] = new_brand
+                monitor["brand"] = new_brand
         if "site_url" in payload:
             monitor["site_url"] = str(payload.get("site_url") or "").strip()
         if "start_urls" in payload:
-            monitor["start_urls"] = normalize_start_urls(payload.get("start_urls"))
-            monitor["site_url"] = monitor.get("site_url") or monitor["start_urls"][0]
+            monitor["start_urls"] = normalize_start_urls(payload.get("start_urls"), allow_empty=True)
+            monitor["site_url"] = monitor.get("site_url") or (monitor["start_urls"][0] if monitor["start_urls"] else "")
         if "enabled" in payload:
             monitor["enabled"] = bool(payload.get("enabled"))
         if "schedule_type" in payload:
@@ -4808,6 +4863,8 @@ def api_scan_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+    if not normalize_start_urls(monitor.get("start_urls") or monitor.get("site_url") or "", allow_empty=True):
+        return jsonify({"error": "У выбранного донора не указан сайт или стартовый URL. Заполните сайт-донор и сохраните настройки."}), 400
     if monitor.get("state", {}).get("status") in {"running", "queued"}:
         return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
     with news_lock:
@@ -4884,7 +4941,7 @@ def api_resume_news_monitor(monitor_id: str):
 def api_create_news_monitor():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
-    urls = normalize_start_urls(payload.get("start_urls") or payload.get("site_url") or DEFAULT_START_URL)
+    urls = normalize_start_urls(payload.get("start_urls") or payload.get("site_url") or "", allow_empty=True)
     group = clean_text(str(payload.get("group") or "РњР°СЂР¶Р°"))
     brand = clean_text(str(payload.get("brand") or "РќРѕРІС‹Р№ РґРѕРЅРѕСЂ"))
     if payload.get("create_new_brand"):
