@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import csv
 import html as html_lib
@@ -99,7 +99,6 @@ def close_request_db_session(error: Optional[BaseException] = None) -> None:
     db.close()
 
 state_lock = threading.RLock()
-exclusions_lock = threading.Lock()
 projects_lock = threading.RLock()
 news_lock = threading.RLock()
 active_stop_event = threading.Event()
@@ -683,27 +682,13 @@ def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object
     return monitors
 
 
-def group_type_from_group(group: str) -> str:
-    normalized = repair_mojibake_text(clean_text(group)).lower().replace("ё", "е")
-    if (
-        "немарж" in normalized
-        or "не марж" in normalized
-        or "non_margin" in normalized
-        or "non-margin" in normalized
-    ):
-        return "non_margin"
-    if "марж" in normalized or "margin" in normalized:
-        return "margin"
-    return "non_margin"
-
-
 def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ Р±СЂРµРЅРґ") -> str:
     base_name = clean_text(base_name) or "РќРѕРІС‹Р№ Р±СЂРµРЅРґ"
-    group_type = group_type_from_group(group)
+    group_name = clean_text(group)
     names = {
         clean_text(str(item.get("brand") or ""))
         for item in news_settings.get("monitors", [])
-        if isinstance(item, dict) and group_type_from_group(str(item.get("group") or "")) == group_type
+        if isinstance(item, dict) and clean_text(str(item.get("group") or "")) == group_name
     }
     if base_name not in names:
         return base_name
@@ -718,6 +703,7 @@ def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
     brand_state = repair_mojibake({**make_news_state(), **(brand.state or {})}) if brand else make_news_state()
+    brand_exclusions = normalize_patterns((brand.exclusions if brand else None) or row.exclusions or DEFAULT_EXCLUSIONS)
     monitor = {
         "id": str(row.id),
         "group": brand.group_name if brand else "",
@@ -735,7 +721,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "thread_count": parse_thread_count(row.thread_count),
         "connection_method": normalize_connection_method(row.connection_method),
         "auto_connection_fallback": bool(row.auto_connection_fallback),
-        "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
+        "exclusions": brand_exclusions,
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "selector_settings": normalize_selector_settings(row.selector_settings or {}),
@@ -760,14 +746,13 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
 def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
     name = clean_text(str(monitor.get("brand") or "Р”РѕРЅРѕСЂ"))
     group_name = clean_text(str(monitor.get("group") or "РњР°СЂР¶Р°"))
-    group_type = group_type_from_group(group_name)
-    row = session.scalar(select(Brand).where(Brand.name == name, Brand.group_type == group_type))
+    row = session.scalar(select(Brand).where(Brand.name == name, Brand.group_name == group_name))
     if row is None:
         row = Brand(
             name=name,
             group_name=group_name,
-            group_type=group_type,
             collapsed=bool(monitor.get("collapsed", True)),
+            exclusions=normalize_patterns(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
             state=dict(monitor.get("brand_state") or make_news_state()),
         )
         session.add(row)
@@ -775,6 +760,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
     else:
         row.group_name = group_name
         row.collapsed = bool(monitor.get("collapsed", row.collapsed))
+        row.exclusions = normalize_patterns(monitor.get("exclusions", row.exclusions or DEFAULT_EXCLUSIONS))
         row.state = {**make_news_state(), **(monitor.get("brand_state") or row.state or {})}
     return row
 
@@ -802,7 +788,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.connection_method = normalize_connection_method(normalized.get("connection_method"))
     row.connection_method_id = connection_method_id_for(session, row.connection_method)
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
-    row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
+    row.exclusions = normalize_patterns(brand.exclusions or normalized.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
     row.extraction_rules = normalize_extraction_rules(normalized.get("extraction_rules", {}))
     row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
@@ -880,9 +866,9 @@ def save_news_settings() -> None:
                     continue
                 group_name = clean_text(str(monitor.get("group") or "РњР°СЂР¶Р°"))
                 brand_name = clean_text(str(monitor.get("brand") or "Р”РѕРЅРѕСЂ"))
-                grouped_monitors.setdefault((brand_name, group_type_from_group(group_name)), []).append(monitor)
-            for (brand_name, group_type), brand_monitors in grouped_monitors.items():
-                brand_row = session.scalar(select(Brand).where(Brand.name == brand_name, Brand.group_type == group_type))
+                grouped_monitors.setdefault((brand_name, group_name), []).append(monitor)
+            for (brand_name, group_name), brand_monitors in grouped_monitors.items():
+                brand_row = session.scalar(select(Brand).where(Brand.name == brand_name, Brand.group_name == group_name))
                 if brand_row:
                     brand_row.state = aggregate_brand_state(brand_monitors)
             if current_donor_ids:
@@ -1045,22 +1031,6 @@ def public_news_settings() -> Dict[str, object]:
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
             "monitors": [public_news_monitor(monitor) for monitor in news_settings.get("monitors", [])],
         }
-
-
-
-def load_exclusions() -> List[str]:
-    return DEFAULT_EXCLUSIONS.copy()
-
-
-def save_exclusions(items: Iterable[str]) -> None:
-    return None
-
-
-def ensure_storage_without_exclusions_loop() -> None:
-    EXPORT_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
-    FEED_DIR.mkdir(exist_ok=True)
-
 
 def reset_state(status: str = "idle", run_id: Optional[int] = None, thread_count: Optional[int] = None) -> None:
     with state_lock:
@@ -2705,7 +2675,7 @@ class MaunfeldCrawler:
         self.start_url = self.start_urls[0]
         self.root_netloc = urlparse(self.start_url).netloc
         self.project = project
-        self.exclusions = exclusions if exclusions is not None else load_exclusions()
+        self.exclusions = exclusions if exclusions is not None else DEFAULT_EXCLUSIONS.copy()
         self.product_url_filters = normalize_patterns(product_url_filters or [])
         self.extraction_rules = normalize_extraction_rules(extraction_rules or {})
         self.connection_method = normalize_connection_method(connection_method)
@@ -4043,6 +4013,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
     add_news_log(monitor, "Р СѓС‡РЅРѕРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє Р·Р°РїСѓС‰РµРЅРѕ" if manual else "РџР»Р°РЅРѕРІРѕРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє Р·Р°РїСѓС‰РµРЅРѕ", "info")
+    add_news_log(monitor, "Начал сбор", "info")
 
     try:
         update_news_monitor_state(monitor, stage="РџРѕРґРіРѕС‚РѕРІРєР°", percent=2)
@@ -4056,10 +4027,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         update_news_monitor_state(monitor, stage="РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р°-РґРѕРЅРѕСЂР°", percent=5)
         products = collect_products_for_monitor(monitor, stop_event)
         check_stopped()
+        add_news_log(monitor, "Сбор закончил", "info")
         add_news_log(monitor, f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р° Р·Р°РІРµСЂС€РµРЅРѕ. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ: {len(products)}", "info")
         update_news_monitor_state(monitor, stage="Р“РµРЅРµСЂР°С†РёСЏ Рё Р·Р°РіСЂСѓР·РєР° С„РёРґРѕРІ РІР°С€РёС… СЃР°Р№С‚РѕРІ", percent=84, currenturl="")
+        add_news_log(monitor, "Скачивание фида", "info")
         all_existing_codes, local_feeds, feed_code_sets = fetch_existing_vendor_code_sets()
         check_stopped()
+        add_news_log(monitor, "Фид скачался", "info")
         add_news_log(
             monitor,
             f"Р¤РёРґС‹ РѕР±РЅРѕРІР»РµРЅС‹ РїРѕСЃР»Рµ СЃР±РѕСЂР° РґРѕРЅРѕСЂР°: {len(local_feeds)}. РњРѕРґРµР»РµР№ РІСЃРµРіРѕ: {len(all_existing_codes)}",
@@ -4074,6 +4048,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             compared_products=0,
             currenturl="",
         )
+        add_news_log(monitor, "Началось сравнение", "info")
         known = monitor.get("known_new_products", {}) if isinstance(monitor.get("known_new_products"), dict) else {}
         for index, product in enumerate(products, start=1):
             check_stopped()
@@ -4104,6 +4079,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             new_items.append(details)
             known[model_key] = details
         missing_summary = build_missing_summary(new_items, feed_code_sets)
+        add_news_log(monitor, "Сравнение закончилось", "info")
         for item in missing_summary:
             add_news_log(
                 monitor,
@@ -4321,12 +4297,6 @@ def index() -> str:
 @app.get("/api/state")
 def api_state():
     return jsonify(snapshot_state())
-
-
-@app.get("/api/exclusions")
-def api_exclusions():
-    with exclusions_lock:
-        return jsonify({"exclusions": load_exclusions()})
 
 
 @app.get("/api/news")
@@ -5031,32 +5001,6 @@ def api_logs_settings():
         news_settings["auto_cleanup"] = auto_cleanup
         save_news_settings()
     return jsonify({"auto_cleanup": auto_cleanup})
-
-
-@app.post("/api/exclusions")
-def add_exclusion():
-    payload = request.get_json(silent=True) or {}
-    pattern = str(payload.get("pattern", "")).strip()
-    if not pattern:
-        return jsonify({"error": "РџСѓСЃС‚РѕРµ РёСЃРєР»СЋС‡РµРЅРёРµ"}), 400
-
-    with exclusions_lock:
-        items = load_exclusions()
-        if pattern not in items:
-            items.append(pattern)
-            save_exclusions(items)
-    return jsonify({"exclusions": items})
-
-
-@app.delete("/api/exclusions/<int:index>")
-def delete_exclusion(index: int):
-    with exclusions_lock:
-        items = load_exclusions()
-        if index < 0 or index >= len(items):
-            return jsonify({"error": "РСЃРєР»СЋС‡РµРЅРёРµ РЅРµ РЅР°Р№РґРµРЅРѕ"}), 404
-        items.pop(index)
-        save_exclusions(items)
-    return jsonify({"exclusions": items})
 
 
 @app.post("/start")

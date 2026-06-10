@@ -845,12 +845,12 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
   const status = aggregateNewsStatus(states);
   const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
   const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
-  const newCount = states.reduce((sum, state) => sum + Number(state.new_count || 0), 0);
+  const newCount = Number(activeState.new_count || 0);
   const inMemoryProducts = Number(activeState.in_memory_products || activeState.found_products || 0);
   const queueSize = Number(activeState.queue_size || 0);
   const activeTasks = Number(activeState.active_tasks || 0);
   const stallSeconds = Number(activeState.stall_seconds || 0);
-  const missingSummary = aggregateMissingByFeed(states);
+  const missingSummary = aggregateMissingByFeed([activeState]);
   const lastScan = states.map((state) => state.last_scan_at || "").filter(Boolean).sort().pop() || "—";
   return `
     <span class="news-tile-remove-wrap">

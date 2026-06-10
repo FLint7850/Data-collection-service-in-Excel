@@ -33,14 +33,19 @@ def init_db() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     migrate_app_settings_table()
     Base.metadata.create_all(bind=engine)
-    with engine.begin() as connection:
-        connection.execute(text("PRAGMA journal_mode=WAL"))
-        connection.execute(text("PRAGMA busy_timeout=5000"))
-        migrate_schema(connection)
-        connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
-        current_revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
-        if not current_revision:
-            connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('20260608_0001')"))
+    with engine.connect() as connection:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.commit()
+        with connection.begin():
+            connection.execute(text("PRAGMA journal_mode=WAL"))
+            connection.execute(text("PRAGMA busy_timeout=5000"))
+            migrate_schema(connection)
+            connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
+            current_revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
+            if not current_revision:
+                connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('20260608_0001')"))
+        connection.execute(text("PRAGMA foreign_keys=ON"))
+        connection.commit()
 
 
 def table_columns(connection, table_name: str) -> dict[str, str]:
@@ -143,9 +148,94 @@ def migrate_app_settings_current_table(connection) -> None:
 
 def migrate_brands_table(connection) -> None:
     columns = table_columns(connection, "brands")
-    if not columns or "exclusions" not in columns:
+    if not columns:
         return
-    connection.execute(text("ALTER TABLE brands DROP COLUMN exclusions"))
+    needs_rebuild = "group_type" in columns or "exclusions" not in columns
+    if not needs_rebuild:
+        return
+
+    donor_columns = table_columns(connection, "donors")
+    exclusions_expr = (
+        safe_json_expr("brands.exclusions", "[]")
+        if "exclusions" in columns
+        else (
+            "COALESCE((SELECT exclusions FROM donors WHERE donors.brand_id = brands.id AND json_valid(exclusions) LIMIT 1), json('[]'))"
+            if donor_columns
+            else "json('[]')"
+        )
+    )
+    state_expr = safe_json_expr("brands.state", '{"status":"idle"}') if "state" in columns else "json('{\"status\":\"idle\"}')"
+
+    connection.execute(text("DROP TABLE IF EXISTS brand_id_map"))
+    connection.execute(
+        text(
+            "CREATE TEMP TABLE brand_id_map AS "
+            "SELECT old_brand.id AS old_id, MIN(new_brand.id) AS new_id "
+            "FROM brands old_brand "
+            "JOIN brands new_brand ON new_brand.name = old_brand.name AND new_brand.group_name = old_brand.group_name "
+            "GROUP BY old_brand.id"
+        )
+    )
+    if donor_columns:
+        connection.execute(text("DROP TABLE IF EXISTS donors_brand_backup"))
+        connection.execute(
+            text(
+                "CREATE TEMP TABLE donors_brand_backup AS "
+                "SELECT donors.*, COALESCE(brand_id_map.new_id, donors.brand_id) AS migrated_brand_id "
+                "FROM donors LEFT JOIN brand_id_map ON brand_id_map.old_id = donors.brand_id"
+            )
+        )
+    connection.execute(text("DROP TABLE IF EXISTS brands_migration_tmp"))
+    connection.execute(
+        text(
+            "CREATE TABLE brands_migration_tmp ("
+            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+            "name VARCHAR(255) NOT NULL, "
+            "group_name VARCHAR(255) NOT NULL DEFAULT '', "
+            "collapsed BOOLEAN NOT NULL DEFAULT 1, "
+            "exclusions JSON NOT NULL DEFAULT '[]', "
+            "state JSON NOT NULL DEFAULT '{\"status\":\"idle\"}', "
+            "created_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL, "
+            "CONSTRAINT uq_brands_name_group_name UNIQUE (name, group_name)"
+            ")"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO brands_migration_tmp (id, name, group_name, collapsed, exclusions, state, created_at, updated_at) "
+            "SELECT brands.id, brands.name, brands.group_name, COALESCE(brands.collapsed, 1), "
+            f"{exclusions_expr}, {state_expr}, "
+            "COALESCE(brands.created_at, CURRENT_TIMESTAMP), COALESCE(brands.updated_at, CURRENT_TIMESTAMP) "
+            "FROM brands "
+            "WHERE brands.id = (SELECT MIN(dedup.id) FROM brands dedup WHERE dedup.name = brands.name AND dedup.group_name = brands.group_name) "
+            "ORDER BY brands.id"
+        )
+    )
+    connection.execute(
+        text(
+            "UPDATE donors SET brand_id = ("
+            "SELECT brand_id_map.new_id FROM brand_id_map WHERE brand_id_map.old_id = donors.brand_id"
+            ") WHERE EXISTS (SELECT 1 FROM brand_id_map WHERE brand_id_map.old_id = donors.brand_id)"
+        )
+    )
+    connection.execute(text("DROP TABLE brands"))
+    connection.execute(text("ALTER TABLE brands_migration_tmp RENAME TO brands"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+    if donor_columns:
+        connection.execute(text("DELETE FROM donors WHERE id IN (SELECT id FROM donors_brand_backup)"))
+        connection.execute(
+            text(
+                "INSERT INTO donors (id, legacy_id, brand_id, site_url, start_urls, enabled, schedule_type, "
+                "scan_time, weekday, next_run_at, thread_count, connection_method, connection_method_id, "
+                "auto_connection_fallback, exclusions, product_url_filters, extraction_rules, selector_settings, "
+                "seen_models, known_new_products, created_at, updated_at) "
+                "SELECT id, legacy_id, migrated_brand_id, site_url, start_urls, enabled, schedule_type, "
+                "scan_time, weekday, next_run_at, thread_count, connection_method, connection_method_id, "
+                "auto_connection_fallback, exclusions, product_url_filters, extraction_rules, selector_settings, "
+                "seen_models, known_new_products, created_at, updated_at FROM donors_brand_backup"
+            )
+        )
 
 
 def migrate_projects_table(connection) -> None:

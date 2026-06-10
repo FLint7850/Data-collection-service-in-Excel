@@ -34,8 +34,8 @@ class Brand(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     group_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    group_type: Mapped[str] = mapped_column(String(32), default="non_margin", nullable=False)
     collapsed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -44,7 +44,7 @@ class Brand(Base):
 
     __table_args__ = (
         Index("ix_brands_name", "name"),
-        UniqueConstraint("name", "group_type", name="uq_brands_name_group_type"),
+        UniqueConstraint("name", "group_name", name="uq_brands_name_group_name"),
     )
 
 
