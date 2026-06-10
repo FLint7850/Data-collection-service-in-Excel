@@ -155,51 +155,8 @@ def migrate_projects_table(connection) -> None:
     if "exclusions" not in columns:
         connection.execute(text("ALTER TABLE projects ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
         columns = table_columns(connection, "projects")
-    needs_rebuild = columns.get("id") != "INTEGER" or "legacy_id" not in columns
-    if not needs_rebuild:
-        return
-
-    connection.execute(text("DROP TABLE IF EXISTS projects_migration_tmp"))
-    connection.execute(
-        text(
-            "CREATE TABLE projects_migration_tmp ("
-            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
-            "legacy_id VARCHAR(32) NOT NULL UNIQUE DEFAULT '', "
-            "name VARCHAR(255) NOT NULL, "
-            "start_urls JSON NOT NULL, "
-            "thread_count INTEGER NOT NULL, "
-            "exclusions JSON NOT NULL, "
-            "product_url_filters JSON NOT NULL, "
-            "extraction_rules JSON NOT NULL, "
-            "state JSON NOT NULL, "
-            "auto_cleanup BOOLEAN NOT NULL, "
-            "connection_method VARCHAR(64) NOT NULL, "
-            "auto_connection_fallback BOOLEAN NOT NULL, "
-            "created_at DATETIME NOT NULL, "
-            "updated_at DATETIME NOT NULL"
-            ")"
-        )
-    )
-    id_expr = "CAST(id AS TEXT)" if columns.get("id") != "INTEGER" else "COALESCE(legacy_id, CAST(id AS TEXT))"
-    connection.execute(
-        text(
-            "INSERT INTO projects_migration_tmp (legacy_id, name, start_urls, thread_count, exclusions, "
-            "product_url_filters, extraction_rules, state, auto_cleanup, connection_method, "
-            "auto_connection_fallback, created_at, updated_at) "
-            f"SELECT {id_expr}, name, {safe_json_expr('start_urls', '[]')}, "
-            "CAST(COALESCE(NULLIF(thread_count, ''), 4) AS INTEGER), "
-            f"{safe_json_expr('exclusions', '[]')}, "
-            f"{safe_json_expr('product_url_filters', '[]')}, "
-            f"{safe_json_expr('extraction_rules', '{}')}, "
-            f"{safe_json_expr('state', '{}')}, "
-            "COALESCE(auto_cleanup, 0), COALESCE(NULLIF(connection_method, ''), 'requests'), "
-            "COALESCE(auto_connection_fallback, 1), "
-            "COALESCE(created_at, CURRENT_TIMESTAMP), COALESCE(updated_at, CURRENT_TIMESTAMP) "
-            "FROM projects ORDER BY created_at, rowid"
-        )
-    )
-    connection.execute(text("DROP TABLE projects"))
-    connection.execute(text("ALTER TABLE projects_migration_tmp RENAME TO projects"))
+    if "legacy_id" not in columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN legacy_id VARCHAR(32) NOT NULL DEFAULT ''"))
 
 
 def migrate_donors_table(connection) -> None:
@@ -210,74 +167,19 @@ def migrate_donors_table(connection) -> None:
         connection.execute(text("ALTER TABLE donors RENAME COLUMN connections_method TO connection_method"))
         columns = table_columns(connection, "donors")
 
-    needs_rebuild = (
-        columns.get("id") != "INTEGER"
-        or columns.get("next_run_at") != "DATETIME"
-        or "legacy_id" not in columns
-        or "connection_method_id" not in columns
-        or "state" in columns
-    )
-    if not needs_rebuild:
-        return
-
-    connection.execute(text("DROP TABLE IF EXISTS donors_migration_tmp"))
+    if "legacy_id" not in columns:
+        connection.execute(text("ALTER TABLE donors ADD COLUMN legacy_id VARCHAR(32) NOT NULL DEFAULT ''"))
+        columns = table_columns(connection, "donors")
+    if "connection_method_id" not in columns:
+        connection.execute(text("ALTER TABLE donors ADD COLUMN connection_method_id INTEGER"))
+        columns = table_columns(connection, "donors")
     connection.execute(
         text(
-            "CREATE TABLE donors_migration_tmp ("
-            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
-            "legacy_id VARCHAR(32) NOT NULL UNIQUE DEFAULT '', "
-            "brand_id INTEGER NOT NULL, "
-            "site_url TEXT NOT NULL, "
-            "start_urls JSON NOT NULL, "
-            "enabled BOOLEAN NOT NULL, "
-            "schedule_type VARCHAR(32) NOT NULL, "
-            "scan_time VARCHAR(8) NOT NULL, "
-            "weekday INTEGER NOT NULL, "
-            "next_run_at DATETIME, "
-            "thread_count INTEGER NOT NULL, "
-            "connection_method VARCHAR(64) NOT NULL, "
-            "connection_method_id INTEGER, "
-            "auto_connection_fallback BOOLEAN NOT NULL, "
-            "exclusions JSON NOT NULL, "
-            "product_url_filters JSON NOT NULL, "
-            "extraction_rules JSON NOT NULL, "
-            "selector_settings JSON NOT NULL, "
-            "seen_models JSON NOT NULL, "
-            "known_new_products JSON NOT NULL, "
-            "created_at DATETIME NOT NULL, "
-            "updated_at DATETIME NOT NULL, "
-            "FOREIGN KEY(brand_id) REFERENCES brands (id) ON DELETE CASCADE, "
-            "FOREIGN KEY(connection_method_id) REFERENCES connection_methods (id)"
-            ")"
+            "UPDATE donors SET connection_method_id = "
+            "(SELECT id FROM connection_methods WHERE code = COALESCE(NULLIF(donors.connection_method, ''), 'requests') LIMIT 1) "
+            "WHERE connection_method_id IS NULL"
         )
     )
-    id_expr = "CAST(id AS TEXT)" if columns.get("id") != "INTEGER" else "COALESCE(legacy_id, CAST(id AS TEXT))"
-    connection.execute(
-        text(
-            "INSERT INTO donors_migration_tmp (legacy_id, brand_id, site_url, start_urls, enabled, "
-            "schedule_type, scan_time, weekday, next_run_at, thread_count, connection_method, "
-            "connection_method_id, auto_connection_fallback, exclusions, product_url_filters, "
-            "extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
-            f"SELECT {id_expr}, brand_id, COALESCE(site_url, ''), {safe_json_expr('start_urls', '[]')}, "
-            "COALESCE(enabled, 1), COALESCE(NULLIF(schedule_type, ''), 'daily'), "
-            "COALESCE(NULLIF(scan_time, ''), '01:00'), CAST(COALESCE(NULLIF(weekday, ''), 0) AS INTEGER), "
-            f"{datetime_expr('next_run_at')}, "
-            "CAST(COALESCE(NULLIF(thread_count, ''), 4) AS INTEGER), "
-            "COALESCE(NULLIF(connection_method, ''), 'requests'), "
-            "(SELECT id FROM connection_methods WHERE code = COALESCE(NULLIF(donors.connection_method, ''), 'requests') LIMIT 1), "
-            "COALESCE(auto_connection_fallback, 1), "
-            f"{safe_json_expr('exclusions', '[]')}, "
-            f"{safe_json_expr('product_url_filters', '[]')}, "
-            f"{safe_json_expr('extraction_rules', '{}')}, "
-            f"{safe_json_expr('selector_settings', '{}')}, "
-            f"{safe_json_expr('seen_models', '[]')}, "
-            f"{safe_json_expr('known_new_products', '{}')}, "
-            "COALESCE(created_at, CURRENT_TIMESTAMP), COALESCE(updated_at, CURRENT_TIMESTAMP) "
-            "FROM donors ORDER BY brand_id, created_at, rowid"
-        )
-    )
-    connection.execute(text("DROP TABLE donors"))
-    connection.execute(text("ALTER TABLE donors_migration_tmp RENAME TO donors"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
 
 
