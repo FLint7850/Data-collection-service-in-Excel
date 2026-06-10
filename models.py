@@ -34,13 +34,27 @@ class Brand(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     group_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
-    collapsed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    schedule_type: Mapped[str] = mapped_column(String(32), default="daily", nullable=False)
+    scan_time: Mapped[str] = mapped_column(String(8), default="01:00", nullable=False)
+    weekday: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    primary_donor_id: Mapped[int | None] = mapped_column(ForeignKey("donors.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    donors: Mapped[list["Donor"]] = relationship("Donor", back_populates="brand", cascade="all, delete-orphan")
+    donors: Mapped[list["Donor"]] = relationship(
+        "Donor",
+        back_populates="brand",
+        cascade="all, delete-orphan",
+        foreign_keys="Donor.brand_id",
+    )
+    primary_donor: Mapped["Donor | None"] = relationship(
+        "Donor",
+        foreign_keys=[primary_donor_id],
+        post_update=True,
+    )
 
     __table_args__ = (
         Index("ix_brands_name", "name"),
@@ -55,15 +69,8 @@ class Donor(Base):
     legacy_id: Mapped[str] = mapped_column(String(32), default="", nullable=False, unique=True)
     brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"), nullable=False)
     site_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    start_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    schedule_type: Mapped[str] = mapped_column(String(32), default="daily", nullable=False)
-    scan_time: Mapped[str] = mapped_column(String(8), default="01:00", nullable=False)
-    weekday: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     thread_count: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
-    connection_method: Mapped[str] = mapped_column(String(64), default="requests", nullable=False)
-    connection_method_id: Mapped[int | None] = mapped_column(ForeignKey("connection_methods.id"), nullable=True)
+    connection_id: Mapped[int | None] = mapped_column(ForeignKey("connection_methods.id"), nullable=True)
     auto_connection_fallback: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     product_url_filters: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
@@ -74,7 +81,7 @@ class Donor(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    brand: Mapped[Brand] = relationship("Brand", back_populates="donors")
+    brand: Mapped[Brand] = relationship("Brand", back_populates="donors", foreign_keys=[brand_id])
     connection_method_row: Mapped["ConnectionMethod | None"] = relationship("ConnectionMethod")
 
     __table_args__ = (Index("ix_donors_brand_id", "brand_id"),)

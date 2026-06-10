@@ -731,35 +731,42 @@ def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ 
         index += 1
 
 
+def donor_connection_code(row: Donor) -> str:
+    method_row = getattr(row, "connection_method_row", None)
+    return normalize_connection_method(getattr(method_row, "code", None))
+
+
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
     brand_state = repair_mojibake({**make_news_state(), **(brand.state or {})}) if brand else make_news_state()
-    brand_exclusions = normalize_patterns((brand.exclusions if brand else None) or row.exclusions or DEFAULT_EXCLUSIONS)
+    site_url = str(row.site_url or "").strip()
     monitor = {
         "id": str(row.id),
         "group": brand.group_name if brand else "",
-        "brand": brand.name if brand else "Р”РѕРЅРѕСЂ",
+        "brand": brand.name if brand else "Донор",
         "brand_id": brand.id if brand else None,
+        "primary_donor_id": brand.primary_donor_id if brand else None,
+        "is_primary": bool(brand and brand.primary_donor_id == row.id),
         "brand_state": brand_state,
         "created_at": row.created_at.isoformat(timespec="milliseconds") if row.created_at else "",
-        "site_url": row.site_url,
-        "start_urls": normalize_start_urls(row.start_urls or row.site_url or DEFAULT_START_URL),
-        "enabled": bool(row.enabled),
-        "schedule_type": row.schedule_type,
-        "scan_time": row.scan_time,
-        "weekday": max(0, min(int(row.weekday or 0), 6)),
-        "next_run_at": datetime_to_input_value(row.next_run_at),
+        "site_url": site_url,
+        "start_urls": [site_url] if site_url else [],
+        "enabled": bool(brand.enabled) if brand else True,
+        "schedule_type": brand.schedule_type if brand else "daily",
+        "scan_time": brand.scan_time if brand else "01:00",
+        "weekday": max(0, min(int((brand.weekday if brand else 0) or 0), 6)),
+        "next_run_at": datetime_to_input_value(brand.next_run_at if brand else None),
         "thread_count": parse_thread_count(row.thread_count),
-        "connection_method": normalize_connection_method(row.connection_method),
+        "connection_method": donor_connection_code(row),
+        "connection_id": row.connection_id,
         "auto_connection_fallback": bool(row.auto_connection_fallback),
-        "exclusions": brand_exclusions,
+        "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "selector_settings": normalize_selector_settings(row.selector_settings or {}),
         "seen_models": [normalize_model_key(str(value)) for value in (row.seen_models or []) if str(value).strip()],
         "known_new_products": row.known_new_products or {},
         "state": dict(brand_state),
-        "collapsed": bool(brand.collapsed) if brand else True,
     }
     if monitor["state"].get("status") in {"running", "queued", "pausing", "stopping"}:
         monitor["state"]["status"] = "error"
@@ -775,24 +782,31 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
 
 
 def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
-    name = clean_text(str(monitor.get("brand") or "Р”РѕРЅРѕСЂ"))
-    group_name = clean_text(str(monitor.get("group") or "РњР°СЂР¶Р°"))
+    name = clean_text(str(monitor.get("brand") or "Донор"))
+    group_name = clean_text(str(monitor.get("group") or "Маржа"))
     row = session.scalar(select(Brand).where(Brand.name == name, Brand.group_name == group_name))
     if row is None:
         row = Brand(
             name=name,
             group_name=group_name,
-            collapsed=bool(monitor.get("collapsed", True)),
-            exclusions=normalize_patterns(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
-            state=dict(monitor.get("brand_state") or make_news_state()),
+            state={**make_news_state(), **(monitor.get("brand_state") or monitor.get("state") or {})},
+            enabled=bool(monitor.get("enabled", True)),
+            schedule_type=str(monitor.get("schedule_type") or "daily"),
+            scan_time=str(monitor.get("scan_time") or "01:00")[:5],
+            weekday=max(0, min(int(monitor.get("weekday", 0) or 0), 6)),
+            next_run_at=parse_datetime_value(monitor.get("next_run_at")),
         )
         session.add(row)
         session.flush()
     else:
         row.group_name = group_name
-        row.collapsed = bool(monitor.get("collapsed", row.collapsed))
-        row.exclusions = normalize_patterns(monitor.get("exclusions", row.exclusions or DEFAULT_EXCLUSIONS))
-        row.state = {**make_news_state(), **(monitor.get("brand_state") or row.state or {})}
+        row.state = {**make_news_state(), **(monitor.get("brand_state") or monitor.get("state") or row.state or {})}
+        row.enabled = bool(monitor.get("enabled", row.enabled))
+        schedule_type = str(monitor.get("schedule_type") or row.schedule_type or "daily")
+        row.schedule_type = schedule_type if schedule_type in {"daily", "weekly", "once"} else "daily"
+        row.scan_time = str(monitor.get("scan_time") or row.scan_time or "01:00")[:5]
+        row.weekday = max(0, min(int(monitor.get("weekday", row.weekday) or 0), 6))
+        row.next_run_at = parse_datetime_value(monitor.get("next_run_at"))
     return row
 
 
@@ -808,24 +822,24 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
         )
         session.add(row)
     row.brand_id = brand.id
-    row.site_url = str(normalized.get("site_url") or "")
-    row.start_urls = normalize_start_urls(normalized.get("start_urls") or normalized.get("site_url") or DEFAULT_START_URL)
-    row.enabled = bool(normalized.get("enabled", True))
-    row.schedule_type = str(normalized.get("schedule_type") or "daily")
-    row.scan_time = str(normalized.get("scan_time") or "01:00")[:5]
-    row.weekday = max(0, min(int(normalized.get("weekday", 0) or 0), 6))
-    row.next_run_at = parse_datetime_value(normalized.get("next_run_at"))
+    site_url = str(normalized.get("site_url") or "").strip()
+    if not site_url:
+        site_url = (normalize_start_urls(normalized.get("start_urls") or DEFAULT_START_URL) or [""])[0]
+    row.site_url = site_url
     row.thread_count = parse_thread_count(normalized.get("thread_count", 4))
-    row.connection_method = normalize_connection_method(normalized.get("connection_method"))
-    row.connection_method_id = connection_method_id_for(session, row.connection_method)
+    row.connection_id = connection_method_id_for(session, normalized.get("connection_method"))
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
-    row.exclusions = normalize_patterns(brand.exclusions or normalized.get("exclusions", DEFAULT_EXCLUSIONS))
+    row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
     row.extraction_rules = normalize_extraction_rules(normalized.get("extraction_rules", {}))
     row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
     row.seen_models = [normalize_model_key(str(value)) for value in normalized.get("seen_models", []) if str(value).strip()]
     row.known_new_products = normalized.get("known_new_products", {}) if isinstance(normalized.get("known_new_products"), dict) else {}
-    brand.state = {**make_news_state(), **(normalized.get("brand_state") or normalized.get("state") or brand.state or {})}
+    session.flush()
+    if not brand.primary_donor_id or not any(donor.id == brand.primary_donor_id for donor in brand.donors):
+        brand.primary_donor_id = row.id
+    elif normalized.get("is_primary"):
+        brand.primary_donor_id = row.id
     session.flush()
     return int(row.id)
 
@@ -842,6 +856,37 @@ def aggregate_brand_state(monitors: List[Dict[str, object]]) -> Dict[str, object
         result["last_scan_at"] = last_scan_at
     return result
 
+
+
+def sync_brand_runtime_fields(source_monitor: Dict[str, object]) -> None:
+    group = clean_text(str(source_monitor.get("group") or ""))
+    brand = clean_text(str(source_monitor.get("brand") or ""))
+    fields = ("enabled", "schedule_type", "scan_time", "weekday", "next_run_at", "state", "brand_state")
+    for item in news_settings.get("monitors", []):
+        if (
+            isinstance(item, dict)
+            and clean_text(str(item.get("group") or "")) == group
+            and clean_text(str(item.get("brand") or "")) == brand
+        ):
+            for field in fields:
+                if field in source_monitor:
+                    item[field] = dict(source_monitor[field]) if isinstance(source_monitor[field], dict) else source_monitor[field]
+
+
+def ensure_brand_primary_flags(monitors: List[Dict[str, object]]) -> None:
+    grouped: Dict[tuple[str, str], List[Dict[str, object]]] = {}
+    for item in monitors:
+        if not isinstance(item, dict):
+            continue
+        key = (clean_text(str(item.get("group") or "")), clean_text(str(item.get("brand") or "")))
+        grouped.setdefault(key, []).append(item)
+    for items in grouped.values():
+        primary_id = str(items[0].get("primary_donor_id") or items[0].get("id") or "")
+        if not any(str(item.get("id")) == primary_id for item in items):
+            primary_id = str(items[0].get("id") or "")
+        for item in items:
+            item["primary_donor_id"] = primary_id
+            item["is_primary"] = str(item.get("id")) == primary_id
 
 def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]:
     if isinstance(settings.get("own_sites"), list):
@@ -906,6 +951,11 @@ def save_news_settings() -> None:
                 session.execute(delete(Donor).where(Donor.id.not_in(current_donor_ids)))
             else:
                 session.execute(delete(Donor))
+            session.flush()
+            for brand_row in session.scalars(select(Brand)).all():
+                donor_ids = [donor.id for donor in brand_row.donors]
+                if donor_ids and brand_row.primary_donor_id not in donor_ids:
+                    brand_row.primary_donor_id = donor_ids[0]
             session.execute(delete(Brand).where(~Brand.donors.any()))
 
             current_feed_urls = set()
@@ -930,7 +980,7 @@ def load_news_settings() -> None:
         with session_scope() as session:
             donor_rows = session.scalars(
                 select(Donor)
-                .join(Brand)
+                .join(Brand, Donor.brand_id == Brand.id)
                 .order_by(Brand.group_name, Brand.name, Donor.id)
             ).all()
             app_setting = session.get(AppSetting, 1)
@@ -960,6 +1010,7 @@ def load_news_settings() -> None:
                 settings["feed_url"] = feed_urls[0]
                 settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
             settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
+            ensure_brand_primary_flags(settings["monitors"])
             settings["logs"] = load_news_logs_from_file()
         news_settings.update(settings)
         save_news_settings()
@@ -979,10 +1030,11 @@ def reload_news_monitors_from_db() -> None:
     with session_scope() as session:
         donor_rows = session.scalars(
             select(Donor)
-            .join(Brand)
+            .join(Brand, Donor.brand_id == Brand.id)
             .order_by(Brand.group_name, Brand.name, Donor.id)
         ).all()
         monitors = [donor_model_to_monitor(row) for row in donor_rows]
+        ensure_brand_primary_flags(monitors)
     with news_lock:
         news_settings["monitors"] = [
             active_by_id.get(str(monitor.get("id")), monitor)
@@ -3836,8 +3888,8 @@ def finalize_stale_news_transition(monitor: Dict[str, object]) -> bool:
     was_pausing = state.get("status") == "pausing"
     state.update(
         {
-            "status": "partial" if was_pausing else "idle",
-            "stage": "Приостановлено" if was_pausing else "Ожидание",
+            "status": "partial" if was_pausing else "stopped",
+            "stage": "Приостановлено" if was_pausing else "Остановлено",
             "error": "",
             "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
             "currenturl": "",
@@ -4729,6 +4781,13 @@ def api_update_news_monitor(monitor_id: str):
         if "exclusions" in payload:
             exclusions = normalize_patterns(payload.get("exclusions"))
             monitor["exclusions"] = exclusions
+        if "product_url_filters" in payload:
+            monitor["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
+        if "extraction_rules" in payload:
+            monitor["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
+        if "selector_settings" in payload:
+            monitor["selector_settings"] = normalize_selector_settings(payload.get("selector_settings"))
+        if payload.get("is_primary") is True:
             group = clean_text(str(monitor.get("group") or ""))
             brand = clean_text(str(monitor.get("brand") or ""))
             for item in news_settings.get("monitors", []):
@@ -4737,15 +4796,9 @@ def api_update_news_monitor(monitor_id: str):
                     and clean_text(str(item.get("group") or "")) == group
                     and clean_text(str(item.get("brand") or "")) == brand
                 ):
-                    item["exclusions"] = list(exclusions)
-        if "product_url_filters" in payload:
-            monitor["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
-        if "extraction_rules" in payload:
-            monitor["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
-        if "selector_settings" in payload:
-            monitor["selector_settings"] = normalize_selector_settings(payload.get("selector_settings"))
-        if "collapsed" in payload:
-            monitor["collapsed"] = bool(payload.get("collapsed"))
+                    item["primary_donor_id"] = monitor.get("id")
+                    item["is_primary"] = str(item.get("id")) == str(monitor.get("id"))
+        sync_brand_runtime_fields(monitor)
         save_news_settings()
     return jsonify({"monitor": dict(monitor)})
 
@@ -4765,6 +4818,7 @@ def api_scan_news_monitor(monitor_id: str):
             "last_csv": str(monitor.get("state", {}).get("last_csv") or ""),
         }
         monitor["brand_state"] = dict(monitor["state"])
+        sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
     thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True)

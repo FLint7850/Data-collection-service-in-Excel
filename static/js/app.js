@@ -1190,6 +1190,10 @@ function renderNewsModal() {
         <span>Потоки</span>
         <input data-field="thread_count" type="number" min="1" max="16" value="${escapeHtml(monitor.thread_count || 4)}">
       </label>
+      <label class="toggle-field modal-inline-toggle">
+        <input data-field="is_primary" type="checkbox" ${monitor.is_primary ? "checked" : ""}>
+        <span>Главный донор бренда</span>
+      </label>
       <label class="field">
         <span>Подключение</span>
         <select data-field="connection_method">${connectionOptionsHtml(monitor.connection_method || "requests")}</select>

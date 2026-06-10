@@ -140,13 +140,11 @@ def migrate_schema(connection) -> None:
 
     brand_columns = table_columns(connection, "brands")
     if brand_columns and "state" not in brand_columns:
-        connection.execute(text(f"ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'"))
+        connection.exec_driver_sql(f"ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'")
 
     migrate_app_settings_current_table(connection)
-    migrate_brands_table(connection)
+    migrate_news_tables(connection)
     migrate_projects_table(connection)
-    migrate_donors_table(connection)
-    reset_brand_states(connection)
 
 
 def reset_brand_states(connection) -> None:
@@ -187,97 +185,221 @@ def migrate_app_settings_current_table(connection) -> None:
     connection.execute(text("ALTER TABLE app_settings_migration_tmp RENAME TO app_settings"))
 
 
-def migrate_brands_table(connection) -> None:
-    columns = table_columns(connection, "brands")
-    if not columns:
-        return
-    needs_rebuild = "group_type" in columns or "exclusions" not in columns
-    if not needs_rebuild:
-        return
 
+def _json_or_default(value, default):
+    if value in (None, ""):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_value(value, default=False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _datetime_value(value):
+    return value if value not in (None, "") else None
+
+
+def migrate_news_tables(connection) -> None:
+    brand_columns = table_columns(connection, "brands")
     donor_columns = table_columns(connection, "donors")
-    exclusions_expr = (
-        safe_json_expr("brands.exclusions", "[]")
-        if "exclusions" in columns
-        else (
-            "COALESCE((SELECT exclusions FROM donors WHERE donors.brand_id = brands.id AND json_valid(exclusions) LIMIT 1), json('[]'))"
-            if donor_columns
-            else "json('[]')"
-        )
-    )
-    state_expr = safe_json_expr("brands.state", DEFAULT_BRAND_STATE_JSON) if "state" in columns else f"json('{DEFAULT_BRAND_STATE_JSON}')"
+    if not brand_columns and not donor_columns:
+        return
 
-    connection.execute(text("DROP TABLE IF EXISTS brand_id_map"))
-    connection.execute(
-        text(
-            "CREATE TEMP TABLE brand_id_map AS "
-            "SELECT old_brand.id AS old_id, MIN(new_brand.id) AS new_id "
-            "FROM brands old_brand "
-            "JOIN brands new_brand ON new_brand.name = old_brand.name AND new_brand.group_name = old_brand.group_name "
-            "GROUP BY old_brand.id"
+    brand_needs_rebuild = bool(
+        brand_columns
+        and (
+            "primary_donor_id" not in brand_columns
+            or "enabled" not in brand_columns
+            or "schedule_type" not in brand_columns
+            or "scan_time" not in brand_columns
+            or "weekday" not in brand_columns
+            or "next_run_at" not in brand_columns
+            or "exclusions" in brand_columns
+            or "collapsed" in brand_columns
+            or "group_type" in brand_columns
         )
     )
-    if donor_columns:
-        connection.execute(text("DROP TABLE IF EXISTS donors_brand_backup"))
-        connection.execute(
-            text(
-                "CREATE TEMP TABLE donors_brand_backup AS "
-                "SELECT donors.*, COALESCE(brand_id_map.new_id, donors.brand_id) AS migrated_brand_id "
-                "FROM donors LEFT JOIN brand_id_map ON brand_id_map.old_id = donors.brand_id"
-            )
+    donor_needs_rebuild = bool(
+        donor_columns
+        and (
+            "connection_id" not in donor_columns
+            or "start_urls" in donor_columns
+            or "enabled" in donor_columns
+            or "schedule_type" in donor_columns
+            or "scan_time" in donor_columns
+            or "weekday" in donor_columns
+            or "next_run_at" in donor_columns
+            or "state" in donor_columns
+            or "connection_method" in donor_columns
+            or "connection_method_id" in donor_columns
         )
+    )
+    if not brand_needs_rebuild and not donor_needs_rebuild:
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
+        return
+
+    brand_rows = []
+    donor_rows = []
+    if brand_columns:
+        brand_rows = [dict(row) for row in connection.execute(text("SELECT * FROM brands")).mappings().all()]
+    if donor_columns:
+        donor_rows = [dict(row) for row in connection.execute(text("SELECT * FROM donors")).mappings().all()]
+
+    connection.execute(text("DROP TABLE IF EXISTS donors_migration_tmp"))
     connection.execute(text("DROP TABLE IF EXISTS brands_migration_tmp"))
+    connection.execute(text("DROP TABLE IF EXISTS donors"))
+    connection.execute(text("DROP TABLE IF EXISTS brands"))
+
+    connection.exec_driver_sql(
+        "CREATE TABLE brands ("
+        "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+        "name VARCHAR(255) NOT NULL, "
+        "group_name VARCHAR(255) NOT NULL DEFAULT '', "
+        f"state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}', "
+        "enabled BOOLEAN NOT NULL DEFAULT 1, "
+        "schedule_type VARCHAR(32) NOT NULL DEFAULT 'daily', "
+        "scan_time VARCHAR(8) NOT NULL DEFAULT '01:00', "
+        "weekday INTEGER NOT NULL DEFAULT 0, "
+        "next_run_at DATETIME, "
+        "primary_donor_id INTEGER, "
+        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "CONSTRAINT uq_brands_name_group_name UNIQUE (name, group_name), "
+        "FOREIGN KEY(primary_donor_id) REFERENCES donors(id) ON DELETE SET NULL"
+        ")"
+    )
     connection.execute(
         text(
-            "CREATE TABLE brands_migration_tmp ("
+            "CREATE TABLE donors ("
             "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
-            "name VARCHAR(255) NOT NULL, "
-            "group_name VARCHAR(255) NOT NULL DEFAULT '', "
-            "collapsed BOOLEAN NOT NULL DEFAULT 1, "
+            "legacy_id VARCHAR(32) NOT NULL DEFAULT '', "
+            "brand_id INTEGER NOT NULL, "
+            "site_url TEXT NOT NULL DEFAULT '', "
+            "thread_count INTEGER NOT NULL DEFAULT 4, "
+            "connection_id INTEGER, "
+            "auto_connection_fallback BOOLEAN NOT NULL DEFAULT 1, "
             "exclusions JSON NOT NULL DEFAULT '[]', "
-            f"state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}', "
-            "created_at DATETIME NOT NULL, "
-            "updated_at DATETIME NOT NULL, "
-            "CONSTRAINT uq_brands_name_group_name UNIQUE (name, group_name)"
+            "product_url_filters JSON NOT NULL DEFAULT '[]', "
+            "extraction_rules JSON NOT NULL DEFAULT '{}', "
+            "selector_settings JSON NOT NULL DEFAULT '{}', "
+            "seen_models JSON NOT NULL DEFAULT '[]', "
+            "known_new_products JSON NOT NULL DEFAULT '{}', "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "FOREIGN KEY(brand_id) REFERENCES brands(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(connection_id) REFERENCES connection_methods(id)"
             ")"
         )
     )
-    connection.execute(
-        text(
-            "INSERT INTO brands_migration_tmp (id, name, group_name, collapsed, exclusions, state, created_at, updated_at) "
-            "SELECT brands.id, brands.name, brands.group_name, COALESCE(brands.collapsed, 1), "
-            f"{exclusions_expr}, {state_expr}, "
-            "COALESCE(brands.created_at, CURRENT_TIMESTAMP), COALESCE(brands.updated_at, CURRENT_TIMESTAMP) "
-            "FROM brands "
-            "WHERE brands.id = (SELECT MIN(dedup.id) FROM brands dedup WHERE dedup.name = brands.name AND dedup.group_name = brands.group_name) "
-            "ORDER BY brands.id"
-        )
-    )
-    connection.execute(
-        text(
-            "UPDATE donors SET brand_id = ("
-            "SELECT brand_id_map.new_id FROM brand_id_map WHERE brand_id_map.old_id = donors.brand_id"
-            ") WHERE EXISTS (SELECT 1 FROM brand_id_map WHERE brand_id_map.old_id = donors.brand_id)"
-        )
-    )
-    connection.execute(text("DROP TABLE brands"))
-    connection.execute(text("ALTER TABLE brands_migration_tmp RENAME TO brands"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
-    if donor_columns:
-        connection.execute(text("DELETE FROM donors WHERE id IN (SELECT id FROM donors_brand_backup)"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
+
+    inserted_brand_ids = set()
+    for row in brand_rows:
+        brand_id = row.get("id")
+        if brand_id in inserted_brand_ids:
+            continue
+        inserted_brand_ids.add(brand_id)
         connection.execute(
             text(
-                "INSERT INTO donors (id, legacy_id, brand_id, site_url, start_urls, enabled, schedule_type, "
-                "scan_time, weekday, next_run_at, thread_count, connection_method, connection_method_id, "
-                "auto_connection_fallback, exclusions, product_url_filters, extraction_rules, selector_settings, "
-                "seen_models, known_new_products, created_at, updated_at) "
-                "SELECT id, legacy_id, migrated_brand_id, site_url, start_urls, enabled, schedule_type, "
-                "scan_time, weekday, next_run_at, thread_count, connection_method, connection_method_id, "
-                "auto_connection_fallback, exclusions, product_url_filters, extraction_rules, selector_settings, "
-                "seen_models, known_new_products, created_at, updated_at FROM donors_brand_backup"
-            )
+                "INSERT OR IGNORE INTO brands "
+                "(id, name, group_name, state, enabled, schedule_type, scan_time, weekday, next_run_at, created_at, updated_at) "
+                "VALUES (:id, :name, :group_name, json(:state), :enabled, :schedule_type, :scan_time, :weekday, :next_run_at, :created_at, :updated_at)"
+            ),
+            {
+                "id": brand_id,
+                "name": row.get("name") or "Донор",
+                "group_name": row.get("group_name") or row.get("group_type") or "Маржа",
+                "state": json.dumps(_json_or_default(row.get("state"), DEFAULT_BRAND_STATE), ensure_ascii=False),
+                "enabled": _bool_value(row.get("enabled"), True),
+                "schedule_type": row.get("schedule_type") or "daily",
+                "scan_time": str(row.get("scan_time") or "01:00")[:5],
+                "weekday": int(row.get("weekday") or 0),
+                "next_run_at": _datetime_value(row.get("next_run_at")),
+                "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
+                "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
+            },
         )
 
+    default_connection_id = connection.execute(
+        text("SELECT id FROM connection_methods WHERE code = 'requests' LIMIT 1")
+    ).scalar()
+    first_donor_by_brand = {}
+    for row in donor_rows:
+        brand_id = row.get("brand_id")
+        if brand_id not in inserted_brand_ids:
+            continue
+        donor_id = row.get("id")
+        legacy_id = row.get("legacy_id") or (str(donor_id) if isinstance(donor_id, str) and not str(donor_id).isdigit() else "")
+        site_url = row.get("site_url") or ""
+        if not site_url:
+            start_urls = _json_or_default(row.get("start_urls"), [])
+            if isinstance(start_urls, list) and start_urls:
+                site_url = str(start_urls[0] or "")
+        connection_id = row.get("connection_id") or row.get("connection_method_id")
+        if not connection_id:
+            method = row.get("connection_method") or "requests"
+            connection_id = connection.execute(
+                text("SELECT id FROM connection_methods WHERE code = :code LIMIT 1"),
+                {"code": method},
+            ).scalar() or default_connection_id
+        donor_state = _json_or_default(row.get("state"), None)
+        if donor_state and brand_id:
+            connection.execute(
+                text("UPDATE brands SET state = json(:state) WHERE id = :brand_id"),
+                {"state": json.dumps(donor_state, ensure_ascii=False), "brand_id": brand_id},
+            )
+        connection.execute(
+            text(
+                "INSERT INTO donors "
+                "(id, legacy_id, brand_id, site_url, thread_count, connection_id, auto_connection_fallback, exclusions, "
+                "product_url_filters, extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
+                "VALUES (:id, :legacy_id, :brand_id, :site_url, :thread_count, :connection_id, :auto_connection_fallback, json(:exclusions), "
+                "json(:product_url_filters), json(:extraction_rules), json(:selector_settings), json(:seen_models), json(:known_new_products), :created_at, :updated_at)"
+            ),
+            {
+                "id": donor_id if isinstance(donor_id, int) or str(donor_id).isdigit() else None,
+                "legacy_id": legacy_id,
+                "brand_id": brand_id,
+                "site_url": site_url,
+                "thread_count": int(row.get("thread_count") or 4),
+                "connection_id": connection_id,
+                "auto_connection_fallback": _bool_value(row.get("auto_connection_fallback"), True),
+                "exclusions": json.dumps(_json_or_default(row.get("exclusions"), []), ensure_ascii=False),
+                "product_url_filters": json.dumps(_json_or_default(row.get("product_url_filters"), []), ensure_ascii=False),
+                "extraction_rules": json.dumps(_json_or_default(row.get("extraction_rules"), {}), ensure_ascii=False),
+                "selector_settings": json.dumps(_json_or_default(row.get("selector_settings"), {}), ensure_ascii=False),
+                "seen_models": json.dumps(_json_or_default(row.get("seen_models"), []), ensure_ascii=False),
+                "known_new_products": json.dumps(_json_or_default(row.get("known_new_products"), {}), ensure_ascii=False),
+                "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
+                "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
+            },
+        )
+        if brand_id not in first_donor_by_brand:
+            first_donor_by_brand[brand_id] = donor_id if isinstance(donor_id, int) or str(donor_id).isdigit() else connection.execute(text("SELECT last_insert_rowid()")).scalar()
+
+    for row in brand_rows:
+        brand_id = row.get("id")
+        primary_id = row.get("primary_donor_id") or first_donor_by_brand.get(brand_id)
+        if primary_id:
+            connection.execute(
+                text(
+                    "UPDATE brands SET primary_donor_id = :primary_id "
+                    "WHERE id = :brand_id AND EXISTS (SELECT 1 FROM donors WHERE id = :primary_id AND brand_id = :brand_id)"
+                ),
+                {"primary_id": primary_id, "brand_id": brand_id},
+            )
 
 def migrate_projects_table(connection) -> None:
     columns = table_columns(connection, "projects")
