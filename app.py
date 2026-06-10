@@ -33,8 +33,10 @@ LOG_DIR = BASE_DIR / "logs"
 FEED_DIR = BASE_DIR / "feeds"
 EXCLUSIONS_FILE = BASE_DIR / "exclusions.json"
 LOGS_FILE = LOG_DIR / "logs.json"
+UNIFIED_LOG_FILE = LOG_DIR / "app.log"
 LEGACY_LOGS_FILE = BASE_DIR / "logs.json"
 EXPORT_DIR = BASE_DIR / "exports"
+BOTASAURUS_FETCH_OUTPUT_FILE = BASE_DIR / "output" / "_fetch_html.json"
 DEFAULT_START_URL = "https://www.maunfeld.ru/"
 DEFAULT_FEED_URL = "https://mega-kuhnya.ru/price/last_modified.xml"
 DEFAULT_FEED_GENERATE_URL = "https://mega-kuhnya.ru/index.php?route=extension/feed/unixml/new_product"
@@ -134,6 +136,7 @@ LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
 HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(3)
 FEED_STORAGE_LOCK = threading.Lock()
+UNIFIED_LOG_LOCK = threading.Lock()
 news_stop_events: Dict[str, threading.Event] = {}
 news_stop_modes: Dict[str, str] = {}
 news_state_persisted_at: Dict[str, float] = {}
@@ -395,6 +398,27 @@ def write_logs_file(data: List[Dict[str, object]]) -> None:
     LOGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def append_unified_log(item: Dict[str, object]) -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    timestamp = str(item.get("time") or datetime.now(MSK_TZ).isoformat(timespec="seconds"))
+    level = str(item.get("level") or "info").upper()
+    project_name = repair_mojibake_text(item.get("project_name") or item.get("project_id") or "system")
+    message = repair_mojibake_text(item.get("message") or "")
+    line = f"{timestamp} [{level}] {project_name}: {message}\n"
+    try:
+        with UNIFIED_LOG_LOCK:
+            UNIFIED_LOG_FILE.open("a", encoding="utf-8").write(line)
+    except OSError:
+        print(line, end="", flush=True)
+
+
+def cleanup_botasaurus_fetch_output() -> None:
+    try:
+        BOTASAURUS_FETCH_OUTPUT_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def read_logs_file() -> List[Dict[str, object]]:
     source_file = LOGS_FILE if LOGS_FILE.exists() else LEGACY_LOGS_FILE
     if not source_file.exists():
@@ -490,15 +514,15 @@ def reset_project_state(project: Dict[str, object], status: str = "idle") -> Non
 def add_project_log(project: Dict[str, object], message: str, level: str = "info") -> None:
     with projects_lock:
         logs = project.setdefault("logs", [])
-        logs.append(
-            {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "project_id": project["id"],
-                "project_name": project["name"],
-                "level": level,
-                "message": message,
-            }
-        )
+        item = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "project_id": project["id"],
+            "project_name": project["name"],
+            "level": level,
+            "message": message,
+        }
+        logs.append(item)
+        append_unified_log(item)
         if project.get("auto_cleanup"):
             cutoff = time.time() - 7 * 24 * 60 * 60
             logs[:] = [
@@ -967,6 +991,7 @@ def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str 
                 "message": repair_mojibake_text(message),
             }
         )
+        append_unified_log(logs[-1])
         if news_settings.get("auto_cleanup"):
             cutoff = time.time() - 7 * 24 * 60 * 60
             logs[:] = [
@@ -2488,7 +2513,7 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
     except ImportError:
         return None
 
-    @botasaurus_request(max_retry=MAX_RETRIES)
+    @botasaurus_request(max_retry=MAX_RETRIES, output=None, create_error_logs=False)
     def _fetch_html(request_client: Request, target_url: str):
         response = request_client.get(target_url)
         response.raise_for_status()
@@ -2501,6 +2526,8 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
         result = _fetch_html(url)
     except Exception:
         return None
+    finally:
+        cleanup_botasaurus_fetch_output()
 
     if isinstance(result, list):
         result = result[0] if result else None
@@ -3873,7 +3900,7 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
     return path
 
 
-def send_news_email(
+def send_news_email_legacy(
     monitor: Optional[Dict[str, object]],
     new_count: int,
     test: bool = False,
@@ -3939,6 +3966,94 @@ def send_news_email(
         add_news_log(monitor, error_message, "error")
         return False
     add_news_log(monitor, "РўРµСЃС‚РѕРІРѕРµ email-СЃРѕРѕР±С‰РµРЅРёРµ РѕС‚РїСЂР°РІР»РµРЅРѕ" if test else f"Email-СѓРІРµРґРѕРјР»РµРЅРёРµ РѕС‚РїСЂР°РІР»РµРЅРѕ. РќРѕРІРёРЅРѕРє: {new_count}", "success")
+    return True
+
+
+def send_news_email(
+    monitor: Optional[Dict[str, object]],
+    new_count: int,
+    test: bool = False,
+    error_holder: Optional[List[str]] = None,
+    missing_summary: Optional[List[Dict[str, object]]] = None,
+) -> bool:
+    with news_lock:
+        smtp_config = dict(news_settings.get("smtp", {}))
+    recipients = normalize_emails(smtp_config.get("recipients", []))
+    username = str(smtp_config.get("username") or "").strip()
+    password = str(smtp_config.get("password") or "").strip()
+    sender_emails = normalize_emails(username)
+    if not username or not password or not recipients:
+        error_message = "Email не отправлен: заполните email-логин, пароль приложения и получателей SMTP"
+        if error_holder is not None:
+            error_holder.append(error_message)
+        add_news_log(monitor, error_message, "warning")
+        return False
+    if not sender_emails:
+        error_message = "Email не отправлен: email-логин должен быть адресом почты"
+        if error_holder is not None:
+            error_holder.append(error_message)
+        add_news_log(monitor, error_message, "warning")
+        return False
+
+    sender_email = sender_emails[0]
+    csv_path: Optional[Path] = None
+    if test:
+        subject = "Тест email-уведомления"
+        body = "Тестовое письмо отправлено из мониторинга новинок. SMTP-настройки работают."
+    else:
+        brand = str(repair_mojibake_text((monitor or {}).get("brand") or "донор"))
+        site_url = str((monitor or {}).get("site_url") or "")
+        subject = f"Уведомление о новинках на сайте {brand}"
+        lines = [f"На {site_url or brand} найдено всего: {new_count}"]
+        for item in missing_summary or []:
+            count = int(item.get("count") or 0)
+            label = str(repair_mojibake_text(item.get("source_label") or item.get("url") or "сайт"))
+            lines.append(f"На сайте {label} не было найдено {count} новинок.")
+        body = "\n".join(lines)
+
+        state = (monitor or {}).get("state", {}) if isinstance((monitor or {}).get("state"), dict) else {}
+        state_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
+        csv_filename = str(state.get("last_csv") or state_data.get("csv") or "")
+        csv_path = resolve_export_file(csv_filename)
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender_email
+    message["To"] = ", ".join(recipients)
+    message.set_content(body)
+    if csv_path:
+        message.add_attachment(
+            csv_path.read_bytes(),
+            maintype="text",
+            subtype="csv",
+            filename=str(repair_mojibake_text(csv_path.name) or csv_path.name),
+        )
+
+    host = str(smtp_config.get("host") or "smtp.yandex.ru")
+    port = int(smtp_config.get("port") or 465)
+    security_mode = str(smtp_config.get("security") or "ssl").lower()
+    try:
+        if security_mode == "tls":
+            with smtplib.SMTP(host, port, timeout=30) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(username, password)
+                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
+        else:
+            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as server:
+                server.login(username, password)
+                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
+    except Exception as exc:
+        error_message = f"Ошибка отправки email: {exc}"
+        if error_holder is not None:
+            error_holder.append(error_message)
+        add_news_log(monitor, error_message, "error")
+        return False
+
+    add_news_log(
+        monitor,
+        "Тестовое email-сообщение отправлено" if test else f"Email-уведомление отправлено. Новинок: {new_count}",
+        "success",
+    )
     return True
 
 

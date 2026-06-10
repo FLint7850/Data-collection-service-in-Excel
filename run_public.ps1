@@ -142,21 +142,18 @@ else {
 
     $LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $LogDir = Join-Path $PSScriptRoot "logs"
-    $OutLogDir = Join-Path $LogDir "server-output"
-    $ErrLogDir = Join-Path $LogDir "server-error"
-    New-Item -ItemType Directory -Force -Path $OutLogDir | Out-Null
-    New-Item -ItemType Directory -Force -Path $ErrLogDir | Out-Null
-    $OutLog = Join-Path $OutLogDir "server-output-public-$Port-$LogStamp.log"
-    $ErrLog = Join-Path $ErrLogDir "server-error-public-$Port-$LogStamp.log"
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $AppLog = Join-Path $LogDir "app.log"
+    Add-Content -Path $AppLog -Encoding UTF8 -Value ""
+    Add-Content -Path $AppLog -Encoding UTF8 -Value "[$(Get-Date -Format o)] Starting public server on port $Port"
 
     Write-Host "Starting Flask app..." -ForegroundColor Green
     $env:PORT = "$Port"
+    $LaunchCommand = "set PORT=$Port&& set PYTHONIOENCODING=utf-8&& `"$venvPython`" `"app.py`" >> `"$AppLog`" 2>>&1"
     $appProcess = Start-Process `
-        -FilePath $venvPython `
-        -ArgumentList "app.py" `
+        -FilePath "cmd.exe" `
+        -ArgumentList "/d", "/c", $LaunchCommand `
         -WorkingDirectory $PSScriptRoot `
-        -RedirectStandardOutput $OutLog `
-        -RedirectStandardError $ErrLog `
         -PassThru `
         -WindowStyle Hidden
 
@@ -175,10 +172,10 @@ else {
 
     if (-not $ready) {
         Write-Host "The app did not start correctly." -ForegroundColor Red
-        if (Test-Path $ErrLog) {
+        if (Test-Path $AppLog) {
             Write-Host ""
-            Write-Host "${ErrLog}:" -ForegroundColor Yellow
-            Get-Content $ErrLog -Tail 80
+            Write-Host "${AppLog}:" -ForegroundColor Yellow
+            Get-Content $AppLog -Tail 120
         }
         Stop-StartedProcess $appProcess
         Write-Host "Press Enter to close this window."
