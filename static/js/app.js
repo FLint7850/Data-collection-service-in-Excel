@@ -809,8 +809,8 @@ function renderFeedStorage() {
 
 function sortedBrandEntries(brands) {
   return Object.entries(brands).sort((left, right) => {
-    const leftCreated = Math.max(...left[1].map((monitor) => createdTimestamp(monitor.created_at)));
-    const rightCreated = Math.max(...right[1].map((monitor) => createdTimestamp(monitor.created_at)));
+    const leftCreated = Math.max(...left[1].map((monitor) => createdTimestamp(monitor.brand_created_at || monitor.created_at)));
+    const rightCreated = Math.max(...right[1].map((monitor) => createdTimestamp(monitor.brand_created_at || monitor.created_at)));
     if (rightCreated !== leftCreated) return rightCreated - leftCreated;
     return String(right[0]).localeCompare(String(left[0]), "ru");
   });
@@ -825,6 +825,7 @@ function newsMonitorsStructureSignature() {
         brand,
         brandMonitors.map((monitor) => ({
           id: monitor.id,
+          brand_created_at: monitor.brand_created_at || "",
           created_at: monitor.created_at || "",
           site_url: monitor.site_url || "",
           start_urls: monitor.start_urls || [],

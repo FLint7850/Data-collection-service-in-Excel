@@ -757,6 +757,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "group": brand.group_name if brand else "",
         "brand": brand.name if brand else "Донор",
         "brand_id": brand.id if brand else None,
+        "brand_created_at": brand.created_at.isoformat(timespec="milliseconds") if brand and brand.created_at else "",
         "primary_donor_id": brand.primary_donor_id if brand else None,
         "is_primary": bool(brand and brand.primary_donor_id == row.id),
         "brand_state": brand_state,
