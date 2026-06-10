@@ -854,6 +854,10 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     elif normalized.get("is_primary"):
         brand.primary_donor_id = row.id
     session.flush()
+    monitor["brand_id"] = brand.id
+    monitor["brand_created_at"] = brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else ""
+    monitor["primary_donor_id"] = brand.primary_donor_id
+    monitor["is_primary"] = brand.primary_donor_id == row.id
     return int(row.id)
 
 
