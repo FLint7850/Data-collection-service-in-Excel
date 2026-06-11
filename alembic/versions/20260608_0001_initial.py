@@ -86,6 +86,7 @@ def upgrade() -> None:
         sa.Column("legacy_id", sa.String(length=32), nullable=False),
         sa.Column("brand_id", sa.Integer(), nullable=False),
         sa.Column("site_url", sa.Text(), nullable=False),
+        sa.Column("start_urls", sa.JSON(), nullable=False),
         sa.Column("thread_count", sa.Integer(), nullable=False),
         sa.Column("connection_id", sa.Integer(), nullable=True),
         sa.Column("auto_connection_fallback", sa.Boolean(), nullable=False),

@@ -2,6 +2,7 @@
 import os
 import csv
 import html as html_lib
+import io
 import faulthandler
 import re
 import shutil
@@ -11,7 +12,7 @@ import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from email.message import EmailMessage
 from fnmatch import fnmatch
@@ -47,8 +48,10 @@ DEFAULT_EXCLUSIONS = [
 ]
 
 REQUEST_TIMEOUT = 20
-REQUEST_DELAY_SECONDS = 0.25
+REQUEST_DELAY_SECONDS = max(0.0, float(os.environ.get("REQUEST_DELAY_SECONDS", "0.05") or 0.05))
 MAX_RETRIES = 3
+FEED_WORKER_COUNT = max(1, min(int(os.environ.get("FEED_WORKER_COUNT", "6") or 6), 12))
+NEWS_ENRICH_WORKER_COUNT = max(1, min(int(os.environ.get("NEWS_ENRICH_WORKER_COUNT", "8") or 8), 16))
 NEWS_SCAN_STALL_TIMEOUT = int(os.environ.get("NEWS_SCAN_STALL_TIMEOUT", "180") or 180)
 SCHEDULE_DUE_GRACE_SECONDS = 90
 CONNECTION_METHODS = (
@@ -614,16 +617,16 @@ def default_news_settings() -> Dict[str, object]:
     }
 
 
-def make_news_monitor(group: str, brand: str, urls: List[str]) -> Dict[str, object]:
+def make_news_monitor(group: str, brand: str, urls: List[str], site_url: str = "") -> Dict[str, object]:
     monitor_id = uuid.uuid4().hex[:10]
-    site_url = urls[0] if urls else ""
+    site_url = str(site_url or "").strip()
     return {
         "id": monitor_id,
         "group": group,
         "brand": brand,
         "created_at": datetime.now().isoformat(timespec="milliseconds"),
         "site_url": site_url,
-        "start_urls": [site_url] if site_url else [],
+        "start_urls": list(urls),
         "enabled": True,
         "schedule_type": "daily",
         "scan_time": "01:00",
@@ -675,14 +678,16 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
 
 
 def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
+    start_urls = normalize_start_urls(item.get("start_urls") or "", allow_empty=True)
     monitor = make_news_monitor(
         clean_text(str(item.get("group") or "РњР°СЂР¶Р°")),
         clean_text(str(item.get("brand") or "Р”РѕРЅРѕСЂ")),
-        normalize_start_urls(item.get("start_urls") or item.get("site_url") or "", allow_empty=True),
+        start_urls,
+        str(item.get("site_url") or ""),
     )
     monitor["id"] = str(item.get("id") or monitor["id"])
     monitor["created_at"] = str(item.get("created_at") or monitor["created_at"])
-    monitor["site_url"] = str(item.get("site_url") or (monitor["start_urls"][0] if monitor["start_urls"] else ""))
+    monitor["site_url"] = str(item.get("site_url") or "")
     monitor["enabled"] = bool(item.get("enabled", True))
     monitor["schedule_type"] = str(item.get("schedule_type") or "daily")
     monitor["scan_time"] = str(item.get("scan_time") or "01:00")[:5]
@@ -712,14 +717,13 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
 
 
 def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object]]:
-    urls = normalize_start_urls(item.get("start_urls") or item.get("site_url") or "", allow_empty=True)
+    urls = normalize_start_urls(item.get("start_urls") or "", allow_empty=True)
     monitors = []
     if not urls:
         return [normalize_news_monitor({**item, "site_url": "", "start_urls": []})]
     for index, url in enumerate(urls):
         copy_item = dict(item)
         copy_item["id"] = str(item.get("id") or uuid.uuid4().hex[:10]) if index == 0 else uuid.uuid4().hex[:10]
-        copy_item["site_url"] = url
         copy_item["start_urls"] = [url]
         monitors.append(normalize_news_monitor(copy_item))
     return monitors
@@ -752,6 +756,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
     brand_state = repair_mojibake({**make_news_state(), **(brand.state or {})}) if brand else make_news_state()
     site_url = str(row.site_url or "").strip()
+    start_urls = normalize_start_urls(getattr(row, "start_urls", None) or "", allow_empty=True)
     monitor = {
         "id": str(row.id),
         "group": brand.group_name if brand else "",
@@ -763,7 +768,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "brand_state": brand_state,
         "created_at": row.created_at.isoformat(timespec="milliseconds") if row.created_at else "",
         "site_url": site_url,
-        "start_urls": [site_url] if site_url else [],
+        "start_urls": start_urls,
         "enabled": bool(brand.enabled) if brand else True,
         "schedule_type": brand.schedule_type if brand else "daily",
         "scan_time": brand.scan_time if brand else "01:00",
@@ -835,10 +840,10 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
         )
         session.add(row)
     row.brand_id = brand.id
+    start_urls = normalize_start_urls(normalized.get("start_urls") or "", allow_empty=True)
     site_url = str(normalized.get("site_url") or "").strip()
-    if not site_url:
-        site_url = (normalize_start_urls(normalized.get("start_urls") or "", allow_empty=True) or [""])[0]
     row.site_url = site_url
+    row.start_urls = start_urls
     row.thread_count = parse_thread_count(normalized.get("thread_count", 4))
     row.connection_id = connection_method_id_for(session, normalized.get("connection_method"))
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
@@ -3647,11 +3652,7 @@ def clear_source_feeds(source: str) -> Path:
     return feed_dir
 
 
-def download_feed_files() -> List[Dict[str, object]]:
-    with news_lock:
-        own_sites = own_sites_from_settings(news_settings)
-        feed_urls = [site["feed_url"] for site in own_sites]
-        generate_urls = [site["feed_generate_url"] for site in own_sites if site.get("feed_generate_url")]
+def make_feed_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
         {
@@ -3661,6 +3662,45 @@ def download_feed_files() -> List[Dict[str, object]]:
             )
         }
     )
+    return session
+
+
+def trigger_feed_generation(generate_url: str) -> None:
+    try:
+        response = make_feed_session().get(generation_file_url(generate_url), timeout=60)
+        response.raise_for_status()
+    except Exception:
+        pass
+
+
+def download_feed_site(index: int, site: Dict[str, str]) -> Optional[Dict[str, object]]:
+    url = site["feed_url"]
+    try:
+        response = make_feed_session().get(url, timeout=60)
+        response.raise_for_status()
+        source = feed_source_key(url)
+        feed_dir = source_feed_dir(source)
+        filename = local_feed_filename("feed", index, url)
+        path = feed_dir / filename
+        path.write_bytes(response.content)
+        return {
+            "kind": "feed",
+            "source": source,
+            "source_label": site.get("name") or feed_source_label(url),
+            "url": url,
+            "filename": filename,
+            "size": path.stat().st_size,
+            "downloaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        }
+    except Exception:
+        return None
+
+
+def download_feed_files() -> List[Dict[str, object]]:
+    with news_lock:
+        own_sites = own_sites_from_settings(news_settings)
+        feed_urls = [site["feed_url"] for site in own_sites]
+        generate_urls = [site["feed_generate_url"] for site in own_sites if site.get("feed_generate_url")]
     downloaded: List[Dict[str, object]] = []
     with FEED_STORAGE_LOCK:
         expected_sources = {feed_source_key(url) for url in feed_urls}
@@ -3670,35 +3710,16 @@ def download_feed_files() -> List[Dict[str, object]]:
                     shutil.rmtree(child, ignore_errors=True)
         for source in expected_sources:
             clear_source_feeds(source)
-        for generate_url in generate_urls:
-            try:
-                response = session.get(generation_file_url(generate_url), timeout=60)
-                response.raise_for_status()
-            except Exception:
-                pass
-        for index, site in enumerate(own_sites, start=1):
-            url = site["feed_url"]
-            try:
-                response = session.get(url, timeout=60)
-                response.raise_for_status()
-                source = feed_source_key(url)
-                feed_dir = source_feed_dir(source)
-                filename = local_feed_filename("feed", index, url)
-                path = feed_dir / filename
-                path.write_bytes(response.content)
-                downloaded.append(
-                    {
-                        "kind": "feed",
-                        "source": source,
-                        "source_label": site.get("name") or feed_source_label(url),
-                        "url": url,
-                        "filename": filename,
-                        "size": path.stat().st_size,
-                        "downloaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
-                    }
-                )
-            except Exception:
-                pass
+        if generate_urls:
+            with ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(generate_urls))) as executor:
+                list(executor.map(trigger_feed_generation, generate_urls))
+        if own_sites:
+            with ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(own_sites))) as executor:
+                futures = [executor.submit(download_feed_site, index, site) for index, site in enumerate(own_sites, start=1)]
+                for future in futures:
+                    feed = future.result()
+                    if feed:
+                        downloaded.append(feed)
     return downloaded
 
 
@@ -3716,13 +3737,7 @@ def fetch_existing_vendor_code_sets() -> tuple[Set[str], List[Dict[str, object]]
         filename = str(feed.get("filename") or "")
         path = source_feed_dir(str(feed.get("source") or "")) / filename
         try:
-            feed_products = parse_feed_products_from_xml(path.read_bytes())
-            feed_codes = {
-                value
-                for product in feed_products
-                for value in (str(product.get("vendor_code") or ""), str(product.get("model_key") or ""))
-                if value
-            }
+            feed_codes = parse_vendor_codes_from_xml(path.read_bytes())
             codes.update(feed_codes)
             feeds.append({**feed, "codes_count": len(feed_codes)})
             feed_code_sets.append({**feed, "codes_count": len(feed_codes), "codes": feed_codes})
@@ -3770,12 +3785,27 @@ def build_missing_summary(new_items: List[Dict[str, str]], feed_code_sets: List[
 
 
 def parse_vendor_codes_from_xml(content: bytes) -> Set[str]:
-    return {
-        value
-        for product in parse_feed_products_from_xml(content)
-        for value in (str(product.get("vendor_code") or ""), str(product.get("model_key") or ""))
-        if value
-    }
+    codes: Set[str] = set()
+    try:
+        for _event, node in ET.iterparse(io.BytesIO(content), events=("end",)):
+            children = list(node)
+            if children:
+                values: Dict[str, str] = {}
+                for child in children:
+                    key = str(child.tag).split("}")[-1].lower()
+                    if key in {"vendorcode", "model", "name", "title"}:
+                        values[key] = clean_text(child.text or "")
+                vendor_code = normalize_model_key(values.get("vendorcode", ""))
+                model = values.get("model") or values.get("name") or values.get("title") or vendor_code
+                model_key = normalize_model_key(model)
+                if vendor_code:
+                    codes.add(vendor_code)
+                if model_key:
+                    codes.add(model_key)
+                node.clear()
+    except ET.ParseError:
+        raise
+    return codes
 
 
 def parse_feed_products_from_xml(content: bytes) -> List[Dict[str, object]]:
@@ -4022,6 +4052,9 @@ def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
 
 def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: threading.Event) -> List[Dict[str, str]]:
     finish_signal = threading.Event()
+    start_urls = normalize_start_urls(monitor.get("start_urls") or "", allow_empty=True)
+    if not start_urls:
+        raise RuntimeError("У донора не указаны стартовые URL для сканирования.")
 
     def progress_callback(payload: Dict[str, object]) -> None:
         log_message = str(payload.get("log_message") or "").strip()
@@ -4057,7 +4090,7 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
         )
 
     crawler = CollectOnlyCrawler(
-        list(monitor.get("start_urls", [])),
+        start_urls,
         int(time.time()),
         stop_signal,
         finish_signal,
@@ -4165,6 +4198,73 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
                 ]
             )
     return path
+
+
+def feed_missing_labels(keys: Set[str], feed_code_sets: List[Dict[str, object]]) -> List[str]:
+    if not keys:
+        return []
+    missing_feeds = []
+    for feed in feed_code_sets:
+        feed_codes = feed.get("codes", set())
+        if not isinstance(feed_codes, set):
+            feed_codes = set(feed_codes) if isinstance(feed_codes, list) else set()
+        if not (keys & feed_codes):
+            missing_feeds.append(str(feed.get("source_label") or feed.get("url") or "Фид"))
+    return missing_feeds
+
+
+def enrich_news_candidates(
+    products: List[Dict[str, str]],
+    monitor: Dict[str, object],
+    feed_code_sets: List[Dict[str, object]],
+    stop_signal: threading.Event,
+    progress_callback,
+) -> List[Dict[str, str]]:
+    candidates: List[tuple[int, Dict[str, str]]] = []
+    resolved: List[Optional[Dict[str, str]]] = [None] * len(products)
+
+    for index, product in enumerate(products):
+        keys = product_compare_keys(product)
+        if not keys:
+            candidates.append((index, product))
+            continue
+        missing_feeds = feed_missing_labels(keys, feed_code_sets)
+        if not missing_feeds:
+            details = {
+                "date_found": datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S"),
+                "group": str(monitor.get("group") or ""),
+                "brand": str(monitor.get("brand") or ""),
+                "name": product.get("model", ""),
+                "model": product.get("model", ""),
+                "price": product.get("price", ""),
+                "availability": "",
+                "photo_url": "",
+                "url": product.get("url", ""),
+            }
+            resolved[index] = details
+            progress_callback(index + 1, details.get("url", ""))
+        else:
+            candidates.append((index, product))
+
+    if candidates and not stop_signal.is_set():
+        max_workers = min(NEWS_ENRICH_WORKER_COUNT, max(1, parse_thread_count(monitor.get("thread_count", 4))), len(candidates))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(enrich_news_product, product, monitor): (index, product)
+                for index, product in candidates
+            }
+            completed = len(products) - len(candidates)
+            for future in as_completed(future_to_index):
+                if stop_signal.is_set():
+                    raise NewsScanStopped()
+                index, product = future_to_index[future]
+                details = future.result()
+                details["model"] = details.get("model") or product.get("model", "")
+                resolved[index] = details
+                completed += 1
+                progress_callback(completed, details.get("url", product.get("url", "")))
+
+    return [item for item in resolved if item]
 
 
 def send_news_email_legacy(
@@ -4395,27 +4495,24 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         )
         add_news_log(monitor, "Началось сравнение", "info")
         known = monitor.get("known_new_products", {}) if isinstance(monitor.get("known_new_products"), dict) else {}
-        for index, product in enumerate(products, start=1):
+        def update_compare_progress(index: int, current_url: str = "") -> None:
             check_stop_requested()
             update_news_monitor_state(
                 monitor,
                 stage="РЎСЂР°РІРЅРµРЅРёРµ СЃ С„РёРґР°РјРё",
                 percent=86 + int((index / max(1, len(products))) * 12),
                 compared_products=index,
-                currenturl=product.get("url", ""),
+                currenturl=current_url,
             )
-            details = enrich_news_product(product, monitor)
+
+        enriched_products = enrich_news_candidates(products, monitor, feed_code_sets, stop_event, update_compare_progress)
+        for details, product in zip(enriched_products, products):
+            check_stop_requested()
             details["model"] = details.get("model") or product.get("model", "")
             detail_keys = product_compare_keys(details) | product_compare_keys(product)
             if not detail_keys:
                 continue
-            missing_feeds = []
-            for feed in feed_code_sets:
-                feed_codes = feed.get("codes", set())
-                if not isinstance(feed_codes, set):
-                    feed_codes = set(feed_codes) if isinstance(feed_codes, list) else set()
-                if not (detail_keys & feed_codes):
-                    missing_feeds.append(str(feed.get("source_label") or feed.get("url") or "Р¤РёРґ"))
+            missing_feeds = feed_missing_labels(detail_keys, feed_code_sets)
             if not missing_feeds:
                 continue
             model_key = sorted(detail_keys)[0]
@@ -4794,11 +4891,6 @@ def api_update_news_monitor(monitor_id: str):
     if not monitor:
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
     payload = request.get_json(silent=True) or {}
-    if ("site_url" in payload or "start_urls" in payload) and not normalize_start_urls(
-        payload.get("start_urls") or payload.get("site_url") or "",
-        allow_empty=True,
-    ):
-        return jsonify({"error": "Укажите сайт-донор или стартовый URL перед сохранением настроек донора."}), 400
     with news_lock:
         old_group = clean_text(str(monitor.get("group") or ""))
         old_brand = clean_text(str(monitor.get("brand") or ""))
@@ -4813,11 +4905,12 @@ def api_update_news_monitor(monitor_id: str):
                     ):
                         item["brand"] = new_brand
                 monitor["brand"] = new_brand
+        if "start_urls" in payload:
+            start_urls = normalize_start_urls(payload.get("start_urls"), allow_empty=True)
+            if start_urls:
+                monitor["start_urls"] = start_urls
         if "site_url" in payload:
             monitor["site_url"] = str(payload.get("site_url") or "").strip()
-        if "start_urls" in payload:
-            monitor["start_urls"] = normalize_start_urls(payload.get("start_urls"), allow_empty=True)
-            monitor["site_url"] = monitor.get("site_url") or (monitor["start_urls"][0] if monitor["start_urls"] else "")
         if "enabled" in payload:
             monitor["enabled"] = bool(payload.get("enabled"))
         if "schedule_type" in payload:
@@ -4868,8 +4961,8 @@ def api_scan_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
-    if not normalize_start_urls(monitor.get("start_urls") or monitor.get("site_url") or "", allow_empty=True):
-        return jsonify({"error": "У выбранного донора не указан сайт или стартовый URL. Заполните сайт-донор и сохраните настройки."}), 400
+    if not normalize_start_urls(monitor.get("start_urls") or "", allow_empty=True):
+        return jsonify({"error": "У выбранного донора не указаны стартовые URL. Заполните поле \"Стартовые URL\" и сохраните настройки."}), 400
     if monitor.get("state", {}).get("status") in {"running", "queued"}:
         return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
     with news_lock:
@@ -4946,7 +5039,8 @@ def api_resume_news_monitor(monitor_id: str):
 def api_create_news_monitor():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
-    urls = normalize_start_urls(payload.get("start_urls") or payload.get("site_url") or "", allow_empty=True)
+    urls = normalize_start_urls(payload.get("start_urls") or "", allow_empty=True)
+    site_url = str(payload.get("site_url") or "").strip()
     group = clean_text(str(payload.get("group") or "РњР°СЂР¶Р°"))
     brand = clean_text(str(payload.get("brand") or "РќРѕРІС‹Р№ РґРѕРЅРѕСЂ"))
     if payload.get("create_new_brand"):
@@ -4956,6 +5050,7 @@ def api_create_news_monitor():
         group,
         brand,
         urls,
+        site_url,
     )
     with news_lock:
         news_settings.setdefault("monitors", []).append(monitor)

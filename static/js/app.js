@@ -1997,11 +1997,10 @@ newsModalContent.addEventListener("click", async (event) => {
       }
       if (notice) notice.textContent = "Сохраняю...";
       if (!newsData) newsData = await requestJson("/api/news");
-      const currentSite = currentMonitor.site_url || (currentMonitor.start_urls || [])[0] || "";
+      const currentSite = currentMonitor.site_url || "";
       if (!currentSite) {
         const payload = collectMonitorPayload(newsModalContent);
         payload.site_url = siteUrl;
-        payload.start_urls = siteUrl;
         const data = await requestJson(`/api/news/monitors/${currentMonitor.id}`, {
           method: "PATCH",
           body: JSON.stringify(payload),
@@ -2024,7 +2023,6 @@ newsModalContent.addEventListener("click", async (event) => {
             group: currentMonitor.group || "Маржа",
             brand: currentMonitor.brand || "Новый донор",
             site_url: siteUrl,
-            start_urls: siteUrl,
           }),
         });
         newsData = await requestJson("/api/news");

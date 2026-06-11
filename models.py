@@ -69,6 +69,7 @@ class Donor(Base):
     legacy_id: Mapped[str] = mapped_column(String(32), default="", nullable=False, unique=True)
     brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id", ondelete="CASCADE"), nullable=False)
     site_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    start_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     thread_count: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     connection_id: Mapped[int | None] = mapped_column(ForeignKey("connection_methods.id"), nullable=True)
     auto_connection_fallback: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

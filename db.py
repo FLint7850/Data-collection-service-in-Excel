@@ -144,6 +144,7 @@ def migrate_schema(connection) -> None:
 
     migrate_app_settings_current_table(connection)
     migrate_news_tables(connection)
+    migrate_donor_start_urls(connection)
     migrate_projects_table(connection)
 
 
@@ -233,7 +234,6 @@ def migrate_news_tables(connection) -> None:
         donor_columns
         and (
             "connection_id" not in donor_columns
-            or "start_urls" in donor_columns
             or "enabled" in donor_columns
             or "schedule_type" in donor_columns
             or "scan_time" in donor_columns
@@ -286,6 +286,7 @@ def migrate_news_tables(connection) -> None:
             "legacy_id VARCHAR(32) NOT NULL DEFAULT '', "
             "brand_id INTEGER NOT NULL, "
             "site_url TEXT NOT NULL DEFAULT '', "
+            "start_urls JSON NOT NULL DEFAULT '[]', "
             "thread_count INTEGER NOT NULL DEFAULT 4, "
             "connection_id INTEGER, "
             "auto_connection_fallback BOOLEAN NOT NULL DEFAULT 1, "
@@ -343,10 +344,14 @@ def migrate_news_tables(connection) -> None:
         donor_id = row.get("id")
         legacy_id = row.get("legacy_id") or (str(donor_id) if isinstance(donor_id, str) and not str(donor_id).isdigit() else "")
         site_url = row.get("site_url") or ""
+        start_urls = _json_or_default(row.get("start_urls"), [])
+        if not isinstance(start_urls, list):
+            start_urls = []
         if not site_url:
-            start_urls = _json_or_default(row.get("start_urls"), [])
-            if isinstance(start_urls, list) and start_urls:
+            if start_urls:
                 site_url = str(start_urls[0] or "")
+        if site_url and not start_urls:
+            start_urls = [site_url]
         connection_id = row.get("connection_id") or row.get("connection_method_id")
         if not connection_id:
             method = row.get("connection_method") or "requests"
@@ -363,9 +368,9 @@ def migrate_news_tables(connection) -> None:
         connection.execute(
             text(
                 "INSERT INTO donors "
-                "(id, legacy_id, brand_id, site_url, thread_count, connection_id, auto_connection_fallback, exclusions, "
+                "(id, legacy_id, brand_id, site_url, start_urls, thread_count, connection_id, auto_connection_fallback, exclusions, "
                 "product_url_filters, extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
-                "VALUES (:id, :legacy_id, :brand_id, :site_url, :thread_count, :connection_id, :auto_connection_fallback, json(:exclusions), "
+                "VALUES (:id, :legacy_id, :brand_id, :site_url, json(:start_urls), :thread_count, :connection_id, :auto_connection_fallback, json(:exclusions), "
                 "json(:product_url_filters), json(:extraction_rules), json(:selector_settings), json(:seen_models), json(:known_new_products), :created_at, :updated_at)"
             ),
             {
@@ -373,6 +378,7 @@ def migrate_news_tables(connection) -> None:
                 "legacy_id": legacy_id,
                 "brand_id": brand_id,
                 "site_url": site_url,
+                "start_urls": json.dumps(start_urls, ensure_ascii=False),
                 "thread_count": int(row.get("thread_count") or 4),
                 "connection_id": connection_id,
                 "auto_connection_fallback": _bool_value(row.get("auto_connection_fallback"), True),
@@ -410,6 +416,21 @@ def migrate_projects_table(connection) -> None:
         columns = table_columns(connection, "projects")
     if "legacy_id" not in columns:
         connection.execute(text("ALTER TABLE projects ADD COLUMN legacy_id VARCHAR(32) NOT NULL DEFAULT ''"))
+
+
+def migrate_donor_start_urls(connection) -> None:
+    columns = table_columns(connection, "donors")
+    if not columns:
+        return
+    if "start_urls" not in columns:
+        connection.execute(text("ALTER TABLE donors ADD COLUMN start_urls JSON NOT NULL DEFAULT '[]'"))
+    connection.execute(
+        text(
+            "UPDATE donors SET start_urls = json_array(site_url) "
+            "WHERE (start_urls IS NULL OR start_urls = '' OR start_urls = '[]') "
+            "AND site_url IS NOT NULL AND trim(site_url) != ''"
+        )
+    )
 
 
 def migrate_donors_table(connection) -> None:
