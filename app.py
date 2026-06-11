@@ -1112,23 +1112,35 @@ def resolve_export_file(filename: str) -> Optional[Path]:
     return None
 
 
-def news_csv_filename(monitor: Dict[str, object]) -> str:
-    site_url = str(monitor.get("site_url") or "").strip()
-    parsed = urlparse(site_url)
-    source = (parsed.hostname or "").lower().removeprefix("www.")
-    source = source.replace(".", "_") if source else "unknown_site"
-    return f"Новинки_{safe_filename(source)}.csv"
+def news_csv_prefix(monitor: Dict[str, object]) -> str:
+    brand = clean_text(str(monitor.get("brand") or "")).strip()
+    source = safe_filename(brand or "unknown_site")
+    return f"Новинки_{source}_"
 
 
-def delete_news_csv_for_monitor(monitor: Dict[str, object]) -> None:
+def news_csv_filename(monitor: Dict[str, object], created_at: Optional[datetime] = None) -> str:
+    created_at = created_at or datetime.now(MSK_TZ)
+    return f"{news_csv_prefix(monitor)}{created_at.strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+
+
+def delete_news_csv_for_monitor(monitor: Dict[str, object], keep_filename: str = "") -> None:
     filenames = {
-        news_csv_filename(monitor),
+        str(keep_filename or "").strip(),
         str((monitor.get("state") or {}).get("last_csv") or ""),
     }
     state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     state_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
     filenames.add(str(state_data.get("csv") or ""))
+    prefix = news_csv_prefix(monitor)
+    try:
+        for path in EXPORT_DIR.glob(f"{prefix}*.csv"):
+            if path.is_file() and path.name not in filenames:
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
     for filename in filenames:
+        if not filename:
+            continue
         path = resolve_export_file(filename)
         if path:
             try:
@@ -4501,7 +4513,6 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     local_feeds: List[Dict[str, object]] = []
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
-    previous_csv = str(monitor.get("state", {}).get("last_csv") or "")
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -4589,10 +4600,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
 
         update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
         csv_path = create_news_csv(new_items, monitor)
-        if previous_csv and previous_csv != csv_path.name:
-            previous_path = resolve_export_file(previous_csv)
-            if previous_path:
-                previous_path.unlink(missing_ok=True)
+        delete_news_csv_for_monitor(monitor, keep_filename=csv_path.name)
         elapsed = int(time.time() - started)
         with news_lock:
             monitor["known_new_products"] = known
@@ -4642,10 +4650,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         if stop_mode == "pause" and new_items:
             partial_path = create_news_csv(new_items, monitor)
             partial_csv = partial_path.name
-            if previous_csv and previous_csv != partial_csv:
-                previous_path = resolve_export_file(previous_csv)
-                if previous_path:
-                    previous_path.unlink(missing_ok=True)
+            delete_news_csv_for_monitor(monitor, keep_filename=partial_csv)
         missing_summary = build_missing_summary(new_items, feed_code_sets) if feed_code_sets else []
         with news_lock:
             monitor["state"] = {
