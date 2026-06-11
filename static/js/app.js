@@ -984,7 +984,6 @@ function tickNewsModalTimers() {
   const state = monitor?.state || {};
   if (!isNewsScanningStatus(state.status)) return;
   setTextIfChanged(newsModalContent.querySelector("[data-summary='elapsed']"), formatDuration(localElapsedSeconds(state)));
-  setTextIfChanged(newsModalContent.querySelector("[data-summary='stall']"), formatDuration(localStallSeconds(state)));
 }
 
 function renderNewsMonitors() {
