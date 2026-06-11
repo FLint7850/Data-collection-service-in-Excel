@@ -253,7 +253,9 @@ def normalize_emails(value: object) -> List[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\n,;]+", value)
     elif isinstance(value, list):
-        raw_items = [str(item) for item in value]
+        raw_items = []
+        for item in value:
+            raw_items.extend(re.split(r"[\n,;]+", str(item)))
     else:
         raw_items = []
 
@@ -4200,6 +4202,71 @@ def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], file
     return path
 
 
+def build_email_message(
+    sender_email: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    csv_path: Optional[Path] = None,
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender_email
+    message["To"] = recipient
+    message.set_content(body)
+    if csv_path:
+        message.add_attachment(
+            csv_path.read_bytes(),
+            maintype="text",
+            subtype="csv",
+            filename=str(repair_mojibake_text(csv_path.name) or csv_path.name),
+        )
+    return message
+
+
+def send_messages_to_recipients(
+    host: str,
+    port: int,
+    security_mode: str,
+    username: str,
+    password: str,
+    sender_email: str,
+    recipients: List[str],
+    subject: str,
+    body: str,
+    csv_path: Optional[Path] = None,
+) -> None:
+    context = ssl.create_default_context()
+    failures: List[str] = []
+    if security_mode == "tls":
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.starttls(context=context)
+            server.login(username, password)
+            for recipient in recipients:
+                try:
+                    server.send_message(
+                        build_email_message(sender_email, recipient, subject, body, csv_path),
+                        from_addr=sender_email,
+                        to_addrs=[recipient],
+                    )
+                except Exception as exc:
+                    failures.append(f"{recipient}: {exc}")
+    else:
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=30) as server:
+            server.login(username, password)
+            for recipient in recipients:
+                try:
+                    server.send_message(
+                        build_email_message(sender_email, recipient, subject, body, csv_path),
+                        from_addr=sender_email,
+                        to_addrs=[recipient],
+                    )
+                except Exception as exc:
+                    failures.append(f"{recipient}: {exc}")
+    if failures:
+        raise RuntimeError("Не удалось отправить на: " + "; ".join(failures))
+
+
 def feed_missing_labels(keys: Set[str], feed_code_sets: List[Dict[str, object]]) -> List[str]:
     if not keys:
         return []
@@ -4309,27 +4376,14 @@ def send_news_email_legacy(
             label = str(item.get("source_label") or item.get("url") or "СЃР°Р№С‚")
             lines.append(f"РќР° СЃР°Р№С‚Рµ {label} РЅРµ Р±С‹Р»Рѕ РЅР°Р№РґРµРЅРѕ {count} РЅРѕРІРёРЅРѕРє.")
         body = "\n".join(lines)
-    message = EmailMessage()
     subject = str(repair_mojibake_text(subject))
     body = str(repair_mojibake_text(body))
-    message["Subject"] = subject
-    message["From"] = sender_email
-    message["To"] = ", ".join(recipients)
-    message.set_content(body)
 
     host = str(smtp_config.get("host") or "smtp.yandex.ru")
     port = int(smtp_config.get("port") or 465)
     security_mode = str(smtp_config.get("security") or "ssl").lower()
     try:
-        if security_mode == "tls":
-            with smtplib.SMTP(host, port, timeout=30) as server:
-                server.starttls(context=ssl.create_default_context())
-                server.login(username, password)
-                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
-        else:
-            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as server:
-                server.login(username, password)
-                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
+        send_messages_to_recipients(host, port, security_mode, username, password, sender_email, recipients, subject, body)
     except Exception as exc:
         error_message = f"РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё email: {exc}"
         error_message = str(repair_mojibake_text(error_message))
@@ -4388,32 +4442,11 @@ def send_news_email(
         csv_filename = str(state.get("last_csv") or state_data.get("csv") or "")
         csv_path = resolve_export_file(csv_filename)
 
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = sender_email
-    message["To"] = ", ".join(recipients)
-    message.set_content(body)
-    if csv_path:
-        message.add_attachment(
-            csv_path.read_bytes(),
-            maintype="text",
-            subtype="csv",
-            filename=str(repair_mojibake_text(csv_path.name) or csv_path.name),
-        )
-
     host = str(smtp_config.get("host") or "smtp.yandex.ru")
     port = int(smtp_config.get("port") or 465)
     security_mode = str(smtp_config.get("security") or "ssl").lower()
     try:
-        if security_mode == "tls":
-            with smtplib.SMTP(host, port, timeout=30) as server:
-                server.starttls(context=ssl.create_default_context())
-                server.login(username, password)
-                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
-        else:
-            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as server:
-                server.login(username, password)
-                server.send_message(message, from_addr=sender_email, to_addrs=recipients)
+        send_messages_to_recipients(host, port, security_mode, username, password, sender_email, recipients, subject, body, csv_path)
     except Exception as exc:
         error_message = f"Ошибка отправки email: {exc}"
         if error_holder is not None:
