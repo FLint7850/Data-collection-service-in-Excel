@@ -1119,8 +1119,9 @@ def news_csv_filename(monitor: Dict[str, object], created_at: Optional[datetime]
 
 
 def delete_news_csv_for_monitor(monitor: Dict[str, object], keep_filename: str = "") -> None:
+    keep_filename = str(keep_filename or "").strip()
     filenames = {
-        str(keep_filename or "").strip(),
+        keep_filename,
         str((monitor.get("state") or {}).get("last_csv") or ""),
     }
     state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
@@ -1135,6 +1136,8 @@ def delete_news_csv_for_monitor(monitor: Dict[str, object], keep_filename: str =
         pass
     for filename in filenames:
         if not filename:
+            continue
+        if filename == keep_filename:
             continue
         path = resolve_export_file(filename)
         if path:
