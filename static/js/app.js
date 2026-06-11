@@ -1087,7 +1087,7 @@ function updateNewsModalProgress() {
   if (statusNode && statusNode.dataset.status !== (state.status || "idle")) {
     statusNode.outerHTML = newsStatusHtml(state.status);
   }
-  const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
+  const percent = getCompareProgress(state);
   const summaryValues = {
     lastScan: state.last_scan_at || "—",
     newCount: Number(state.new_count || 0),
@@ -1101,7 +1101,7 @@ function updateNewsModalProgress() {
     queue: Number(state.queue_size || 0),
     active: Number(state.active_tasks || 0),
     failed: Number(state.failed_pages || 0),
-    stall: formatDuration(localStallSeconds(state)),
+    stall: formatDuration(Number(state.stall_seconds || 0)),
     elapsed: formatDuration(localElapsedSeconds(state)),
     lastEvent: state.last_event || "—",
     lastWarning: state.last_warning || "",
@@ -1162,7 +1162,7 @@ function renderNewsModal() {
 
   const state = monitor.state || {};
   const disabled = ["running", "queued", "stopping"].includes(state.status);
-  const percent = clampPercent(state.percent || (state.status === "completed" ? 100 : 0));
+  const percent = getCompareProgress(state);
   const brand = monitor.brand || "Донор";
   const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
   const isDraftBrand = !brand || /^Новый бренд(?:\s+\d+)?$/i.test(brand);
@@ -1240,7 +1240,7 @@ function renderNewsModal() {
       <span>Очередь: <strong data-summary="queue">${Number(state.queue_size || 0)}</strong></span>
       <span>Активно: <strong data-summary="active">${Number(state.active_tasks || 0)}</strong></span>
       <span>Ошибок страниц: <strong data-summary="failed">${Number(state.failed_pages || 0)}</strong></span>
-      <span>Без прогресса: <span data-summary="stall">${formatDuration(localStallSeconds(state))}</span></span>
+      <span>Без прогресса: <span data-summary="stall">${formatDuration(Number(state.stall_seconds || 0))}</span></span>
       <span>Событие: <span data-summary="lastEvent">${escapeHtml(state.last_event || "—")}</span></span>
       <span>Предупреждение: <span data-summary="lastWarning">${escapeHtml(state.last_warning || "")}</span></span>
     </div>
@@ -1250,7 +1250,7 @@ function renderNewsModal() {
     <div class="news-progress-block">
       <div class="progress-track"><div class="progress-fill" data-role="modal-progress-fill" style="width: ${percent}%"></div></div>
       <div class="percent-row">
-        <span data-role="modal-percent">${percent}%</span>
+        <span>Прогресс сравнения: <span data-role="modal-percent">${percent}%</span></span>
         <span data-role="modal-current-url">${escapeHtml(state.currenturl || "")}</span>
       </div>
       <div class="active-url-list ${Array.isArray(state.active_urls) && state.active_urls.length ? "" : "hidden"}" data-role="modal-active-urls">
