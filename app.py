@@ -1112,6 +1112,31 @@ def resolve_export_file(filename: str) -> Optional[Path]:
     return None
 
 
+def news_csv_filename(monitor: Dict[str, object]) -> str:
+    site_url = str(monitor.get("site_url") or "").strip()
+    parsed = urlparse(site_url)
+    source = (parsed.hostname or "").lower().removeprefix("www.")
+    source = source.replace(".", "_") if source else "unknown_site"
+    return f"Новинки_{safe_filename(source)}.csv"
+
+
+def delete_news_csv_for_monitor(monitor: Dict[str, object]) -> None:
+    filenames = {
+        news_csv_filename(monitor),
+        str((monitor.get("state") or {}).get("last_csv") or ""),
+    }
+    state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+    state_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
+    filenames.add(str(state_data.get("csv") or ""))
+    for filename in filenames:
+        path = resolve_export_file(filename)
+        if path:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
     public_monitor = repair_mojibake(dict(monitor))
     state = dict(public_monitor.get("state") or make_news_state())
@@ -4167,7 +4192,7 @@ def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> 
 
 def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], filename: str = "") -> Path:
     if not filename:
-        filename = f"Новинки_{safe_filename(str(monitor.get('brand') or 'donor'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+        filename = news_csv_filename(monitor)
     filename = output_text(filename)
     path = EXPORT_DIR / filename
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
@@ -4563,7 +4588,11 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             )
 
         update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
-        csv_path = create_news_csv(new_items, monitor, previous_csv)
+        csv_path = create_news_csv(new_items, monitor)
+        if previous_csv and previous_csv != csv_path.name:
+            previous_path = resolve_export_file(previous_csv)
+            if previous_path:
+                previous_path.unlink(missing_ok=True)
         elapsed = int(time.time() - started)
         with news_lock:
             monitor["known_new_products"] = known
@@ -4611,7 +4640,12 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             stop_mode = news_stop_modes.get(monitor_id, "stop")
         partial_csv = ""
         if stop_mode == "pause" and new_items:
-            partial_csv = create_news_csv(new_items, monitor, previous_csv).name
+            partial_path = create_news_csv(new_items, monitor)
+            partial_csv = partial_path.name
+            if previous_csv and previous_csv != partial_csv:
+                previous_path = resolve_export_file(previous_csv)
+                if previous_path:
+                    previous_path.unlink(missing_ok=True)
         missing_summary = build_missing_summary(new_items, feed_code_sets) if feed_code_sets else []
         with news_lock:
             monitor["state"] = {
@@ -5111,6 +5145,7 @@ def api_delete_news_monitor(monitor_id: str):
         if len(brand_monitors) < 2:
             return jsonify({"error": "Нельзя удалить единственного донора бренда"}), 409
     request_news_stop(monitor_id, "stop")
+    delete_news_csv_for_monitor(monitor)
     with news_lock:
         monitors = news_settings.get("monitors", [])
         news_settings["monitors"] = [
