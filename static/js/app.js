@@ -785,6 +785,15 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, Math.round(percent)));
 }
 
+function getCompareProgress(state) {
+  const compared = Number(state?.compared_products || 0);
+  const total = Number(state?.candidate_products || state?.found_products || 0);
+
+  if (!Number.isFinite(total) || total <= 0) return 0;
+
+  return clampPercent((compared / total) * 100);
+}
+
 function formatFileSize(value) {
   const bytes = Number(value || 0);
   if (!Number.isFinite(bytes) || bytes <= 0) return "";
@@ -884,7 +893,7 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
   const states = brandMonitors.map((item) => stateWithBrandState(item));
   const status = aggregateNewsStatus(states);
   const activeState = states.find((state) => state.status === "running" || state.status === "queued") || states[0] || {};
-  const percent = clampPercent(activeState.percent || (status === "completed" ? 100 : 0));
+  const percent = getCompareProgress(activeState);
   const newCount = Number(activeState.new_count || 0);
   const inMemoryProducts = Number(activeState.in_memory_products || activeState.found_products || 0);
   const queueSize = Number(activeState.queue_size || 0);
