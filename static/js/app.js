@@ -869,7 +869,7 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
       Стр: ${Number(activeState.processed || 0)} · Тов: ${Number(activeState.found_products || 0)} · Сравнено: ${Number(activeState.compared_products || 0)}
     </span>
     <span class="brand-counters brand-counters-secondary">
-      В памяти: ${inMemoryProducts} В· Очередь: ${queueSize} В· Активно: ${activeTasks}
+      В памяти: ${inMemoryProducts} · Очередь: ${queueSize} · Активно: ${activeTasks}
     </span>
     ${stallSeconds ? `<span class="brand-stage">Без прогресса: ${formatDuration(stallSeconds)}</span>` : ""}
     <span class="brand-stage">${escapeHtml(activeState.stage || "")}</span>

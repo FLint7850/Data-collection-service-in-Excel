@@ -79,8 +79,8 @@ BLOCKED_PAGE_MARKERS = (
     "__qrator",
     "qauth.js",
     "qrator",
-    "РґРѕСЃС‚СѓРї РѕРіСЂР°РЅРёС‡РµРЅ",
-    "РїСЂРѕРІРµСЂСЏРµРј РІР°С€ Р±СЂР°СѓР·РµСЂ",
+    "доступ ограничен",
+    "проверяем ваш браузер",
     "enable javascript",
 )
 
@@ -174,7 +174,7 @@ def make_state(thread_count: int = 4) -> Dict[str, object]:
 
 
 def ensure_storage() -> None:
-    """РЎРѕР·РґР°РµС‚ СЂР°Р±РѕС‡РёРµ С„Р°Р№Р»С‹ РїСЂРё РїРµСЂРІРѕРј Р·Р°РїСѓСЃРєРµ."""
+    """Создает рабочие файлы при первом запуске."""
     EXPORT_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     FEED_DIR.mkdir(exist_ok=True)
@@ -279,7 +279,7 @@ def normalize_selector_settings(value: object) -> Dict[str, str]:
     return settings
 
 
-def make_project(name: str = "РџСЂРѕРµРєС‚ 1", start_urls: Optional[List[str]] = None) -> Dict[str, object]:
+def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] = None) -> Dict[str, object]:
     project_id = uuid.uuid4().hex[:10]
     return {
         "id": project_id,
@@ -345,7 +345,7 @@ def project_model_to_dict(row: Project) -> Dict[str, object]:
     }
     if project["state"].get("status") == "running":
         project["state"]["status"] = "error"
-        project["state"]["error"] = "РЎР±РѕСЂ Р±С‹Р» РїСЂРµСЂРІР°РЅ РїРµСЂРµР·Р°РїСѓСЃРєРѕРј СЃРµСЂРІРµСЂР°. Р—Р°РїСѓСЃС‚РёС‚Рµ РµРіРѕ СЃРЅРѕРІР°."
+        project["state"]["error"] = "Сбор был прерван перезапуском сервера. Запустите его снова."
     return project
 
 
@@ -463,7 +463,7 @@ def load_projects() -> None:
             rows = session.scalars(select(Project).order_by(Project.created_at, Project.id)).all()
 
         if not rows:
-            project = make_project("РџСЂРѕРµРєС‚ 1", [DEFAULT_START_URL])
+            project = make_project("Проект 1", [DEFAULT_START_URL])
             projects[project["id"]] = project
             save_projects()
         else:
@@ -471,7 +471,7 @@ def load_projects() -> None:
                 projects[str(row.id)] = project_model_to_dict(row)
 
         if not projects:
-            project = make_project("РџСЂРѕРµРєС‚ 1", [DEFAULT_START_URL])
+            project = make_project("Проект 1", [DEFAULT_START_URL])
             projects[project["id"]] = project
             save_projects()
         load_logs()
@@ -552,14 +552,14 @@ def repair_mojibake_text(value: object) -> object:
         "\u0455",
         "\u045f",
         "\u20ac",
-        "РЎ",
-        "Рџ",
-        "Рћ",
-        "Рњ",
-        "Рќ",
-        "Р”",
-        "Р“",
-        "Р¦",
+        "С",
+        "П",
+        "О",
+        "М",
+        "Н",
+        "Д",
+        "Г",
+        "Ц",
         "Р",
         "С",
     )
@@ -682,8 +682,8 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
 def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     start_urls = normalize_start_urls(item.get("start_urls") or "", allow_empty=True)
     monitor = make_news_monitor(
-        clean_text(str(item.get("group") or "РњР°СЂР¶Р°")),
-        clean_text(str(item.get("brand") or "Р”РѕРЅРѕСЂ")),
+        clean_text(str(item.get("group") or "Маржа")),
+        clean_text(str(item.get("brand") or "Донор")),
         start_urls,
         str(item.get("site_url") or ""),
     )
@@ -731,8 +731,8 @@ def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object
     return monitors
 
 
-def unique_news_brand_name(group: str, base_name: str = "РќРѕРІС‹Р№ Р±СЂРµРЅРґ") -> str:
-    base_name = clean_text(base_name) or "РќРѕРІС‹Р№ Р±СЂРµРЅРґ"
+def unique_news_brand_name(group: str, base_name: str = "Новый бренд") -> str:
+    base_name = clean_text(base_name) or "Новый бренд"
     group_name = clean_text(group)
     names = {
         clean_text(str(item.get("brand") or ""))
@@ -923,7 +923,7 @@ def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]
                 continue
             sites.append(
                 {
-                    "name": clean_text(str(item.get("name") or "")) or f"Р¤РёРґ {index}",
+                    "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
                     "feed_url": feed_url,
                     "feed_generate_url": normalize_feed_url(str(item.get("feed_generate_url") or "").strip()),
                 }
@@ -964,8 +964,8 @@ def save_news_settings() -> None:
             for monitor in news_settings.get("monitors", []):
                 if not isinstance(monitor, dict):
                     continue
-                group_name = clean_text(str(monitor.get("group") or "РњР°СЂР¶Р°"))
-                brand_name = clean_text(str(monitor.get("brand") or "Р”РѕРЅРѕСЂ"))
+                group_name = clean_text(str(monitor.get("group") or "Маржа"))
+                brand_name = clean_text(str(monitor.get("brand") or "Донор"))
                 grouped_monitors.setdefault((brand_name, group_name), []).append(monitor)
             for (brand_name, group_name), brand_monitors in grouped_monitors.items():
                 brand_row = session.scalar(select(Brand).where(Brand.name == brand_name, Brand.group_name == group_name))
@@ -1073,7 +1073,7 @@ def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str 
             {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "project_id": f"news:{monitor.get('id')}" if monitor else "news",
-                "project_name": repair_mojibake_text(f"РќРѕРІРёРЅРєРё: {monitor.get('brand')}") if monitor else "Новинки",
+                "project_name": repair_mojibake_text(f"Новинки: {monitor.get('brand')}") if monitor else "Новинки",
                 "level": level,
                 "message": repair_mojibake_text(message),
             }
@@ -1306,7 +1306,7 @@ def now_iso() -> str:
 
 
 def normalize_url(raw_url: str, base_url: str) -> Optional[str]:
-    """РџСЂРёРІРѕРґРёС‚ СЃСЃС‹Р»РєСѓ Рє РєР°РЅРѕРЅРёС‡РµСЃРєРѕРјСѓ РІРёРґСѓ РІРЅСѓС‚СЂРё СЃР°Р№С‚Р°."""
+    """Приводит ссылку к каноническому виду внутри сайта."""
     if not raw_url:
         return None
     raw_url = raw_url.strip()
@@ -1324,8 +1324,8 @@ def normalize_url(raw_url: str, base_url: str) -> Optional[str]:
     if path != "/" and path.endswith("/") and not keep_trailing_slash:
         path = path[:-1]
 
-    # РЎРѕС…СЂР°РЅСЏРµРј С‚РѕР»СЊРєРѕ РїР°РіРёРЅР°С†РёСЋ. РћСЃС‚Р°Р»СЊРЅС‹Рµ РїР°СЂР°РјРµС‚СЂС‹ РѕР±С‹С‡РЅРѕ СЃРѕР·РґР°СЋС‚ РґСѓР±Р»РёРєР°С‚С‹:
-    # СЃРѕСЂС‚РёСЂРѕРІРєРё, UTM-РјРµС‚РєРё, СЃСЂР°РІРЅРµРЅРёРµ, С„РёР»СЊС‚СЂС‹ СЃ С‚РµРјРё Р¶Рµ С‚РѕРІР°СЂР°РјРё.
+    # Сохраняем только пагинацию. Остальные параметры обычно создают дубликаты:
+    # сортировки, UTM-метки, сравнение, фильтры с теми же товарами.
     pagination_params = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=False):
         key_lower = key.lower()
@@ -1450,7 +1450,7 @@ def is_obvious_service_path(path: str) -> bool:
 
 
 def looks_blocked_or_empty(html: str) -> bool:
-    """РћРїСЂРµРґРµР»СЏРµС‚ СЃС‚СЂР°РЅРёС†С‹ Р±Р»РѕРєРёСЂРѕРІРєРё РёР»Рё РїРѕС‡С‚Рё РїСѓСЃС‚С‹Рµ HTML-РѕР±РѕР»РѕС‡РєРё."""
+    """Определяет страницы блокировки или почти пустые HTML-оболочки."""
     lowered = html.lower()
     soup = BeautifulSoup(html, "html.parser")
     text = clean_text(soup.get_text(" ", strip=True))
@@ -1463,7 +1463,7 @@ def looks_blocked_or_empty(html: str) -> bool:
 
 
 def should_follow_url(url: str, start_url: str, root_netloc: str) -> bool:
-    """РћРіСЂР°РЅРёС‡РёРІР°РµС‚ РѕР±С…РѕРґ СЃС‚СЂР°РЅРёС†Р°РјРё СЃР°Р№С‚Р°, РїРѕР»РµР·РЅС‹РјРё РґР»СЏ РїРѕРёСЃРєР° С‚РѕРІР°СЂРѕРІ."""
+    """Ограничивает обход страницами сайта, полезными для поиска товаров."""
     if not same_site(url, root_netloc) or has_static_extension(url):
         return False
 
@@ -1513,7 +1513,7 @@ def is_catalog_url(url: str) -> bool:
 
 
 def exclusion_matches(url: str, pattern: str) -> bool:
-    """РџСЂРѕРІРµСЂСЏРµС‚ URL РїРѕ РїРѕР»СЊР·РѕРІР°С‚РµР»СЊСЃРєРѕРјСѓ С€Р°Р±Р»РѕРЅСѓ РёСЃРєР»СЋС‡РµРЅРёСЏ."""
+    """Проверяет URL по пользовательскому шаблону исключения."""
     pattern = pattern.strip()
     if not pattern:
         return False
@@ -1599,19 +1599,19 @@ MODEL_COLOR_WORDS = {
     "BROWN",
     "ORANGE",
     "IVORY",
-    "Р§Р•Р РќР«Р™",
-    "Р§РЃР РќР«Р™",
-    "Р‘Р•Р›Р«Р™",
-    "РЎР•Р Р«Р™",
-    "РЎР•Р Р•Р‘Р РРЎРўР«Р™",
-    "Р—РћР›РћРўРћР™",
-    "РљР РђРЎРќР«Р™",
-    "РЎРРќРР™",
-    "Р—Р•Р›Р•РќР«Р™",
-    "Р—Р•Р›РЃРќР«Р™",
-    "Р РћР—РћР’Р«Р™",
-    "Р‘Р•Р–Р•Р’Р«Р™",
-    "РљРћР РР§РќР•Р’Р«Р™",
+    "ЧЕРНЫЙ",
+    "ЧЁРНЫЙ",
+    "БЕЛЫЙ",
+    "СЕРЫЙ",
+    "СЕРЕБРИСТЫЙ",
+    "ЗОЛОТОЙ",
+    "КРАСНЫЙ",
+    "СИНИЙ",
+    "ЗЕЛЕНЫЙ",
+    "ЗЕЛЁНЫЙ",
+    "РОЗОВЫЙ",
+    "БЕЖЕВЫЙ",
+    "КОРИЧНЕВЫЙ",
 }
 
 
@@ -1697,7 +1697,7 @@ def normalize_kuppersberg_model(value: str, product_url: str = "") -> str:
 
 
 def normalize_model(value: str, product_url: str = "") -> str:
-    """Р’РѕР·РІСЂР°С‰Р°РµС‚ РјР°СЂРєРёСЂРѕРІРєСѓ РјРѕРґРµР»Рё Р±РµР· РїРѕР»РЅРѕРіРѕ С‚РѕРІР°СЂРЅРѕРіРѕ РЅР°Р·РІР°РЅРёСЏ."""
+    """Возвращает маркировку модели без полного товарного названия."""
     text = clean_text(value)
     url_model = technopark_model_from_url(product_url)
     if url_model:
@@ -1710,7 +1710,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
     if not text:
         return ""
 
-    # Р§Р°СЃС‚С‹Р№ СЃР»СѓС‡Р°Р№: "РЁРєР°С„ РґСѓС…РѕРІРѕР№ MAUNFELD AEOC6040B" -> "AEOC6040B".
+    # Частый случай: "Шкаф духовой MAUNFELD AEOC6040B" -> "AEOC6040B".
     brand_match = re.search(r"\bMAUNFELD\b\s+([A-Z0-9][A-Z0-9./\\_-]{2,})", text, re.IGNORECASE)
     if brand_match:
         return brand_match.group(1).strip(" .,/\\_-").replace("\\", "/").upper()
@@ -1750,9 +1750,9 @@ def normalize_model(value: str, product_url: str = "") -> str:
         "ONLINE",
         "SALE",
         "NEW",
-        "РћРќР›РђР™Рќ",
-        "Р РђРЎРџР РћР”РђР–Рђ",
-        "РќРћР’РРќРљРђ",
+        "ОНЛАЙН",
+        "РАСПРОДАЖА",
+        "НОВИНКА",
     }
     code_tokens = []
     for token in re.findall(r"[A-Z\u0400-\u04FF0-9][A-Z\u0400-\u04FF0-9./\\_-]{2,}", text, flags=re.IGNORECASE):
@@ -1767,7 +1767,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
     if code_tokens:
         return code_tokens[-1].replace("\\", "/").upper()
 
-    # РџРѕСЃР»РµРґРЅРёР№ С€Р°РЅСЃ РґР»СЏ Maunfeld: РјРѕРґРµР»СЊ С‡Р°СЃС‚Рѕ Р»РµР¶РёС‚ РІ РєРѕРЅС†Рµ slug РїРѕСЃР»Рµ "-maunfeld-".
+    # Последний шанс для Maunfeld: модель часто лежит в конце slug после "-maunfeld-".
     slug = urlparse(product_url).path.rstrip("/").split("/")[-1]
     slug_match = re.search(r"(?:^|-)maunfeld-([a-z0-9-]+)$", slug, re.IGNORECASE)
     if slug_match:
@@ -1875,7 +1875,7 @@ def extract_schema_listing_products(soup: BeautifulSoup, current_url: str) -> Li
 
 
 def find_labeled_value(soup: BeautifulSoup, labels: Iterable[str]) -> str:
-    """РС‰РµС‚ Р·РЅР°С‡РµРЅРёРµ СЂСЏРґРѕРј СЃ РїРѕРґРїРёСЃСЊСЋ РІСЂРѕРґРµ 'РђСЂС‚РёРєСѓР»' РёР»Рё 'РњРѕРґРµР»СЊ'."""
+    """Ищет значение рядом с подписью вроде 'Артикул' или 'Модель'."""
     label_regex = re.compile("|".join(re.escape(label) for label in labels), re.IGNORECASE)
 
     for row in soup.select("tr, li, .row, .item, .chars__item, .characteristics__item"):
@@ -1886,46 +1886,46 @@ def find_labeled_value(soup: BeautifulSoup, labels: Iterable[str]) -> str:
         value_node = row.select_one(".val, .value, td:last-child, span:last-child, div:last-child")
         if value_node:
             value = clean_text(value_node.get_text(" ", strip=True))
-            value = label_regex.sub("", value).strip(" :вЂ”-")
+            value = label_regex.sub("", value).strip(" :—-")
             if value:
                 return value
 
-        value = label_regex.sub("", row_text).strip(" :вЂ”-")
+        value = label_regex.sub("", row_text).strip(" :—-")
         if value:
             return value
 
     page_text = clean_text(soup.get_text(" ", strip=True))
     match = re.search(r"(?:Артикул|Модель|Art:)\s*[:\-]?\s*([A-Za-z\u0400-\u04FF0-9][^|]{1,80})", page_text)
     if match:
-        return clean_text(match.group(1)).split(" Р’ РЅР°Р»РёС‡РёРё")[0].strip()
+        return clean_text(match.group(1)).split(" В наличии")[0].strip()
 
     return ""
 
 
 def extract_maunfeld_article(soup: BeautifulSoup) -> str:
-    """Р”Р»СЏ Maunfeld РјРѕРґРµР»СЊ Р±РµСЂРµРј С‚РѕР»СЊРєРѕ РёР· С…Р°СЂР°РєС‚РµСЂРёСЃС‚РёРєРё 'РђСЂС‚РёРєСѓР»'."""
+    """Для Maunfeld модель берем только из характеристики 'Артикул'."""
     for row in soup.select("li, tr, .item, .features-grid__item, .characteristics__item"):
         name_node = row.select_one(".name")
         value_node = row.select_one(".val")
         if name_node and value_node:
             name = clean_text(name_node.get_text(" ", strip=True))
             value = clean_text(value_node.get_text(" ", strip=True))
-            if name.lower() == "Р°СЂС‚РёРєСѓР»" and value:
+            if name.lower() == "артикул" and value:
                 return value
 
         row_text = clean_text(row.get_text(" ", strip=True))
-        if not row_text.lower().startswith("Р°СЂС‚РёРєСѓР»"):
+        if not row_text.lower().startswith("артикул"):
             continue
 
-        value = re.sub(r"^РђСЂС‚РёРєСѓР»\s*", "", row_text, flags=re.IGNORECASE).strip(" :вЂ”-")
+        value = re.sub(r"^Артикул\s*", "", row_text, flags=re.IGNORECASE).strip(" :—-")
         if value:
             return value
 
-    # Fallback РґР»СЏ С‚РµРєСЃС‚РѕРІРѕРіРѕ HTML, РіРґРµ С…Р°СЂР°РєС‚РµСЂРёСЃС‚РёРєРё СѓР¶Рµ СЂР°Р·РІРµСЂРЅСѓС‚С‹ Р±РµР· РєР»Р°СЃСЃРѕРІ.
+    # Fallback для текстового HTML, где характеристики уже развернуты без классов.
     page_lines = split_text_lines(soup.get_text("\n", strip=True))
     for line in page_lines:
-        if line.lower().startswith("Р°СЂС‚РёРєСѓР» "):
-            value = re.sub(r"^РђСЂС‚РёРєСѓР»\s*", "", line, flags=re.IGNORECASE).strip(" :вЂ”-")
+        if line.lower().startswith("артикул "):
+            value = re.sub(r"^Артикул\s*", "", line, flags=re.IGNORECASE).strip(" :—-")
             if value:
                 return value
 
@@ -1974,7 +1974,7 @@ def is_probable_product_url(url: str) -> bool:
 
 
 def find_card_container(price_node, current_url: str) -> Optional[object]:
-    """РќР°С…РѕРґРёС‚ Р±Р»РёР¶Р°Р№С€РёР№ РєРѕРЅС‚РµР№РЅРµСЂ РєР°СЂС‚РѕС‡РєРё С‚РѕРІР°СЂР° РІРѕРєСЂСѓРі С†РµРЅС‹."""
+    """Находит ближайший контейнер карточки товара вокруг цены."""
     node = price_node if hasattr(price_node, "select") else price_node.parent
     best = None
     for _ in range(10):
@@ -2012,15 +2012,15 @@ def extract_model_from_card(card, price: str) -> str:
                 return text
 
     ignored = {
-        "РѕРЅР»Р°Р№РЅ",
-        "СЂР°СЃРїСЂРѕРґР°Р¶Р°",
-        "РЅРѕРІРёРЅРєР°",
-        "СЃРґРµР»Р°РЅРѕ РІ РµРІСЂРѕРїРµ",
-        "РєСѓС…РѕРЅРЅС‹Рј СЃС‚СѓРґРёСЏРј",
-        "РІ РЅР°Р»РёС‡РёРё",
-        "РЅРµС‚ РІ РЅР°Р»РёС‡РёРё",
-        "РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ",
-        "РїРѕ РїРѕРїСѓР»СЏСЂРЅРѕСЃС‚Рё",
+        "онлайн",
+        "распродажа",
+        "новинка",
+        "сделано в европе",
+        "кухонным студиям",
+        "в наличии",
+        "нет в наличии",
+        "по умолчанию",
+        "по популярности",
     }
     lines = split_text_lines(card.get_text("\n", strip=True))
     lines = [
@@ -2042,13 +2042,13 @@ def is_good_model_text(text: str) -> bool:
         return False
     lowered = text.lower()
     if lowered in {
-        "РІ РЅР°Р»РёС‡РёРё",
-        "РЅРµС‚ РІ РЅР°Р»РёС‡РёРё",
-        "РѕРЅР»Р°Р№РЅ",
-        "СЂР°СЃРїСЂРѕРґР°Р¶Р°",
-        "РЅРѕРІРёРЅРєР°",
-        "РєСѓРїРёС‚СЊ",
-        "РїРѕРґСЂРѕР±РЅРµРµ",
+        "в наличии",
+        "нет в наличии",
+        "онлайн",
+        "распродажа",
+        "новинка",
+        "купить",
+        "подробнее",
     }:
         return False
     if PRICE_RE.search(text):
@@ -2464,7 +2464,7 @@ def extract_listing_products(
     rules: Optional[Dict[str, str]] = None,
     product_url_filters: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, str]]:
-    """РЎРѕР±РёСЂР°РµС‚ С‚РѕРІР°СЂС‹ РїСЂСЏРјРѕ СЃРѕ СЃС‚СЂР°РЅРёС†С‹ РєР°С‚РµРіРѕСЂРёРё/РєР°С‚Р°Р»РѕРіР°."""
+    """Собирает товары прямо со страницы категории/каталога."""
     soup = BeautifulSoup(html, "html.parser")
     products: List[Dict[str, str]] = extract_schema_listing_products(soup, current_url)
     price_sources = []
@@ -2571,7 +2571,7 @@ def extract_product_data(
         schema_product = extract_schema_product(soup, url, price)
         if schema_product:
             return schema_product
-        model = find_labeled_value(soup, ["РђСЂС‚РёРєСѓР»", "РњРѕРґРµР»СЊ", "Art:"])
+        model = find_labeled_value(soup, ["Артикул", "Модель", "Art:"])
     if not is_maunfeld_url(url):
         precise_model = first_text(
             soup,
@@ -2612,7 +2612,7 @@ def extract_product_data(
     page_text = clean_text(soup.get_text(" ", strip=True))
     has_product_signal = any(
         signal in page_text
-        for signal in ("РљРѕРґ С‚РѕРІР°СЂР°", "Р’ РєРѕСЂР·РёРЅСѓ", "РҐР°СЂР°РєС‚РµСЂРёСЃС‚РёРєРё", "Р’Р°С€Р° С†РµРЅР°", "РЎРѕРѕР±С‰РёС‚СЊ Рѕ РїРѕСЃС‚СѓРїР»РµРЅРёРё")
+        for signal in ("Код товара", "В корзину", "Характеристики", "Ваша цена", "Сообщить о поступлении")
     )
     looks_like_product_url = is_probable_product_url(url)
 
@@ -2628,7 +2628,7 @@ def extract_product_data(
 
 
 def fetch_with_botasaurus_request(url: str) -> Optional[str]:
-    """Fallback С‡РµСЂРµР· Botasaurus Request: Р±СЂР°СѓР·РµСЂРѕРїРѕРґРѕР±РЅС‹Р№ HTTP-Р·Р°РїСЂРѕСЃ СЃ Google Referrer."""
+    """Fallback через Botasaurus Request: браузероподобный HTTP-запрос с Google Referrer."""
     try:
         from botasaurus.request import Request
         from botasaurus.request import request as botasaurus_request
@@ -2662,7 +2662,7 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
 
 
 def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optional[str]:
-    """Fallback С‡РµСЂРµР· Botasaurus Browser РґР»СЏ СЃС‚СЂР°РЅРёС†, РєРѕС‚РѕСЂС‹Рј РЅСѓР¶РµРЅ РЅР°СЃС‚РѕСЏС‰РёР№ СЂРµРЅРґРµСЂРёРЅРі."""
+    """Fallback через Botasaurus Browser для страниц, которым нужен настоящий рендеринг."""
     try:
         from botasaurus.browser import Driver
         from botasaurus.browser import browser
@@ -2706,7 +2706,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
 
 
 def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
-    """Р’РёРґРёРјС‹Р№ Р±СЂР°СѓР·РµСЂ СЃ РїРѕСЃС‚РѕСЏРЅРЅС‹Рј РїСЂРѕС„РёР»РµРј: РЅСѓР¶РµРЅ РґР»СЏ Qrator/JS-С‡РµР»Р»РµРЅРґР¶РµР№ РІСЂРѕРґРµ Technopark."""
+    """Видимый браузер с постоянным профилем: нужен для Qrator/JS-челленджей вроде Technopark."""
     try:
         from botasaurus.browser import Driver
         from botasaurus.browser import browser
@@ -2955,7 +2955,7 @@ class MaunfeldCrawler:
                     if not looks_blocked_or_empty(response.text):
                         return response.text
 
-                    last_error = "СЃС‚СЂР°РЅРёС†Р° РїРѕС…РѕР¶Р° РЅР° Р±Р»РѕРєРёСЂРѕРІРєСѓ РёР»Рё РїСѓСЃС‚РѕР№ JS-С€Р°Р±Р»РѕРЅ"
+                    last_error = "страница похожа на блокировку или пустой JS-шаблон"
                     break
                 except requests.RequestException as exc:
                     last_error = str(exc)
@@ -2967,14 +2967,14 @@ class MaunfeldCrawler:
                     if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in {401, 403}:
                         continue
                     break
-            if last_error == "СЃС‚СЂР°РЅРёС†Р° РїРѕС…РѕР¶Р° РЅР° Р±Р»РѕРєРёСЂРѕРІРєСѓ РёР»Рё РїСѓСЃС‚РѕР№ JS-С€Р°Р±Р»РѕРЅ":
+            if last_error == "страница похожа на блокировку или пустой JS-шаблон":
                 break
             if self.stop_signal.is_set():
                 return None
             if attempt < MAX_RETRIES:
                 time.sleep(min(attempt, 3))
         if last_error:
-            self.log(f"requests РЅРµ СЃРјРѕРі Р·Р°РіСЂСѓР·РёС‚СЊ {url}: {last_error}", "warning")
+            self.log(f"requests не смог загрузить {url}: {last_error}", "warning")
         return None
 
     def fetch_by_method(self, url: str, method: str) -> Optional[str]:
@@ -3025,21 +3025,21 @@ class MaunfeldCrawler:
             html = self.fetch_by_method(url, method)
             if html and not looks_blocked_or_empty(html):
                 if method != self.connection_method:
-                    self.log(f"РђРІС‚РѕРїРµСЂРµРєР»СЋС‡РµРЅРёРµ РїРѕРґРєР»СЋС‡РµРЅРёСЏ: {method} РґР»СЏ {url}", "warning")
+                    self.log(f"Автопереключение подключения: {method} для {url}", "warning")
                 return html
             with self.data_lock:
                 if url in self.permanent_failures:
                     break
-            self.log(f"РњРµС‚РѕРґ РїРѕРґРєР»СЋС‡РµРЅРёСЏ {method} РЅРµ СЃСЂР°Р±РѕС‚Р°Р» РґР»СЏ {url}", "warning")
+            self.log(f"Метод подключения {method} не сработал для {url}", "warning")
 
-        self.update_state(error=f"РћР±С‹С‡РЅС‹Р№ Р·Р°РїСЂРѕСЃ РЅРµ СЃСЂР°Р±РѕС‚Р°Р» РґР»СЏ {url}. РџСЂРѕР±СѓСЋ Botasaurus...")
+        self.update_state(error=f"Обычный запрос не сработал для {url}. Пробую Botasaurus...")
         self.update_state(
             error=(
-                f"РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ {url}. РџРѕСЃР»РµРґРЅРёР№ РјРµС‚РѕРґ: {last_method}. "
-                "РџСЂРѕРІРµСЂСЊС‚Рµ СЃРїРѕСЃРѕР± РїРѕРґРєР»СЋС‡РµРЅРёСЏ РёР»Рё РІРєР»СЋС‡РёС‚Рµ Р°РІС‚РѕРїРµСЂРµРєР»СЋС‡РµРЅРёРµ."
+                f"Не удалось загрузить {url}. Последний метод: {last_method}. "
+                "Проверьте способ подключения или включите автопереключение."
             ),
         )
-        self.log(f"РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ {url}. РџРѕСЃР»РµРґРЅРёР№ РјРµС‚РѕРґ: {last_method}", "error")
+        self.log(f"Не удалось загрузить {url}. Последний метод: {last_method}", "error")
         return None
 
     def is_excluded(self, url: str) -> bool:
@@ -3244,7 +3244,7 @@ class MaunfeldCrawler:
             if product:
                 self.add_products([product])
                 if is_technopark_url(url):
-                    self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: 1", "info")
+                    self.log(f"Страница обработана: {url}. Найдено товаров на странице: 1", "info")
                 return
 
             current_is_product = False
@@ -3262,16 +3262,16 @@ class MaunfeldCrawler:
             if product:
                 self.add_products([product])
                 if is_technopark_url(url):
-                    self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: 1", "info")
+                    self.log(f"Страница обработана: {url}. Найдено товаров на странице: 1", "info")
                 return
 
             current_is_product = False
 
         if not current_is_product and not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)) and not PRICE_RE.search(html):
             self.update_state(
-                error=f"РќР° СЃС‚СЂР°РЅРёС†Рµ РєР°С‚Р°Р»РѕРіР° РЅРµС‚ С†РµРЅ РІ HTML. Р РµРЅРґРµСЂСЋ С‡РµСЂРµР· Botasaurus: {url}",
+                error=f"На странице каталога нет цен в HTML. Рендерю через Botasaurus: {url}",
             )
-            self.log(f"Р РµРЅРґРµСЂРёРЅРі РєР°С‚Р°Р»РѕРіР° С‡РµСЂРµР· Botasaurus: {url}", "warning")
+            self.log(f"Рендеринг каталога через Botasaurus: {url}", "warning")
             rendered_html = fetch_with_botasaurus_browser(url)
             if rendered_html and not looks_blocked_or_empty(rendered_html):
                 html = rendered_html
@@ -3308,7 +3308,7 @@ class MaunfeldCrawler:
             self.add_products([product])
 
         if is_technopark_url(url):
-            self.log(f"РЎС‚СЂР°РЅРёС†Р° РѕР±СЂР°Р±РѕС‚Р°РЅР°: {url}. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ РЅР° СЃС‚СЂР°РЅРёС†Рµ: {len(listing_products)}", "info")
+            self.log(f"Страница обработана: {url}. Найдено товаров на странице: {len(listing_products)}", "info")
 
         if not current_is_product:
             self.extract_links(html, url)
@@ -3324,11 +3324,11 @@ class MaunfeldCrawler:
         filename = create_export_file(rows, self.project)
         final_error = ""
         if partial:
-            final_error = "РЎР±РѕСЂ РїСЂРёРѕСЃС‚Р°РЅРѕРІР»РµРЅ. CSV СЃС„РѕСЂРјРёСЂРѕРІР°РЅ РїРѕ СѓР¶Рµ РЅР°Р№РґРµРЅРЅС‹Рј С‚РѕРІР°СЂР°Рј."
+            final_error = "Сбор приостановлен. CSV сформирован по уже найденным товарам."
         elif not self.results:
             final_error = (
-                "РЎР±РѕСЂ Р·Р°РІРµСЂС€РµРЅ, РЅРѕ С‚РѕРІР°СЂС‹ РЅРµ РЅР°Р№РґРµРЅС‹. РџСЂРѕРІРµСЂСЊС‚Рµ СЃС‚Р°СЂС‚РѕРІС‹Р№ URL Рё РёСЃРєР»СЋС‡РµРЅРёСЏ; "
-                "РґР»СЏ Р·Р°С‰РёС‰РµРЅРЅС‹С… СЃС‚СЂР°РЅРёС† СѓР±РµРґРёС‚РµСЃСЊ, С‡С‚Рѕ Botasaurus СѓСЃС‚Р°РЅРѕРІРёР»СЃСЏ С‡РµСЂРµР· run.ps1."
+                "Сбор завершен, но товары не найдены. Проверьте стартовый URL и исключения; "
+                "для защищенных страниц убедитесь, что Botasaurus установился через run.ps1."
             )
 
         self.update_state(
@@ -3349,7 +3349,7 @@ class MaunfeldCrawler:
             finished_at=now_iso() if not partial else "",
             paused_with_result=partial,
         )
-        self.log(f"CSV СЃС„РѕСЂРјРёСЂРѕРІР°РЅ: {filename.name}. РўРѕРІР°СЂРѕРІ: {counts['results']}", "success")
+        self.log(f"CSV сформирован: {filename.name}. Товаров: {counts['results']}", "success")
         if self.project is not None:
             save_projects()
 
@@ -3362,7 +3362,7 @@ class MaunfeldCrawler:
             started_at=(self.project or {}).get("state", {}).get("started_at") or now_iso(),
             paused_with_result=False,
         )
-        self.log("РЎР±РѕСЂ РїСЂРѕРґРѕР»Р¶РµРЅ" if resume else "РЎР±РѕСЂ Р·Р°РїСѓС‰РµРЅ", "info")
+        self.log("Сбор продолжен" if resume else "Сбор запущен", "info")
         if not resume:
             for start_url in self.start_urls:
                 self.enqueue(start_url)
@@ -3419,9 +3419,9 @@ class MaunfeldCrawler:
                     html = None
                     try:
                         html = future.result()
-                    except Exception as exc:  # noqa: BLE001 - РѕС€РёР±РєСѓ РїРѕРєР°Р·С‹РІР°РµРј РІ РёРЅС‚РµСЂС„РµР№СЃРµ.
-                        self.update_state(error=f"РћС€РёР±РєР° РѕР±СЂР°Р±РѕС‚РєРё {url}: {exc}")
-                        self.log(f"РћС€РёР±РєР° РѕР±СЂР°Р±РѕС‚РєРё {url}: {exc}", "error")
+                    except Exception as exc:  # noqa: BLE001 - ошибку показываем в интерфейсе.
+                        self.update_state(error=f"Ошибка обработки {url}: {exc}")
+                        self.log(f"Ошибка обработки {url}: {exc}", "error")
 
                     if html and not self.stop_signal.is_set():
                         self.process_page(url, html)
@@ -3438,9 +3438,9 @@ class MaunfeldCrawler:
                             with self.data_lock:
                                 self.visited.discard(url)
                             self.enqueue(url, force=True)
-                            self.log(f"РџРѕРІС‚РѕСЂРЅР°СЏ РїРѕРїС‹С‚РєР° Р·Р°РіСЂСѓР·РєРё {retry_count}/2: {url}", "warning")
+                            self.log(f"Повторная попытка загрузки {retry_count}/2: {url}", "warning")
                         else:
-                            self.log(f"URL РїСЂРѕРїСѓС‰РµРЅ РїРѕСЃР»Рµ РїРѕРІС‚РѕСЂРЅС‹С… РїРѕРїС‹С‚РѕРє Р·Р°РіСЂСѓР·РєРё: {url}", "error")
+                            self.log(f"URL пропущен после повторных попыток загрузки: {url}", "error")
 
                     self.refresh_progress(url)
         finally:
@@ -3583,11 +3583,11 @@ def extract_availability(soup: BeautifulSoup, selector: str = "") -> str:
         return selected
     page_text = clean_text(soup.get_text(" ", strip=True))
     patterns = [
-        r"Р’ РЅР°Р»РёС‡РёРё",
-        r"РќРµС‚ РІ РЅР°Р»РёС‡РёРё",
-        r"РџРѕРґ Р·Р°РєР°Р·",
-        r"РћР¶РёРґР°РµС‚СЃСЏ",
-        r"РЎРѕРѕР±С‰РёС‚СЊ Рѕ РїРѕСЃС‚СѓРїР»РµРЅРёРё",
+        r"В наличии",
+        r"Нет в наличии",
+        r"Под заказ",
+        r"Ожидается",
+        r"Сообщить о поступлении",
         r"available",
         r"out of stock",
         r"in stock",
@@ -3617,10 +3617,10 @@ def feed_source_key(url: str) -> str:
 def feed_source_label(url: str) -> str:
     hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
     if "mega-kuhnya" in hostname:
-        return "РњРµРіР°-РєСѓС…РЅСЏ"
+        return "Мега-кухня"
     if "vsya-tehnika" in hostname:
-        return "Р’СЃСЏ С‚РµС…РЅРёРєР°"
-    return hostname or "Р¤РёРґ"
+        return "Вся техника"
+    return hostname or "Фид"
 
 
 def source_feed_dir(source: str) -> Path:
@@ -3776,7 +3776,7 @@ def build_missing_summary(new_items: List[Dict[str, str]], feed_code_sets: List[
         summary.append(
             {
                 "source": str(feed.get("source") or ""),
-                "source_label": str(feed.get("source_label") or feed.get("url") or "Р¤РёРґ"),
+                "source_label": str(feed.get("source_label") or feed.get("url") or "Фид"),
                 "url": str(feed.get("url") or ""),
                 "count": count,
                 "codes_count": int(feed.get("codes_count") or 0),
@@ -3853,7 +3853,7 @@ def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
         try:
             soup.select(selector)
         except Exception as exc:
-            raise ValueError(f"РћС€РёР±РєР° CSS-СЃРµР»РµРєС‚РѕСЂР° {key}: {selector}. {exc}") from exc
+            raise ValueError(f"Ошибка CSS-селектора {key}: {selector}. {exc}") from exc
 
 
 def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, **kwargs: object) -> None:
@@ -4076,7 +4076,7 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
         update_news_monitor_state(
             monitor,
             status="running",
-            stage="РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р°-РґРѕРЅРѕСЂР°",
+            stage="Сканирование сайта-донора",
             percent=min(85, int(payload.get("percent", 0) or 0)),
             currenturl=str(payload.get("currenturl", "")),
             processed=int(payload.get("totalprocessed", 0) or 0),
@@ -4348,14 +4348,14 @@ def send_news_email_legacy(
     password = str(smtp_config.get("password") or "").strip()
     sender_emails = normalize_emails(username)
     if not username or not password or not recipients:
-        error_message = "Email РЅРµ РѕС‚РїСЂР°РІР»РµРЅ: Р·Р°РїРѕР»РЅРёС‚Рµ email-Р»РѕРіРёРЅ, РїР°СЂРѕР»СЊ РїСЂРёР»РѕР¶РµРЅРёСЏ Рё РїРѕР»СѓС‡Р°С‚РµР»РµР№ SMTP"
+        error_message = "Email не отправлен: заполните email-логин, пароль приложения и получателей SMTP"
         error_message = str(repair_mojibake_text(error_message))
         if error_holder is not None:
             error_holder.append(error_message)
         add_news_log(monitor, error_message, "warning")
         return False
     if not sender_emails:
-        error_message = "Email РЅРµ РѕС‚РїСЂР°РІР»РµРЅ: email-Р»РѕРіРёРЅ РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ Р°РґСЂРµСЃРѕРј РїРѕС‡С‚С‹"
+        error_message = "Email не отправлен: email-логин должен быть адресом почты"
         error_message = str(repair_mojibake_text(error_message))
         if error_holder is not None:
             error_holder.append(error_message)
@@ -4364,17 +4364,17 @@ def send_news_email_legacy(
     sender_email = sender_emails[0]
 
     if test:
-        subject = "РўРµСЃС‚ email-СѓРІРµРґРѕРјР»РµРЅРёР№"
-        body = "РўРµСЃС‚РѕРІРѕРµ РїРёСЃСЊРјРѕ РѕС‚РїСЂР°РІР»РµРЅРѕ РёР· РјРѕРЅРёС‚РѕСЂРёРЅРіР° РЅРѕРІРёРЅРѕРє. SMTP-РЅР°СЃС‚СЂРѕР№РєРё СЂР°Р±РѕС‚Р°СЋС‚."
+        subject = "Тест email-уведомлений"
+        body = "Тестовое письмо отправлено из мониторинга новинок. SMTP-настройки работают."
     else:
-        brand = str((monitor or {}).get("brand") or "РґРѕРЅРѕСЂ")
+        brand = str((monitor or {}).get("brand") or "донор")
         site_url = str((monitor or {}).get("site_url") or "")
-        subject = f"РЈРІРµРґРѕРјР»РµРЅРёРµ Рѕ РЅРѕРІРёРЅРєР°С… РЅР° СЃР°Р№С‚Рµ {brand}"
-        lines = [f"РќР° {site_url or brand} РЅР°Р№РґРµРЅРѕ РІСЃРµРіРѕ: {new_count}"]
+        subject = f"Уведомление о новинках на сайте {brand}"
+        lines = [f"На {site_url or brand} найдено всего: {new_count}"]
         for item in missing_summary or []:
             count = int(item.get("count") or 0)
-            label = str(item.get("source_label") or item.get("url") or "СЃР°Р№С‚")
-            lines.append(f"РќР° СЃР°Р№С‚Рµ {label} РЅРµ Р±С‹Р»Рѕ РЅР°Р№РґРµРЅРѕ {count} РЅРѕРІРёРЅРѕРє.")
+            label = str(item.get("source_label") or item.get("url") or "сайт")
+            lines.append(f"На сайте {label} не было найдено {count} новинок.")
         body = "\n".join(lines)
     subject = str(repair_mojibake_text(subject))
     body = str(repair_mojibake_text(body))
@@ -4385,13 +4385,13 @@ def send_news_email_legacy(
     try:
         send_messages_to_recipients(host, port, security_mode, username, password, sender_email, recipients, subject, body)
     except Exception as exc:
-        error_message = f"РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё email: {exc}"
+        error_message = f"Ошибка отправки email: {exc}"
         error_message = str(repair_mojibake_text(error_message))
         if error_holder is not None:
             error_holder.append(error_message)
         add_news_log(monitor, error_message, "error")
         return False
-    add_news_log(monitor, "РўРµСЃС‚РѕРІРѕРµ email-СЃРѕРѕР±С‰РµРЅРёРµ РѕС‚РїСЂР°РІР»РµРЅРѕ" if test else f"Email-СѓРІРµРґРѕРјР»РµРЅРёРµ РѕС‚РїСЂР°РІР»РµРЅРѕ. РќРѕРІРёРЅРѕРє: {new_count}", "success")
+    add_news_log(monitor, "Тестовое email-сообщение отправлено" if test else f"Email-уведомление отправлено. Новинок: {new_count}", "success")
     return True
 
 
@@ -4485,16 +4485,16 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     with news_lock:
         monitor["state"] = {
             **make_news_state("running"),
-            "stage": "РџРѕРґРіРѕС‚РѕРІРєР°",
+            "stage": "Подготовка",
             "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         }
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
-    add_news_log(monitor, "Р СѓС‡РЅРѕРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє Р·Р°РїСѓС‰РµРЅРѕ" if manual else "РџР»Р°РЅРѕРІРѕРµ СЃРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє Р·Р°РїСѓС‰РµРЅРѕ", "info")
+    add_news_log(monitor, "Ручное сканирование новинок запущено" if manual else "Плановое сканирование новинок запущено", "info")
     add_news_log(monitor, "Начал сбор", "info")
 
     try:
-        update_news_monitor_state(monitor, stage="РџРѕРґРіРѕС‚РѕРІРєР°", percent=2)
+        update_news_monitor_state(monitor, stage="Подготовка", percent=2)
         validate_monitor_selectors(monitor)
         add_news_log(
             monitor,
@@ -4502,24 +4502,24 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             f"method={monitor.get('connection_method')}; threads={monitor.get('thread_count')}",
             "info",
         )
-        update_news_monitor_state(monitor, stage="РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р°-РґРѕРЅРѕСЂР°", percent=5)
+        update_news_monitor_state(monitor, stage="Сканирование сайта-донора", percent=5)
         products = collect_products_for_monitor(monitor, stop_event)
         check_stop_requested()
         add_news_log(monitor, "Сбор закончил", "info")
-        add_news_log(monitor, f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СЃР°Р№С‚Р° Р·Р°РІРµСЂС€РµРЅРѕ. РќР°Р№РґРµРЅРѕ С‚РѕРІР°СЂРѕРІ: {len(products)}", "info")
-        update_news_monitor_state(monitor, stage="Р“РµРЅРµСЂР°С†РёСЏ Рё Р·Р°РіСЂСѓР·РєР° С„РёРґРѕРІ РІР°С€РёС… СЃР°Р№С‚РѕРІ", percent=84, currenturl="")
+        add_news_log(monitor, f"Сканирование сайта завершено. Найдено товаров: {len(products)}", "info")
+        update_news_monitor_state(monitor, stage="Генерация и загрузка фидов ваших сайтов", percent=84, currenturl="")
         add_news_log(monitor, "Скачивание фида", "info")
         all_existing_codes, local_feeds, feed_code_sets = fetch_existing_vendor_code_sets()
         check_stop_requested()
         add_news_log(monitor, "Фид скачался", "info")
         add_news_log(
             monitor,
-            f"Р¤РёРґС‹ РѕР±РЅРѕРІР»РµРЅС‹ РїРѕСЃР»Рµ СЃР±РѕСЂР° РґРѕРЅРѕСЂР°: {len(local_feeds)}. РњРѕРґРµР»РµР№ РІСЃРµРіРѕ: {len(all_existing_codes)}",
+            f"Фиды обновлены после сбора донора: {len(local_feeds)}. Моделей всего: {len(all_existing_codes)}",
             "info",
         )
         update_news_monitor_state(
             monitor,
-            stage="РЎСЂР°РІРЅРµРЅРёРµ СЃ С„РёРґР°РјРё",
+            stage="Сравнение с фидами",
             percent=86,
             candidate_products=len(products),
             found_products=len(products),
@@ -4532,7 +4532,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             check_stop_requested()
             update_news_monitor_state(
                 monitor,
-                stage="РЎСЂР°РІРЅРµРЅРёРµ СЃ С„РёРґР°РјРё",
+                stage="Сравнение с фидами",
                 percent=86 + int((index / max(1, len(products))) * 12),
                 compared_products=index,
                 currenturl=current_url,
@@ -4558,11 +4558,11 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         for item in missing_summary:
             add_news_log(
                 monitor,
-                f"РќРµС‚ РЅР° {item.get('source_label')}: {int(item.get('count') or 0)}",
+                f"Нет на {item.get('source_label')}: {int(item.get('count') or 0)}",
                 "info",
             )
 
-        update_news_monitor_state(monitor, stage="Р¤РѕСЂРјРёСЂРѕРІР°РЅРёРµ CSV", percent=99, currenturl="")
+        update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
         csv_path = create_news_csv(new_items, monitor, previous_csv)
         elapsed = int(time.time() - started)
         with news_lock:
@@ -4570,7 +4570,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["state"] = {
                 **monitor.get("state", {}),
                 "status": "completed",
-                "stage": "Р—Р°РІРµСЂС€РµРЅРѕ",
+                "stage": "Завершено",
                 "percent": 100,
                 "processed": len(products),
                 "found_products": len(products),
@@ -4593,7 +4593,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             if monitor.get("schedule_type") != "once":
                 monitor["next_run_at"] = compute_next_run_at(monitor)
             save_news_settings()
-        add_news_log(monitor, f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ Р·Р°РІРµСЂС€РµРЅРѕ. РќР°Р№РґРµРЅРѕ РЅРѕРІРёРЅРѕРє: {len(new_items)}. CSV: {csv_path.name}", "success")
+        add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
         update_brand_scan_state(
             "donor",
             monitor_id,
@@ -4617,7 +4617,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["state"] = {
                 **monitor.get("state", {}),
                 "status": "partial" if stop_mode == "pause" else "idle",
-                "stage": "РџСЂРёРѕСЃС‚Р°РЅРѕРІР»РµРЅРѕ" if stop_mode == "pause" else "Ожидание",
+                "stage": "Приостановлено" if stop_mode == "pause" else "Ожидание",
                 "error": "",
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
@@ -4636,7 +4636,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             save_news_settings()
         add_news_log(
             monitor,
-            f"РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє РїСЂРёРѕСЃС‚Р°РЅРѕРІР»РµРЅРѕ. CSV: {partial_csv}" if stop_mode == "pause" else "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ РЅРѕРІРёРЅРѕРє РѕСЃС‚Р°РЅРѕРІР»РµРЅРѕ",
+            f"Сканирование новинок приостановлено. CSV: {partial_csv}" if stop_mode == "pause" else "Сканирование новинок остановлено",
             "warning",
         )
         update_brand_scan_state(
@@ -4654,7 +4654,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["state"] = {
                 **monitor.get("state", {}),
                 "status": "error",
-                "stage": "РћС€РёР±РєР°",
+                "stage": "Ошибка",
                 "error": str(exc),
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
@@ -4665,7 +4665,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             }
             monitor["brand_state"] = dict(monitor["state"])
             save_news_settings()
-        add_news_log(monitor, f"РћС€РёР±РєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє: {exc}", "error")
+        add_news_log(monitor, f"Ошибка сканирования новинок: {exc}", "error")
         update_brand_scan_state(
             "donor",
             monitor_id,
@@ -4853,7 +4853,7 @@ def api_update_news_settings():
                 feed_generate_url = normalize_feed_url(str(item.get("feed_generate_url") or "").strip())
                 own_sites.append(
                     {
-                        "name": clean_text(str(item.get("name") or "")) or f"Р¤РёРґ {index}",
+                        "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
                         "feed_url": feed_url,
                         "feed_generate_url": feed_generate_url,
                     }
@@ -4914,7 +4914,7 @@ def api_test_news_email():
     ensure_storage()
     errors: List[str] = []
     if not send_news_email(None, 0, test=True, error_holder=errors):
-        return jsonify({"error": errors[-1] if errors else "Email РЅРµ РѕС‚РїСЂР°РІР»РµРЅ. РџСЂРѕРІРµСЂСЊС‚Рµ SMTP-РЅР°СЃС‚СЂРѕР№РєРё Рё Р»РѕРіРё РјРѕРЅРёС‚РѕСЂРёРЅРіР°."}), 500
+        return jsonify({"error": errors[-1] if errors else "Email не отправлен. Проверьте SMTP-настройки и логи мониторинга."}), 500
     return jsonify({"ok": True})
 
 
@@ -4922,7 +4922,7 @@ def api_test_news_email():
 def api_update_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     payload = request.get_json(silent=True) or {}
     with news_lock:
         old_group = clean_text(str(monitor.get("group") or ""))
@@ -4993,11 +4993,11 @@ def api_update_news_monitor(monitor_id: str):
 def api_scan_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     if not normalize_start_urls(monitor.get("start_urls") or "", allow_empty=True):
         return jsonify({"error": "У выбранного донора не указаны стартовые URL. Заполните поле \"Стартовые URL\" и сохраните настройки."}), 400
     if monitor.get("state", {}).get("status") in {"running", "queued"}:
-        return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
+        return jsonify({"error": "Сканирование уже выполняется"}), 409
     with news_lock:
         monitor["state"] = {
             **make_news_state("queued"),
@@ -5020,13 +5020,13 @@ def api_scan_news_monitor(monitor_id: str):
 def api_stop_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "stop")
     with news_lock:
         response_monitor = dict(monitor)
     threading.Thread(
         target=add_news_log,
-        args=(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє", "warning"),
+        args=(monitor, "Запрошена остановка сканирования новинок", "warning"),
         daemon=True,
     ).start()
     return jsonify({"monitor": response_monitor})
@@ -5036,13 +5036,13 @@ def api_stop_news_monitor(monitor_id: str):
 def api_pause_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "pause")
     with news_lock:
         response_monitor = dict(monitor)
     threading.Thread(
         target=add_news_log,
-        args=(monitor, "Р—Р°РїСЂРѕС€РµРЅР° РїСЂРёРѕСЃС‚Р°РЅРѕРІРєР° СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏ РЅРѕРІРёРЅРѕРє СЃ СЃРѕС…СЂР°РЅРµРЅРёРµРј СЂРµР·СѓР»СЊС‚Р°С‚Р°", "warning"),
+        args=(monitor, "Запрошена приостановка сканирования новинок с сохранением результата", "warning"),
         daemon=True,
     ).start()
     return jsonify({"monitor": response_monitor})
@@ -5052,9 +5052,9 @@ def api_pause_news_monitor(monitor_id: str):
 def api_resume_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     if monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}:
-        return jsonify({"error": "РЎРєР°РЅРёСЂРѕРІР°РЅРёРµ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
+        return jsonify({"error": "Сканирование уже выполняется"}), 409
     with news_lock:
         monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "Продолжение"}
         monitor["brand_state"] = dict(monitor["state"])
@@ -5074,11 +5074,11 @@ def api_create_news_monitor():
     payload = request.get_json(silent=True) or {}
     urls = normalize_start_urls(payload.get("start_urls") or "", allow_empty=True)
     site_url = str(payload.get("site_url") or "").strip()
-    group = clean_text(str(payload.get("group") or "РњР°СЂР¶Р°"))
-    brand = clean_text(str(payload.get("brand") or "РќРѕРІС‹Р№ РґРѕРЅРѕСЂ"))
+    group = clean_text(str(payload.get("group") or "Маржа"))
+    brand = clean_text(str(payload.get("brand") or "Новый донор"))
     if payload.get("create_new_brand"):
         with news_lock:
-            brand = unique_news_brand_name(group, brand if brand and brand != "РќРѕРІС‹Р№ РґРѕРЅРѕСЂ" else "РќРѕРІС‹Р№ Р±СЂРµРЅРґ")
+            brand = unique_news_brand_name(group, brand if brand and brand != "Новый донор" else "Новый бренд")
     monitor = make_news_monitor(
         group,
         brand,
@@ -5088,7 +5088,7 @@ def api_create_news_monitor():
     with news_lock:
         news_settings.setdefault("monitors", []).append(monitor)
         save_news_settings()
-    add_news_log(monitor, "РњРѕРЅРёС‚РѕСЂ РЅРѕРІРёРЅРѕРє СЃРѕР·РґР°РЅ", "success")
+    add_news_log(monitor, "Монитор новинок создан", "success")
     return jsonify({"monitor": dict(monitor)})
 
 
@@ -5096,7 +5096,7 @@ def api_create_news_monitor():
 def api_delete_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     if request.args.get("mode") != "brand":
         group = clean_text(str(monitor.get("group") or ""))
         brand = clean_text(str(monitor.get("brand") or ""))
@@ -5109,7 +5109,7 @@ def api_delete_news_monitor(monitor_id: str):
                 and clean_text(str(item.get("brand") or "")) == brand
             ]
         if len(brand_monitors) < 2:
-            return jsonify({"error": "РќРµР»СЊР·СЏ СѓРґР°Р»РёС‚СЊ РµРґРёРЅСЃС‚РІРµРЅРЅРѕРіРѕ РґРѕРЅРѕСЂР° Р±СЂРµРЅРґР°"}), 409
+            return jsonify({"error": "Нельзя удалить единственного донора бренда"}), 409
     request_news_stop(monitor_id, "stop")
     with news_lock:
         monitors = news_settings.get("monitors", [])
@@ -5120,7 +5120,7 @@ def api_delete_news_monitor(monitor_id: str):
         ]
         news_stop_events.pop(monitor_id, None)
         save_news_settings()
-    add_news_log(monitor, "РњРѕРЅРёС‚РѕСЂ РЅРѕРІРёРЅРѕРє СѓРґР°Р»РµРЅ", "warning")
+    add_news_log(monitor, "Монитор новинок удален", "warning")
     return jsonify({"ok": True, "monitors": [dict(item) for item in news_settings.get("monitors", []) if isinstance(item, dict)]})
 
 
@@ -5128,13 +5128,13 @@ def api_delete_news_monitor(monitor_id: str):
 def api_download_news_csv(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
-        return jsonify({"error": "РњРѕРЅРёС‚РѕСЂ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Монитор не найден"}), 404
     state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     state_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
     filename = str(state.get("last_csv") or state_data.get("csv") or "")
     path = resolve_export_file(filename)
     if not path:
-        return jsonify({"error": "CSV РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
+        return jsonify({"error": "CSV еще не готов"}), 404
     download_name = output_text(path.name)
     return send_file(path, as_attachment=True, download_name=download_name)
 
@@ -5149,11 +5149,11 @@ def api_download_news_feed(source: str, filename: str):
         and str(feed.get("source") or "") == source
     }
     if filename not in allowed_names:
-        return jsonify({"error": "Р¤РёРґ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Фид не найден"}), 404
     feed_dir = source_feed_dir(source).resolve()
     path = (feed_dir / filename).resolve()
     if feed_dir not in path.parents or not path.exists():
-        return jsonify({"error": "Р¤РёРґ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Фид не найден"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
@@ -5168,13 +5168,13 @@ def api_projects():
 def api_create_project():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
-    name = str(payload.get("name") or f"РџСЂРѕРµРєС‚ {len(projects) + 1}").strip()
+    name = str(payload.get("name") or f"Проект {len(projects) + 1}").strip()
     start_urls = normalize_start_urls(payload.get("start_urls") or DEFAULT_START_URL)
     project = make_project(name, start_urls)
     with projects_lock:
         projects[project["id"]] = project
         save_projects()
-    add_project_log(project, "РџСЂРѕРµРєС‚ СЃРѕР·РґР°РЅ", "success")
+    add_project_log(project, "Проект создан", "success")
     return jsonify({"project": public_project(project)})
 
 
@@ -5182,7 +5182,7 @@ def api_create_project():
 def api_update_project(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
 
     payload = request.get_json(silent=True) or {}
     with projects_lock:
@@ -5215,10 +5215,10 @@ def api_update_project(project_id: str):
 def api_delete_project(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     with projects_lock:
         if len(projects) <= 1:
-            return jsonify({"error": "РќРµР»СЊР·СЏ СѓРґР°Р»РёС‚СЊ РїРѕСЃР»РµРґРЅРёР№ РїСЂРѕРµРєС‚"}), 400
+            return jsonify({"error": "Нельзя удалить последний проект"}), 400
         stop_event = project.get("stop_event")
         if isinstance(stop_event, threading.Event):
             stop_event.set()
@@ -5231,7 +5231,7 @@ def api_delete_project(project_id: str):
 def api_project_exclusions(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     return jsonify({"exclusions": project.get("exclusions", [])})
 
 
@@ -5239,11 +5239,11 @@ def api_project_exclusions(project_id: str):
 def api_project_add_exclusion(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     payload = request.get_json(silent=True) or {}
     pattern = str(payload.get("pattern", "")).strip()
     if not pattern:
-        return jsonify({"error": "РџСѓСЃС‚РѕРµ РёСЃРєР»СЋС‡РµРЅРёРµ"}), 400
+        return jsonify({"error": "Пустое исключение"}), 400
     with projects_lock:
         exclusions = project.setdefault("exclusions", [])
         if pattern not in exclusions:
@@ -5256,11 +5256,11 @@ def api_project_add_exclusion(project_id: str):
 def api_project_delete_exclusion(project_id: str, index: int):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     with projects_lock:
         exclusions = project.setdefault("exclusions", [])
         if index < 0 or index >= len(exclusions):
-            return jsonify({"error": "РСЃРєР»СЋС‡РµРЅРёРµ РЅРµ РЅР°Р№РґРµРЅРѕ"}), 404
+            return jsonify({"error": "Исключение не найдено"}), 404
         exclusions.pop(index)
         save_projects()
     return jsonify({"exclusions": project.get("exclusions", [])})
@@ -5270,7 +5270,7 @@ def api_project_delete_exclusion(project_id: str, index: int):
 def api_project_product_url_filters(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     return jsonify({"product_url_filters": project.get("product_url_filters", [])})
 
 
@@ -5278,11 +5278,11 @@ def api_project_product_url_filters(project_id: str):
 def api_project_add_product_url_filter(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     payload = request.get_json(silent=True) or {}
     pattern = str(payload.get("pattern", "")).strip()
     if not pattern:
-        return jsonify({"error": "РџСѓСЃС‚РѕР№ С„РёР»СЊС‚СЂ СЃСЃС‹Р»РєРё"}), 400
+        return jsonify({"error": "Пустой фильтр ссылки"}), 400
     with projects_lock:
         filters = project.setdefault("product_url_filters", [])
         if pattern not in filters:
@@ -5295,11 +5295,11 @@ def api_project_add_product_url_filter(project_id: str):
 def api_project_delete_product_url_filter(project_id: str, index: int):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     with projects_lock:
         filters = project.setdefault("product_url_filters", [])
         if index < 0 or index >= len(filters):
-            return jsonify({"error": "Р¤РёР»СЊС‚СЂ СЃСЃС‹Р»РєРё РЅРµ РЅР°Р№РґРµРЅ"}), 404
+            return jsonify({"error": "Фильтр ссылки не найден"}), 404
         filters.pop(index)
         save_projects()
     return jsonify({"product_url_filters": project.get("product_url_filters", [])})
@@ -5310,10 +5310,10 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
     state = project.get("state", {})
     if isinstance(worker, threading.Thread) and worker.is_alive():
         if state.get("status") == "running":
-            raise RuntimeError("РЎР±РѕСЂ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ")
+            raise RuntimeError("Сбор уже выполняется")
         worker.join(timeout=2)
         if worker.is_alive():
-            raise RuntimeError("РџСЂРµРґС‹РґСѓС‰РёР№ РїРѕС‚РѕРє РµС‰Рµ Р·Р°РІРµСЂС€Р°РµС‚СЃСЏ. РџРѕРІС‚РѕСЂРёС‚Рµ С‡РµСЂРµР· РЅРµСЃРєРѕР»СЊРєРѕ СЃРµРєСѓРЅРґ.")
+            raise RuntimeError("Предыдущий поток еще завершается. Повторите через несколько секунд.")
 
     project["stop_event"] = threading.Event()
     project["finish_event"] = threading.Event()
@@ -5354,12 +5354,12 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             crawler.run(resume=resume)
         except Exception as exc:  # noqa: BLE001
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
-            add_project_log(project, f"РљСЂРёС‚РёС‡РµСЃРєР°СЏ РѕС€РёР±РєР°: {exc}", "error")
+            add_project_log(project, f"Критическая ошибка: {exc}", "error")
 
     worker_thread = threading.Thread(target=target, daemon=True)
     project["worker_thread"] = worker_thread
     worker_thread.start()
-    add_project_log(project, "РџСЂРѕРґРѕР»Р¶РµРЅРёРµ РїРѕСЃС‚Р°РІР»РµРЅРѕ РІ РѕС‡РµСЂРµРґСЊ" if resume else "РЎР±РѕСЂ РїРѕСЃС‚Р°РІР»РµРЅ РІ РѕС‡РµСЂРµРґСЊ Р·Р°РїСѓСЃРєР°", "info")
+    add_project_log(project, "Продолжение поставлено в очередь" if resume else "Сбор поставлен в очередь запуска", "info")
     return project["state"]
 
 
@@ -5367,7 +5367,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
 def api_project_start(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
 
     payload = request.get_json(silent=True) or {}
     with projects_lock:
@@ -5396,10 +5396,10 @@ def api_project_start(project_id: str):
 def api_project_pause(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     status = project.get("state", {}).get("status")
     if status not in {"running", "paused"}:
-        return jsonify({"error": "РЎР±РѕСЂ РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
+        return jsonify({"error": "Сбор не выполняется"}), 409
     finish_event = project.get("finish_event")
     stop_event = project.get("stop_event")
     project["stop_mode"] = "pause"
@@ -5410,7 +5410,7 @@ def api_project_pause(project_id: str):
     crawler = project.get("crawler")
     if crawler:
         crawler.finish_with_excel(partial=True)
-    add_project_log(project, "РЎР±РѕСЂ РїСЂРёРѕСЃС‚Р°РЅРѕРІР»РµРЅ СЃ С„РѕСЂРјРёСЂРѕРІР°РЅРёРµРј CSV", "warning")
+    add_project_log(project, "Сбор приостановлен с формированием CSV", "warning")
     return jsonify(project["state"])
 
 
@@ -5418,15 +5418,15 @@ def api_project_pause(project_id: str):
 def api_project_soft_pause(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     if project.get("state", {}).get("status") != "running":
-        return jsonify({"error": "РЎР±РѕСЂ РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
+        return jsonify({"error": "Сбор не выполняется"}), 409
     stop_event = project.get("stop_event")
     project["stop_mode"] = "pause"
     if isinstance(stop_event, threading.Event):
         stop_event.set()
-    update_project_state(project, error="РЎС‚Р°РІР»СЋ СЃР±РѕСЂ РЅР° РїР°СѓР·Сѓ...", currenturl="")
-    add_project_log(project, "Р—Р°РїСЂРѕС€РµРЅР° РѕР±С‹С‡РЅР°СЏ РїР°СѓР·Р°", "warning")
+    update_project_state(project, error="Ставлю сбор на паузу...", currenturl="")
+    add_project_log(project, "Запрошена обычная пауза", "warning")
     return jsonify(project["state"])
 
 
@@ -5434,10 +5434,10 @@ def api_project_soft_pause(project_id: str):
 def api_project_resume(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     status = project.get("state", {}).get("status")
     if status not in {"paused", "partial"}:
-        return jsonify({"error": "РџСЂРѕРґРѕР»Р¶РёС‚СЊ РјРѕР¶РЅРѕ С‚РѕР»СЊРєРѕ РїРѕСЃР»Рµ РїР°СѓР·С‹"}), 409
+        return jsonify({"error": "Продолжить можно только после паузы"}), 409
     try:
         state = start_project(project, resume=True)
     except RuntimeError as exc:
@@ -5449,7 +5449,7 @@ def api_project_resume(project_id: str):
 def api_project_stop(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     stop_event = project.get("stop_event")
     if isinstance(stop_event, threading.Event):
         stop_event.set()
@@ -5473,7 +5473,7 @@ def api_project_stop(project_id: str):
         )
         project["state"] = state
         save_projects()
-    add_project_log(project, "РЎР±РѕСЂ РѕСЃС‚Р°РЅРѕРІР»РµРЅ", "warning")
+    add_project_log(project, "Сбор остановлен", "warning")
     return jsonify(project["state"])
 
 
@@ -5481,7 +5481,7 @@ def api_project_stop(project_id: str):
 def api_project_restart(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     stop_event = project.get("stop_event")
     if isinstance(stop_event, threading.Event):
         stop_event.set()
@@ -5493,7 +5493,7 @@ def api_project_restart(project_id: str):
             project["crawler"] = None
         worker.join(timeout=3)
         if worker.is_alive():
-            return jsonify({"error": "РџСЂРµРґС‹РґСѓС‰РёР№ СЃР±РѕСЂ РµС‰Рµ Р·Р°РІРµСЂС€Р°РµС‚СЃСЏ. РџРѕРІС‚РѕСЂРёС‚Рµ РїРµСЂРµР·Р°РїСѓСЃРє С‡РµСЂРµР· РЅРµСЃРєРѕР»СЊРєРѕ СЃРµРєСѓРЅРґ."}), 409
+            return jsonify({"error": "Предыдущий сбор еще завершается. Повторите перезапуск через несколько секунд."}), 409
     try:
         state = start_project(project)
     except RuntimeError as exc:
@@ -5580,7 +5580,7 @@ def start_scan():
 
     current_status = snapshot_state()["status"]
     if current_status == "running" and worker_thread and worker_thread.is_alive():
-        return jsonify({"error": "РЎР±РѕСЂ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
+        return jsonify({"error": "Сбор уже выполняется"}), 409
 
     payload = request.get_json(silent=True) or {}
     start_url = str(payload.get("start_url") or DEFAULT_START_URL).strip()
@@ -5602,7 +5602,7 @@ def start_scan():
     def target() -> None:
         try:
             crawler.run()
-        except Exception as exc:  # noqa: BLE001 - РїРѕРєР°Р·С‹РІР°РµРј РѕС€РёР±РєСѓ РїРѕР»СЊР·РѕРІР°С‚РµР»СЋ РІ РёРЅС‚РµСЂС„РµР№СЃРµ.
+        except Exception as exc:  # noqa: BLE001 - показываем ошибку пользователю в интерфейсе.
             update_state(run_id, status="error", error=str(exc), currenturl="", download_ready=False)
 
     worker_thread = threading.Thread(target=target, daemon=True)
@@ -5627,7 +5627,7 @@ def pause_scan_with_result():
     global active_crawler, active_run_id
 
     if snapshot_state()["status"] != "running":
-        return jsonify({"error": "РЎР±РѕСЂ РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ"}), 409
+        return jsonify({"error": "Сбор не выполняется"}), 409
 
     active_finish_event.set()
     active_stop_event.set()
@@ -5641,7 +5641,7 @@ def pause_scan_with_result():
 
     update_state(
         active_run_id,
-        error="РћСЃС‚Р°РЅР°РІР»РёРІР°СЋ СЃР±РѕСЂ Рё С„РѕСЂРјРёСЂСѓСЋ Excel РїРѕ СѓР¶Рµ РЅР°Р№РґРµРЅРЅС‹Рј С‚РѕРІР°СЂР°Рј...",
+        error="Останавливаю сбор и формирую Excel по уже найденным товарам...",
         currenturl="",
     )
     return jsonify(snapshot_state())
@@ -5685,7 +5685,7 @@ def download_excel():
     filename = str(current_state.get("filename") or "")
     path = EXPORT_DIR / filename
     if not filename or not path.exists():
-        return jsonify({"error": "Р¤Р°Р№Р» РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
+        return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
@@ -5693,12 +5693,12 @@ def download_excel():
 def download_project_csv(project_id: str):
     project = get_project(project_id)
     if not project:
-        return jsonify({"error": "РџСЂРѕРµРєС‚ РЅРµ РЅР°Р№РґРµРЅ"}), 404
+        return jsonify({"error": "Проект не найден"}), 404
     current_state = project.get("state", {})
     filename = str(current_state.get("filename") or "")
     path = EXPORT_DIR / filename
     if not filename or not path.exists():
-        return jsonify({"error": "Р¤Р°Р№Р» РµС‰Рµ РЅРµ РіРѕС‚РѕРІ"}), 404
+        return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
