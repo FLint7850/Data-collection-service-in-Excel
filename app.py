@@ -4822,19 +4822,15 @@ def start_news_scheduler() -> None:
                         reference = brand_monitors[0]
                         if not is_monitor_due(reference):
                             continue
-                        primary_id = str(reference.get("primary_donor_id") or "")
+                        brand_row = None
+                        brand_id = parse_db_int(reference.get("brand_id"))
+                        if brand_id:
+                            with session_scope() as session:
+                                brand_row = session.get(Brand, brand_id)
+                        primary_id = str(brand_row.primary_donor_id if brand_row else reference.get("primary_donor_id") or "")
                         selected = next((item for item in brand_monitors if str(item.get("id")) == primary_id), None)
                         if selected is None:
-                            selected = next(
-                                (
-                                    item
-                                    for item in brand_monitors
-                                    if normalize_start_urls(item.get("start_urls") or item.get("site_url") or "", allow_empty=True)
-                                ),
-                                brand_monitors[0],
-                            )
-                        if not normalize_start_urls(selected.get("start_urls") or selected.get("site_url") or "", allow_empty=True):
-                            add_news_log(selected, "Плановый запуск пропущен: у основного донора бренда не указан сайт.", "warning")
+                            add_news_log(reference, "Плановый запуск пропущен: основной донор бренда не найден.", "warning")
                             continue
                         selected["state"] = {**selected.get("state", {}), "status": "queued"}
                         selected["brand_state"] = dict(selected["state"])
