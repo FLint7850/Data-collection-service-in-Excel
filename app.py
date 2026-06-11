@@ -766,7 +766,6 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "brand_id": brand.id if brand else None,
         "brand_created_at": brand.created_at.isoformat(timespec="milliseconds") if brand and brand.created_at else "",
         "primary_donor_id": brand.primary_donor_id if brand else None,
-        "is_primary": bool(brand and brand.primary_donor_id == row.id),
         "brand_state": brand_state,
         "created_at": row.created_at.isoformat(timespec="milliseconds") if row.created_at else "",
         "site_url": site_url,
@@ -858,13 +857,10 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     session.flush()
     if not brand.primary_donor_id or not any(donor.id == brand.primary_donor_id for donor in brand.donors):
         brand.primary_donor_id = row.id
-    elif normalized.get("is_primary"):
-        brand.primary_donor_id = row.id
     session.flush()
     monitor["brand_id"] = brand.id
     monitor["brand_created_at"] = brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else ""
     monitor["primary_donor_id"] = brand.primary_donor_id
-    monitor["is_primary"] = brand.primary_donor_id == row.id
     return int(row.id)
 
 
@@ -910,7 +906,6 @@ def ensure_brand_primary_flags(monitors: List[Dict[str, object]]) -> None:
             primary_id = str(items[0].get("id") or "")
         for item in items:
             item["primary_donor_id"] = primary_id
-            item["is_primary"] = str(item.get("id")) == primary_id
 
 def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]:
     if isinstance(settings.get("own_sites"), list):
@@ -5012,20 +5007,20 @@ def api_update_news_monitor(monitor_id: str):
             monitor["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
         if "selector_settings" in payload:
             monitor["selector_settings"] = normalize_selector_settings(payload.get("selector_settings"))
-        if payload.get("is_primary") is True:
-            group = clean_text(str(monitor.get("group") or ""))
-            brand = clean_text(str(monitor.get("brand") or ""))
-            for item in news_settings.get("monitors", []):
-                if (
-                    isinstance(item, dict)
-                    and clean_text(str(item.get("group") or "")) == group
-                    and clean_text(str(item.get("brand") or "")) == brand
-                ):
-                    item["primary_donor_id"] = monitor.get("id")
-                    item["is_primary"] = str(item.get("id")) == str(monitor.get("id"))
+        if "primary_donor_id" in payload:
+            primary_donor_id = str(payload.get("primary_donor_id") or "").strip()
+            primary_donor_pk = parse_db_int(primary_donor_id)
+            if primary_donor_pk:
+                with session_scope() as session:
+                    brand = session.get(Brand, parse_db_int(monitor.get("brand_id")))
+                    if brand and any(donor.id == primary_donor_pk for donor in brand.donors):
+                        brand.primary_donor_id = primary_donor_pk
         sync_brand_runtime_fields(monitor)
         save_news_settings()
-    return jsonify({"monitor": dict(monitor)})
+    response_monitor = dict(monitor)
+    if "primary_donor_id" in payload:
+        response_monitor["primary_donor_id"] = parse_db_int(payload.get("primary_donor_id"))
+    return jsonify({"monitor": response_monitor})
 
 
 @app.post("/api/news/monitors/<monitor_id>/scan")

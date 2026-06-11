@@ -969,14 +969,23 @@ function monitorsForBrandKey(brandKey) {
 function activeNewsMonitor() {
   const monitors = monitorsForBrandKey(activeNewsBrandKey);
   if (!monitors.length) return null;
+  const primaryId = String(monitors[0]?.primary_donor_id || "");
   const selectedId = selectedNewsSites.get(activeNewsBrandKey);
-  const monitor = monitors.find((item) => item.id === selectedId) || monitors[0];
+  const monitor =
+    monitors.find((item) => item.id === primaryId) ||
+    monitors.find((item) => item.id === selectedId) ||
+    monitors[0];
   selectedNewsSites.set(activeNewsBrandKey, monitor.id);
   return monitor;
 }
 
 function openNewsModal(brandKey) {
   activeNewsBrandKey = brandKey;
+  const monitors = monitorsForBrandKey(brandKey);
+  const primaryId = String(monitors[0]?.primary_donor_id || "");
+  if (primaryId) {
+    selectedNewsSites.set(brandKey, primaryId);
+  }
   activeNewsSelectorsOpen = false;
   activeNewsReplaceRulesOpen = false;
   activeNewsBrandNameEditing = false;
@@ -1128,7 +1137,7 @@ function renderNewsModal() {
           ${monitors
             .map((item) => {
               const itemSite = item.site_url || (item.start_urls || [])[0] || "";
-              return `<option value="${item.id}" ${item.id === monitor.id ? "selected" : ""}>${escapeHtml(itemSite)}</option>`;
+              return `<option value="${item.id}" ${item.id === String(monitor.primary_donor_id || monitor.id) ? "selected" : ""}>${escapeHtml(itemSite)}</option>`;
             })
             .join("")}
         </select>
@@ -1213,10 +1222,6 @@ function renderNewsModal() {
       <label class="field">
         <span>Потоки</span>
         <input data-field="thread_count" type="number" min="1" max="16" value="${escapeHtml(monitor.thread_count || 4)}">
-      </label>
-      <label class="toggle-field modal-inline-toggle">
-        <input data-field="is_primary" type="checkbox" ${monitor.is_primary ? "checked" : ""}>
-        <span>Главный донор бренда</span>
       </label>
       <label class="field">
         <span>Подключение</span>
@@ -1320,6 +1325,12 @@ function collectMonitorPayload(root) {
     extraction_rules: {},
     selector_settings: {},
   };
+  if (root === newsModalContent) {
+    const primaryDonorSelect = scope.querySelector("[data-action='modal-select-news-site']");
+    if (primaryDonorSelect) {
+      payload.primary_donor_id = primaryDonorSelect.value;
+    }
+  }
   scope.querySelectorAll("[data-field]").forEach((input) => {
     const key = input.dataset.field;
     if (input.type === "checkbox") {
@@ -1914,10 +1925,24 @@ newsMonitorModal.addEventListener("click", (event) => {
   }
 });
 
-newsModalContent.addEventListener("change", (event) => {
+newsModalContent.addEventListener("change", async (event) => {
   const select = event.target.closest("[data-action='modal-select-news-site']");
   if (!select) return;
   selectedNewsSites.set(activeNewsBrandKey, select.value);
+  const monitorId = newsModalContent.dataset.monitorId;
+  if (monitorId) {
+    try {
+      const data = await requestJson(`/api/news/monitors/${monitorId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ primary_donor_id: select.value }),
+      });
+      const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
+      if (index >= 0) newsData.monitors[index] = data.monitor;
+    } catch (error) {
+      errorText.textContent = error.message;
+      return;
+    }
+  }
   activeNewsSelectorsOpen = false;
   activeNewsReplaceRulesOpen = false;
   renderNewsModal();
