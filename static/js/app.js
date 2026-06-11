@@ -110,6 +110,8 @@ let tabsRenderKey = "";
 const collapsedNewsGroups = new Set();
 let newsMonitorsStructureKey = "";
 let logsSignature = null;
+let newsListRenderQueued = false;
+let newsModalProgressQueued = false;
 
 const statusLabels = {
   idle: "ожидание",
@@ -136,6 +138,45 @@ function formatDuration(value) {
   const minutes = Math.floor((total % 3600) / 60);
   const secs = total % 60;
   return [hours, minutes, secs].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+function parseDateTimeMs(value) {
+  if (!value) return 0;
+  const normalized = String(value).replace(/\.\d+/, "");
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function stampNewsStates(data) {
+  const receivedAt = Date.now();
+  (data?.monitors || []).forEach((monitor) => {
+    if (monitor?.state) monitor.state._receivedAt = receivedAt;
+    if (monitor?.brand_state) monitor.brand_state._receivedAt = receivedAt;
+  });
+  return data;
+}
+
+function localElapsedSeconds(state) {
+  const base = Number(state?.elapsed_seconds || 0);
+  if (!isNewsScanningStatus(state?.status)) return base;
+  const startedAt = parseDateTimeMs(state?.started_at);
+  if (startedAt) {
+    return Math.max(base, Math.floor((Date.now() - startedAt) / 1000));
+  }
+  const receivedAt = Number(state?._receivedAt || 0);
+  if (!receivedAt) return base;
+  return base + Math.floor((Date.now() - receivedAt) / 1000);
+}
+
+function localStallSeconds(state) {
+  const seconds = Number(state?.stall_seconds || 0);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : 0;
+}
+
+function setTextIfChanged(node, value) {
+  if (!node) return;
+  const next = String(value ?? "");
+  if (node.textContent !== next) node.textContent = next;
 }
 
 async function requestJson(url, options = {}) {
@@ -327,7 +368,7 @@ async function deletePendingNewsMonitor() {
     if (Array.isArray(data.monitors)) latestMonitors = data.monitors;
   }
   if (mode === "donor") {
-    newsData = await requestJson("/api/news");
+    newsData = stampNewsStates(await requestJson("/api/news"));
   } else {
     newsData.monitors = latestMonitors || (newsData.monitors || []).filter((item) => !idsToDelete.includes(item.id));
   }
@@ -910,6 +951,33 @@ function renderNewsList() {
   }
 }
 
+function scheduleNewsListRender() {
+  if (newsListRenderQueued) return;
+  newsListRenderQueued = true;
+  requestAnimationFrame(() => {
+    newsListRenderQueued = false;
+    renderNewsList();
+  });
+}
+
+function scheduleNewsModalProgressUpdate() {
+  if (newsModalProgressQueued) return;
+  newsModalProgressQueued = true;
+  requestAnimationFrame(() => {
+    newsModalProgressQueued = false;
+    updateNewsModalProgress();
+  });
+}
+
+function tickNewsModalTimers() {
+  if (!activeNewsBrandKey || !newsMonitorModal || newsMonitorModal.classList.contains("hidden")) return;
+  const monitor = activeNewsMonitor();
+  const state = monitor?.state || {};
+  if (!isNewsScanningStatus(state.status)) return;
+  setTextIfChanged(newsModalContent.querySelector("[data-summary='elapsed']"), formatDuration(localElapsedSeconds(state)));
+  setTextIfChanged(newsModalContent.querySelector("[data-summary='stall']"), formatDuration(localStallSeconds(state)));
+}
+
 function renderNewsMonitors() {
   if (!newsData || !newsGroups) return;
   const grouped = groupNewsMonitors();
@@ -1025,14 +1093,14 @@ function updateNewsModalProgress() {
     queue: Number(state.queue_size || 0),
     active: Number(state.active_tasks || 0),
     failed: Number(state.failed_pages || 0),
-    stall: formatDuration(state.stall_seconds || 0),
-    elapsed: formatDuration(state.elapsed_seconds || 0),
+    stall: formatDuration(localStallSeconds(state)),
+    elapsed: formatDuration(localElapsedSeconds(state)),
     lastEvent: state.last_event || "—",
     lastWarning: state.last_warning || "",
   };
   Object.entries(summaryValues).forEach(([key, value]) => {
     const node = newsModalContent.querySelector(`[data-summary='${key}']`);
-    if (node) node.textContent = value;
+    setTextIfChanged(node, value);
   });
   const missingNode = newsModalContent.querySelector("[data-role='modal-missing-summary']");
   if (missingNode) {
@@ -1050,9 +1118,9 @@ function updateNewsModalProgress() {
   const fill = newsModalContent.querySelector("[data-role='modal-progress-fill']");
   if (fill) fill.style.width = `${percent}%`;
   const percentNode = newsModalContent.querySelector("[data-role='modal-percent']");
-  if (percentNode) percentNode.textContent = `${percent}%`;
+  setTextIfChanged(percentNode, `${percent}%`);
   const currentUrlNode = newsModalContent.querySelector("[data-role='modal-current-url']");
-  if (currentUrlNode) currentUrlNode.textContent = state.currenturl || "";
+  setTextIfChanged(currentUrlNode, state.currenturl || "");
   const activeUrlsNode = newsModalContent.querySelector("[data-role='modal-active-urls']");
   if (activeUrlsNode) {
     const activeUrls = Array.isArray(state.active_urls) ? state.active_urls.filter(Boolean).slice(0, 8) : [];
@@ -1076,7 +1144,7 @@ function updateNewsModalProgress() {
     downloadLink.href = ready ? `/api/news/monitors/${monitor.id}/download` : "#";
   }
   const errorNode = newsModalContent.querySelector("[data-role='modal-error']");
-  if (errorNode) errorNode.textContent = state.error || "";
+  setTextIfChanged(errorNode, state.error || "");
 }
 
 function renderNewsModal() {
@@ -1157,14 +1225,14 @@ function renderNewsModal() {
       <span>Ссылок/страниц: <strong data-summary="processed">${Number(state.processed || 0)}</strong></span>
       <span>Товаров найдено: <strong data-summary="found">${Number(state.found_products || 0)}</strong></span>
       <span>Сравнено: <strong data-summary="compared">${Number(state.compared_products || 0)}</strong> / <span data-summary="candidates">${Number(state.candidate_products || state.found_products || 0)}</span></span>
-      <span>Время: <span data-summary="elapsed">${formatDuration(state.elapsed_seconds || 0)}</span></span>
+      <span>Время: <span data-summary="elapsed">${formatDuration(localElapsedSeconds(state))}</span></span>
     </div>
     <div class="modal-summary-row modal-summary-row--diagnostics">
       <span>В памяти: <strong data-summary="memory">${Number(state.in_memory_products || state.found_products || 0)}</strong></span>
       <span>Очередь: <strong data-summary="queue">${Number(state.queue_size || 0)}</strong></span>
       <span>Активно: <strong data-summary="active">${Number(state.active_tasks || 0)}</strong></span>
       <span>Ошибок страниц: <strong data-summary="failed">${Number(state.failed_pages || 0)}</strong></span>
-      <span>Без прогресса: <span data-summary="stall">${formatDuration(state.stall_seconds || 0)}</span></span>
+      <span>Без прогресса: <span data-summary="stall">${formatDuration(localStallSeconds(state))}</span></span>
       <span>Событие: <span data-summary="lastEvent">${escapeHtml(state.last_event || "—")}</span></span>
       <span>Предупреждение: <span data-summary="lastWarning">${escapeHtml(state.last_warning || "")}</span></span>
     </div>
@@ -1459,7 +1527,7 @@ async function saveNewsBrandTitle() {
     method: "PATCH",
     body: JSON.stringify({ brand }),
   });
-  newsData = await requestJson("/api/news");
+  newsData = stampNewsStates(await requestJson("/api/news"));
   const updated = data.monitor || monitor;
   activeNewsBrandKey = `${updated.group || monitor.group || "Маржа"}::${updated.brand || brand}`;
   selectedNewsSites.set(activeNewsBrandKey, updated.id || monitor.id);
@@ -1478,7 +1546,7 @@ async function persistPendingNewsBrandTitle() {
     method: "PATCH",
     body: JSON.stringify({ brand }),
   });
-  newsData = await requestJson("/api/news");
+  newsData = stampNewsStates(await requestJson("/api/news"));
   const updated = data.monitor || monitor;
   activeNewsBrandKey = `${updated.group || monitor.group || "Маржа"}::${updated.brand || brand}`;
   selectedNewsSites.set(activeNewsBrandKey, updated.id || monitor.id);
@@ -1487,7 +1555,7 @@ async function persistPendingNewsBrandTitle() {
 }
 
 async function loadNews() {
-  newsData = await requestJson("/api/news");
+  newsData = stampNewsStates(await requestJson("/api/news"));
   renderNews();
 }
 
@@ -2030,7 +2098,7 @@ newsModalContent.addEventListener("click", async (event) => {
           method: "PATCH",
           body: JSON.stringify(payload),
         });
-        newsData = await requestJson("/api/news");
+        newsData = stampNewsStates(await requestJson("/api/news"));
         const updated = data.monitor || currentMonitor;
         activeNewsBrandKey = `${updated.group || currentMonitor.group || "Маржа"}::${updated.brand || currentMonitor.brand || "Новый донор"}`;
         selectedNewsSites.set(activeNewsBrandKey, updated.id);
@@ -2050,7 +2118,7 @@ newsModalContent.addEventListener("click", async (event) => {
             site_url: siteUrl,
           }),
         });
-        newsData = await requestJson("/api/news");
+        newsData = stampNewsStates(await requestJson("/api/news"));
         selectedNewsSites.set(activeNewsBrandKey, data.monitor.id);
       }
       urlInput.value = "";
@@ -2252,6 +2320,8 @@ autoCleanup.addEventListener("change", async () => {
   loadLogs(true);
 });
 
+window.setInterval(tickNewsModalTimers, 1000);
+
 const events = new EventSource("/progress");
 events.addEventListener("progress", (event) => {
   const data = JSON.parse(event.data);
@@ -2267,11 +2337,11 @@ events.addEventListener("progress", (event) => {
     }
   }
   if (data.news) {
-    newsData = data.news;
+    newsData = stampNewsStates(data.news);
     if (activeView === "news") {
-      renderNewsList();
+      scheduleNewsListRender();
       if (activeNewsBrandKey && newsMonitorModal && !newsMonitorModal.classList.contains("hidden")) {
-        updateNewsModalProgress();
+        scheduleNewsModalProgressUpdate();
       }
     } else if (activeView === "settings") {
       renderFeedStorage();
