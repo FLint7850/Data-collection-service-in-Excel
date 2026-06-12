@@ -415,14 +415,15 @@ select:focus {
   grid-column: 1 / -1;
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
   align-items: center;
+  justify-content: space-between;
 }
 
 .project-control-panel .button {
   width: auto;
   min-width: 0;
   white-space: nowrap;
+  flex-grow: 1;
 }
 
 .button {
