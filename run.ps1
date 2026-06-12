@@ -104,19 +104,22 @@ if (Test-PortBusy -PortToCheck $Port) {
 $LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $LogDir = Join-Path $PSScriptRoot "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$AppLog = Join-Path $LogDir "app.log"
-Add-Content -Path $AppLog -Encoding UTF8 -Value ""
-Add-Content -Path $AppLog -Encoding UTF8 -Value "[$(Get-Date -Format o)] Starting local server on port $Port"
+$OutputLogDir = Join-Path $LogDir "server-output"
+$ErrorLogDir = Join-Path $LogDir "server-error"
+New-Item -ItemType Directory -Force -Path $OutputLogDir, $ErrorLogDir | Out-Null
+$OutputLog = Join-Path $OutputLogDir "server-output-$Port-$LogStamp.log"
+$ErrorLog = Join-Path $ErrorLogDir "server-error-$Port-$LogStamp.log"
 
 Write-Host "Starting Flask app..." -ForegroundColor Green
 $env:PORT = "$Port"
-$LaunchCommand = "set PORT=$Port&& set PYTHONIOENCODING=utf-8&& `"$venvPython`" `"app.py`" >> `"$AppLog`" 2>>&1"
 $process = Start-Process `
-    -FilePath "cmd.exe" `
-    -ArgumentList "/d", "/c", $LaunchCommand `
+    -FilePath $venvPython `
+    -ArgumentList "app.py" `
     -WorkingDirectory $PSScriptRoot `
     -PassThru `
-    -WindowStyle Hidden
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $OutputLog `
+    -RedirectStandardError $ErrorLog
 
 Write-Host "Waiting for $AppUrl ..." -ForegroundColor Cyan
 $ready = $false
@@ -133,10 +136,15 @@ for ($i = 0; $i -lt 40; $i++) {
 
 if (-not $ready) {
     Write-Host "The app did not start correctly." -ForegroundColor Red
-    if (Test-Path $AppLog) {
+    if (Test-Path $ErrorLog) {
         Write-Host ""
-        Write-Host "${AppLog}:" -ForegroundColor Yellow
-        Get-Content $AppLog -Tail 120
+        Write-Host "${ErrorLog}:" -ForegroundColor Yellow
+        Get-Content $ErrorLog -Tail 120
+    }
+    if (Test-Path $OutputLog) {
+        Write-Host ""
+        Write-Host "${OutputLog}:" -ForegroundColor Yellow
+        Get-Content $OutputLog -Tail 120
     }
     Write-Host ""
     Write-Host "Press Enter to close this window." -ForegroundColor Yellow

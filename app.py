@@ -8,6 +8,9 @@ import re
 import shutil
 import smtplib
 import ssl
+import base64
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -47,7 +50,29 @@ DEFAULT_EXCLUSIONS = [
     "/contacts/",
 ]
 
+
+def load_local_env() -> None:
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError:
+        return
+
+
+load_local_env()
+
 REQUEST_TIMEOUT = 20
+CONNECTION_METHOD_TIMEOUT_SECONDS = int(os.environ.get("CONNECTION_METHOD_TIMEOUT_SECONDS", "60") or 60)
 REQUEST_DELAY_SECONDS = max(0.0, float(os.environ.get("REQUEST_DELAY_SECONDS", "0.05") or 0.05))
 MAX_RETRIES = 3
 FEED_WORKER_COUNT = max(1, min(int(os.environ.get("FEED_WORKER_COUNT", "6") or 6), 12))
@@ -2969,27 +2994,121 @@ def fetch_with_firecrawl(url: str) -> Optional[str]:
     return None
 
 
+ENGINE_OUTPUT_MARKER = "__PARSER_ENGINE_HTML_BASE64__:"
+
+SCRAPY_FETCH_SCRIPT = r"""
+import base64
+import sys
+
+import scrapy
+from scrapy.crawler import CrawlerProcess
+
+url = sys.argv[1]
+timeout = int(float(sys.argv[2]))
+marker = sys.argv[3]
+
+
+class SinglePageSpider(scrapy.Spider):
+    name = "single_page_fetch"
+    body = b""
+    handle_httpstatus_all = True
+    custom_settings = {
+        "LOG_ENABLED": False,
+        "ROBOTSTXT_OBEY": False,
+        "DOWNLOAD_TIMEOUT": timeout,
+        "RETRY_ENABLED": False,
+        "COOKIES_ENABLED": True,
+        "HTTPERROR_ALLOW_ALL": True,
+        "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "DEFAULT_REQUEST_HEADERS": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        },
+        "TELNETCONSOLE_ENABLED": False,
+        "WARN_ON_GENERATOR_RETURN_VALUE": False,
+    }
+
+    async def start(self):
+        yield scrapy.Request(url, dont_filter=True)
+
+    def parse(self, response):
+        SinglePageSpider.body = bytes(response.body or b"")
+
+
+process = CrawlerProcess(settings=SinglePageSpider.custom_settings)
+process.crawl(SinglePageSpider)
+process.start(stop_after_crawl=True)
+print(marker + base64.b64encode(SinglePageSpider.body).decode("ascii"))
+"""
+
+CRAWLEE_FETCH_SCRIPT = r"""
+import asyncio
+import base64
+import sys
+from datetime import timedelta
+
+from crawlee.crawlers._http import HttpCrawler
+
+url = sys.argv[1]
+timeout = int(float(sys.argv[2]))
+marker = sys.argv[3]
+
+
+async def main():
+    result = {"body": b""}
+    crawler = HttpCrawler(
+        max_requests_per_crawl=1,
+        max_request_retries=0,
+        request_handler_timeout=timedelta(seconds=timeout),
+        configure_logging=False,
+        ignore_http_error_status_codes=list(range(300, 600)),
+    )
+
+    @crawler.router.default_handler
+    async def handler(context):
+        result["body"] = await context.http_response.read()
+
+    await crawler.run([url])
+    print(marker + base64.b64encode(result["body"]).decode("ascii"))
+
+
+asyncio.run(main())
+"""
+
+
+def fetch_with_python_engine(script: str, url: str, timeout_seconds: int) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER],
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            timeout=timeout_seconds + 10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return None
+    output = completed.stdout.decode("utf-8", "replace")
+    for line in reversed(output.splitlines()):
+        if ENGINE_OUTPUT_MARKER not in line:
+            continue
+        payload = line.split(ENGINE_OUTPUT_MARKER, 1)[1].strip()
+        if not payload:
+            return None
+        try:
+            html_bytes = base64.b64decode(payload)
+        except Exception:
+            return None
+        html = html_bytes.decode("utf-8", "replace").strip()
+        return html or None
+    return None
+
+
 def fetch_with_scrapy(url: str) -> Optional[str]:
     try:
         import scrapy  # noqa: F401
     except ImportError:
         return None
-    try:
-        response = requests.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.text
-    except Exception:
-        return None
+    return fetch_with_python_engine(SCRAPY_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
 
 
 def fetch_with_crawlee(url: str) -> Optional[str]:
@@ -2997,22 +3116,7 @@ def fetch_with_crawlee(url: str) -> Optional[str]:
         import crawlee  # noqa: F401
     except ImportError:
         return None
-    try:
-        response = requests.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.text
-    except Exception:
-        return None
+    return fetch_with_python_engine(CRAWLEE_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
 
 
 class MaunfeldCrawler:
@@ -3154,12 +3258,39 @@ class MaunfeldCrawler:
         if method == "crawl4ai":
             return fetch_with_crawl4ai(target_url)
         if method == "firecrawl":
+            if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
+                self.log("Метод firecrawl пропущен: не задан FIRECRAWL_API_KEY", "warning")
+                return None
             return fetch_with_firecrawl(target_url)
         if method == "scrapy":
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
             return fetch_with_crawlee(target_url)
         return None
+
+    def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
+        result_queue: Queue = Queue(maxsize=1)
+
+        def run_method() -> None:
+            try:
+                result_queue.put(("ok", self.fetch_by_method(url, method)), block=False)
+            except Exception as error:
+                result_queue.put(("error", error), block=False)
+
+        thread = threading.Thread(target=run_method, daemon=True)
+        thread.start()
+        try:
+            status, value = result_queue.get(timeout=CONNECTION_METHOD_TIMEOUT_SECONDS)
+        except Empty:
+            self.log(
+                f"Метод подключения {method} превысил таймаут {CONNECTION_METHOD_TIMEOUT_SECONDS} сек. для {url}",
+                "warning",
+            )
+            return None
+        if status == "error":
+            self.log(f"Метод подключения {method} завершился ошибкой для {url}: {value}", "warning")
+            return None
+        return value if isinstance(value, str) else None
 
     def method_sequence(self, url: str = "") -> List[str]:
         methods = [self.connection_method]
@@ -3177,7 +3308,8 @@ class MaunfeldCrawler:
             if self.stop_signal.is_set():
                 return None
             last_method = method
-            html = self.fetch_by_method(url, method)
+            self.log(f"Пробую метод подключения {method} для {url}", "info")
+            html = self.fetch_by_method_with_timeout(url, method)
             if html and not looks_blocked_or_empty(html):
                 if method != self.connection_method:
                     self.log(f"Автопереключение подключения: {method} для {url}", "warning")
