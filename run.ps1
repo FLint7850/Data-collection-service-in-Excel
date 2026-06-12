@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$Port = 5056
+$Port = 5055
 $AppUrl = "http://127.0.0.1:$Port"
 
 function Find-Python {
