@@ -451,27 +451,29 @@ function renderState(project) {
   const state = project?.state || {};
   const percent = Number(state.percent || 0);
   const status = state.status || "idle";
-  statusText.textContent = statusLabels[status] || status;
-  statusDot.className = `status-dot status-${status}`;
-  progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
-  percentText.textContent = `${percent}%`;
+  if (statusText) statusText.textContent = statusLabels[status] || status;
+  if (statusDot) statusDot.className = `status-dot status-${status}`;
+  if (progressFill) progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  if (percentText) percentText.textContent = `${percent}%`;
   const nextCurrentUrl = state.currenturl || (["running", "queued"].includes(status) ? "" : "Текущий URL появится после запуска.");
-  if (currentUrl.dataset.value !== nextCurrentUrl) {
+  if (currentUrl && currentUrl.dataset.value !== nextCurrentUrl) {
     currentUrl.textContent = nextCurrentUrl;
     currentUrl.dataset.value = nextCurrentUrl;
   }
-  processedCount.textContent = state.totalprocessed || 0;
-  foundCount.textContent = state.found_products || 0;
-  skippedCount.textContent = state.skipped || 0;
-  elapsedTime.textContent = formatDuration(state.elapsed_seconds || 0);
-  etaTime.textContent = state.eta_seconds === null || state.eta_seconds === undefined ? "—" : formatDuration(state.eta_seconds);
-  errorText.textContent = state.error || "";
-  fileName.textContent = state.filename || "";
+  if (processedCount) processedCount.textContent = state.totalprocessed || 0;
+  if (foundCount) foundCount.textContent = state.found_products || 0;
+  if (skippedCount) skippedCount.textContent = state.skipped || 0;
+  if (elapsedTime) elapsedTime.textContent = formatDuration(state.elapsed_seconds || 0);
+  if (etaTime) etaTime.textContent = state.eta_seconds === null || state.eta_seconds === undefined ? "—" : formatDuration(state.eta_seconds);
+  if (errorText) errorText.textContent = state.error || "";
+  if (fileName) fileName.textContent = state.filename || "";
 
   const ready = Boolean(state.download_ready || state.filename);
-  downloadButton.classList.toggle("disabled", !ready);
-  downloadButton.setAttribute("aria-disabled", ready ? "false" : "true");
-  downloadButton.href = ready && project ? `/api/projects/${project.id}/download` : "#";
+  if (downloadButton) {
+    downloadButton.classList.toggle("disabled", !ready);
+    downloadButton.setAttribute("aria-disabled", ready ? "false" : "true");
+    downloadButton.href = ready && project ? `/api/projects/${project.id}/download` : "#";
+  }
   setControls(status);
 }
 

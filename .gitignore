@@ -31,6 +31,7 @@ exclusions.json
 data/*.db
 data/*.db-shm
 data/*.db-wal
+/storage/
 
 # Logs
 /logs
