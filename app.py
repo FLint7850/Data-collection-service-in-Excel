@@ -267,15 +267,18 @@ def normalize_emails(value: object) -> List[str]:
     return emails
 
 
-def normalize_selector_settings(value: object) -> Dict[str, str]:
+def normalize_selector_settings(value: object) -> Dict[str, object]:
     if not isinstance(value, dict):
         value = {}
     allowed = {"name_selector", "availability_selector", "photo_selector"}
-    settings = {}
+    settings: Dict[str, object] = {}
     for key in allowed:
         text = clean_text(str(value.get(key, "")))
         if text:
             settings[key] = text
+    status_exclusions = normalize_patterns(value.get("availability_exclusions", []))
+    if status_exclusions:
+        settings["availability_exclusions"] = status_exclusions
     return settings
 
 
@@ -662,6 +665,7 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "active_tasks": 0,
         "active_urls": [],
         "in_memory_products": 0,
+        "availability_skipped": 0,
         "failed_pages": 0,
         "stall_seconds": 0,
         "last_event": "",
@@ -3634,6 +3638,18 @@ def extract_availability(soup: BeautifulSoup, selector: str = "") -> str:
     return ""
 
 
+def availability_is_excluded(availability: str, rules: object) -> bool:
+    """Проверяет статус наличия по построчным правилам исключения до сравнения с фидами."""
+    status = clean_text(availability).lower()
+    if not status:
+        return False
+    for rule in normalize_patterns(rules):
+        normalized_rule = clean_text(rule).lower()
+        if normalized_rule and normalized_rule in status:
+            return True
+    return False
+
+
 def extract_product_name(soup: BeautifulSoup, selector: str = "") -> str:
     selected = text_by_selector(soup, selector)
     if selected:
@@ -4511,6 +4527,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     local_feeds: List[Dict[str, object]] = []
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
+    availability_skipped = 0
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -4573,9 +4590,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             )
 
         enriched_products = enrich_news_candidates(products, monitor, feed_code_sets, stop_event, update_compare_progress)
+        availability_exclusions = normalize_patterns((monitor.get("selector_settings") or {}).get("availability_exclusions", []))
         for details, product in zip(enriched_products, products):
             check_stop_requested()
             details["model"] = details.get("model") or product.get("model", "")
+            if availability_is_excluded(details.get("availability", ""), availability_exclusions):
+                availability_skipped += 1
+                continue
             detail_keys = product_compare_keys(details) | product_compare_keys(product)
             if not detail_keys:
                 continue
@@ -4589,6 +4610,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             known[model_key] = details
         missing_summary = build_missing_summary(new_items, feed_code_sets)
         add_news_log(monitor, "Сравнение закончилось", "info")
+        if availability_skipped:
+            add_news_log(monitor, f"Исключено по статусу наличия: {availability_skipped}", "info")
         for item in missing_summary:
             add_news_log(
                 monitor,
@@ -4612,6 +4635,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "candidate_products": len(products),
                 "compared_products": len(products),
                 "in_memory_products": len(products),
+                "availability_skipped": availability_skipped,
                 "queue_size": 0,
                 "active_tasks": 0,
                 "active_urls": [],
@@ -4636,7 +4660,12 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             started,
             found_products=len(products),
             new_count=len(new_items),
-            data={"csv": csv_path.name, "feeds": local_feeds, "missing_by_feed": missing_summary},
+            data={
+                "csv": csv_path.name,
+                "feeds": local_feeds,
+                "missing_by_feed": missing_summary,
+                "availability_skipped": availability_skipped,
+            },
         )
         if new_items:
             send_news_email(monitor, len(new_items), missing_summary=missing_summary)
@@ -4665,6 +4694,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "processed": len(products),
                 "found_products": len(products),
                 "in_memory_products": len(products),
+                "availability_skipped": availability_skipped,
                 "queue_size": int(monitor.get("state", {}).get("queue_size", 0) or 0),
                 "active_tasks": 0,
                 "active_urls": [],
@@ -4683,7 +4713,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             started,
             found_products=len(products),
             new_count=len(new_items),
-            data={"csv": partial_csv},
+            data={"csv": partial_csv, "availability_skipped": availability_skipped},
         )
     except Exception as exc:
         elapsed = int(time.time() - started)
@@ -4697,6 +4727,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "elapsed_seconds": elapsed,
                 "found_products": len(products),
                 "in_memory_products": len(products),
+                "availability_skipped": availability_skipped,
                 "active_tasks": 0,
                 "active_urls": [],
             }

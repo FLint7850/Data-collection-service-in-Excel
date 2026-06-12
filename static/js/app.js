@@ -1101,6 +1101,7 @@ function updateNewsModalProgress() {
     queue: Number(state.queue_size || 0),
     active: Number(state.active_tasks || 0),
     failed: Number(state.failed_pages || 0),
+    availabilitySkipped: Number(state.availability_skipped || 0),
     stall: formatDuration(Number(state.stall_seconds || 0)),
     elapsed: formatDuration(localElapsedSeconds(state)),
     lastEvent: state.last_event || "—",
@@ -1240,6 +1241,7 @@ function renderNewsModal() {
       <span>Очередь: <strong data-summary="queue">${Number(state.queue_size || 0)}</strong></span>
       <span>Активно: <strong data-summary="active">${Number(state.active_tasks || 0)}</strong></span>
       <span>Ошибок страниц: <strong data-summary="failed">${Number(state.failed_pages || 0)}</strong></span>
+      <span>Исключено по статусу: <strong data-summary="availabilitySkipped">${Number(state.availability_skipped || 0)}</strong></span>
       <span>Без прогресса: <span data-summary="stall">${formatDuration(Number(state.stall_seconds || 0))}</span></span>
       <span>Событие: <span data-summary="lastEvent">${escapeHtml(state.last_event || "—")}</span></span>
       <span>Предупреждение: <span data-summary="lastWarning">${escapeHtml(state.last_warning || "")}</span></span>
@@ -1349,6 +1351,10 @@ function renderNewsModal() {
         <span>Селектор наличия</span>
         <input data-selector="availability_selector" type="text" value="${escapeHtml(monitor.selector_settings?.availability_selector || "")}">
       </label>
+      <label class="field modal-wide-field">
+        <span>Исключение товаров по статусу</span>
+        <textarea data-selector="availability_exclusions" rows="3" placeholder="Снят с производства&#10;Нет в наличии">${escapeHtml((monitor.selector_settings?.availability_exclusions || []).join("\n"))}</textarea>
+      </label>
       <label class="field">
         <span>Селектор фото</span>
         <input data-selector="photo_selector" type="text" value="${escapeHtml(monitor.selector_settings?.photo_selector || "")}">
@@ -1421,7 +1427,14 @@ function collectMonitorPayload(root) {
     payload.extraction_rules[input.dataset.rule] = input.value.trim();
   });
   scope.querySelectorAll("[data-selector]").forEach((input) => {
-    payload.selector_settings[input.dataset.selector] = input.value.trim();
+    if (input.dataset.selector === "availability_exclusions") {
+      payload.selector_settings[input.dataset.selector] = input.value
+        .split(/\r?\n|;/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    } else {
+      payload.selector_settings[input.dataset.selector] = input.value.trim();
+    }
   });
   return payload;
 }
