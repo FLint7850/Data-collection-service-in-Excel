@@ -67,6 +67,10 @@ CONNECTION_METHODS = (
 )
 GENERIC_FALLBACK_METHODS = (
     "requests",
+    "botasaurus-request",
+    "botasaurus-browser-direct",
+    "botasaurus-browser",
+    "crawl4ai",
     "scrapy",
     "crawlee",
 )
@@ -306,13 +310,13 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
 
 
 def public_project(project: Dict[str, object]) -> Dict[str, object]:
-    state = dict(project["state"])
+    state = repair_mojibake(dict(project["state"]))
     filename = str(state.get("filename") or "")
     if filename and (EXPORT_DIR / filename).exists():
         state["download_ready"] = True
     return {
         "id": project["id"],
-        "name": project["name"],
+        "name": repair_mojibake_text(project["name"]),
         "start_urls": project["start_urls"],
         "thread_count": project["thread_count"],
         "exclusions": project["exclusions"],
@@ -1151,6 +1155,41 @@ def delete_news_csv_for_monitor(monitor: Dict[str, object], keep_filename: str =
                 pass
 
 
+def project_csv_prefix(project: Optional[Dict[str, object]]) -> str:
+    source = safe_filename(str((project or {}).get("name") or "project"))
+    return f"{source}_"
+
+
+def project_csv_filename(project: Optional[Dict[str, object]], created_at: Optional[datetime] = None) -> str:
+    created_at = created_at or datetime.now()
+    return f"{project_csv_prefix(project)}{created_at.strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+
+
+def delete_project_csv_for_project(project: Dict[str, object], keep_filename: str = "") -> None:
+    keep_filename = str(keep_filename or "").strip()
+    state = project.get("state", {}) if isinstance(project.get("state"), dict) else {}
+    filenames = {
+        keep_filename,
+        str(state.get("filename") or ""),
+    }
+    prefix = project_csv_prefix(project)
+    try:
+        for path in EXPORT_DIR.glob(f"{prefix}*.csv"):
+            if path.is_file() and path.name not in filenames:
+                path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    for filename in filenames:
+        if not filename or filename == keep_filename:
+            continue
+        path = resolve_export_file(filename)
+        if path:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
     public_monitor = repair_mojibake(dict(monitor))
     state = dict(public_monitor.get("state") or make_news_state())
@@ -1494,6 +1533,22 @@ def looks_blocked_or_empty(html: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
     text = clean_text(soup.get_text(" ", strip=True))
     links_count = len(soup.select("a[href]"))
+    product_links_count = 0
+    for link in soup.select("a[href]"):
+        href = normalize_url(link.get("href", ""), "https://placeholder.local/") or ""
+        if href and is_probable_product_url(href):
+            product_links_count += 1
+            if product_links_count >= 2:
+                break
+    has_product_markup = bool(
+        soup.select_one(
+            "[itemtype*='Product'], [itemprop='price'], script[type='application/ld+json'], "
+            ".catalog-card, .js-ecom_product-item, [class*='product-card'], [class*='product-item'], "
+            "[class*='price'], [class*='cost']"
+        )
+    )
+    if product_links_count or has_product_markup or PRICE_RE.search(html):
+        return False
     if PRICE_RE.search(text) and links_count > 10:
         return False
     if any(marker in lowered for marker in BLOCKED_PAGE_MARKERS):
@@ -1579,6 +1634,19 @@ def product_url_matches_filters(url: str, filters: Iterable[str]) -> bool:
     parsed = urlparse(url)
     haystack = f"{url} {parsed.path}".lower()
     return any(pattern in haystack or fnmatch(haystack, pattern) for pattern in patterns)
+
+
+def product_url_filter_patterns(
+    product_url_filters: Optional[Iterable[str]],
+    rules: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    patterns = normalize_patterns(product_url_filters or [])
+    rules = rules or {}
+    selector_value = str(rules.get("product_url_selector", "") or "").strip()
+    if selector_value and (selector_value.startswith(("http://", "https://", "/")) or "://" in selector_value):
+        if selector_value not in patterns:
+            patterns.append(selector_value)
+    return patterns
 
 
 def canonicalize_product_url_by_filters(url: str, filters: Iterable[str]) -> str:
@@ -2367,7 +2435,10 @@ def prepare_rule_model(value: str, rules: Dict[str, str]) -> str:
 def first_by_selector(root, selector: str) -> str:
     if not selector or not hasattr(root, "select"):
         return ""
-    node = root.select_one(selector)
+    try:
+        node = root.select_one(selector)
+    except Exception:
+        return ""
     if not node:
         return ""
     return clean_text(node.get("content") or node.get("value") or node.get_text(" ", strip=True))
@@ -2410,8 +2481,19 @@ def extract_listing_products_by_rules(
         return []
     filters = list(product_url_filters or [])
     products: List[Dict[str, str]] = []
-    for card in soup.select(card_selector):
-        link_node = card.select_one(rules.get("product_url_selector", "")) if rules.get("product_url_selector") else None
+    try:
+        cards = soup.select(card_selector)
+    except Exception:
+        return []
+    url_selector = rules.get("product_url_selector", "")
+    use_url_selector = bool(url_selector) and not product_url_filter_patterns([], {"product_url_selector": url_selector})
+    for card in cards:
+        link_node = None
+        if use_url_selector:
+            try:
+                link_node = card.select_one(url_selector)
+            except Exception:
+                link_node = None
         if not link_node:
             link_node = card.select_one("a[href]")
         product_url = canonicalize_product_url_by_filters(normalize_url(link_node.get("href", "") if link_node else "", current_url), filters)
@@ -2510,7 +2592,7 @@ def extract_listing_products(
     seen_urls: Set[str] = {product["url"] for product in products}
     seen_source_ids: Set[int] = set()
     rules = normalize_extraction_rules(rules or {})
-    filters = list(product_url_filters or [])
+    filters = product_url_filter_patterns(product_url_filters or [], rules)
 
     products.extend(extract_listing_products_from_common_cards(soup, current_url, rules, seen_urls, filters))
 
@@ -2913,8 +2995,8 @@ class MaunfeldCrawler:
         self.root_netloc = urlparse(self.start_url).netloc
         self.project = project
         self.exclusions = exclusions if exclusions is not None else DEFAULT_EXCLUSIONS.copy()
-        self.product_url_filters = normalize_patterns(product_url_filters or [])
         self.extraction_rules = normalize_extraction_rules(extraction_rules or {})
+        self.product_url_filters = product_url_filter_patterns(product_url_filters or [], self.extraction_rules)
         self.connection_method = normalize_connection_method(connection_method)
         self.auto_connection_fallback = bool(auto_connection_fallback)
         self.thread_local = threading.local()
@@ -3046,6 +3128,15 @@ class MaunfeldCrawler:
             preferred = ["botasaurus-visible", "requests"]
             if self.connection_method == "botasaurus-request":
                 return preferred
+            methods = [self.connection_method]
+            methods.extend(method for method in preferred if method not in methods)
+            return methods
+
+        if self.auto_connection_fallback and is_kuppersberg_url(url):
+            if self.connection_method == "botasaurus-visible":
+                return ["botasaurus-visible"]
+
+            preferred = ["requests", "botasaurus-browser-direct", "botasaurus-browser", "botasaurus-visible"]
             methods = [self.connection_method]
             methods.extend(method for method in preferred if method not in methods)
             return methods
@@ -3361,6 +3452,8 @@ class MaunfeldCrawler:
         rows = self.snapshot_results()
         counts = self.snapshot_counts()
         filename = create_export_file(rows, self.project)
+        if self.project is not None:
+            delete_project_csv_for_project(self.project, keep_filename=filename.name)
         final_error = ""
         if partial:
             final_error = "Сбор приостановлен. CSV сформирован по уже найденным товарам."
@@ -3533,7 +3626,7 @@ def safe_filename(value: str) -> str:
 
 def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, object]] = None) -> Path:
     if project:
-        filename = f"{safe_filename(str(project.get('name') or 'project'))}_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+        filename = project_csv_filename(project)
     else:
         filename = f"exportmaunfeld{datetime.now().strftime('%d-%m-%Y')}.csv"
     path = EXPORT_DIR / filename
@@ -5392,8 +5485,8 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.finish_signal = project["finish_event"]
         crawler.thread_count = parse_thread_count(project.get("thread_count", 4))
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
-        crawler.product_url_filters = normalize_patterns(project.get("product_url_filters", []))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
+        crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)
         crawler.connection_method = normalize_connection_method(project.get("connection_method"))
         crawler.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
         crawler.excel_finalized = False
