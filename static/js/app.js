@@ -1,5 +1,6 @@
 const projectTabs = document.querySelector("#projectTabs");
 const addProjectButton = document.querySelector("#addProjectButton");
+const projectsTabButton = document.querySelector("#projectsTabButton");
 const newItemsTabButton = document.querySelector("#newItemsTabButton");
 const settingsTabButton = document.querySelector("#settingsTabButton");
 const logsTabButton = document.querySelector("#logsTabButton");
@@ -90,7 +91,28 @@ const cancelAddFeedIconButton = document.querySelector("#cancelAddFeedIconButton
 let projects = [];
 let newsData = null;
 let activeProjectId = null;
-let activeView = "project";
+const activeViewStorageKey = "excelServiceActiveView";
+const allowedActiveViews = new Set(["projects", "news", "settings", "logs"]);
+
+function readStoredActiveView() {
+  try {
+    const storedView = window.localStorage.getItem(activeViewStorageKey);
+    if (storedView === "project") return "projects";
+    return allowedActiveViews.has(storedView) ? storedView : "projects";
+  } catch {
+    return "projects";
+  }
+}
+
+function setActiveView(view) {
+  activeView = allowedActiveViews.has(view) ? view : "projects";
+  try {
+    window.localStorage.setItem(activeViewStorageKey, activeView);
+  } catch {
+  }
+}
+
+let activeView = readStoredActiveView();
 let isHydratingForm = false;
 let isHydratingNews = false;
 let saveTimer = null;
@@ -237,14 +259,14 @@ function renderTabs() {
   projectTabs.innerHTML = "";
   projects.forEach((project) => {
     const tab = document.createElement("div");
-    tab.className = `project-tab ${project.id === activeProjectId && activeView === "project" ? "active" : ""}`;
+    tab.className = `project-tab ${project.id === activeProjectId && activeView === "projects" ? "active" : ""}`;
 
     const button = document.createElement("button");
     button.type = "button";
     button.className = "project-tab-button";
     button.textContent = project.name;
     button.addEventListener("click", () => {
-      activeView = "project";
+      setActiveView("projects");
       activeProjectId = project.id;
       renderAll();
     });
@@ -264,6 +286,7 @@ function renderTabs() {
     tab.append(button, closeButton);
     projectTabs.append(tab);
   });
+  projectsTabButton.classList.toggle("active", activeView === "projects");
   newItemsTabButton.classList.toggle("active", activeView === "news");
   settingsTabButton.classList.toggle("active", activeView === "settings");
   logsTabButton.classList.toggle("active", activeView === "logs");
@@ -294,7 +317,7 @@ async function deletePendingProject() {
   projects = projects.filter((project) => project.id !== projectId);
   if (activeProjectId === projectId) {
     activeProjectId = projects[Math.max(0, index - 1)]?.id || projects[0]?.id || null;
-    activeView = "project";
+    setActiveView("projects");
   }
   closeDeleteProjectModal();
   renderAll();
@@ -1583,11 +1606,11 @@ async function loadNews() {
 function renderAll() {
   renderTabs();
   const project = activeProject();
-  projectView.classList.toggle("hidden", activeView !== "project");
+  projectView.classList.toggle("hidden", activeView !== "projects");
   newItemsView.classList.toggle("hidden", activeView !== "news");
   settingsView.classList.toggle("hidden", activeView !== "settings");
   logsView.classList.toggle("hidden", activeView !== "logs");
-  if (activeView === "project") {
+  if (activeView === "projects") {
     renderProjectForm(project);
     renderState(project);
   } else if (activeView === "news") {
@@ -1701,17 +1724,22 @@ addProjectButton.addEventListener("click", async () => {
   });
   projects.push(data.project);
   activeProjectId = data.project.id;
-  activeView = "project";
+  setActiveView("projects");
+  renderAll();
+});
+
+projectsTabButton.addEventListener("click", () => {
+  setActiveView("projects");
   renderAll();
 });
 
 logsTabButton.addEventListener("click", () => {
-  activeView = "logs";
+  setActiveView("logs");
   renderAll();
 });
 
 newItemsTabButton.addEventListener("click", () => {
-  activeView = "news";
+  setActiveView("news");
   loadNews().catch((error) => {
     errorText.textContent = error.message;
   });
@@ -1719,7 +1747,7 @@ newItemsTabButton.addEventListener("click", () => {
 });
 
 settingsTabButton.addEventListener("click", () => {
-  activeView = "settings";
+  setActiveView("settings");
   loadNews().catch((error) => {
     errorText.textContent = error.message;
   });
@@ -2349,7 +2377,7 @@ events.addEventListener("progress", (event) => {
   if (Array.isArray(data.projects)) {
     projects = data.projects;
     if (!activeProjectId && projects.length) activeProjectId = projects[0].id;
-    if (activeView === "project") {
+    if (activeView === "projects") {
       renderTabs();
       renderState(activeProject());
     }

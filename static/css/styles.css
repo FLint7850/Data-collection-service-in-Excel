@@ -187,6 +187,49 @@ h2 {
   color: var(--text);
 }
 
+.projects-layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.projects-sidebar {
+  position: sticky;
+  top: 16px;
+  padding: 16px;
+}
+
+.projects-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.project-list .project-tab {
+  display: flex;
+  width: 100%;
+  min-height: 44px;
+}
+
+.project-list .project-tab-button {
+  flex: 1;
+  max-width: none;
+  text-align: left;
+}
+
+.project-workspace-main {
+  min-width: 0;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -244,9 +287,6 @@ h2 {
   margin-bottom: 20px;
 }
 
-.project-control-panel {
-  grid-template-columns: minmax(160px, 0.5fr) minmax(260px, 1fr) 95px minmax(190px, 0.45fr) minmax(160px, 0.35fr);
-}
 
 .urls-field textarea {
   min-height: 88px;
@@ -328,15 +368,67 @@ select:focus {
   gap: 10px;
 }
 
+
+.project-control-panel {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+
+.project-control-panel .name-field,
+.project-control-panel .urls-field,
+.project-control-panel .thread-field,
+.project-control-panel .connection-field {
+  min-width: 0;
+}
+
+.project-control-panel .name-field {
+  grid-column: span 3;
+}
+
+.project-control-panel .urls-field {
+  grid-column: span 3;
+}
+
+.project-control-panel .urls-field textarea {
+  min-height: 88px;
+}
+
+.project-control-panel .thread-field,
+.project-control-panel .connection-field,
+.project-control-panel .fallback-field {
+  grid-column: span 2;
+}
+
+.project-control-panel .thread-field input {
+  text-align: center;
+}
+
+.project-control-panel .fallback-field {
+  min-height: 44px;
+  align-self: end;
+  white-space: nowrap;
+}
+
 .project-control-panel .button-row {
   grid-column: 1 / -1;
-  display: grid;
-  grid-template-columns: repeat(5, minmax(160px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
 }
 
 .project-control-panel .button {
-  width: 100%;
+  width: auto;
   min-width: 0;
+  white-space: nowrap;
+}
+
+.button {
+  width: auto;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .button {
@@ -1479,6 +1571,7 @@ select:focus {
   .control-panel,
   .project-control-panel,
   .layout-grid,
+  .projects-layout,
   .news-settings-grid,
   .news-monitor-grid,
   .news-monitor-list,
@@ -1489,6 +1582,15 @@ select:focus {
 
   .topbar {
     display: grid;
+  }
+
+  .projects-sidebar {
+    position: static;
+  }
+
+  .projects-sidebar-header {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .brand-title {
@@ -1518,7 +1620,24 @@ select:focus {
     grid-template-columns: 1fr;
   }
 
-  .project-control-panel .button-row,
+  .project-control-panel .name-field,
+  .project-control-panel .urls-field,
+  .project-control-panel .thread-field,
+  .project-control-panel .connection-field,
+  .project-control-panel .fallback-field,
+  .project-control-panel .button-row {
+    grid-column: 1 / -1;
+  }
+
+  .project-control-panel .button-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .project-control-panel .button-row .button {
+    width: 100%;
+  }
+
   .time-grid {
     grid-template-columns: 1fr;
   }

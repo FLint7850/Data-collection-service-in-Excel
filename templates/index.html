@@ -25,14 +25,22 @@
     </header>
 
     <nav class="tabs-bar">
-      <div class="tabs-list" id="projectTabs"></div>
-      <button class="tab-button add-tab" id="addProjectButton" type="button">+ Проект</button>
+      <button class="tab-button" id="projectsTabButton" type="button">Проекты</button>
       <button class="tab-button" id="newItemsTabButton" type="button">Новинки</button>
       <button class="tab-button" id="settingsTabButton" type="button">Настройки</button>
       <button class="tab-button" id="logsTabButton" type="button">Логи</button>
     </nav>
 
     <section class="project-view" id="projectView">
+      <div class="projects-layout">
+        <aside class="panel projects-sidebar">
+          <div class="projects-sidebar-header">
+            <h2>Проекты</h2>
+            <button class="button secondary compact-button" id="addProjectButton" type="button">+ Проект</button>
+          </div>
+          <div class="project-list" id="projectTabs"></div>
+        </aside>
+        <div class="project-workspace-main">
       <section class="panel control-panel project-control-panel">
         <label class="field name-field">
           <span>Название проекта</span>
@@ -185,6 +193,8 @@
           </div>
         </div>
       </section>
+        </div>
+      </div>
     </section>
 
     <section class="news-view hidden" id="newItemsView">
