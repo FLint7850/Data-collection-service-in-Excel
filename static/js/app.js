@@ -134,6 +134,7 @@ let newsMonitorsStructureKey = "";
 let logsSignature = null;
 let newsListRenderQueued = false;
 let newsModalProgressQueued = false;
+let connectionMethods = [];
 
 const statusLabels = {
   idle: "ожидание",
@@ -176,6 +177,12 @@ function stampNewsStates(data) {
     if (monitor?.brand_state) monitor.brand_state._receivedAt = receivedAt;
   });
   return data;
+}
+
+function applyNewsPayload(data) {
+  setConnectionMethods(data?.connection_methods);
+  newsData = stampNewsStates(data);
+  return newsData;
 }
 
 function localElapsedSeconds(state) {
@@ -391,7 +398,7 @@ async function deletePendingNewsMonitor() {
     if (Array.isArray(data.monitors)) latestMonitors = data.monitors;
   }
   if (mode === "donor") {
-    newsData = stampNewsStates(await requestJson("/api/news"));
+    newsData = applyNewsPayload(await requestJson("/api/news"));
   } else {
     newsData.monitors = latestMonitors || (newsData.monitors || []).filter((item) => !idsToDelete.includes(item.id));
   }
@@ -425,7 +432,7 @@ function renderProjectForm(project) {
   projectName.value = project.name || "";
   startUrls.value = (project.start_urls || []).join("\n");
   threadCount.value = project.thread_count || project.state?.thread_count || 4;
-  connectionMethod.value = project.connection_method || "requests";
+  hydrateConnectionSelect(connectionMethod, project.connection_method);
   autoConnectionFallback.checked = project.auto_connection_fallback !== false;
   const rules = project.extraction_rules || {};
   productCardSelector.value = rules.product_card_selector || "";
@@ -530,6 +537,50 @@ function escapeHtml(value) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function defaultConnectionMethod() {
+  return connectionMethods[0]?.code || "requests";
+}
+
+function setConnectionMethods(methods) {
+  if (!Array.isArray(methods)) return;
+  connectionMethods = methods
+    .map((method, index) => ({
+      id: Number(method.id ?? index),
+      code: String(method.code || "").trim(),
+      name: String(method.name || method.code || "").trim(),
+    }))
+    .filter((method) => method.code);
+}
+
+function connectionOptionsHtml(current) {
+  const currentValue = current || defaultConnectionMethod();
+  const options = connectionMethods.length
+    ? connectionMethods
+    : [{ id: 0, code: "requests", name: "Requests" }];
+  return options
+    .map((method) => {
+      const value = escapeHtml(method.code);
+      const label = escapeHtml(method.name || method.code);
+      return `<option value="${value}" ${method.code === currentValue ? "selected" : ""}>${label}</option>`;
+    })
+    .join("");
+}
+
+function hydrateConnectionSelect(select, current) {
+  if (!select) return;
+  const currentValue = current || select.value || defaultConnectionMethod();
+  const previousValue = select.value;
+  const nextHtml = connectionOptionsHtml(currentValue);
+  if (select.dataset.optionsHtml !== nextHtml) {
+    select.innerHTML = nextHtml;
+    select.dataset.optionsHtml = nextHtml;
+  }
+  select.value = connectionMethods.some((method) => method.code === currentValue)
+    ? currentValue
+    : defaultConnectionMethod();
+  if (!select.value && previousValue) select.value = previousValue;
 }
 
 function renderNewsSettings() {
@@ -663,23 +714,6 @@ function collectOwnSites() {
       feed_generate_url: card.querySelector('[data-own-site-field="feed_generate_url"]')?.value.trim() || "",
     }))
     .filter((site) => site.feed_url || site.feed_generate_url);
-}
-
-function connectionOptionsHtml(current) {
-  const options = [
-    ["requests", "Requests"],
-    ["botasaurus-request", "Botasaurus Request"],
-    ["botasaurus-browser", "Botasaurus Browser Google"],
-    ["botasaurus-browser-direct", "Botasaurus Browser Direct"],
-    ["botasaurus-visible", "Botasaurus Visible Browser"],
-    ["crawl4ai", "Crawl4AI"],
-    ["firecrawl", "Firecrawl"],
-    ["scrapy", "Scrapy"],
-    ["crawlee", "Crawlee"],
-  ];
-  return options
-    .map(([value, label]) => `<option value="${value}" ${value === current ? "selected" : ""}>${label}</option>`)
-    .join("");
 }
 
 function scheduleTypeOptionsHtml(current) {
@@ -1479,10 +1513,10 @@ async function saveNewsSettings() {
       recipients: smtpRecipients.value,
     },
   };
-  newsData = await requestJson("/api/news/settings", {
+  newsData = applyNewsPayload(await requestJson("/api/news/settings", {
     method: "PATCH",
     body: JSON.stringify(payload),
-  });
+  }));
   renderNewsSettings();
   if (newsSettingsNotice) {
     newsSettingsNotice.textContent = "Настройки сохранены";
@@ -1571,7 +1605,7 @@ async function saveNewsBrandTitle() {
     method: "PATCH",
     body: JSON.stringify({ brand }),
   });
-  newsData = stampNewsStates(await requestJson("/api/news"));
+  newsData = applyNewsPayload(await requestJson("/api/news"));
   const updated = data.monitor || monitor;
   activeNewsBrandKey = `${updated.group || monitor.group || "Маржа"}::${updated.brand || brand}`;
   selectedNewsSites.set(activeNewsBrandKey, updated.id || monitor.id);
@@ -1590,7 +1624,7 @@ async function persistPendingNewsBrandTitle() {
     method: "PATCH",
     body: JSON.stringify({ brand }),
   });
-  newsData = stampNewsStates(await requestJson("/api/news"));
+  newsData = applyNewsPayload(await requestJson("/api/news"));
   const updated = data.monitor || monitor;
   activeNewsBrandKey = `${updated.group || monitor.group || "Маржа"}::${updated.brand || brand}`;
   selectedNewsSites.set(activeNewsBrandKey, updated.id || monitor.id);
@@ -1599,7 +1633,7 @@ async function persistPendingNewsBrandTitle() {
 }
 
 async function loadNews() {
-  newsData = stampNewsStates(await requestJson("/api/news"));
+  newsData = applyNewsPayload(await requestJson("/api/news"));
   renderNews();
 }
 
@@ -1637,6 +1671,7 @@ function renderAll() {
 
 async function loadProjects() {
   const data = await requestJson("/api/projects");
+  setConnectionMethods(data.connection_methods);
   projects = data.projects || [];
   if (!activeProjectId && projects.length) {
     activeProjectId = projects[0].id;
@@ -1897,7 +1932,7 @@ async function addNewsMonitorToGroup(group) {
         create_new_brand: true,
       }),
     });
-    if (!newsData) newsData = await requestJson("/api/news");
+    if (!newsData) newsData = applyNewsPayload(await requestJson("/api/news"));
     newsData.monitors.push(data.monitor);
     renderNewsMonitors();
     selectedNewsSites.set(`${data.monitor.group}::${data.monitor.brand}`, data.monitor.id);
@@ -2138,7 +2173,7 @@ newsModalContent.addEventListener("click", async (event) => {
         return;
       }
       if (notice) notice.textContent = "Сохраняю...";
-      if (!newsData) newsData = await requestJson("/api/news");
+      if (!newsData) newsData = applyNewsPayload(await requestJson("/api/news"));
       const currentSite = currentMonitor.site_url || "";
       if (!currentSite) {
         const payload = collectMonitorPayload(newsModalContent);
@@ -2147,7 +2182,7 @@ newsModalContent.addEventListener("click", async (event) => {
           method: "PATCH",
           body: JSON.stringify(payload),
         });
-        newsData = stampNewsStates(await requestJson("/api/news"));
+        newsData = applyNewsPayload(await requestJson("/api/news"));
         const updated = data.monitor || currentMonitor;
         activeNewsBrandKey = `${updated.group || currentMonitor.group || "Маржа"}::${updated.brand || currentMonitor.brand || "Новый донор"}`;
         selectedNewsSites.set(activeNewsBrandKey, updated.id);
@@ -2167,7 +2202,7 @@ newsModalContent.addEventListener("click", async (event) => {
             site_url: siteUrl,
           }),
         });
-        newsData = stampNewsStates(await requestJson("/api/news"));
+        newsData = applyNewsPayload(await requestJson("/api/news"));
         selectedNewsSites.set(activeNewsBrandKey, data.monitor.id);
       }
       urlInput.value = "";
@@ -2374,6 +2409,9 @@ window.setInterval(tickNewsModalTimers, 1000);
 const events = new EventSource("/progress");
 events.addEventListener("progress", (event) => {
   const data = JSON.parse(event.data);
+  if (Array.isArray(data.connection_methods)) {
+    setConnectionMethods(data.connection_methods);
+  }
   if (Array.isArray(data.projects)) {
     projects = data.projects;
     if (!activeProjectId && projects.length) activeProjectId = projects[0].id;
@@ -2386,7 +2424,7 @@ events.addEventListener("progress", (event) => {
     }
   }
   if (data.news) {
-    newsData = stampNewsStates(data.news);
+    newsData = applyNewsPayload(data.news);
     if (activeView === "news") {
       scheduleNewsListRender();
       if (activeNewsBrandKey && newsMonitorModal && !newsMonitorModal.classList.contains("hidden")) {

@@ -282,7 +282,7 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
         "state": make_state(4),
         "logs": [],
         "auto_cleanup": False,
-        "connection_method": "requests",
+        "connection_method": normalize_connection_method(None),
         "auto_connection_fallback": True,
         "worker_thread": None,
         "stop_event": threading.Event(),
@@ -625,7 +625,7 @@ def make_news_monitor(group: str, brand: str, urls: List[str], site_url: str = "
         "weekday": 0,
         "next_run_at": "",
         "thread_count": 4,
-        "connection_method": "requests",
+        "connection_method": normalize_connection_method(None),
         "auto_connection_fallback": True,
         "exclusions": DEFAULT_EXCLUSIONS.copy(),
         "product_url_filters": [],
@@ -1223,6 +1223,7 @@ def public_news_settings() -> Dict[str, object]:
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
+            "connection_methods": public_connection_methods(),
             "monitors": [public_news_monitor(monitor) for monitor in news_settings.get("monitors", [])],
         }
 
@@ -1297,9 +1298,31 @@ def get_connection_method_codes(force_refresh: bool = False) -> List[str]:
     return codes
 
 
+def public_connection_methods() -> List[Dict[str, object]]:
+    try:
+        with session_scope() as session:
+            rows = session.execute(
+                select(ConnectionMethod).order_by(ConnectionMethod.id)
+            ).scalars().all()
+        methods = [
+            {
+                "id": int(row.id),
+                "code": str(row.code or "").strip(),
+                "name": str(row.name or row.code or "").strip(),
+            }
+            for row in rows
+            if str(row.code or "").strip()
+        ]
+    except Exception as error:
+        append_unified_log("system", "warning", f"Не удалось прочитать способы подключения из БД: {error}")
+        methods = []
+    if methods:
+        return methods
+    return [{"id": 0, "code": "requests", "name": "Requests"}]
+
+
 def ordered_db_connection_methods(
     preferred: Optional[Iterable[str]] = None,
-    include_visible: bool = False,
 ) -> List[str]:
     """Строит fallback-цепочку только из методов, которые есть в БД."""
     db_codes = get_connection_method_codes()
@@ -1313,9 +1336,6 @@ def ordered_db_connection_methods(
     for method in db_codes:
         if method not in ordered:
             ordered.append(method)
-
-    if not include_visible:
-        ordered = [method for method in ordered if method != "botasaurus-visible"]
     return ordered
 
 
@@ -1435,8 +1455,7 @@ def normalize_url(raw_url: str, base_url: str) -> Optional[str]:
         return None
 
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
-    keep_trailing_slash = parsed.netloc.lower().endswith("technopark.ru")
-    if path != "/" and path.endswith("/") and not keep_trailing_slash:
+    if path != "/" and path.endswith("/"):
         path = path[:-1]
 
     # Сохраняем только пагинацию. Остальные параметры обычно создают дубликаты:
@@ -1449,8 +1468,6 @@ def normalize_url(raw_url: str, base_url: str) -> Optional[str]:
     query = urlencode(pagination_params)
 
     result = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
-    if parsed.netloc.lower().endswith("technopark.ru"):
-        result = technopark_slash_url(result)
     return result
 
 
@@ -1494,16 +1511,6 @@ def is_technopark_product_url(url: str) -> bool:
         re.search(r"-\d{5,}$", slug)
         or re.search(rf"-({known_brand})-[a-z0-9][a-z0-9-]*\d[a-z0-9-]*$", slug)
     )
-
-
-def technopark_slash_url(url: str) -> str:
-    parsed = urlparse(url)
-    if not parsed.netloc.lower().endswith("technopark.ru"):
-        return url
-    path = parsed.path or "/"
-    if path == "/" or path.endswith("/") or "." in path.rsplit("/", 1)[-1]:
-        return url
-    return urlunparse((parsed.scheme, parsed.netloc, path + "/", parsed.params, parsed.query, parsed.fragment))
 
 
 def has_static_extension(url: str) -> bool:
@@ -2864,7 +2871,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
 
 
 def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
-    """Видимый браузер с постоянным профилем: нужен для Qrator/JS-челленджей вроде Technopark."""
+    """Видимый браузер с постоянным профилем для сложных JS/anti-bot страниц."""
     try:
         from botasaurus.browser import Driver
         from botasaurus.browser import browser
@@ -2897,7 +2904,7 @@ def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
 
     try:
         with VISIBLE_BROWSER_LOCK:
-            result = _render_html(technopark_slash_url(url))
+            result = _render_html(url)
     except Exception:
         return None
 
@@ -3097,9 +3104,6 @@ class MaunfeldCrawler:
     def fetch_with_requests(self, url: str) -> Optional[str]:
         last_error = ""
         candidate_urls = [url]
-        slash_url = technopark_slash_url(url)
-        if slash_url != url:
-            candidate_urls.append(slash_url)
         for attempt in range(1, MAX_RETRIES + 1):
             if self.stop_signal.is_set():
                 return None
@@ -3136,7 +3140,7 @@ class MaunfeldCrawler:
         return None
 
     def fetch_by_method(self, url: str, method: str) -> Optional[str]:
-        target_url = technopark_slash_url(url)
+        target_url = url
         if method == "requests":
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
@@ -3158,37 +3162,11 @@ class MaunfeldCrawler:
         return None
 
     def method_sequence(self, url: str = "") -> List[str]:
-        if self.auto_connection_fallback and is_technopark_url(url):
-            if self.connection_method == "botasaurus-visible":
-                return ["botasaurus-visible"]
-
-            preferred = ["botasaurus-visible", "requests"]
-            methods = [self.connection_method]
-            methods.extend(
-                method
-                for method in ordered_db_connection_methods(preferred, include_visible=True)
-                if method not in methods
-            )
-            return methods
-
-        if self.auto_connection_fallback and is_kuppersberg_url(url):
-            if self.connection_method == "botasaurus-visible":
-                return ["botasaurus-visible"]
-
-            preferred = ["requests", "botasaurus-browser-direct", "botasaurus-browser", "botasaurus-visible"]
-            methods = [self.connection_method]
-            methods.extend(
-                method
-                for method in ordered_db_connection_methods(preferred, include_visible=True)
-                if method not in methods
-            )
-            return methods
-
         methods = [self.connection_method]
         if self.auto_connection_fallback:
             methods.extend(
                 method
-                for method in ordered_db_connection_methods(include_visible=False)
+                for method in ordered_db_connection_methods()
                 if method not in methods
             )
         return methods
@@ -5036,6 +5014,12 @@ def api_state():
     return jsonify(snapshot_state())
 
 
+@app.get("/api/connection-methods")
+def api_connection_methods():
+    ensure_storage()
+    return jsonify({"connection_methods": public_connection_methods()})
+
+
 @app.get("/api/news")
 def api_news():
     ensure_storage()
@@ -5366,7 +5350,12 @@ def api_download_news_feed(source: str, filename: str):
 def api_projects():
     ensure_storage()
     with projects_lock:
-        return jsonify({"projects": [public_project(project) for project in projects.values()]})
+        return jsonify(
+            {
+                "projects": [public_project(project) for project in projects.values()],
+                "connection_methods": public_connection_methods(),
+            }
+        )
 
 
 @app.post("/api/projects")
@@ -5874,6 +5863,7 @@ def progress_stream():
                     {
                         "projects": [public_project(project) for project in projects.values()],
                         "news": public_news_settings(),
+                        "connection_methods": public_connection_methods(),
                         "logs_signature": logs_signature(),
                     },
                     ensure_ascii=False,
