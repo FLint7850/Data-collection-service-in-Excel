@@ -54,26 +54,7 @@ FEED_WORKER_COUNT = max(1, min(int(os.environ.get("FEED_WORKER_COUNT", "6") or 6
 NEWS_ENRICH_WORKER_COUNT = max(1, min(int(os.environ.get("NEWS_ENRICH_WORKER_COUNT", "8") or 8), 16))
 NEWS_SCAN_STALL_TIMEOUT = int(os.environ.get("NEWS_SCAN_STALL_TIMEOUT", "180") or 180)
 SCHEDULE_DUE_GRACE_SECONDS = 90
-CONNECTION_METHODS = (
-    "requests",
-    "botasaurus-request",
-    "botasaurus-browser",
-    "botasaurus-browser-direct",
-    "botasaurus-visible",
-    "crawl4ai",
-    "firecrawl",
-    "scrapy",
-    "crawlee",
-)
-GENERIC_FALLBACK_METHODS = (
-    "requests",
-    "botasaurus-request",
-    "botasaurus-browser-direct",
-    "botasaurus-browser",
-    "crawl4ai",
-    "scrapy",
-    "crawlee",
-)
+CONNECTION_METHOD_CACHE_SECONDS = 30
 PRICE_RE = re.compile(r"\d[\d\s\u2009\xa0]{1,}(?:\u20bd|\u0440\u0443\u0431\.?)", re.IGNORECASE)
 BLOCKED_PAGE_MARKERS = (
     "cloudflare",
@@ -133,6 +114,8 @@ VISIBLE_BROWSER_LOCK = threading.Lock()
 HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(3)
 FEED_STORAGE_LOCK = threading.Lock()
 UNIFIED_LOG_LOCK = threading.Lock()
+connection_method_cache_lock = threading.Lock()
+connection_method_cache: Dict[str, object] = {"loaded_at": 0.0, "codes": []}
 news_stop_events: Dict[str, threading.Event] = {}
 news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
@@ -1285,9 +1268,63 @@ def parse_thread_count(value: object) -> int:
         return 4
 
 
+def get_connection_method_codes(force_refresh: bool = False) -> List[str]:
+    """Возвращает коды способов подключения из БД в порядке их id."""
+    now = time.time()
+    with connection_method_cache_lock:
+        cached_codes = list(connection_method_cache.get("codes") or [])
+        loaded_at = float(connection_method_cache.get("loaded_at") or 0.0)
+        if cached_codes and not force_refresh and now - loaded_at < CONNECTION_METHOD_CACHE_SECONDS:
+            return cached_codes
+
+    codes: List[str] = []
+    try:
+        with session_scope() as session:
+            rows = session.execute(select(ConnectionMethod.code).order_by(ConnectionMethod.id)).scalars().all()
+        for code in rows:
+            code_text = str(code or "").strip()
+            if code_text and code_text not in codes:
+                codes.append(code_text)
+    except Exception as error:
+        append_unified_log("system", "warning", f"Не удалось прочитать способы подключения из БД: {error}")
+
+    if not codes:
+        codes = ["requests"]
+
+    with connection_method_cache_lock:
+        connection_method_cache["codes"] = list(codes)
+        connection_method_cache["loaded_at"] = now
+    return codes
+
+
+def ordered_db_connection_methods(
+    preferred: Optional[Iterable[str]] = None,
+    include_visible: bool = False,
+) -> List[str]:
+    """Строит fallback-цепочку только из методов, которые есть в БД."""
+    db_codes = get_connection_method_codes()
+    ordered: List[str] = []
+
+    if preferred:
+        for method in preferred:
+            if method in db_codes and method not in ordered:
+                ordered.append(method)
+
+    for method in db_codes:
+        if method not in ordered:
+            ordered.append(method)
+
+    if not include_visible:
+        ordered = [method for method in ordered if method != "botasaurus-visible"]
+    return ordered
+
+
 def normalize_connection_method(value: object) -> str:
     method = str(value or "requests").strip()
-    return method if method in CONNECTION_METHODS else "requests"
+    codes = get_connection_method_codes()
+    if method in codes:
+        return method
+    return codes[0] if codes else "requests"
 
 
 def parse_db_int(value: object) -> Optional[int]:
@@ -3126,10 +3163,12 @@ class MaunfeldCrawler:
                 return ["botasaurus-visible"]
 
             preferred = ["botasaurus-visible", "requests"]
-            if self.connection_method == "botasaurus-request":
-                return preferred
             methods = [self.connection_method]
-            methods.extend(method for method in preferred if method not in methods)
+            methods.extend(
+                method
+                for method in ordered_db_connection_methods(preferred, include_visible=True)
+                if method not in methods
+            )
             return methods
 
         if self.auto_connection_fallback and is_kuppersberg_url(url):
@@ -3138,12 +3177,20 @@ class MaunfeldCrawler:
 
             preferred = ["requests", "botasaurus-browser-direct", "botasaurus-browser", "botasaurus-visible"]
             methods = [self.connection_method]
-            methods.extend(method for method in preferred if method not in methods)
+            methods.extend(
+                method
+                for method in ordered_db_connection_methods(preferred, include_visible=True)
+                if method not in methods
+            )
             return methods
 
         methods = [self.connection_method]
         if self.auto_connection_fallback:
-            methods.extend(method for method in GENERIC_FALLBACK_METHODS if method not in methods)
+            methods.extend(
+                method
+                for method in ordered_db_connection_methods(include_visible=False)
+                if method not in methods
+            )
         return methods
 
     def fetch(self, url: str) -> Optional[str]:
