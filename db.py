@@ -120,6 +120,8 @@ def seed_connection_methods(connection) -> None:
         ("firecrawl", "Firecrawl"),
         ("scrapy", "Scrapy"),
         ("crawlee", "Crawlee"),
+        ("playwright", "Playwright"),
+        ("scrapegraphai", "ScrapeGraphAI"),
     ]
     for code, name in methods:
         connection.execute(

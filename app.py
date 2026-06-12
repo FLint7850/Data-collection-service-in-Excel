@@ -3075,6 +3075,89 @@ async def main():
 asyncio.run(main())
 """
 
+PLAYWRIGHT_FETCH_SCRIPT = r"""
+import base64
+import sys
+
+from playwright.sync_api import sync_playwright
+
+url = sys.argv[1]
+timeout = int(float(sys.argv[2])) * 1000
+marker = sys.argv[3]
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+        ],
+    )
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        locale="ru-RU",
+        viewport={"width": 1366, "height": 900},
+    )
+    page = context.new_page()
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    try:
+        page.wait_for_load_state("networkidle", timeout=min(timeout, 15000))
+    except Exception:
+        pass
+    for _ in range(3):
+        try:
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(500)
+        except Exception:
+            break
+    html = page.content()
+    browser.close()
+    print(marker + base64.b64encode(html.encode("utf-8", "replace")).decode("ascii"))
+"""
+
+SCRAPEGRAPHAI_FETCH_SCRIPT = r"""
+import base64
+import sys
+
+from scrapegraphai.nodes.fetch_node import FetchNode
+
+url = sys.argv[1]
+timeout = int(float(sys.argv[2]))
+marker = sys.argv[3]
+
+node = FetchNode(
+    input="url",
+    output=["doc"],
+    node_config={
+        "headless": True,
+        "timeout": timeout,
+        "use_soup": False,
+        "cut": False,
+        "loader_kwargs": {
+            "timeout": timeout,
+            "requires_js_support": True,
+            "load_state": "networkidle",
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        },
+    },
+)
+state = node.execute({"url": url})
+documents = state.get("doc") or []
+html = ""
+if documents:
+    html = getattr(documents[0], "page_content", "") or ""
+if not html:
+    compressed = state.get("doc") or state.get("document") or []
+    if compressed:
+        html = getattr(compressed[0], "page_content", "") or ""
+print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("ascii"))
+"""
+
 
 def fetch_with_python_engine(script: str, url: str, timeout_seconds: int) -> Optional[str]:
     try:
@@ -3117,6 +3200,22 @@ def fetch_with_crawlee(url: str) -> Optional[str]:
     except ImportError:
         return None
     return fetch_with_python_engine(CRAWLEE_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
+
+
+def fetch_with_playwright(url: str) -> Optional[str]:
+    try:
+        import playwright  # noqa: F401
+    except ImportError:
+        return None
+    return fetch_with_python_engine(PLAYWRIGHT_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
+
+
+def fetch_with_scrapegraphai(url: str) -> Optional[str]:
+    try:
+        import scrapegraphai  # noqa: F401
+    except ImportError:
+        return None
+    return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
 
 
 class MaunfeldCrawler:
@@ -3266,6 +3365,10 @@ class MaunfeldCrawler:
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
             return fetch_with_crawlee(target_url)
+        if method == "playwright":
+            return fetch_with_playwright(target_url)
+        if method == "scrapegraphai":
+            return fetch_with_scrapegraphai(target_url)
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
