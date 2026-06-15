@@ -115,13 +115,14 @@ def seed_connection_methods(connection) -> None:
         ("botasaurus-request", "Botasaurus Request"),
         ("botasaurus-browser", "Botasaurus Browser"),
         ("botasaurus-browser-direct", "Botasaurus Browser Direct"),
-        ("botasaurus-visible", "Botasaurus Visible Browser"),
+        ("botasaurus-visible", "Botasaurus Headless Browser"),
         ("crawl4ai", "Crawl4AI"),
         ("firecrawl", "Firecrawl"),
         ("scrapy", "Scrapy"),
         ("crawlee", "Crawlee"),
         ("playwright", "Playwright"),
         ("scrapegraphai", "ScrapeGraphAI"),
+        ("botasaurus-debug-visible", "Botasaurus Debug Visible"),
     ]
     for code, name in methods:
         connection.execute(

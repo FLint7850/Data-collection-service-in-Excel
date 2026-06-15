@@ -136,7 +136,7 @@ news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
-HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(3)
+HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
 FEED_STORAGE_LOCK = threading.Lock()
 UNIFIED_LOG_LOCK = threading.Lock()
 connection_method_cache_lock = threading.Lock()
@@ -146,6 +146,33 @@ news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
 NEWS_TRANSITION_TIMEOUT_SECONDS = 180
+BROWSER_RENDER_METHODS = {
+    "botasaurus-browser",
+    "botasaurus-browser-direct",
+    "botasaurus-visible",
+    "botasaurus-debug-visible",
+    "crawl4ai",
+    "playwright",
+    "scrapegraphai",
+}
+DEBUG_VISIBLE_METHODS = {"botasaurus-debug-visible"}
+BLOCKED_BROWSER_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
+BLOCKED_BROWSER_URL_PARTS = (
+    "google-analytics",
+    "googletagmanager",
+    "doubleclick",
+    "adservice",
+    "adsystem",
+    "yandex.ru/metrika",
+    "mc.yandex",
+    "metrika",
+    "analytics",
+    "counter",
+    "facebook.net",
+    "vk.com/rtrg",
+    "top-fwz1.mail.ru",
+    "mail.ru/counter",
+)
 
 scan_state: Dict[str, object] = {
     "status": "idle",
@@ -2871,7 +2898,14 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
 
     @browser(
         headless=True,
-        add_arguments=["--headless=new"],
+        add_arguments=[
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--blink-settings=imagesEnabled=false",
+        ],
         window_size=[1280, 720],
         block_images_and_css=True,
         wait_for_complete_page_load=False,
@@ -2906,7 +2940,12 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
 
 
 def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
-    """Видимый браузер с постоянным профилем для сложных JS/anti-bot страниц."""
+    """Совместимый скрытый вариант старого botasaurus-visible для автопереключения."""
+    return fetch_with_botasaurus_browser(url, "direct")
+
+
+def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
+    """Ручной диагностический режим: открывает видимый браузер только при явном выборе."""
     try:
         from botasaurus.browser import Driver
         from botasaurus.browser import browser
@@ -2915,7 +2954,7 @@ def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
 
     @browser(
         headless=False,
-        profile="protected_sites_visible",
+        profile="protected_sites_debug_visible",
         window_size=[1280, 720],
         add_arguments=["--window-position=40,40"],
         block_images_and_css=False,
@@ -2951,18 +2990,58 @@ def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
     try:
         import asyncio
-        from crawl4ai import AsyncWebCrawler
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
     except ImportError:
         return None
 
     async def _fetch() -> Optional[str]:
-        async with AsyncWebCrawler() as crawler:
-            result = await crawler.arun(url=url)
+        browser_config = BrowserConfig(
+            browser_type="chromium",
+            headless=True,
+            channel="chromium",
+            text_mode=True,
+            light_mode=True,
+            avoid_ads=True,
+            avoid_css=True,
+            viewport_width=1366,
+            viewport_height=900,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            extra_args=[
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--blink-settings=imagesEnabled=false",
+            ],
+            verbose=False,
+        )
+        run_config = CrawlerRunConfig(
+            wait_until="domcontentloaded",
+            page_timeout=REQUEST_TIMEOUT * 1000,
+            wait_for_images=False,
+            delay_before_return_html=0.2,
+            exclude_all_images=True,
+            excluded_tags=["img", "picture", "source", "video", "audio", "svg", "style"],
+            exclude_domains=list(BLOCKED_BROWSER_URL_PARTS),
+            log_console=False,
+            capture_network_requests=False,
+            max_retries=0,
+            verbose=False,
+        )
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            result = await asyncio.wait_for(
+                crawler.arun(url=url, config=run_config),
+                timeout=REQUEST_TIMEOUT + 10,
+            )
             html = getattr(result, "html", "") or getattr(result, "cleaned_html", "")
             return html if isinstance(html, str) else None
 
     try:
-        return asyncio.run(_fetch())
+        with HEADLESS_BROWSER_SEMAPHORE:
+            return asyncio.run(_fetch())
     except Exception:
         return None
 
@@ -3094,6 +3173,30 @@ from playwright.sync_api import sync_playwright
 url = sys.argv[1]
 timeout = int(float(sys.argv[2])) * 1000
 marker = sys.argv[3]
+blocked_resource_types = {"image", "media", "font", "stylesheet"}
+blocked_url_parts = (
+    "google-analytics",
+    "googletagmanager",
+    "doubleclick",
+    "adservice",
+    "adsystem",
+    "yandex.ru/metrika",
+    "mc.yandex",
+    "metrika",
+    "analytics",
+    "counter",
+    "facebook.net",
+    "vk.com/rtrg",
+    "top-fwz1.mail.ru",
+    "mail.ru/counter",
+)
+
+
+def should_block(request):
+    if request.resource_type in blocked_resource_types:
+        return True
+    request_url = (request.url or "").lower()
+    return any(part in request_url for part in blocked_url_parts)
 
 with sync_playwright() as p:
     browser = p.chromium.launch(
@@ -3110,6 +3213,7 @@ with sync_playwright() as p:
         viewport={"width": 1366, "height": 900},
     )
     page = context.new_page()
+    page.route("**/*", lambda route, request: route.abort() if should_block(request) else route.continue_())
     page.goto(url, wait_until="domcontentloaded", timeout=timeout)
     try:
         page.wait_for_load_state("networkidle", timeout=min(timeout, 15000))
@@ -3167,6 +3271,103 @@ if not html:
         html = getattr(compressed[0], "page_content", "") or ""
 print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("ascii"))
 """
+
+
+class PlaywrightHeadlessRenderer:
+    """Один скрытый Chromium внутри сервиса; на каждый URL открывается только новая page."""
+
+    def __init__(self) -> None:
+        self.jobs: Queue = Queue()
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+
+    def ensure_started(self) -> None:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.thread = threading.Thread(target=self._worker, name="playwright-headless-renderer", daemon=True)
+            self.thread.start()
+
+    def fetch(self, url: str, timeout_seconds: int) -> Optional[str]:
+        self.ensure_started()
+        result_queue: Queue = Queue(maxsize=1)
+        self.jobs.put((url, timeout_seconds, result_queue))
+        try:
+            status, value = result_queue.get(timeout=timeout_seconds + 35)
+        except Empty as error:
+            raise RuntimeError("Playwright: внутренний headless browser не ответил вовремя") from error
+        if status == "error":
+            raise RuntimeError(f"Playwright: {value}")
+        return value if isinstance(value, str) and value.strip() else None
+
+    def _worker(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        def should_block_resource(request) -> bool:
+            resource_type = getattr(request, "resource_type", "")
+            if resource_type in BLOCKED_BROWSER_RESOURCE_TYPES:
+                return True
+            request_url = str(getattr(request, "url", "") or "").lower()
+            return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--no-sandbox",
+                    "--blink-settings=imagesEnabled=false",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                locale="ru-RU",
+                viewport={"width": 1366, "height": 900},
+            )
+            try:
+                while True:
+                    url, timeout_seconds, result_queue = self.jobs.get()
+                    page = None
+                    try:
+                        page = context.new_page()
+                        page.route(
+                            "**/*",
+                            lambda route, request: route.abort()
+                            if should_block_resource(request)
+                            else route.continue_(),
+                        )
+                        timeout_ms = int(float(timeout_seconds)) * 1000
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
+                        except Exception:
+                            pass
+                        for _ in range(3):
+                            page.mouse.wheel(0, 1600)
+                            page.wait_for_timeout(350)
+                        html = page.content()
+                        result_queue.put(("ok", html), block=False)
+                    except Exception as error:
+                        result_queue.put(("error", error), block=False)
+                    finally:
+                        if page is not None:
+                            try:
+                                page.close()
+                            except Exception:
+                                pass
+            finally:
+                context.close()
+                browser.close()
+
+
+playwright_headless_renderer = PlaywrightHeadlessRenderer()
 
 
 def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine_name: str = "engine") -> Optional[str]:
@@ -3234,7 +3435,8 @@ def fetch_with_playwright(url: str) -> Optional[str]:
         import playwright  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(PLAYWRIGHT_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Playwright")
+    with HEADLESS_BROWSER_SEMAPHORE:
+        return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
 
 
 def fetch_with_scrapegraphai(url: str) -> Optional[str]:
@@ -3242,7 +3444,8 @@ def fetch_with_scrapegraphai(url: str) -> Optional[str]:
         import scrapegraphai  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
+    with HEADLESS_BROWSER_SEMAPHORE:
+        return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
 
 
 class MaunfeldCrawler:
@@ -3381,6 +3584,8 @@ class MaunfeldCrawler:
             return fetch_with_botasaurus_browser(target_url, "direct")
         if method == "botasaurus-visible":
             return fetch_with_botasaurus_visible_browser(target_url)
+        if method == "botasaurus-debug-visible":
+            return fetch_with_botasaurus_debug_visible_browser(target_url)
         if method == "crawl4ai":
             return fetch_with_crawl4ai(target_url)
         if method == "firecrawl":
@@ -3399,6 +3604,13 @@ class MaunfeldCrawler:
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
+        if method in BROWSER_RENDER_METHODS:
+            try:
+                return self.fetch_by_method(url, method)
+            except Exception as error:
+                self.log(f"Метод подключения {method} завершился ошибкой для {url}: {error}", "warning")
+                return None
+
         result_queue: Queue = Queue(maxsize=1)
 
         def run_method() -> None:
@@ -3428,7 +3640,7 @@ class MaunfeldCrawler:
             methods.extend(
                 method
                 for method in ordered_db_connection_methods()
-                if method not in methods
+                if method not in methods and method not in DEBUG_VISIBLE_METHODS
             )
         return methods
 
