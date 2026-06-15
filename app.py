@@ -1312,7 +1312,12 @@ def get_connection_method_codes(force_refresh: bool = False) -> List[str]:
             if code_text and code_text not in codes:
                 codes.append(code_text)
     except Exception as error:
-        append_unified_log("system", "warning", f"Не удалось прочитать способы подключения из БД: {error}")
+        append_unified_log({
+            "project_id": "system",
+            "project_name": "system",
+            "level": "warning",
+            "message": f"Не удалось прочитать способы подключения из БД: {error}",
+        })
 
     if not codes:
         codes = ["requests"]
@@ -1339,7 +1344,12 @@ def public_connection_methods() -> List[Dict[str, object]]:
             if str(row.code or "").strip()
         ]
     except Exception as error:
-        append_unified_log("system", "warning", f"Не удалось прочитать способы подключения из БД: {error}")
+        append_unified_log({
+            "project_id": "system",
+            "project_name": "system",
+            "level": "warning",
+            "message": f"Не удалось прочитать способы подключения из БД: {error}",
+        })
         methods = []
     if methods:
         return methods
@@ -3159,7 +3169,7 @@ print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("as
 """
 
 
-def fetch_with_python_engine(script: str, url: str, timeout_seconds: int) -> Optional[str]:
+def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine_name: str = "engine") -> Optional[str]:
     try:
         completed = subprocess.run(
             [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER],
@@ -3168,22 +3178,39 @@ def fetch_with_python_engine(script: str, url: str, timeout_seconds: int) -> Opt
             timeout=timeout_seconds + 10,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except Exception:
-        return None
-    output = completed.stdout.decode("utf-8", "replace")
-    for line in reversed(output.splitlines()):
+    except Exception as error:
+        raise RuntimeError(f"{engine_name}: не удалось запустить процесс: {error}") from error
+
+    stdout = completed.stdout.decode("utf-8", "replace")
+    stderr = completed.stderr.decode("utf-8", "replace")
+
+    if completed.returncode != 0:
+        details = (stderr or stdout or "").strip()
+        if len(details) > 1200:
+            details = details[-1200:]
+        raise RuntimeError(f"{engine_name}: процесс завершился с кодом {completed.returncode}: {details}")
+
+    for line in reversed(stdout.splitlines()):
         if ENGINE_OUTPUT_MARKER not in line:
             continue
+
         payload = line.split(ENGINE_OUTPUT_MARKER, 1)[1].strip()
+
         if not payload:
-            return None
+            raise RuntimeError(f"{engine_name}: движок вернул пустой HTML")
+
         try:
             html_bytes = base64.b64decode(payload)
-        except Exception:
-            return None
+        except Exception as error:
+            raise RuntimeError(f"{engine_name}: не удалось декодировать HTML: {error}") from error
+
         html = html_bytes.decode("utf-8", "replace").strip()
         return html or None
-    return None
+
+    details = (stderr or stdout or "").strip()
+    if len(details) > 1200:
+        details = details[-1200:]
+    raise RuntimeError(f"{engine_name}: движок не вернул HTML. Вывод: {details}")
 
 
 def fetch_with_scrapy(url: str) -> Optional[str]:
@@ -3191,7 +3218,7 @@ def fetch_with_scrapy(url: str) -> Optional[str]:
         import scrapy  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(SCRAPY_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
+    return fetch_with_python_engine(SCRAPY_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Scrapy")
 
 
 def fetch_with_crawlee(url: str) -> Optional[str]:
@@ -3199,7 +3226,7 @@ def fetch_with_crawlee(url: str) -> Optional[str]:
         import crawlee  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(CRAWLEE_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
+    return fetch_with_python_engine(CRAWLEE_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Crawlee")
 
 
 def fetch_with_playwright(url: str) -> Optional[str]:
@@ -3207,7 +3234,7 @@ def fetch_with_playwright(url: str) -> Optional[str]:
         import playwright  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(PLAYWRIGHT_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
+    return fetch_with_python_engine(PLAYWRIGHT_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Playwright")
 
 
 def fetch_with_scrapegraphai(url: str) -> Optional[str]:
@@ -3215,7 +3242,7 @@ def fetch_with_scrapegraphai(url: str) -> Optional[str]:
         import scrapegraphai  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT)
+    return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
 
 
 class MaunfeldCrawler:

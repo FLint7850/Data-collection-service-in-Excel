@@ -9,6 +9,6 @@ botasaurus
 crawl4ai
 firecrawl-py
 scrapy
-crawlee
+crawlee[all]
 playwright
 scrapegraphai

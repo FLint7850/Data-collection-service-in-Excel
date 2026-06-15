@@ -57,6 +57,12 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 $env:STATIC_DEPS = "true"
 & $venvPython -m pip install -r requirements.txt
 
+Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan
+& $venvPython -m playwright install chromium
+
+Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
+& $venvPython -m crawl4ai-setup
+
 function Test-AppReady {
     try {
         $response = Invoke-WebRequest -Uri "$AppUrl/api/projects" -UseBasicParsing -TimeoutSec 2

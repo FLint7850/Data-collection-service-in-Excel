@@ -125,6 +125,12 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r requirements.txt
 
+Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan
+& $venvPython -m playwright install chromium
+
+Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
+& $venvPython -m crawl4ai-setup
+
 if (Test-AppReady) {
     Write-Host "The app is already running at $AppUrl" -ForegroundColor Green
 }
