@@ -129,7 +129,17 @@ Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan
 & $venvPython -m playwright install chromium
 
 Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
-& $venvPython -m crawl4ai-setup
+$crawl4aiSetup = Join-Path ".venv" "Scripts\crawl4ai-setup.exe"
+if (-not (Test-Path $crawl4aiSetup)) {
+    Write-Host "crawl4ai-setup.exe was not found. Updating Crawl4AI..." -ForegroundColor Yellow
+    & $venvPython -m pip install -U crawl4ai
+}
+if (Test-Path $crawl4aiSetup) {
+    & $crawl4aiSetup
+}
+else {
+    Write-Host "crawl4ai-setup.exe is still missing after install. Skipping Crawl4AI browser preparation." -ForegroundColor Yellow
+}
 
 if (Test-AppReady) {
     Write-Host "The app is already running at $AppUrl" -ForegroundColor Green
