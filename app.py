@@ -1994,6 +1994,19 @@ def normalize_model(value: str, product_url: str = "") -> str:
 
     if not text:
         return ""
+        
+            # Сохраняем регистр моделей, которые уже выглядят как готовая модель.
+    mixed_case_model = text.replace("\\", "/")
+    mixed_case_model = re.sub(r"\s+[–—-]\s+", " ", mixed_case_model)
+    mixed_case_model = re.sub(r"\s{2,}", " ", mixed_case_model).strip()
+
+    if (
+        re.fullmatch(r"[A-Za-z0-9./_-]+(?:\s+[A-Za-z0-9./_-]+){0,5}", mixed_case_model)
+        and any(char.isdigit() for char in mixed_case_model)
+        and any(char.isalpha() for char in mixed_case_model)
+        and any(char.islower() for char in mixed_case_model)
+    ):
+        return mixed_case_model
 
     # Частый случай: "Бренд ABC123" -> "ABC123".
     brands_regex = known_brand_regex()
