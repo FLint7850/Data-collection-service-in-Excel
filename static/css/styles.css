@@ -49,6 +49,17 @@ select {
   margin-bottom: 20px;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.topbar-actions form {
+  margin: 0;
+}
+
 .brand-block {
   min-width: 0;
 }

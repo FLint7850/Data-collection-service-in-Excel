@@ -65,12 +65,12 @@ Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
 
 function Test-AppReady {
     try {
-        $response = Invoke-WebRequest -Uri "$AppUrl/api/projects" -UseBasicParsing -TimeoutSec 2
+        $response = Invoke-WebRequest -Uri "$AppUrl/api/health" -UseBasicParsing -TimeoutSec 2
         if ($response.StatusCode -ne 200) {
             return $false
         }
         $data = $response.Content | ConvertFrom-Json
-        return $null -ne $data.projects
+        return $data.ok -eq $true
     }
     catch {
         return $false

@@ -18,9 +18,14 @@
         </div>
         <p>Проекты парсинга с независимыми настройками, прогрессом, CSV и логами.</p>
       </div>
-      <div class="status-pill" id="statusPill">
-        <span class="status-dot status-idle" id="statusDot"></span>
-        <span id="statusText">ожидание</span>
+      <div class="topbar-actions">
+        <div class="status-pill" id="statusPill">
+          <span class="status-dot status-idle" id="statusDot"></span>
+          <span id="statusText">ожидание</span>
+        </div>
+        <form method="post" action="{{ url_for('logout') }}">
+          <button class="button secondary compact-button" type="submit">Выйти</button>
+        </form>
       </div>
     </header>
 
@@ -243,13 +248,23 @@
           </label>
           <label class="field">
             <span>Email-логин</span>
-            <input id="smtpUsername" type="email" autocomplete="off">
+            <input id="smtpUsername" type="text" inputmode="email" autocomplete="off">
           </label>
           <label class="field">
             <span>Пароль Email</span>
             <span class="password-input-wrap">
-              <input id="smtpPassword" type="password" autocomplete="new-password" placeholder="Пароль приложения">
-              <button class="password-visibility-button" id="toggleSmtpPasswordButton" type="button" title="Показать пароль" aria-label="Показать пароль">
+              <input
+                      id="smtpPassword"
+                      type="text"
+              >
+
+              <button
+                      class="password-visibility-button"
+                      id="toggleSmtpPasswordButton"
+                      type="button"
+                      title="Показать пароль"
+                      aria-label="Показать пароль"
+              >
                 &#128065;
               </button>
             </span>

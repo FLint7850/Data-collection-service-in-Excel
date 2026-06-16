@@ -27,11 +27,12 @@ import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, Response, g, jsonify as flask_jsonify, render_template, request, send_file
+from flask import Flask, Response, g, jsonify as flask_jsonify, redirect, render_template, request, send_file, session, url_for
 from sqlalchemy import delete, select
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from db import SessionLocal, init_db, session_scope
-from models import AppSetting, Brand, ConnectionMethod, Donor, OwnSite, Project
+from models import AppSetting, Brand, ConnectionMethod, Donor, OwnSite, Project, User
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -149,6 +150,11 @@ BLOCKED_PAGE_MARKERS = tuple(
 )
 
 app = Flask(__name__)
+app.secret_key = env_str("FLASK_SECRET_KEY", "change-this-secret-key")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 
 @app.errorhandler(Exception)
@@ -163,6 +169,37 @@ def log_unhandled_exception(error: Exception):
 @app.before_request
 def open_request_db_session() -> None:
     g.db = SessionLocal()
+
+
+def ensure_default_user() -> None:
+    init_db()
+    with session_scope() as db_session:
+        existing_user = db_session.scalar(select(User.id).limit(1))
+        if existing_user:
+            return
+        username = env_str("AUTH_DEFAULT_USERNAME", "admin")
+        password = env_str("AUTH_DEFAULT_PASSWORD", "admin")
+        db_session.add(
+            User(
+                username=username,
+                password_hash=generate_password_hash(password),
+                is_active=True,
+            )
+        )
+
+
+def is_public_endpoint() -> bool:
+    endpoint = request.endpoint or ""
+    return endpoint in {"healthcheck", "login", "static"} or request.path.startswith("/static/")
+
+
+@app.before_request
+def require_login() -> Optional[Response]:
+    if is_public_endpoint():
+        return None
+    if session.get("user_id"):
+        return None
+    return redirect(url_for("login"))
 
 
 @app.teardown_request
@@ -272,6 +309,7 @@ def ensure_storage() -> None:
     LOG_DIR.mkdir(exist_ok=True)
     FEED_DIR.mkdir(exist_ok=True)
     init_db()
+    ensure_default_user()
     load_projects()
     load_news_settings()
     start_news_scheduler()
@@ -5684,6 +5722,16 @@ def refresh_monitor_schedule_from_brand(monitor: Dict[str, object]) -> None:
         monitor.update(brand_schedule_fields(brand))
 
 
+def safe_next_path(value: object) -> str:
+    text = str(value or "").strip()
+    if not text.startswith("/") or text.startswith("//"):
+        return url_for("index")
+    parsed = urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return url_for("index")
+    return urlunparse(("", "", parsed.path or "/", "", parsed.query, ""))
+
+
 def start_news_scheduler() -> None:
     global news_scheduler_thread
     if isinstance(news_scheduler_thread, threading.Thread) and news_scheduler_thread.is_alive():
@@ -5744,6 +5792,37 @@ def start_news_scheduler() -> None:
 
     news_scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
     news_scheduler_thread.start()
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login() -> str | Response:
+    ensure_default_user()
+    if session.get("user_id"):
+        return redirect(url_for("index"))
+    error = ""
+    if request.method == "POST":
+        username = str(request.form.get("username") or "").strip()
+        password = str(request.form.get("password") or "")
+        user = g.db.scalar(select(User).where(User.username == username, User.is_active.is_(True)))
+        if user and check_password_hash(user.password_hash, password):
+            session.clear()
+            session["user_id"] = int(user.id)
+            session["username"] = user.username
+            return redirect(url_for("index"))
+        error = "Неверный логин или пароль"
+    return render_template("login.html", error=error)
+
+
+@app.get("/api/health")
+def healthcheck():
+    ensure_storage()
+    return jsonify({"ok": True})
+
+
+@app.post("/logout")
+def logout() -> Response:
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.route("/")
