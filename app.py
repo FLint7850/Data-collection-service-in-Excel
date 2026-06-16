@@ -1984,6 +1984,7 @@ def model_from_url_slug(product_url: str) -> str:
     match = re.search(r"-([a-z0-9][a-z0-9-]*?[a-z][a-z0-9-]*\d[a-z0-9-]*)(?:-\d{5,})?$", slug)
     if not match:
         return ""
+
     model = match.group(1).replace("-", " ").strip()
     return model.upper()
 
@@ -1994,14 +1995,19 @@ def normalize_model(value: str, product_url: str = "") -> str:
 
     if not text:
         return ""
-        
-            # Сохраняем регистр моделей, которые уже выглядят как готовая модель.
+
+    # Сохраняем регистр и разделители моделей, которые уже выглядят как готовая модель.
     mixed_case_model = text.replace("\\", "/")
-    mixed_case_model = re.sub(r"\s+[–—-]\s+", " ", mixed_case_model)
+    mixed_case_model = re.sub(r"[–—]", "-", mixed_case_model)
+    mixed_case_model = re.sub(r"\s+-\s+", " - ", mixed_case_model)
     mixed_case_model = re.sub(r"\s{2,}", " ", mixed_case_model).strip()
+    mixed_case_model = mixed_case_model.rstrip(".")
 
     if (
-        re.fullmatch(r"[A-Za-z0-9./_-]+(?:\s+[A-Za-z0-9./_-]+){0,5}", mixed_case_model)
+        re.fullmatch(
+            r"[A-Za-z0-9./_-]+(?:\s+-\s+|\s+[A-Za-z0-9./_-]+){0,8}",
+            mixed_case_model,
+        )
         and any(char.isdigit() for char in mixed_case_model)
         and any(char.isalpha() for char in mixed_case_model)
         and any(char.islower() for char in mixed_case_model)
@@ -2011,7 +2017,11 @@ def normalize_model(value: str, product_url: str = "") -> str:
     # Частый случай: "Бренд ABC123" -> "ABC123".
     brands_regex = known_brand_regex()
     if brands_regex:
-        brand_match = re.search(rf"\b(?:{brands_regex})\b\s+([A-Z0-9][A-Z0-9./\\_-]{{2,}})", text, re.IGNORECASE)
+        brand_match = re.search(
+            rf"\b(?:{brands_regex})\b\s+([A-Z0-9][A-Z0-9./\\_-]{{2,}})",
+            text,
+            re.IGNORECASE,
+        )
         if brand_match:
             return brand_match.group(1).strip(" .,/\\_-").replace("\\", "/").upper()
 
