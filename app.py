@@ -1549,34 +1549,6 @@ def is_technopark_url(url: str) -> bool:
     return urlparse(url).netloc.lower().endswith("technopark.ru")
 
 
-def is_kuppersberg_url(url: str) -> bool:
-    return urlparse(url).netloc.lower().endswith("kuppersberg.ru")
-
-
-def is_kuppersberg_product_url(url: str) -> bool:
-    if not is_kuppersberg_url(url):
-        return False
-    parts = [part for part in urlparse(url).path.split("/") if part]
-    return len(parts) == 2 and parts[0] == "products"
-
-
-def is_technopark_product_url(url: str) -> bool:
-    path = urlparse(url).path.rstrip("/")
-    if not is_technopark_url(url):
-        return False
-    if path.startswith(("/photos/", "/support/", "/about/", "/action/", "/brand/")):
-        return False
-    path_parts = [part for part in path.split("/") if part]
-    if len(path_parts) != 1:
-        return False
-    slug = path_parts[0].lower()
-    known_brand = known_brand_regex()
-    return bool(
-        re.search(r"-\d{5,}$", slug)
-        or re.search(rf"-({known_brand})-[a-z0-9][a-z0-9-]*\d[a-z0-9-]*$", slug)
-    )
-
-
 def has_static_extension(url: str) -> bool:
     return bool(
         re.search(
@@ -1592,23 +1564,39 @@ def looks_like_product_path(path: str) -> bool:
     if not path_parts:
         return False
     slug = path_parts[-1]
+    service_prefixes = {
+        "articles",
+        "reviews",
+        "delivery-and-payment",
+        "services",
+        "credit",
+        "guarantee",
+        "contacts",
+        "favorites",
+        "compare",
+        "cart",
+        "login",
+        "personal",
+        "search",
+        "upload",
+        "bitrix",
+        "ajax",
+        "support",
+        "about",
+        "action",
+        "brand",
+    }
+    if path_parts[0].lower() in service_prefixes:
+        return False
+    if re.search(r"(?:^|/)goods?_\d+", path, flags=re.IGNORECASE):
+        return True
     if len(path_parts) >= 3 and path_parts[0] == "catalog":
         return "-" in slug or any(char.isdigit() for char in slug)
     if len(path_parts) >= 2 and slug.lower().endswith(".html"):
-        service_prefixes = {
-            "articles",
-            "reviews",
-            "delivery-and-payment",
-            "services",
-            "credit",
-            "guarantee",
-            "contacts",
-        }
-        if path_parts[0].lower() in service_prefixes:
-            return False
         product_slug = slug.rsplit(".", 1)[0]
-        if re.search(r"(?:^|/)goods?_\d+", path, flags=re.IGNORECASE):
-            return True
+        return "-" in product_slug and any(char.isdigit() for char in product_slug)
+    if len(path_parts) <= 3:
+        product_slug = slug.rsplit(".", 1)[0]
         return "-" in product_slug and any(char.isdigit() for char in product_slug)
     return False
 
@@ -1781,39 +1769,39 @@ def split_text_lines(value: str) -> List[str]:
     return [clean_text(line) for line in re.split(r"[\n\r]+", value) if clean_text(line)]
 
 
-MODEL_BRANDS = {
-    # Список используется только как эвристика для выделения модели из названия/URL.
-    # Он не должен определять, является ли страница товаром.
-    "AEG",
-    "ASKO",
-    "BORK",
-    "BOSCH",
-    "BRAUN",
-    "DREAME",
-    "DYSON",
-    "GRAUDE",
-    "HAIER",
-    "HIBERG",
-    "KITCHENAID",
-    "KITFORT",
-    "KORTING",
-    "KUPPERSBERG",
-    "MAUNFELD",
-    "MIELE",
-    "POLARIS",
-    "QYRON",
-    "ROWENTA",
-    "SMEG",
-    "TEFAL",
-    "VARD",
-    "V-ZUG",
-    "WHIRLPOOL",
-    "ZUGEL",
-}
+MODEL_BRAND_CACHE_SECONDS = 60
+model_brand_cache_lock = threading.Lock()
+model_brand_cache: Dict[str, object] = {"loaded_at": 0.0, "brands": set()}
+
+
+def model_brand_names(force_refresh: bool = False) -> Set[str]:
+    """Возвращает бренды из БД только для fallback-очистки модели из названия."""
+    now = time.time()
+    with model_brand_cache_lock:
+        cached = set(model_brand_cache.get("brands") or set())
+        loaded_at = float(model_brand_cache.get("loaded_at") or 0.0)
+        if cached and not force_refresh and now - loaded_at < MODEL_BRAND_CACHE_SECONDS:
+            return cached
+
+    brands: Set[str] = set()
+    try:
+        with session_scope() as session:
+            rows = session.execute(select(Brand.name)).scalars().all()
+        for name in rows:
+            text = clean_text(str(name or "")).upper()
+            if text:
+                brands.add(text)
+    except Exception:
+        brands = set()
+
+    with model_brand_cache_lock:
+        model_brand_cache["brands"] = set(brands)
+        model_brand_cache["loaded_at"] = now
+    return brands
 
 
 def known_brand_regex() -> str:
-    return "|".join(re.escape(brand.lower()) for brand in sorted(MODEL_BRANDS, key=len, reverse=True))
+    return "|".join(re.escape(brand.lower()) for brand in sorted(model_brand_names(), key=len, reverse=True))
 
 MODEL_COLOR_WORDS = {
     "BLACK",
@@ -1850,9 +1838,12 @@ def model_tokens_after_brand(value: str) -> str:
     tokens = re.findall(r"[A-Za-z\u0400-\u04FF0-9]+(?:[./_-][A-Za-z\u0400-\u04FF0-9]+)*", clean_text(value))
     if not tokens:
         return ""
+    brands = model_brand_names()
+    if not brands:
+        return ""
 
     for index, token in enumerate(tokens):
-        if token.upper() not in MODEL_BRANDS:
+        if token.upper() not in brands:
             continue
 
         model_parts = []
@@ -1877,74 +1868,28 @@ def model_tokens_after_brand(value: str) -> str:
     return ""
 
 
-def brand_slug_from_url(url: str) -> str:
-    parts = [part.lower() for part in urlparse(url).path.split("/") if part]
-    if not parts:
-        return ""
-    candidate = parts[-1]
-    if candidate in {brand.lower() for brand in MODEL_BRANDS}:
-        return candidate
-    return ""
-
-
-def matches_listing_brand(current_url: str, product_url: str, source_text: str = "") -> bool:
-    brand = brand_slug_from_url(current_url)
-    if not brand:
-        return True
-    haystack = f"{product_url} {source_text}".lower()
-    return brand in haystack
-
-
-def technopark_model_from_url(product_url: str) -> str:
-    if not is_technopark_url(product_url):
-        return ""
+def model_from_url_slug(product_url: str) -> str:
     slug = urlparse(product_url).path.rstrip("/").split("/")[-1].lower()
-    brands = known_brand_regex()
-    match = re.search(rf"-(?:{brands})-([a-z0-9][a-z0-9-]*?)(?:-\d{{5,}})?$", slug)
+    match = re.search(r"-([a-z0-9][a-z0-9-]*?[a-z][a-z0-9-]*\d[a-z0-9-]*)(?:-\d{5,})?$", slug)
     if not match:
         return ""
     model = match.group(1).replace("-", " ").strip()
     return model.upper()
 
 
-def kuppersberg_model_from_url(product_url: str) -> str:
-    if not is_kuppersberg_product_url(product_url):
-        return ""
-    slug = urlparse(product_url).path.strip("/").split("/")[-1]
-    parts = [part for part in re.split(r"[_-]+", slug) if part]
-    if not parts:
-        return ""
-    return " ".join(part.upper() if re.search(r"\d", part) or len(part) <= 3 else part.capitalize() for part in parts)
-
-
-def normalize_kuppersberg_model(value: str, product_url: str = "") -> str:
-    text = clean_text(value)
-    if text:
-        tokens = re.findall(r"[A-Za-z0-9]+", text)
-        for index, token in enumerate(tokens):
-            if re.search(r"[A-Za-z]", token) and (re.search(r"\d", token) or len(token) <= 4):
-                return " ".join(tokens[index : index + 5]).strip()
-    return kuppersberg_model_from_url(product_url)
-
-
 def normalize_model(value: str, product_url: str = "") -> str:
     """Возвращает маркировку модели без полного товарного названия."""
     text = clean_text(value)
-    url_model = technopark_model_from_url(product_url)
-    if url_model:
-        return url_model
-    if is_kuppersberg_url(product_url):
-        kuppersberg_model = normalize_kuppersberg_model(text, product_url)
-        if kuppersberg_model:
-            return kuppersberg_model
 
     if not text:
         return ""
 
     # Частый случай: "Бренд ABC123" -> "ABC123".
-    brand_match = re.search(rf"\b(?:{known_brand_regex()})\b\s+([A-Z0-9][A-Z0-9./\\_-]{{2,}})", text, re.IGNORECASE)
-    if brand_match:
-        return brand_match.group(1).strip(" .,/\\_-").replace("\\", "/").upper()
+    brands_regex = known_brand_regex()
+    if brands_regex:
+        brand_match = re.search(rf"\b(?:{brands_regex})\b\s+([A-Z0-9][A-Z0-9./\\_-]{{2,}})", text, re.IGNORECASE)
+        if brand_match:
+            return brand_match.group(1).strip(" .,/\\_-").replace("\\", "/").upper()
 
     generic_brand_model = model_tokens_after_brand(text)
     if generic_brand_model:
@@ -1959,7 +1904,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
         and any(any(char.isdigit() for char in token) for token in latin_model_tokens)
         and any(any(char.isalpha() for char in token) for token in latin_model_tokens)
         and latin_model_tokens[0].upper() not in {"SERIE", "SERIES"}
-        and latin_model_tokens[0].upper() not in MODEL_BRANDS
+        and latin_model_tokens[0].upper() not in model_brand_names()
     ):
         return " ".join(token.strip(" .,/\\_-").upper() for token in latin_model_tokens if token.strip(" .,/\\_-"))
 
@@ -1972,7 +1917,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
             continue
         if not all(re.fullmatch(r"[A-Z0-9./_-]+", token) for token in candidate_tokens):
             continue
-        if candidate_tokens[0].upper() in MODEL_BRANDS or candidate_tokens[0].upper() in {"SERIE", "SERIES"}:
+        if candidate_tokens[0].upper() in model_brand_names() or candidate_tokens[0].upper() in {"SERIE", "SERIES"}:
             continue
         return " ".join(candidate_tokens).upper()
 
@@ -1983,7 +1928,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
         "ОНЛАЙН",
         "РАСПРОДАЖА",
         "НОВИНКА",
-        *MODEL_BRANDS,
+        *model_brand_names(),
     }
     code_tokens = []
     for token in re.findall(r"[A-Z\u0400-\u04FF0-9][A-Z\u0400-\u04FF0-9./\\_-]{2,}", text, flags=re.IGNORECASE):
@@ -2000,9 +1945,14 @@ def normalize_model(value: str, product_url: str = "") -> str:
 
     # Последний шанс: модель часто лежит в конце slug после названия бренда.
     slug = urlparse(product_url).path.rstrip("/").split("/")[-1]
-    slug_match = re.search(rf"(?:^|-)(?:{known_brand_regex()})-([a-z0-9-]+)$", slug, re.IGNORECASE)
-    if slug_match:
-        return slug_match.group(1).replace("-", "").upper()
+    if brands_regex:
+        slug_match = re.search(rf"(?:^|-)(?:{brands_regex})-([a-z0-9-]+)$", slug, re.IGNORECASE)
+        if slug_match:
+            return slug_match.group(1).replace("-", "").upper()
+
+    url_model = model_from_url_slug(product_url)
+    if url_model:
+        return url_model
 
     return text
 
@@ -2073,7 +2023,12 @@ def extract_offer_price(offers: Any) -> str:
     return ""
 
 
-def extract_schema_product(soup: BeautifulSoup, url: str, fallback_price: str = "") -> Optional[Dict[str, str]]:
+def extract_schema_product(
+    soup: BeautifulSoup,
+    url: str,
+    fallback_price: str = "",
+    allow_empty_price: bool = False,
+) -> Optional[Dict[str, str]]:
     for item in jsonld_items(soup):
         for node in iter_json_nodes(item):
             if not type_contains(node.get("@type"), "Product"):
@@ -2081,7 +2036,7 @@ def extract_schema_product(soup: BeautifulSoup, url: str, fallback_price: str = 
             model = clean_text(str(node.get("model") or node.get("sku") or node.get("name") or ""))
             price = extract_offer_price(node.get("offers")) or fallback_price
             item_url = normalize_url(str(node.get("url") or ""), url) or url
-            if model and price:
+            if model and (price or allow_empty_price):
                 return {"url": item_url, "model": normalize_model(model, item_url), "price": price}
     return None
 
@@ -2207,10 +2162,6 @@ def extract_price(soup: BeautifulSoup) -> str:
 
 
 def is_probable_product_url(url: str) -> bool:
-    if is_technopark_product_url(url):
-        return True
-    if is_kuppersberg_product_url(url):
-        return True
     return looks_like_product_path(urlparse(url).path)
 
 
@@ -2294,7 +2245,7 @@ def is_good_model_text(text: str) -> bool:
         return False
     if PRICE_RE.search(text):
         return False
-    return bool(model_tokens_after_brand(text) or re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
+    return bool(re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
 
 
 def extract_product_url_from_card(card, current_url: str, product_url_filters: Optional[Iterable[str]] = None) -> str:
@@ -2355,8 +2306,6 @@ def extract_listing_products_from_links(
         product_url = canonicalize_product_url_by_filters(normalize_url(link.get("href", ""), current_url), filters)
         if not product_url or not is_product_url_for_filters(product_url, filters) or product_url in seen_urls:
             continue
-        if not matches_listing_brand(current_url, product_url, link.get_text(" ", strip=True)):
-            continue
 
         card = find_card_container_from_link(link, current_url, filters)
         if not card:
@@ -2404,16 +2353,21 @@ def extract_name_near_text(value: str) -> str:
         matches = re.findall(rf'"{key}"\s*:\s*"([^"]{{3,220}})"', value, flags=re.IGNORECASE)
         for match in matches:
             text = clean_text(html_lib.unescape(match))
-            if is_good_model_text(text) or model_tokens_after_brand(text):
+            if is_good_model_text(text) or normalize_model(text):
                 return text
     return ""
 
 
-def extract_listing_products_from_scripts(soup: BeautifulSoup, current_url: str, seen_urls: Set[str]) -> List[Dict[str, str]]:
+def extract_listing_products_from_scripts(
+    soup: BeautifulSoup,
+    current_url: str,
+    seen_urls: Set[str],
+    product_url_filters: Optional[Iterable[str]] = None,
+) -> List[Dict[str, str]]:
     products: List[Dict[str, str]] = []
-    known_brand = known_brand_regex()
+    filters = list(product_url_filters or [])
     product_url_re = re.compile(
-        rf'(?:https?://[^"\'<>\s]+)?/[^"\'<>\s]+(?:-\d{{5,}}|-({known_brand})-[^"\'<>\s/]*\d[^"\'<>\s/]*)/?',
+        r'(?:https?://[^"\'<>\s]+)?/[^"\'<>\s]+(?:goods?_\d+|[a-z0-9][a-z0-9_-]*\d[a-z0-9_-]*)(?:\.html)?/?',
         re.IGNORECASE,
     )
 
@@ -2427,14 +2381,13 @@ def extract_listing_products_from_scripts(soup: BeautifulSoup, current_url: str,
 
         for match in product_url_re.finditer(text):
             product_url = normalize_url(match.group(0), current_url)
-            if not product_url or not is_probable_product_url(product_url) or product_url in seen_urls:
+            product_url = canonicalize_product_url_by_filters(product_url or "", filters)
+            if not product_url or not is_product_url_for_filters(product_url, filters) or product_url in seen_urls:
                 continue
 
             left = max(0, match.start() - 2500)
             right = min(len(text), match.end() + 2500)
             window = text[left:right]
-            if not matches_listing_brand(current_url, product_url, window):
-                continue
             price = extract_price_near_text(window)
             name = extract_name_near_text(window)
             model = normalize_model(name, product_url)
@@ -2633,8 +2586,6 @@ def extract_listing_products_by_rules(
         product_url = canonicalize_product_url_by_filters(normalize_url(link_node.get("href", "") if link_node else "", current_url), filters)
         if not product_url or product_url in seen_urls or not is_product_url_for_filters(product_url, filters):
             continue
-        if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
-            continue
 
         model = extract_model_by_markers(str(card), rules)
         if not model:
@@ -2680,8 +2631,6 @@ def extract_listing_products_from_common_cards(
     for card in cards:
         product_url = extract_product_url_from_card(card, current_url, filters)
         if not product_url or product_url in seen_urls or not is_product_url_for_filters(product_url, filters):
-            continue
-        if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
             continue
 
         price = extract_price_from_container(card, rules.get("price_selector", ""))
@@ -2752,15 +2701,12 @@ def extract_listing_products(
         card = find_card_container(price_node, current_url)
         if not card:
             continue
-        if is_kuppersberg_url(current_url):
-            card_prices = extract_prices(card.get_text(" ", strip=True))
-            if card_prices:
-                price = card_prices[-1]
+        card_prices = extract_prices(card.get_text(" ", strip=True))
+        if len(card_prices) > 1:
+            price = card_prices[-1]
 
         product_url = extract_product_url_from_card(card, current_url, filters)
         if product_url == current_url and not is_product_url_for_filters(current_url, filters):
-            continue
-        if not matches_listing_brand(current_url, product_url, card.get_text(" ", strip=True)):
             continue
         model = normalize_model(extract_model_from_card(card, price), product_url)
 
@@ -2771,7 +2717,7 @@ def extract_listing_products(
         products.append({"url": product_url, "model": model, "price": price})
 
     products.extend(extract_listing_products_from_links(soup, current_url, seen_urls, filters))
-    products.extend(extract_listing_products_from_scripts(soup, current_url, seen_urls))
+    products.extend(extract_listing_products_from_scripts(soup, current_url, seen_urls, filters))
     if rules:
         products.extend(extract_listing_products_by_rules(soup, current_url, rules, seen_urls, filters))
     return products
@@ -2810,7 +2756,7 @@ def has_generic_product_signal(
     if any(signal.lower() in page_text.lower() for signal in product_signals):
         return True
 
-    return bool(h1 and (price or model_tokens_after_brand(h1) or normalize_model(h1)))
+    return bool(h1 and (price or re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", h1, re.IGNORECASE)))
 
 
 def should_accept_extracted_product(
@@ -2835,6 +2781,8 @@ def should_accept_extracted_product(
     if not price and not allow_empty_price:
         return False
     if assume_product:
+        return True
+    if rules and any(str(rules.get(key, "")).strip() for key in ("product_card_selector", "product_url_selector", "model_selector", "price_selector", "model_start_marker")):
         return True
     if not is_probable_product_url(url):
         return False
@@ -2909,7 +2857,7 @@ def extract_product_data(
     h1 = first_text(soup, ["h1"])
     price = fallback_price or extract_price(soup)
 
-    schema_product = extract_schema_product(soup, url, price)
+    schema_product = extract_schema_product(soup, url, price, allow_empty_price=allow_empty_price)
     if schema_product and (schema_product.get("price") or allow_empty_price):
         return schema_product
 
