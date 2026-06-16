@@ -34,21 +34,6 @@ from db import SessionLocal, init_db, session_scope
 from models import AppSetting, Brand, ConnectionMethod, Donor, OwnSite, Project
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_DIR = BASE_DIR / "logs"
-FEED_DIR = BASE_DIR / "feeds"
-LOGS_FILE = LOG_DIR / "logs.json"
-UNIFIED_LOG_FILE = LOG_DIR / "app.log"
-EXPORT_DIR = BASE_DIR / "exports"
-DEFAULT_START_URL = ""
-DEFAULT_FEED_URL = "https://mega-kuhnya.ru/price/last_modified.xml"
-DEFAULT_FEED_GENERATE_URL = "https://mega-kuhnya.ru/index.php?route=extension/feed/unixml/new_product"
-MSK_TZ = timezone(timedelta(hours=3))
-DEFAULT_EXCLUSIONS = [
-    "/catalog/rasprodazha/",
-    "/catalog/utsenka/",
-    "/about/",
-    "/contacts/",
-]
 
 
 def load_local_env() -> None:
@@ -71,27 +56,96 @@ def load_local_env() -> None:
 
 load_local_env()
 
-REQUEST_TIMEOUT = 20
-CONNECTION_METHOD_TIMEOUT_SECONDS = int(os.environ.get("CONNECTION_METHOD_TIMEOUT_SECONDS", "60") or 60)
-REQUEST_DELAY_SECONDS = max(0.0, float(os.environ.get("REQUEST_DELAY_SECONDS", "0.05") or 0.05))
-MAX_RETRIES = 3
-FEED_WORKER_COUNT = max(1, min(int(os.environ.get("FEED_WORKER_COUNT", "6") or 6), 12))
-NEWS_ENRICH_WORKER_COUNT = max(1, min(int(os.environ.get("NEWS_ENRICH_WORKER_COUNT", "8") or 8), 16))
-NEWS_SCAN_STALL_TIMEOUT = int(os.environ.get("NEWS_SCAN_STALL_TIMEOUT", "180") or 180)
-SCHEDULE_DUE_GRACE_SECONDS = 90
-CONNECTION_METHOD_CACHE_SECONDS = 30
+
+def env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, default) or default).strip()
+
+
+def env_int(name: str, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def env_float(name: str, default: float, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def env_list(name: str, default: Iterable[str]) -> List[str]:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return [str(item).strip() for item in default if str(item).strip()]
+    return [item.strip() for item in raw_value.replace("\n", ",").split(",") if item.strip()]
+
+
+def env_path(name: str, default: str) -> Path:
+    value = env_str(name, default)
+    path = Path(value)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+LOG_DIR = env_path("LOG_DIR", "logs")
+FEED_DIR = env_path("FEED_DIR", "feeds")
+LOGS_FILE = env_path("LOGS_FILE", str(LOG_DIR / "logs.json"))
+UNIFIED_LOG_FILE = env_path("UNIFIED_LOG_FILE", str(LOG_DIR / "app.log"))
+EXPORT_DIR = env_path("EXPORT_DIR", "exports")
+DEFAULT_START_URL = env_str("DEFAULT_START_URL", "")
+DEFAULT_FEED_URL = env_str("DEFAULT_FEED_URL", "https://mega-kuhnya.ru/price/last_modified.xml")
+DEFAULT_FEED_GENERATE_URL = env_str(
+    "DEFAULT_FEED_GENERATE_URL",
+    "https://mega-kuhnya.ru/index.php?route=extension/feed/unixml/new_product",
+)
+MSK_TZ = timezone(timedelta(hours=env_int("APP_TIMEZONE_OFFSET_HOURS", 3)))
+DEFAULT_EXCLUSIONS = env_list(
+    "DEFAULT_EXCLUSIONS",
+    [
+        "/catalog/rasprodazha/",
+        "/catalog/utsenka/",
+        "/about/",
+        "/contacts/",
+    ],
+)
+
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 20, minimum=1)
+CONNECTION_METHOD_TIMEOUT_SECONDS = env_int("CONNECTION_METHOD_TIMEOUT_SECONDS", 60, minimum=1)
+REQUEST_DELAY_SECONDS = env_float("REQUEST_DELAY_SECONDS", 0.05, minimum=0.0)
+MAX_RETRIES = env_int("MAX_RETRIES", 3, minimum=1)
+FEED_WORKER_COUNT = env_int("FEED_WORKER_COUNT", 6, minimum=1, maximum=12)
+NEWS_ENRICH_WORKER_COUNT = env_int("NEWS_ENRICH_WORKER_COUNT", 8, minimum=1, maximum=16)
+NEWS_SCAN_STALL_TIMEOUT = env_int("NEWS_SCAN_STALL_TIMEOUT", 180, minimum=1)
+SCHEDULE_DUE_GRACE_SECONDS = env_int("SCHEDULE_DUE_GRACE_SECONDS", 90, minimum=0)
+CONNECTION_METHOD_CACHE_SECONDS = env_int("CONNECTION_METHOD_CACHE_SECONDS", 30, minimum=1)
 PRICE_RE = re.compile(r"\d[\d\s\u2009\xa0]{1,}(?:\u20bd|\u0440\u0443\u0431\.?)", re.IGNORECASE)
-BLOCKED_PAGE_MARKERS = (
-    "cloudflare",
-    "captcha",
-    "access denied",
-    "http 403",
-    "__qrator",
-    "qauth.js",
-    "qrator",
-    "доступ ограничен",
-    "проверяем ваш браузер",
-    "enable javascript",
+BLOCKED_PAGE_MARKERS = tuple(
+    env_list(
+        "BLOCKED_PAGE_MARKERS",
+        [
+            "cloudflare",
+            "captcha",
+            "access denied",
+            "http 403",
+            "__qrator",
+            "qauth.js",
+            "qrator",
+            "доступ ограничен",
+            "проверяем ваш браузер",
+            "enable javascript",
+        ],
+    )
 )
 
 app = Flask(__name__)
@@ -640,6 +694,35 @@ def output_text(value: object) -> str:
     return str(repair_mojibake_text(str(value)) or "")
 
 
+def default_smtp_settings() -> Dict[str, object]:
+    return {
+        "host": env_str("SMTP_HOST", "smtp.yandex.ru"),
+        "port": env_int("SMTP_PORT", 465, minimum=1, maximum=65535),
+        "security": env_str("SMTP_SECURITY", "ssl"),
+        "username": env_str("SMTP_USERNAME", ""),
+        "password": env_str("SMTP_PASSWORD", env_str("YANDEX_SMTP_PASSWORD", "")),
+        "recipients": env_list("SMTP_RECIPIENTS", []),
+    }
+
+
+def merge_smtp_settings(base: Dict[str, object], stored: Dict[str, object]) -> Dict[str, object]:
+    smtp = dict(base)
+    for key in ("host", "security", "username", "password"):
+        value = str(stored.get(key) or "").strip()
+        if value:
+            smtp[key] = value
+    if stored.get("port"):
+        try:
+            smtp["port"] = int(stored.get("port") or smtp.get("port") or 465)
+        except (TypeError, ValueError):
+            pass
+    recipients = normalize_emails(stored.get("recipients", []))
+    if recipients:
+        smtp["recipients"] = recipients
+    smtp.pop("sender", None)
+    return smtp
+
+
 def default_news_settings() -> Dict[str, object]:
     return {
         "feed_url": DEFAULT_FEED_URL,
@@ -647,14 +730,7 @@ def default_news_settings() -> Dict[str, object]:
         "feed_urls": [DEFAULT_FEED_URL],
         "feed_generate_urls": [DEFAULT_FEED_GENERATE_URL],
         "auto_cleanup": False,
-        "smtp": {
-            "host": "smtp.yandex.ru",
-            "port": 465,
-            "security": "ssl",
-            "username": "",
-            "password": os.environ.get("YANDEX_SMTP_PASSWORD", ""),
-            "recipients": [],
-        },
+        "smtp": default_smtp_settings(),
         "monitors": [],
         "logs": [],
         "feed_storage": [],
@@ -1049,10 +1125,7 @@ def load_news_settings() -> None:
             if app_setting:
                 settings["auto_cleanup"] = bool(app_setting.auto_cleanup)
                 if isinstance(app_setting.smtp, dict):
-                    smtp = dict(settings["smtp"])
-                    smtp.update(app_setting.smtp)
-                    smtp.pop("sender", None)
-                    settings["smtp"] = smtp
+                    settings["smtp"] = merge_smtp_settings(dict(settings["smtp"]), app_setting.smtp)
                 if isinstance(app_setting.feed_storage, list):
                     settings["feed_storage"] = app_setting.feed_storage
             own_sites = session.scalars(select(OwnSite).order_by(OwnSite.id)).all()
@@ -5144,9 +5217,10 @@ def send_news_email_legacy(
     subject = str(repair_mojibake_text(subject))
     body = str(repair_mojibake_text(body))
 
-    host = str(smtp_config.get("host") or "smtp.yandex.ru")
-    port = int(smtp_config.get("port") or 465)
-    security_mode = str(smtp_config.get("security") or "ssl").lower()
+    smtp_defaults = default_smtp_settings()
+    host = str(smtp_config.get("host") or smtp_defaults["host"])
+    port = int(smtp_config.get("port") or smtp_defaults["port"])
+    security_mode = str(smtp_config.get("security") or smtp_defaults["security"]).lower()
     try:
         send_messages_to_recipients(host, port, security_mode, username, password, sender_email, recipients, subject, body)
     except Exception as exc:
@@ -5207,9 +5281,10 @@ def send_news_email(
         csv_filename = str(state.get("last_csv") or state_data.get("csv") or "")
         csv_path = resolve_export_file(csv_filename)
 
-    host = str(smtp_config.get("host") or "smtp.yandex.ru")
-    port = int(smtp_config.get("port") or 465)
-    security_mode = str(smtp_config.get("security") or "ssl").lower()
+    smtp_defaults = default_smtp_settings()
+    host = str(smtp_config.get("host") or smtp_defaults["host"])
+    port = int(smtp_config.get("port") or smtp_defaults["port"])
+    security_mode = str(smtp_config.get("security") or smtp_defaults["security"]).lower()
     try:
         send_messages_to_recipients(host, port, security_mode, username, password, sender_email, recipients, subject, body, csv_path)
     except Exception as exc:
@@ -6497,8 +6572,8 @@ def download_project_csv(project_id: str):
 
 if __name__ == "__main__":
     ensure_storage()
-    port = int(os.environ.get("PORT", "5000"))
-    if os.environ.get("DEBUG_HANG_DUMP") == "1":
+    port = env_int("PORT", 5000, minimum=1, maximum=65535)
+    if env_str("DEBUG_HANG_DUMP", "0") == "1":
         faulthandler.dump_traceback_later(10, repeat=True)
     from socketserver import ThreadingMixIn
     from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
