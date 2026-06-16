@@ -2,6 +2,28 @@ $ErrorActionPreference = "Stop"
 $Port = 5055
 $AppUrl = "http://127.0.0.1:$Port"
 
+function Load-LocalEnv {
+    $envPath = Join-Path $PSScriptRoot ".env"
+    if (-not (Test-Path $envPath)) {
+        return
+    }
+
+    foreach ($rawLine in Get-Content -Encoding UTF8 -LiteralPath $envPath) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) {
+            continue
+        }
+        $parts = $line.Split("=", 2)
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim().Trim('"').Trim("'")
+        if ($key -and -not [Environment]::GetEnvironmentVariable($key, "Process")) {
+            [Environment]::SetEnvironmentVariable($key, $value, "Process")
+        }
+    }
+}
+
+Load-LocalEnv
+
 function Find-Python {
     $candidates = @(
         @{ Command = "python"; Args = @("--version") },
@@ -114,31 +136,41 @@ else {
     $pythonArgs = @()
 }
 
+$createdVenv = $false
 if (-not (Test-Path ".venv")) {
     Write-Host "Creating virtual environment..." -ForegroundColor Cyan
     & $python @pythonArgs -m venv .venv
+    $createdVenv = $true
 }
 
 $venvPython = Join-Path ".venv" "Scripts\python.exe"
+$ForceBrowserSetup = $env:FORCE_BROWSER_SETUP -eq "1"
 
 Write-Host "Installing dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r requirements.txt
 
-Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan
-& $venvPython -m playwright install chromium
-
-Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
-$crawl4aiSetup = Join-Path ".venv" "Scripts\crawl4ai-setup.exe"
-if (-not (Test-Path $crawl4aiSetup)) {
-    Write-Host "crawl4ai-setup.exe was not found. Updating Crawl4AI..." -ForegroundColor Yellow
-    & $venvPython -m pip install -U crawl4ai
-}
-if (Test-Path $crawl4aiSetup) {
-    & $crawl4aiSetup
+if ($createdVenv -or $ForceBrowserSetup) {
+    Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan
+    & $venvPython -m playwright install chromium
 }
 else {
-    Write-Host "crawl4ai-setup.exe is still missing after install. Skipping Crawl4AI browser preparation." -ForegroundColor Yellow
+    Write-Host "Skipping browser setup for existing .venv. Set FORCE_BROWSER_SETUP=1 to reinstall." -ForegroundColor DarkGray
+}
+
+if ($createdVenv -or $ForceBrowserSetup) {
+    Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
+    $crawl4aiSetup = Join-Path ".venv" "Scripts\crawl4ai-setup.exe"
+    if (-not (Test-Path $crawl4aiSetup)) {
+        Write-Host "crawl4ai-setup.exe was not found. Updating Crawl4AI..." -ForegroundColor Yellow
+        & $venvPython -m pip install -U crawl4ai
+    }
+    if (Test-Path $crawl4aiSetup) {
+        & $crawl4aiSetup
+    }
+    else {
+        Write-Host "crawl4ai-setup.exe is still missing after install. Skipping Crawl4AI browser preparation." -ForegroundColor Yellow
+    }
 }
 
 if (Test-AppReady) {

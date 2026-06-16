@@ -17,7 +17,6 @@ ENV/
 !.env.example
 instance/
 .webassets-cache
-.setup/
 
 # Runtime project data
 exports/
