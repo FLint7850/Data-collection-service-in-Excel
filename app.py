@@ -1517,8 +1517,10 @@ def normalize_url(raw_url: str, base_url: str) -> Optional[str]:
         return None
 
     path = re.sub(r"/{2,}", "/", parsed.path or "/")
-    if path != "/" and path.endswith("/"):
-        path = path[:-1]
+
+# Важно: не удаляем завершающий слэш.
+# Для Bitrix/каталогов URL вида /catalog/category/ и /catalog/category
+# могут обрабатываться сайтом по-разному. Например ZUGEL требует слэш.
 
     # Сохраняем только пагинацию. Остальные параметры обычно создают дубликаты:
     # сортировки, UTM-метки, сравнение, фильтры с теми же товарами.
