@@ -2758,6 +2758,7 @@ def extract_product_data_by_rules(
     rules: Dict[str, str],
     fallback_price: str = "",
     assume_product: bool = False,
+    allow_empty_price: bool = False,
 ) -> Optional[Dict[str, str]]:
     if not rules:
         return None
@@ -2775,7 +2776,7 @@ def extract_product_data_by_rules(
         prices = extract_prices(soup.get_text(" ", strip=True))
         price = prices[-1] if prices else ""
     model = normalize_model(model, url)
-    if model and price and (assume_product or is_probable_product_url(url)):
+    if model and (price or allow_empty_price) and (assume_product or is_probable_product_url(url)):
         return {"url": url, "model": model, "price": price}
     return None
 
@@ -2786,9 +2787,18 @@ def extract_product_data(
     fallback_price: str = "",
     rules: Optional[Dict[str, str]] = None,
     assume_product: bool = False,
+    allow_empty_price: bool = False,
 ) -> Optional[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
-    ruled_product = extract_product_data_by_rules(url, html, soup, rules or {}, fallback_price, assume_product)
+    ruled_product = extract_product_data_by_rules(
+        url,
+        html,
+        soup,
+        rules or {},
+        fallback_price,
+        assume_product,
+        allow_empty_price=allow_empty_price,
+    )
     if ruled_product:
         return ruled_product
     path_parts = [part for part in urlparse(url).path.split("/") if part]
@@ -2828,14 +2838,14 @@ def extract_product_data(
     if not model and h1:
         model = h1
 
-    if price and model and is_maunfeld_url(url) and model_from_labeled_value:
+    if (price or allow_empty_price) and model and is_maunfeld_url(url) and model_from_labeled_value:
         return {"url": url, "model": clean_text(model), "price": price}
 
     if rules:
         model = prepare_rule_model(model, rules)
     model = normalize_model(model, url)
 
-    if price and model and assume_product:
+    if (price or allow_empty_price) and model and assume_product:
         return {"url": url, "model": model, "price": price}
 
     page_text = clean_text(soup.get_text(" ", strip=True))
@@ -2845,7 +2855,7 @@ def extract_product_data(
     )
     looks_like_product_url = is_probable_product_url(url)
 
-    if price and model and looks_like_product_url and (
+    if (price or allow_empty_price) and model and looks_like_product_url and (
         has_product_signal
         or "MAUNFELD" in h1.upper()
         or is_kuppersberg_url(url)
@@ -3465,6 +3475,7 @@ class ProductSiteCrawler:
         connection_method: str = "requests",
         auto_connection_fallback: bool = True,
         connection_method_state: Optional[Dict[str, object]] = None,
+        allow_empty_price: bool = False,
     ):
         self.run_id = run_id
         self.stop_signal = stop_signal
@@ -3479,6 +3490,7 @@ class ProductSiteCrawler:
         self.product_url_filters = product_url_filter_patterns(product_url_filters or [], self.extraction_rules)
         self.connection_method = normalize_connection_method(connection_method)
         self.auto_connection_fallback = bool(auto_connection_fallback)
+        self.allow_empty_price = bool(allow_empty_price)
         if connection_method_state is None:
             connection_method_state = {
                 "active_method": self.connection_method,
@@ -3817,7 +3829,7 @@ class ProductSiteCrawler:
                 price = product.get("price", "")
                 if product_url and not self.is_product_allowed(product_url):
                     continue
-                if not product_url or not model or not price or product_url in self.result_urls:
+                if not product_url or not model or (not price and not self.allow_empty_price) or product_url in self.result_urls:
                     continue
                 product["url"] = product_url
                 self.result_urls.add(product_url)
@@ -3924,6 +3936,7 @@ class ProductSiteCrawler:
                 listing_price,
                 self.extraction_rules,
                 assume_product=True,
+                allow_empty_price=self.allow_empty_price,
             )
             if product:
                 self.add_products([product])
@@ -3942,6 +3955,7 @@ class ProductSiteCrawler:
                 listing_price,
                 self.extraction_rules,
                 assume_product=True,
+                allow_empty_price=self.allow_empty_price,
             )
             if product:
                 self.add_products([product])
@@ -3987,6 +4001,7 @@ class ProductSiteCrawler:
             self.get_listing_price(url),
             self.extraction_rules,
             assume_product=self.is_product_url(url),
+            allow_empty_price=self.allow_empty_price,
         )
         if product:
             self.add_products([product])
@@ -4196,6 +4211,7 @@ def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, o
 
 class CollectOnlyCrawler(ProductSiteCrawler):
     def __init__(self, *args, progress_callback=None, **kwargs):
+        kwargs.setdefault("allow_empty_price", True)
         super().__init__(*args, **kwargs)
         self.progress_callback = progress_callback
 
@@ -4801,6 +4817,7 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
         extraction_rules=normalize_extraction_rules(monitor.get("extraction_rules", {})),
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
+        allow_empty_price=True,
         progress_callback=progress_callback,
     )
     crawler.run()
@@ -4847,13 +4864,20 @@ def enrich_news_product(
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
         connection_method_state=connection_method_state,
+        allow_empty_price=True,
     )
     html = fetcher.fetch(url) if url else ""
     if not html:
         return details
     soup = BeautifulSoup(html, "html.parser")
     name = extract_product_name(soup, str(selector_settings.get("name_selector", "")))
-    product_data = extract_product_data(url, html, product.get("price", ""), extraction_rules)
+    product_data = extract_product_data(
+        url,
+        html,
+        product.get("price", ""),
+        extraction_rules,
+        allow_empty_price=True,
+    )
     if product_data:
         details["model"] = product_data.get("model", details["model"])
         details["price"] = product_data.get("price", details["price"])
