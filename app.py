@@ -3450,7 +3450,7 @@ def fetch_with_scrapegraphai(url: str) -> Optional[str]:
         return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
 
 
-class MaunfeldCrawler:
+class ProductSiteCrawler:
     def __init__(
         self,
         start_urls: List[str],
@@ -3464,6 +3464,7 @@ class MaunfeldCrawler:
         extraction_rules: Optional[Dict[str, str]] = None,
         connection_method: str = "requests",
         auto_connection_fallback: bool = True,
+        connection_method_state: Optional[Dict[str, object]] = None,
     ):
         self.run_id = run_id
         self.stop_signal = stop_signal
@@ -3478,6 +3479,16 @@ class MaunfeldCrawler:
         self.product_url_filters = product_url_filter_patterns(product_url_filters or [], self.extraction_rules)
         self.connection_method = normalize_connection_method(connection_method)
         self.auto_connection_fallback = bool(auto_connection_fallback)
+        if connection_method_state is None:
+            connection_method_state = {
+                "active_method": self.connection_method,
+                "lock": threading.Lock(),
+            }
+        else:
+            connection_method_state.setdefault("active_method", self.connection_method)
+            connection_method_state.setdefault("lock", threading.Lock())
+        self.connection_method_state = connection_method_state
+        self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
         self.thread_local = threading.local()
         self.headers = {
             "User-Agent": (
@@ -3636,34 +3647,76 @@ class MaunfeldCrawler:
             return None
         return value if isinstance(value, str) else None
 
-    def method_sequence(self, url: str = "") -> List[str]:
-        methods = [self.connection_method]
-        if self.auto_connection_fallback:
-            methods.extend(
-                method
-                for method in ordered_db_connection_methods()
-                if method not in methods and method not in DEBUG_VISIBLE_METHODS
-            )
-        return methods
+    def fallback_method_sequence(self) -> List[str]:
+        """Возвращает полный цикл fallback-методов из БД в порядке id."""
+        return [
+            method
+            for method in ordered_db_connection_methods()
+            if method not in DEBUG_VISIBLE_METHODS or method == self.connection_method
+        ]
+
+    def current_connection_method(self) -> str:
+        lock = self.connection_method_state["lock"]
+        with lock:
+            current = normalize_connection_method(self.connection_method_state.get("active_method"))
+            self.connection_method_state["active_method"] = current
+            self.active_connection_method = current
+            return current
+
+    def set_active_connection_method(self, method: str) -> None:
+        lock = self.connection_method_state["lock"]
+        with lock:
+            current = normalize_connection_method(method)
+            self.connection_method_state["active_method"] = current
+            self.active_connection_method = current
+
+    def fetch_with_connection_method(self, url: str, method: str) -> Optional[str]:
+        self.log(f"Пробую метод подключения {method} для {url}", "info")
+        html = self.fetch_by_method_with_timeout(url, method)
+        if html and not looks_blocked_or_empty(html):
+            return html
+        self.log(f"Метод подключения {method} не сработал для {url}", "warning")
+        return None
 
     def fetch(self, url: str) -> Optional[str]:
-        last_method = ""
-        for method in self.method_sequence(url):
+        current_method = self.current_connection_method()
+        last_method = current_method
+
+        if self.stop_signal.is_set():
+            return None
+
+        html = self.fetch_with_connection_method(url, current_method)
+        if html:
+            return html
+
+        with self.data_lock:
+            if url in self.permanent_failures:
+                return None
+
+        if not self.auto_connection_fallback:
+            self.update_state(
+                error=(
+                    f"Не удалось загрузить {url}. Последний метод: {last_method}. "
+                    "Проверьте способ подключения или включите автопереключение."
+                ),
+            )
+            self.log(f"Не удалось загрузить {url}. Последний метод: {last_method}", "error")
+            return None
+
+        for method in self.fallback_method_sequence():
             if self.stop_signal.is_set():
                 return None
             last_method = method
-            self.log(f"Пробую метод подключения {method} для {url}", "info")
-            html = self.fetch_by_method_with_timeout(url, method)
-            if html and not looks_blocked_or_empty(html):
-                if method != self.connection_method:
+            html = self.fetch_with_connection_method(url, method)
+            if html:
+                if method != current_method:
+                    self.set_active_connection_method(method)
                     self.log(f"Автопереключение подключения: {method} для {url}", "warning")
                 return html
             with self.data_lock:
                 if url in self.permanent_failures:
                     break
-            self.log(f"Метод подключения {method} не сработал для {url}", "warning")
 
-        self.update_state(error=f"Обычный запрос не сработал для {url}. Пробую Botasaurus...")
         self.update_state(
             error=(
                 f"Не удалось загрузить {url}. Последний метод: {last_method}. "
@@ -4141,7 +4194,7 @@ def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, o
     return path
 
 
-class CollectOnlyCrawler(MaunfeldCrawler):
+class CollectOnlyCrawler(ProductSiteCrawler):
     def __init__(self, *args, progress_callback=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.progress_callback = progress_callback
@@ -4766,7 +4819,11 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
     return products
 
 
-def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> Dict[str, str]:
+def enrich_news_product(
+    product: Dict[str, str],
+    monitor: Dict[str, object],
+    connection_method_state: Optional[Dict[str, object]] = None,
+) -> Dict[str, str]:
     url = product.get("url", "")
     selector_settings = monitor.get("selector_settings", {}) if isinstance(monitor.get("selector_settings"), dict) else {}
     extraction_rules = normalize_extraction_rules(monitor.get("extraction_rules", {}))
@@ -4789,6 +4846,7 @@ def enrich_news_product(product: Dict[str, str], monitor: Dict[str, object]) -> 
         1,
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
+        connection_method_state=connection_method_state,
     )
     html = fetcher.fetch(url) if url else ""
     if not html:
@@ -4960,9 +5018,13 @@ def enrich_news_candidates(
 
     if candidates and not stop_signal.is_set():
         max_workers = min(NEWS_ENRICH_WORKER_COUNT, max(1, parse_thread_count(monitor.get("thread_count", 4))), len(candidates))
+        connection_method_state = {
+            "active_method": normalize_connection_method(monitor.get("connection_method")),
+            "lock": threading.Lock(),
+        }
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {
-                executor.submit(enrich_news_product, product, monitor): (index, product)
+                executor.submit(enrich_news_product, product, monitor, connection_method_state): (index, product)
                 for index, product in candidates
             }
             completed = len(products) - len(candidates)
@@ -6001,10 +6063,12 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)
         crawler.connection_method = normalize_connection_method(project.get("connection_method"))
         crawler.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
+        crawler.active_connection_method = crawler.connection_method
+        crawler.connection_method_state["active_method"] = crawler.connection_method
         crawler.excel_finalized = False
     else:
         reset_project_state(project, "running")
-        crawler = MaunfeldCrawler(
+        crawler = ProductSiteCrawler(
             list(project.get("start_urls", [DEFAULT_START_URL])),
             int(project["run_id"]),
             project["stop_event"],
@@ -6266,7 +6330,7 @@ def start_scan():
 
     reset_state("running", thread_count=thread_count)
 
-    crawler = MaunfeldCrawler([start_url], run_id, stop_signal, finish_signal, thread_count)
+    crawler = ProductSiteCrawler([start_url], run_id, stop_signal, finish_signal, thread_count)
     active_crawler = crawler
 
     def target() -> None:
