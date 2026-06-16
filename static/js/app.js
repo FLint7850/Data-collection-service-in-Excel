@@ -117,7 +117,7 @@ let isHydratingForm = false;
 let isHydratingNews = false;
 let saveTimer = null;
 let newsSaveTimer = null;
-const monitorSaveTimers = new Map();
+new Map();
 const selectedNewsSites = new Map();
 let activeNewsBrandKey = null;
 let activeNewsSelectorsOpen = false;
@@ -196,12 +196,6 @@ function localElapsedSeconds(state) {
   if (!receivedAt) return base;
   return base + Math.floor((Date.now() - receivedAt) / 1000);
 }
-
-function localStallSeconds(state) {
-  const seconds = Number(state?.stall_seconds || 0);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds : 0;
-}
-
 function setTextIfChanged(node, value) {
   if (!node) return;
   const next = String(value ?? "");
@@ -1549,27 +1543,6 @@ function scheduleSaveNewsSettings() {
     });
   }, 500);
 }
-
-function scheduleSaveMonitor(card) {
-  const monitorId = card.dataset.monitorId;
-  window.clearTimeout(monitorSaveTimers.get(monitorId));
-  monitorSaveTimers.set(
-    monitorId,
-    window.setTimeout(async () => {
-      try {
-        const data = await requestJson(`/api/news/monitors/${monitorId}`, {
-          method: "PATCH",
-          body: JSON.stringify(collectMonitorPayload(card)),
-        });
-        const index = (newsData.monitors || []).findIndex((monitor) => monitor.id === monitorId);
-        if (index >= 0) newsData.monitors[index] = data.monitor;
-      } catch (error) {
-        errorText.textContent = error.message;
-      }
-    }, 500),
-  );
-}
-
 async function saveNewsMonitor(root) {
   const monitorId = root.dataset.monitorId;
   const notice = root.querySelector("[data-role='monitor-notice']");
