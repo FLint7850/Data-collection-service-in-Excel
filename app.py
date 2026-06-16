@@ -2696,6 +2696,7 @@ def extract_listing_products_by_rules(
     rules: Dict[str, str],
     seen_urls: Set[str],
     product_url_filters: Optional[Iterable[str]] = None,
+    allow_empty_price: bool = False,
 ) -> List[Dict[str, str]]:
     card_selector = rules.get("product_card_selector", "")
     if not card_selector:
@@ -2730,7 +2731,7 @@ def extract_listing_products_by_rules(
         model = normalize_model(model, product_url)
 
         price = extract_price_from_container(card, rules.get("price_selector", ""))
-        if not model or not price:
+        if not price and not allow_empty_price:
             continue
 
         seen_urls.add(product_url)
@@ -2744,6 +2745,7 @@ def extract_listing_products_from_common_cards(
     rules: Dict[str, str],
     seen_urls: Set[str],
     product_url_filters: Optional[Iterable[str]] = None,
+    allow_empty_price: bool = False,
 ) -> List[Dict[str, str]]:
     products: List[Dict[str, str]] = []
     filters = list(product_url_filters or [])
@@ -2768,7 +2770,7 @@ def extract_listing_products_from_common_cards(
             continue
 
         price = extract_price_from_container(card, rules.get("price_selector", ""))
-        if not price:
+        if not price and not allow_empty_price:
             continue
 
         model = extract_model_by_markers(str(card), rules)
@@ -2801,6 +2803,7 @@ def extract_listing_products(
     html: str,
     rules: Optional[Dict[str, str]] = None,
     product_url_filters: Optional[Iterable[str]] = None,
+    allow_empty_price: bool = False,
 ) -> List[Dict[str, str]]:
     """Собирает товары прямо со страницы категории/каталога."""
     soup = BeautifulSoup(html, "html.parser")
@@ -2811,7 +2814,16 @@ def extract_listing_products(
     rules = normalize_extraction_rules(rules or {})
     filters = product_url_filter_patterns(product_url_filters or [], rules)
 
-    products.extend(extract_listing_products_from_common_cards(soup, current_url, rules, seen_urls, filters))
+    products.extend(
+    extract_listing_products_from_common_cards(
+        soup,
+        current_url,
+        rules,
+        seen_urls,
+        filters,
+        allow_empty_price=allow_empty_price,
+    )
+)
 
     for price_node in soup.find_all(string=PRICE_RE):
         price_sources.append(price_node)
@@ -2944,7 +2956,7 @@ def extract_product_data_by_rules(
         price = prices[-1]
     else:
         price = normalize_price_value(price or fallback_price)
-    if not price:
+    if not price and not allow_empty_price:
         prices = extract_prices(soup.get_text(" ", strip=True))
         price = prices[-1] if prices else ""
     model = normalize_model(model, url)
@@ -4121,7 +4133,13 @@ class ProductSiteCrawler:
 
             current_is_product = False
 
-        listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
+        listing_products = extract_listing_products(
+    url,
+    html,
+    self.extraction_rules,
+    self.product_url_filters,
+    allow_empty_price=self.allow_empty_price,
+)
 
         if current_is_product and not listing_products:
             product = extract_product_data(
