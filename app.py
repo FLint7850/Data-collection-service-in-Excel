@@ -39,7 +39,7 @@ FEED_DIR = BASE_DIR / "feeds"
 LOGS_FILE = LOG_DIR / "logs.json"
 UNIFIED_LOG_FILE = LOG_DIR / "app.log"
 EXPORT_DIR = BASE_DIR / "exports"
-DEFAULT_START_URL = "https://www.maunfeld.ru/"
+DEFAULT_START_URL = ""
 DEFAULT_FEED_URL = "https://mega-kuhnya.ru/price/last_modified.xml"
 DEFAULT_FEED_GENERATE_URL = "https://mega-kuhnya.ru/index.php?route=extension/feed/unixml/new_product"
 MSK_TZ = timezone(timedelta(hours=3))
@@ -1541,8 +1541,8 @@ def same_site(url: str, root_netloc: str) -> bool:
     return netloc == root or netloc.endswith("." + root)
 
 
-def is_maunfeld_url(url: str) -> bool:
-    return urlparse(url).netloc.lower().endswith("maunfeld.ru")
+def is_domain_url(url: str, domain: str) -> bool:
+    return urlparse(url).netloc.lower().removeprefix("www.").endswith(domain.lower().removeprefix("www."))
 
 
 def is_technopark_url(url: str) -> bool:
@@ -1570,7 +1570,7 @@ def is_technopark_product_url(url: str) -> bool:
     if len(path_parts) != 1:
         return False
     slug = path_parts[0].lower()
-    known_brand = "|".join(re.escape(brand.lower()) for brand in MODEL_BRANDS if brand != "MAUNFELD")
+    known_brand = known_brand_regex()
     return bool(
         re.search(r"-\d{5,}$", slug)
         or re.search(rf"-({known_brand})-[a-z0-9][a-z0-9-]*\d[a-z0-9-]*$", slug)
@@ -1697,9 +1697,7 @@ def should_follow_project_url(url: str, start_urls: List[str], root_netloc: str)
         allowed_domain = True
         start_path = (urlparse(start_url).path or "/").rstrip("/") or "/"
         if start_path in {"/", "/catalog"}:
-            if not is_maunfeld_url(start_url):
-                return True
-            return path == "/" or path == "/catalog" or path.startswith("/catalog/")
+            return True
         if path == start_path or path.startswith(start_path + "/"):
             return True
 
@@ -1784,20 +1782,38 @@ def split_text_lines(value: str) -> List[str]:
 
 
 MODEL_BRANDS = {
-    "QYRON",
+    # Список используется только как эвристика для выделения модели из названия/URL.
+    # Он не должен определять, является ли страница товаром.
+    "AEG",
+    "ASKO",
     "BORK",
-    "DYSON",
-    "DREAME",
-    "SMEG",
-    "POLARIS",
-    "HAIER",
-    "ROWENTA",
-    "TEFAL",
-    "BRAUN",
     "BOSCH",
+    "BRAUN",
+    "DREAME",
+    "DYSON",
+    "GRAUDE",
+    "HAIER",
+    "HIBERG",
+    "KITCHENAID",
     "KITFORT",
+    "KORTING",
+    "KUPPERSBERG",
     "MAUNFELD",
+    "MIELE",
+    "POLARIS",
+    "QYRON",
+    "ROWENTA",
+    "SMEG",
+    "TEFAL",
+    "VARD",
+    "V-ZUG",
+    "WHIRLPOOL",
+    "ZUGEL",
 }
+
+
+def known_brand_regex() -> str:
+    return "|".join(re.escape(brand.lower()) for brand in sorted(MODEL_BRANDS, key=len, reverse=True))
 
 MODEL_COLOR_WORDS = {
     "BLACK",
@@ -1866,7 +1882,7 @@ def brand_slug_from_url(url: str) -> str:
     if not parts:
         return ""
     candidate = parts[-1]
-    if candidate in {brand.lower() for brand in MODEL_BRANDS if brand != "MAUNFELD"}:
+    if candidate in {brand.lower() for brand in MODEL_BRANDS}:
         return candidate
     return ""
 
@@ -1883,7 +1899,7 @@ def technopark_model_from_url(product_url: str) -> str:
     if not is_technopark_url(product_url):
         return ""
     slug = urlparse(product_url).path.rstrip("/").split("/")[-1].lower()
-    brands = "|".join(re.escape(brand.lower()) for brand in MODEL_BRANDS if brand != "MAUNFELD")
+    brands = known_brand_regex()
     match = re.search(rf"-(?:{brands})-([a-z0-9][a-z0-9-]*?)(?:-\d{{5,}})?$", slug)
     if not match:
         return ""
@@ -1925,8 +1941,8 @@ def normalize_model(value: str, product_url: str = "") -> str:
     if not text:
         return ""
 
-    # Частый случай: "Шкаф духовой MAUNFELD AEOC6040B" -> "AEOC6040B".
-    brand_match = re.search(r"\bMAUNFELD\b\s+([A-Z0-9][A-Z0-9./\\_-]{2,})", text, re.IGNORECASE)
+    # Частый случай: "Бренд ABC123" -> "ABC123".
+    brand_match = re.search(rf"\b(?:{known_brand_regex()})\b\s+([A-Z0-9][A-Z0-9./\\_-]{{2,}})", text, re.IGNORECASE)
     if brand_match:
         return brand_match.group(1).strip(" .,/\\_-").replace("\\", "/").upper()
 
@@ -1961,13 +1977,13 @@ def normalize_model(value: str, product_url: str = "") -> str:
         return " ".join(candidate_tokens).upper()
 
     ignored_tokens = {
-        "MAUNFELD",
         "ONLINE",
         "SALE",
         "NEW",
         "ОНЛАЙН",
         "РАСПРОДАЖА",
         "НОВИНКА",
+        *MODEL_BRANDS,
     }
     code_tokens = []
     for token in re.findall(r"[A-Z\u0400-\u04FF0-9][A-Z\u0400-\u04FF0-9./\\_-]{2,}", text, flags=re.IGNORECASE):
@@ -1982,9 +1998,9 @@ def normalize_model(value: str, product_url: str = "") -> str:
     if code_tokens:
         return code_tokens[-1].replace("\\", "/").upper()
 
-    # Последний шанс для Maunfeld: модель часто лежит в конце slug после "-maunfeld-".
+    # Последний шанс: модель часто лежит в конце slug после названия бренда.
     slug = urlparse(product_url).path.rstrip("/").split("/")[-1]
-    slug_match = re.search(r"(?:^|-)maunfeld-([a-z0-9-]+)$", slug, re.IGNORECASE)
+    slug_match = re.search(rf"(?:^|-)(?:{known_brand_regex()})-([a-z0-9-]+)$", slug, re.IGNORECASE)
     if slug_match:
         return slug_match.group(1).replace("-", "").upper()
 
@@ -2117,31 +2133,41 @@ def find_labeled_value(soup: BeautifulSoup, labels: Iterable[str]) -> str:
     return ""
 
 
-def extract_maunfeld_article(soup: BeautifulSoup) -> str:
-    """Для Maunfeld модель берем только из характеристики 'Артикул'."""
-    for row in soup.select("li, tr, .item, .features-grid__item, .characteristics__item"):
-        name_node = row.select_one(".name")
-        value_node = row.select_one(".val")
+def extract_labeled_model_value(soup: BeautifulSoup) -> str:
+    """Ищет модель/артикул в характеристиках без привязки к конкретному бренду."""
+    labels = (
+        "модель",
+        "артикул",
+        "sku",
+        "код модели",
+        "model",
+        "article",
+        "art.",
+    )
+    label_regex = re.compile(r"^(?:" + "|".join(re.escape(label) for label in labels) + r")\b", re.IGNORECASE)
+
+    for row in soup.select("li, tr, .item, .features-grid__item, .characteristics__item, .chars__item, .row"):
+        name_node = row.select_one(".name, .label, .title, td:first-child, th:first-child")
+        value_node = row.select_one(".val, .value, td:last-child, span:last-child, div:last-child")
         if name_node and value_node:
-            name = clean_text(name_node.get_text(" ", strip=True))
-            value = clean_text(value_node.get_text(" ", strip=True))
-            if name.lower() == "артикул" and value:
+            name = clean_text(name_node.get_text(" ", strip=True)).strip(" :—-")
+            value = clean_text(value_node.get_text(" ", strip=True)).strip(" :—-")
+            if label_regex.search(name) and value and not PRICE_RE.search(value):
                 return value
 
         row_text = clean_text(row.get_text(" ", strip=True))
-        if not row_text.lower().startswith("артикул"):
+        if not label_regex.search(row_text):
             continue
 
-        value = re.sub(r"^Артикул\s*", "", row_text, flags=re.IGNORECASE).strip(" :—-")
-        if value:
+        value = label_regex.sub("", row_text).strip(" :—-")
+        if value and not PRICE_RE.search(value):
             return value
 
-    # Fallback для текстового HTML, где характеристики уже развернуты без классов.
     page_lines = split_text_lines(soup.get_text("\n", strip=True))
     for line in page_lines:
-        if line.lower().startswith("артикул "):
-            value = re.sub(r"^Артикул\s*", "", line, flags=re.IGNORECASE).strip(" :—-")
-            if value:
+        if label_regex.search(line):
+            value = label_regex.sub("", line).strip(" :—-")
+            if value and not PRICE_RE.search(value):
                 return value
 
     return ""
@@ -2268,7 +2294,7 @@ def is_good_model_text(text: str) -> bool:
         return False
     if PRICE_RE.search(text):
         return False
-    return "maunfeld" in lowered or bool(re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
+    return bool(model_tokens_after_brand(text) or re.search(r"[A-Z\u0400-\u04FF]{2,}[\w.\-/]*\d", text, re.IGNORECASE))
 
 
 def extract_product_url_from_card(card, current_url: str, product_url_filters: Optional[Iterable[str]] = None) -> str:
@@ -2385,7 +2411,7 @@ def extract_name_near_text(value: str) -> str:
 
 def extract_listing_products_from_scripts(soup: BeautifulSoup, current_url: str, seen_urls: Set[str]) -> List[Dict[str, str]]:
     products: List[Dict[str, str]] = []
-    known_brand = "|".join(re.escape(brand.lower()) for brand in MODEL_BRANDS if brand != "MAUNFELD")
+    known_brand = known_brand_regex()
     product_url_re = re.compile(
         rf'(?:https?://[^"\'<>\s]+)?/[^"\'<>\s]+(?:-\d{{5,}}|-({known_brand})-[^"\'<>\s/]*\d[^"\'<>\s/]*)/?',
         re.IGNORECASE,
@@ -2751,6 +2777,70 @@ def extract_listing_products(
     return products
 
 
+def has_generic_product_signal(
+    soup: BeautifulSoup,
+    page_text: str,
+    h1: str,
+    price: str,
+    model_from_labeled_value: bool,
+    rules: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Универсальные признаки товарной страницы без привязки к бренду или домену."""
+    if soup.select_one("[itemtype*='Product'], [itemprop='price'], [itemprop='sku'], [itemprop='model'], script[type='application/ld+json']"):
+        return True
+
+    if rules and (str(rules.get("model_selector", "")).strip() or str(rules.get("price_selector", "")).strip()):
+        return True
+
+    if model_from_labeled_value:
+        return True
+
+    product_signals = (
+        "Код товара",
+        "Артикул",
+        "Модель",
+        "Характеристики",
+        "В корзину",
+        "Купить",
+        "Ваша цена",
+        "Сообщить о поступлении",
+        "Нет в наличии",
+        "Наличие",
+    )
+    if any(signal.lower() in page_text.lower() for signal in product_signals):
+        return True
+
+    return bool(h1 and (price or model_tokens_after_brand(h1) or normalize_model(h1)))
+
+
+def should_accept_extracted_product(
+    url: str,
+    soup: BeautifulSoup,
+    model: str,
+    price: str,
+    h1: str,
+    page_text: str,
+    model_from_labeled_value: bool,
+    rules: Optional[Dict[str, str]] = None,
+    assume_product: bool = False,
+    allow_empty_price: bool = False,
+) -> bool:
+    """Решает, можно ли сохранить страницу как товар.
+
+    Важно: здесь нет проверок вида `is_maunfeld_url()` или `is_kuppersberg_url()`.
+    Новый бренд должен работать через URL-фильтры, селекторы, schema.org и общие признаки товара.
+    """
+    if not model:
+        return False
+    if not price and not allow_empty_price:
+        return False
+    if assume_product:
+        return True
+    if not is_probable_product_url(url):
+        return False
+    return has_generic_product_signal(soup, page_text, h1, price, model_from_labeled_value, rules)
+
+
 def extract_product_data_by_rules(
     url: str,
     html: str,
@@ -2776,7 +2866,20 @@ def extract_product_data_by_rules(
         prices = extract_prices(soup.get_text(" ", strip=True))
         price = prices[-1] if prices else ""
     model = normalize_model(model, url)
-    if model and (price or allow_empty_price) and (assume_product or is_probable_product_url(url)):
+    page_text = clean_text(soup.get_text(" ", strip=True))
+    h1 = first_text(soup, ["h1"])
+    if should_accept_extracted_product(
+        url=url,
+        soup=soup,
+        model=model,
+        price=price,
+        h1=h1,
+        page_text=page_text,
+        model_from_labeled_value=False,
+        rules=rules,
+        assume_product=assume_product,
+        allow_empty_price=allow_empty_price,
+    ):
         return {"url": url, "model": model, "price": price}
     return None
 
@@ -2790,81 +2893,71 @@ def extract_product_data(
     allow_empty_price: bool = False,
 ) -> Optional[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
+    rules = rules or {}
     ruled_product = extract_product_data_by_rules(
         url,
         html,
         soup,
-        rules or {},
+        rules,
         fallback_price,
         assume_product,
         allow_empty_price=allow_empty_price,
     )
     if ruled_product:
         return ruled_product
-    path_parts = [part for part in urlparse(url).path.split("/") if part]
+
     h1 = first_text(soup, ["h1"])
     price = fallback_price or extract_price(soup)
-    if is_maunfeld_url(url):
-        model = extract_maunfeld_article(soup)
-    else:
-        schema_product = extract_schema_product(soup, url, price)
-        if schema_product:
-            return schema_product
-        model = find_labeled_value(soup, ["Артикул", "Модель", "Art:"])
-    if not is_maunfeld_url(url):
-        precise_model = first_text(
-            soup,
-            [
-                ".product-description__subtitle",
-                ".product-code",
-                ".article",
-                ".articul",
-                ".sku",
-            ],
-        )
-        if precise_model:
-            model = precise_model
+
+    schema_product = extract_schema_product(soup, url, price)
+    if schema_product and (schema_product.get("price") or allow_empty_price):
+        return schema_product
+
+    model = find_labeled_value(soup, ["Модель", "Артикул", "SKU", "Код модели", "Art:", "Model", "Article"])
     model_from_labeled_value = bool(model)
 
     if not model:
-        fallback_selectors = [
-            ".product-description__subtitle",
-            ".product-code",
-            ".article",
-            ".articul",
-            ".sku",
-        ]
-        model = first_text(soup, fallback_selectors)
+        model = extract_labeled_model_value(soup)
+        model_from_labeled_value = bool(model)
+
+    if not model:
+        model = first_text(
+            soup,
+            [
+                "[itemprop='model']",
+                "[itemprop='sku']",
+                "meta[itemprop='sku']",
+                ".product-description__subtitle",
+                ".sku",
+                ".article",
+                ".articul",
+            ],
+        )
+        model_from_labeled_value = bool(model)
+
     if not model and h1:
         model = h1
-
-    if (price or allow_empty_price) and model and is_maunfeld_url(url) and model_from_labeled_value:
-        return {"url": url, "model": clean_text(model), "price": price}
 
     if rules:
         model = prepare_rule_model(model, rules)
     model = normalize_model(model, url)
 
-    if (price or allow_empty_price) and model and assume_product:
-        return {"url": url, "model": model, "price": price}
-
     page_text = clean_text(soup.get_text(" ", strip=True))
-    has_product_signal = any(
-        signal in page_text
-        for signal in ("Код товара", "В корзину", "Характеристики", "Ваша цена", "Сообщить о поступлении")
-    )
-    looks_like_product_url = is_probable_product_url(url)
-
-    if (price or allow_empty_price) and model and looks_like_product_url and (
-        has_product_signal
-        or "MAUNFELD" in h1.upper()
-        or is_kuppersberg_url(url)
-        or (is_maunfeld_url(url) and model_from_labeled_value)
+    if should_accept_extracted_product(
+        url=url,
+        soup=soup,
+        model=model,
+        price=price,
+        h1=h1,
+        page_text=page_text,
+        model_from_labeled_value=model_from_labeled_value,
+        rules=rules,
+        assume_product=assume_product,
+        allow_empty_price=allow_empty_price,
     ):
         return {"url": url, "model": model, "price": price}
 
     return None
-
 
 def fetch_with_botasaurus_request(url: str) -> Optional[str]:
     """Fallback через Botasaurus Request: браузероподобный HTTP-запрос с Google Referrer."""
@@ -3976,20 +4069,13 @@ class ProductSiteCrawler:
                 listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
                 self.update_state(error="")
 
-        if is_maunfeld_url(url):
-            for product in listing_products:
-                product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
-                product["url"] = product_url
-                self.remember_listing_price(product_url, product.get("price", ""))
-                self.enqueue(product_url, force=True)
-        else:
-            for product in listing_products:
-                product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
-                product["url"] = product_url
-                self.remember_listing_price(product_url, product.get("price", ""))
-                self.enqueue(product_url, force=True)
-            if not self.product_url_filters:
-                self.add_products(listing_products)
+        for product in listing_products:
+            product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
+            product["url"] = product_url
+            self.remember_listing_price(product_url, product.get("price", ""))
+            self.enqueue(product_url, force=True)
+        if not self.product_url_filters:
+            self.add_products(listing_products)
 
         should_extract_current_product = (
             not self.is_start_url_path(url)
@@ -4197,7 +4283,7 @@ def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, o
     if project:
         filename = project_csv_filename(project)
     else:
-        filename = f"exportmaunfeld{datetime.now().strftime('%d-%m-%Y')}.csv"
+        filename = f"export_{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}.csv"
     path = EXPORT_DIR / filename
 
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
