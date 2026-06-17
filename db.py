@@ -149,6 +149,7 @@ def migrate_schema(connection) -> None:
     migrate_news_tables(connection)
     migrate_donor_start_urls(connection)
     migrate_projects_table(connection)
+    migrate_file_import_table(connection)
 
 
 def reset_brand_states(connection) -> None:
@@ -199,6 +200,73 @@ def _json_or_default(value, default):
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _string_array_from_lines(value) -> list[str]:
+    parsed = _json_or_default(value, None)
+    if isinstance(parsed, list):
+        raw_items = []
+        for item in parsed:
+            raw_items.extend(str(item or "").splitlines())
+    elif isinstance(value, str):
+        raw_items = value.splitlines()
+    else:
+        raw_items = []
+
+    result = []
+    for item in raw_items:
+        text_value = str(item or "").strip()
+        if text_value and text_value not in result:
+            result.append(text_value)
+    return result
+
+
+def migrate_file_import_table(connection) -> None:
+    columns = table_columns(connection, "file_import")
+    if not columns:
+        return
+
+    rows = [dict(row) for row in connection.execute(text("SELECT * FROM file_import")).mappings().all()]
+    if columns.get("exclusions") == "JSON":
+        for row in rows:
+            connection.execute(
+                text("UPDATE file_import SET exclusions = json(:exclusions) WHERE id = :id"),
+                {
+                    "id": row.get("id"),
+                    "exclusions": json.dumps(_string_array_from_lines(row.get("exclusions")), ensure_ascii=False),
+                },
+            )
+        return
+
+    connection.execute(text("DROP TABLE IF EXISTS file_import_migration_tmp"))
+    connection.execute(
+        text(
+            "CREATE TABLE file_import_migration_tmp ("
+            "id INTEGER NOT NULL PRIMARY KEY, "
+            "exclusions JSON NOT NULL DEFAULT '[]', "
+            "file JSON NOT NULL DEFAULT '{}', "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+    )
+    for row in rows:
+        connection.execute(
+            text(
+                "INSERT INTO file_import_migration_tmp "
+                "(id, exclusions, file, created_at, updated_at) "
+                "VALUES (:id, json(:exclusions), json(:file), :created_at, :updated_at)"
+            ),
+            {
+                "id": row.get("id"),
+                "exclusions": json.dumps(_string_array_from_lines(row.get("exclusions")), ensure_ascii=False),
+                "file": json.dumps(_json_or_default(row.get("file"), {}), ensure_ascii=False),
+                "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
+                "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
+            },
+        )
+    connection.execute(text("DROP TABLE file_import"))
+    connection.execute(text("ALTER TABLE file_import_migration_tmp RENAME TO file_import"))
 
 
 def _bool_value(value, default=False) -> bool:

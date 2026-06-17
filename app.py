@@ -383,6 +383,28 @@ def normalize_patterns(value: object) -> List[str]:
     return patterns
 
 
+def normalize_file_import_exclusions(value: object) -> List[str]:
+    if isinstance(value, str):
+        raw_items = value.splitlines()
+    elif isinstance(value, list):
+        raw_items = []
+        for item in value:
+            raw_items.extend(str(item or "").splitlines())
+    else:
+        raw_items = []
+
+    exclusions = []
+    for item in raw_items:
+        item = str(item or "").strip()
+        if item and item not in exclusions:
+            exclusions.append(item)
+    return exclusions
+
+
+def file_import_exclusions_text(value: object) -> str:
+    return "\n".join(normalize_file_import_exclusions(value))
+
+
 def normalize_emails(value: object) -> List[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\n,;]+", value)
@@ -4391,9 +4413,14 @@ def get_file_import_row(db_session=None) -> FileImport:
     db = db_session or g.db
     row = db.get(FileImport, 1)
     if row is None:
-        row = FileImport(id=1, exclusions="", file={})
+        row = FileImport(id=1, exclusions=[], file={})
         db.add(row)
         db.flush()
+    else:
+        normalized_exclusions = normalize_file_import_exclusions(row.exclusions)
+        if row.exclusions != normalized_exclusions:
+            row.exclusions = normalized_exclusions
+            db.flush()
     if not isinstance(row.file, dict) or not row.file.get("stored_filename"):
         stored_files = stored_file_import_files()
         if stored_files:
@@ -4424,11 +4451,14 @@ def public_file_import_state() -> Dict[str, object]:
     row = get_file_import_row()
     path = current_file_import_path()
     file_meta = row.file if isinstance(row.file, dict) else {}
+    exclusions = normalize_file_import_exclusions(row.exclusions)
+    exclusions_text = "\n".join(exclusions)
     if not path:
-        return {"file": None, "exclusions": row.exclusions or ""}
+        return {"file": None, "exclusions": exclusions_text, "exclusions_list": exclusions}
     stat = path.stat()
     return {
-        "exclusions": row.exclusions or "",
+        "exclusions": exclusions_text,
+        "exclusions_list": exclusions,
         "file": {
             "filename": output_text(str(file_meta.get("original_filename") or path.name)),
             "stored_filename": path.name,
@@ -6282,7 +6312,7 @@ def api_update_file_import():
     payload = request.get_json(silent=True) or {}
     row = get_file_import_row()
     if "exclusions" in payload:
-        row.exclusions = str(payload.get("exclusions") or "").strip()
+        row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
     if "file" in payload:
         file_payload = payload.get("file")
         if not file_payload:
