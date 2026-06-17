@@ -16,7 +16,7 @@ function Load-LocalEnv {
         $parts = $line.Split("=", 2)
         $key = $parts[0].Trim()
         $value = $parts[1].Trim().Trim('"').Trim("'")
-        if ($key -and -not [Environment]::GetEnvironmentVariable($key, "Process")) {
+        if ($key) {
             [Environment]::SetEnvironmentVariable($key, $value, "Process")
         }
     }

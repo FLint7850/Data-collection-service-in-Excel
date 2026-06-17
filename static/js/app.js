@@ -2,10 +2,12 @@ const projectTabs = document.querySelector("#projectTabs");
 const addProjectButton = document.querySelector("#addProjectButton");
 const projectsTabButton = document.querySelector("#projectsTabButton");
 const newItemsTabButton = document.querySelector("#newItemsTabButton");
+const importTabButton = document.querySelector("#importTabButton");
 const settingsTabButton = document.querySelector("#settingsTabButton");
 const logsTabButton = document.querySelector("#logsTabButton");
 const projectView = document.querySelector("#projectView");
 const newItemsView = document.querySelector("#newItemsView");
+const fileImportView = document.querySelector("#fileImportView");
 const settingsView = document.querySelector("#settingsView");
 const logsView = document.querySelector("#logsView");
 
@@ -45,6 +47,18 @@ const priceSelector = document.querySelector("#priceSelector");
 const modelStartMarker = document.querySelector("#modelStartMarker");
 const modelEndMarker = document.querySelector("#modelEndMarker");
 const modelReplaceRules = document.querySelector("#modelReplaceRules");
+const fileImportInput = document.querySelector("#fileImportInput");
+const fileImportSelected = document.querySelector("#fileImportSelected");
+const fileImportName = document.querySelector("#fileImportName");
+const fileImportSize = document.querySelector("#fileImportSize");
+const clearFileImportButton = document.querySelector("#clearFileImportButton");
+const fileImportProgress = document.querySelector("#fileImportProgress");
+const fileImportProgressFill = document.querySelector("#fileImportProgressFill");
+const fileImportProgressText = document.querySelector("#fileImportProgressText");
+const fileImportNotice = document.querySelector("#fileImportNotice");
+const fileImportActions = document.querySelector("#fileImportActions");
+const compareFileImportButton = document.querySelector("#compareFileImportButton");
+const downloadFileImportCsvButton = document.querySelector("#downloadFileImportCsvButton");
 
 const logsList = document.querySelector("#logsList");
 const clearLogsButton = document.querySelector("#clearLogsButton");
@@ -90,9 +104,12 @@ const cancelAddFeedIconButton = document.querySelector("#cancelAddFeedIconButton
 
 let projects = [];
 let newsData = null;
+let fileImportData = null;
+let fileImportLoaded = false;
+let fileImportUploading = false;
 let activeProjectId = null;
 const activeViewStorageKey = "excelServiceActiveView";
-const allowedActiveViews = new Set(["projects", "news", "settings", "logs"]);
+const allowedActiveViews = new Set(["projects", "news", "import", "settings", "logs"]);
 
 function readStoredActiveView() {
   try {
@@ -289,6 +306,7 @@ function renderTabs() {
   });
   projectsTabButton.classList.toggle("active", activeView === "projects");
   newItemsTabButton.classList.toggle("active", activeView === "news");
+  importTabButton.classList.toggle("active", activeView === "import");
   settingsTabButton.classList.toggle("active", activeView === "settings");
   logsTabButton.classList.toggle("active", activeView === "logs");
 }
@@ -853,6 +871,67 @@ function formatFileSize(value) {
   if (bytes < 1024) return `${bytes} Б`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`;
   return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+}
+
+function setFileImportProgress(percent, notice = "") {
+  const value = clampPercent(percent);
+  fileImportProgressFill.style.width = `${value}%`;
+  fileImportProgressText.textContent = `${value}%`;
+  fileImportNotice.textContent = notice;
+}
+
+function renderFileImport() {
+  const file = fileImportData?.file || null;
+  fileImportName.textContent = file?.filename || "—";
+  fileImportSize.textContent = file?.size ? formatFileSize(file.size) : "";
+  fileImportSelected.classList.toggle("hidden", !file);
+  fileImportActions.classList.toggle("hidden", !file);
+  clearFileImportButton.disabled = fileImportUploading || !file;
+  compareFileImportButton.disabled = fileImportUploading || !file;
+  downloadFileImportCsvButton.classList.add("disabled");
+  downloadFileImportCsvButton.setAttribute("aria-disabled", "true");
+  downloadFileImportCsvButton.href = "#";
+  fileImportInput.disabled = fileImportUploading;
+  if (!fileImportUploading && !file) {
+    fileImportProgress.classList.add("hidden");
+    setFileImportProgress(0, "");
+  }
+}
+
+async function loadFileImport() {
+  fileImportData = await requestJson("/api/file-import");
+  fileImportLoaded = true;
+  renderFileImport();
+}
+
+function uploadFileImport(file) {
+  return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/file-import");
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) {
+        setFileImportProgress((event.loaded / event.total) * 100, "Выгружаю файл...");
+      }
+    });
+    xhr.addEventListener("load", () => {
+      const data = JSON.parse(xhr.responseText || "{}");
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data);
+      } else {
+        reject(new Error(data.error || "Не удалось выгрузить файл"));
+      }
+    });
+    xhr.addEventListener("error", () => reject(new Error("Не удалось выгрузить файл")));
+    xhr.send(formData);
+  });
+}
+
+async function deleteFileImport() {
+  fileImportData = await requestJson("/api/file-import", { method: "DELETE" });
+  fileImportInput.value = "";
+  renderFileImport();
 }
 
 function renderFeedStorage() {
@@ -1617,6 +1696,7 @@ function renderAll() {
   const project = activeProject();
   projectView.classList.toggle("hidden", activeView !== "projects");
   newItemsView.classList.toggle("hidden", activeView !== "news");
+  fileImportView.classList.toggle("hidden", activeView !== "import");
   settingsView.classList.toggle("hidden", activeView !== "settings");
   logsView.classList.toggle("hidden", activeView !== "logs");
   if (activeView === "projects") {
@@ -1636,6 +1716,14 @@ function renderAll() {
       renderFeedStorage();
     } else {
       loadNews().catch((error) => {
+        errorText.textContent = error.message;
+      });
+    }
+  } else if (activeView === "import") {
+    if (fileImportLoaded) {
+      renderFileImport();
+    } else {
+      loadFileImport().catch((error) => {
         errorText.textContent = error.message;
       });
     }
@@ -1756,12 +1844,50 @@ newItemsTabButton.addEventListener("click", () => {
   renderAll();
 });
 
+importTabButton.addEventListener("click", () => {
+  setActiveView("import");
+  renderAll();
+});
+
 settingsTabButton.addEventListener("click", () => {
   setActiveView("settings");
   loadNews().catch((error) => {
     errorText.textContent = error.message;
   });
   renderAll();
+});
+
+fileImportInput.addEventListener("change", async () => {
+  const file = fileImportInput.files?.[0] || null;
+  if (!file) return;
+  fileImportUploading = true;
+  fileImportProgress.classList.remove("hidden");
+  setFileImportProgress(0, "Подготовка...");
+  renderFileImport();
+  try {
+    fileImportData = await uploadFileImport(file);
+    fileImportLoaded = true;
+    setFileImportProgress(100, "Файл выгружен");
+  } catch (error) {
+    fileImportInput.value = "";
+    fileImportNotice.textContent = error.message;
+  } finally {
+    fileImportUploading = false;
+    renderFileImport();
+  }
+});
+
+clearFileImportButton.addEventListener("click", async () => {
+  clearFileImportButton.disabled = true;
+  fileImportNotice.textContent = "Удаляю файл...";
+  fileImportProgress.classList.remove("hidden");
+  setFileImportProgress(100, "Удаляю файл...");
+  try {
+    await deleteFileImport();
+  } catch (error) {
+    fileImportNotice.textContent = error.message;
+    clearFileImportButton.disabled = false;
+  }
 });
 
 projectName.addEventListener("input", scheduleSaveActiveProject);

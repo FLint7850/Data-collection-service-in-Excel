@@ -49,13 +49,14 @@ def load_local_env() -> None:
             key, value = line.split("=", 1)
             key = key.strip()
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            if key:
                 os.environ[key] = value
     except OSError:
         return
 
 
 load_local_env()
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -104,6 +105,7 @@ FEED_DIR = env_path("FEED_DIR", "feeds")
 LOGS_FILE = env_path("LOGS_FILE", str(LOG_DIR / "logs.json"))
 UNIFIED_LOG_FILE = env_path("UNIFIED_LOG_FILE", str(LOG_DIR / "app.log"))
 EXPORT_DIR = env_path("EXPORT_DIR", "exports")
+FILE_IMPORT_DIR = env_path("FILE_IMPORT_DIR", "storage/file-import")
 DEFAULT_START_URL = env_str("DEFAULT_START_URL", "")
 DEFAULT_FEED_URL = env_str("DEFAULT_FEED_URL", "https://mega-kuhnya.ru/price/last_modified.xml")
 DEFAULT_FEED_GENERATE_URL = env_str(
@@ -308,6 +310,7 @@ def ensure_storage() -> None:
     EXPORT_DIR.mkdir(exist_ok=True)
     LOG_DIR.mkdir(exist_ok=True)
     FEED_DIR.mkdir(exist_ok=True)
+    FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
     ensure_default_user()
     load_projects()
@@ -4358,6 +4361,62 @@ def safe_filename(value: str) -> str:
     return cleaned or "project"
 
 
+FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx"}
+FILE_IMPORT_META = "current.json"
+
+
+def clear_file_import_storage() -> None:
+    FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    for path in FILE_IMPORT_DIR.iterdir():
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+
+def file_import_meta_path() -> Path:
+    return FILE_IMPORT_DIR / FILE_IMPORT_META
+
+
+def current_file_import_path() -> Optional[Path]:
+    meta_path = file_import_meta_path()
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    filename = str(meta.get("stored_filename") or "").strip()
+    if not filename:
+        return None
+    base_dir = FILE_IMPORT_DIR.resolve()
+    path = (FILE_IMPORT_DIR / filename).resolve()
+    if base_dir not in path.parents or not path.exists() or not path.is_file():
+        return None
+    return path
+
+
+def public_file_import_state() -> Dict[str, object]:
+    path = current_file_import_path()
+    if not path:
+        return {"file": None}
+    meta = {}
+    try:
+        meta = json.loads(file_import_meta_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    stat = path.stat()
+    return {
+        "file": {
+            "filename": output_text(str(meta.get("original_filename") or path.name)),
+            "stored_filename": path.name,
+            "size": stat.st_size,
+            "uploaded_at": str(meta.get("uploaded_at") or datetime.fromtimestamp(stat.st_mtime, MSK_TZ).isoformat(timespec="seconds")),
+        }
+    }
+
+
 def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, object]] = None) -> Path:
     if project:
         filename = project_csv_filename(project)
@@ -6186,6 +6245,54 @@ def api_download_news_feed(source: str, filename: str):
     if feed_dir not in path.parents or not path.exists():
         return jsonify({"error": "Фид не найден"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
+
+
+@app.get("/api/file-import")
+def api_file_import_state():
+    ensure_storage()
+    return jsonify(public_file_import_state())
+
+
+@app.post("/api/file-import")
+def api_upload_file_import():
+    ensure_storage()
+    uploads = request.files.getlist("file")
+    if len(uploads) > 1:
+        return jsonify({"error": "Можно загрузить только один файл"}), 400
+    upload = uploads[0] if uploads else None
+    if not upload or not upload.filename:
+        return jsonify({"error": "Файл не выбран"}), 400
+    original_filename = output_text(upload.filename)
+    suffix = Path(original_filename).suffix.lower()
+    if suffix not in FILE_IMPORT_ALLOWED_SUFFIXES:
+        return jsonify({"error": "Можно загрузить только CSV или XLSX"}), 400
+
+    clear_file_import_storage()
+    stored_filename = f"{datetime.now(MSK_TZ).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{safe_filename(Path(original_filename).stem)}{suffix}"
+    target = (FILE_IMPORT_DIR / stored_filename).resolve()
+    if FILE_IMPORT_DIR.resolve() not in target.parents:
+        return jsonify({"error": "Некорректное имя файла"}), 400
+    upload.save(target)
+    file_import_meta_path().write_text(
+        json.dumps(
+            {
+                "original_filename": original_filename,
+                "stored_filename": stored_filename,
+                "uploaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return jsonify(public_file_import_state())
+
+
+@app.delete("/api/file-import")
+def api_delete_file_import():
+    ensure_storage()
+    clear_file_import_storage()
+    return jsonify(public_file_import_state())
 
 
 @app.get("/api/projects")

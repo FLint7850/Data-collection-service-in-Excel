@@ -872,7 +872,108 @@ select:focus {
   gap: 18px;
 }
 
-.settings-view.hidden {
+.settings-view.hidden,
+.file-import-view.hidden {
+  display: none;
+}
+
+.file-import-view {
+  display: grid;
+  gap: 18px;
+}
+
+.file-upload-shell {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.file-dropzone {
+  display: grid;
+  gap: 8px;
+  place-items: center;
+  min-height: 180px;
+  border: 1px dashed rgba(45, 168, 157, 0.58);
+  border-radius: 8px;
+  padding: 24px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  cursor: pointer;
+  text-align: center;
+}
+
+.file-dropzone:hover,
+.file-dropzone:focus-within {
+  border-color: var(--primary);
+  background: rgba(45, 168, 157, 0.1);
+}
+
+.file-dropzone input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.file-dropzone__title {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.file-dropzone__meta {
+  font-size: 14px;
+}
+
+.file-import-selected {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: #11171c;
+}
+
+.file-import-selected.hidden {
+  display: none;
+}
+
+.file-import-selected strong {
+  display: block;
+  max-width: 520px;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-import-size {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.file-import-progress {
+  display: grid;
+  gap: 8px;
+}
+
+.file-import-progress.hidden {
+  display: none;
+}
+
+.file-import-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.file-import-actions.hidden {
   display: none;
 }
 
@@ -1675,8 +1776,14 @@ select:focus {
   .news-card-head,
   .news-card-footer,
   .modal-site-row,
-  .modal-actions {
+  .modal-actions,
+  .file-import-selected,
+  .file-import-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .file-import-selected strong {
+    max-width: 100%;
   }
 }
