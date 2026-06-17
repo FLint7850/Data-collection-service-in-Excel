@@ -2108,6 +2108,8 @@ def normalize_price_value(value: object) -> str:
     match = PRICE_RE.search(text)
     if match:
         return clean_text(match.group(0))
+    if not re.fullmatch(r"[^\w\u0400-\u04FF]*\d[\d\s\u2009\xa0.,]*[^\w\u0400-\u04FF]*", text):
+        return ""
     digits = re.sub(r"[^\d]", "", text)
     if digits and len(digits) >= 2:
         return f"{int(digits):,}".replace(",", " ") + " \u20bd"
@@ -2262,7 +2264,7 @@ def extract_labeled_model_value(soup: BeautifulSoup) -> str:
     return ""
 
 
-def extract_price(soup: BeautifulSoup) -> str:
+def extract_price(soup: BeautifulSoup, allow_page_fallback: bool = True) -> str:
     meta_price = soup.select_one(
         '[itemprop="price"], meta[property="product:price:amount"], meta[property="og:price:amount"]'
     )
@@ -2289,6 +2291,9 @@ def extract_price(soup: BeautifulSoup) -> str:
     if price:
         match = PRICE_RE.search(price)
         return clean_text(match.group(0) if match else price)
+
+    if not allow_page_fallback:
+        return ""
 
     page_text = clean_text(soup.get_text(" ", strip=True))
     match = PRICE_RE.search(page_text)
@@ -2720,6 +2725,15 @@ def extract_listing_products_by_rules(
         product_url = canonicalize_product_url_by_filters(normalize_url(link_node.get("href", "") if link_node else "", current_url), filters)
         if not product_url or product_url in seen_urls or not is_product_url_for_filters(product_url, filters):
             continue
+        card_product_urls = {
+            canonicalize_product_url_by_filters(normalize_url(link.get("href", ""), current_url), filters)
+            for link in card.select("a[href]")
+        }
+        card_product_urls = {
+            item for item in card_product_urls if item and is_product_url_for_filters(item, filters)
+        }
+        if len(card_product_urls) > 1:
+            continue
 
         model = extract_model_by_markers(str(card), rules)
         if not model:
@@ -2944,7 +2958,7 @@ def extract_product_data_by_rules(
         price = prices[-1]
     else:
         price = normalize_price_value(price or fallback_price)
-    if not price:
+    if not price and not allow_empty_price:
         prices = extract_prices(soup.get_text(" ", strip=True))
         price = prices[-1] if prices else ""
     model = normalize_model(model, url)
@@ -2989,7 +3003,7 @@ def extract_product_data(
         return ruled_product
 
     h1 = first_text(soup, ["h1"])
-    price = fallback_price or extract_price(soup)
+    price = fallback_price or extract_price(soup, allow_page_fallback=not allow_empty_price)
 
     schema_product = extract_schema_product(soup, url, price, allow_empty_price=allow_empty_price)
     if schema_product and (schema_product.get("price") or allow_empty_price):
@@ -4104,7 +4118,7 @@ class ProductSiteCrawler:
         listing_products: List[Dict[str, str]] = []
         listing_price = self.get_listing_price(url)
 
-        if current_is_product and listing_price:
+        if current_is_product:
             product = extract_product_data(
                 url,
                 html,
@@ -4122,23 +4136,6 @@ class ProductSiteCrawler:
             current_is_product = False
 
         listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
-
-        if current_is_product and not listing_products:
-            product = extract_product_data(
-                url,
-                html,
-                listing_price,
-                self.extraction_rules,
-                assume_product=True,
-                allow_empty_price=self.allow_empty_price,
-            )
-            if product:
-                self.add_products([product])
-                if is_technopark_url(url):
-                    self.log(f"Страница обработана: {url}. Найдено товаров на странице: 1", "info")
-                return
-
-            current_is_product = False
 
         if not current_is_product and not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)) and not PRICE_RE.search(html):
             self.update_state(
