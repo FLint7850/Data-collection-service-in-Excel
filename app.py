@@ -32,7 +32,7 @@ from sqlalchemy import delete, select
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from db import SessionLocal, init_db, session_scope
-from models import AppSetting, Brand, ConnectionMethod, Donor, OwnSite, Project, User
+from models import AppSetting, Brand, ConnectionMethod, Donor, FileImport, OwnSite, Project, User
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -4362,7 +4362,6 @@ def safe_filename(value: str) -> str:
 
 
 FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx"}
-FILE_IMPORT_META = "current.json"
 
 
 def clear_file_import_storage() -> None:
@@ -4375,19 +4374,43 @@ def clear_file_import_storage() -> None:
                 continue
 
 
-def file_import_meta_path() -> Path:
-    return FILE_IMPORT_DIR / FILE_IMPORT_META
+def stored_file_import_files() -> List[Path]:
+    FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(
+        [
+            path
+            for path in FILE_IMPORT_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in FILE_IMPORT_ALLOWED_SUFFIXES
+        ],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def get_file_import_row(db_session=None) -> FileImport:
+    db = db_session or g.db
+    row = db.get(FileImport, 1)
+    if row is None:
+        row = FileImport(id=1, exclusions="", file={})
+        db.add(row)
+        db.flush()
+    if not isinstance(row.file, dict) or not row.file.get("stored_filename"):
+        stored_files = stored_file_import_files()
+        if stored_files:
+            path = stored_files[0]
+            row.file = {
+                "original_filename": path.name.split("_", 3)[-1] if "_" in path.name else path.name,
+                "stored_filename": path.name,
+                "uploaded_at": datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds"),
+            }
+            db.flush()
+    return row
 
 
 def current_file_import_path() -> Optional[Path]:
-    meta_path = file_import_meta_path()
-    if not meta_path.exists():
-        return None
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    filename = str(meta.get("stored_filename") or "").strip()
+    row = get_file_import_row()
+    file_meta = row.file if isinstance(row.file, dict) else {}
+    filename = str(file_meta.get("stored_filename") or "").strip()
     if not filename:
         return None
     base_dir = FILE_IMPORT_DIR.resolve()
@@ -4398,21 +4421,19 @@ def current_file_import_path() -> Optional[Path]:
 
 
 def public_file_import_state() -> Dict[str, object]:
+    row = get_file_import_row()
     path = current_file_import_path()
+    file_meta = row.file if isinstance(row.file, dict) else {}
     if not path:
-        return {"file": None}
-    meta = {}
-    try:
-        meta = json.loads(file_import_meta_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        meta = {}
+        return {"file": None, "exclusions": row.exclusions or ""}
     stat = path.stat()
     return {
+        "exclusions": row.exclusions or "",
         "file": {
-            "filename": output_text(str(meta.get("original_filename") or path.name)),
+            "filename": output_text(str(file_meta.get("original_filename") or path.name)),
             "stored_filename": path.name,
             "size": stat.st_size,
-            "uploaded_at": str(meta.get("uploaded_at") or datetime.fromtimestamp(stat.st_mtime, MSK_TZ).isoformat(timespec="seconds")),
+            "uploaded_at": str(file_meta.get("uploaded_at") or datetime.fromtimestamp(stat.st_mtime, MSK_TZ).isoformat(timespec="seconds")),
         }
     }
 
@@ -5907,7 +5928,9 @@ def logout() -> Response:
 @app.route("/")
 def index() -> str:
     ensure_storage()
-    return render_template("index.html", default_start_url=DEFAULT_START_URL)
+    static_files = [BASE_DIR / "static" / "js" / "app.js", BASE_DIR / "static" / "css" / "styles.css"]
+    static_version = max((int(path.stat().st_mtime) for path in static_files if path.exists()), default=0)
+    return render_template("index.html", default_start_url=DEFAULT_START_URL, static_version=static_version)
 
 
 @app.get("/api/state")
@@ -6253,6 +6276,30 @@ def api_file_import_state():
     return jsonify(public_file_import_state())
 
 
+@app.patch("/api/file-import")
+def api_update_file_import():
+    ensure_storage()
+    payload = request.get_json(silent=True) or {}
+    row = get_file_import_row()
+    if "exclusions" in payload:
+        row.exclusions = str(payload.get("exclusions") or "").strip()
+    if "file" in payload:
+        file_payload = payload.get("file")
+        if not file_payload:
+            row.file = {}
+        elif isinstance(file_payload, dict):
+            stored_filename = str(file_payload.get("stored_filename") or "").strip()
+            base_dir = FILE_IMPORT_DIR.resolve()
+            path = (FILE_IMPORT_DIR / stored_filename).resolve()
+            if stored_filename and base_dir in path.parents and path.exists() and path.is_file():
+                row.file = {
+                    "original_filename": output_text(str(file_payload.get("filename") or file_payload.get("original_filename") or path.name)),
+                    "stored_filename": path.name,
+                    "uploaded_at": str(file_payload.get("uploaded_at") or datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")),
+                }
+    return jsonify(public_file_import_state())
+
+
 @app.post("/api/file-import")
 def api_upload_file_import():
     ensure_storage()
@@ -6273,18 +6320,12 @@ def api_upload_file_import():
     if FILE_IMPORT_DIR.resolve() not in target.parents:
         return jsonify({"error": "Некорректное имя файла"}), 400
     upload.save(target)
-    file_import_meta_path().write_text(
-        json.dumps(
-            {
-                "original_filename": original_filename,
-                "stored_filename": stored_filename,
-                "uploaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    row = get_file_import_row()
+    row.file = {
+        "original_filename": original_filename,
+        "stored_filename": stored_filename,
+        "uploaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+    }
     return jsonify(public_file_import_state())
 
 
@@ -6292,6 +6333,8 @@ def api_upload_file_import():
 def api_delete_file_import():
     ensure_storage()
     clear_file_import_storage()
+    row = get_file_import_row()
+    row.file = {}
     return jsonify(public_file_import_state())
 
 

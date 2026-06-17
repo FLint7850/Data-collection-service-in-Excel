@@ -130,3 +130,13 @@ class AppSetting(Base):
     auto_cleanup: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     smtp: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     feed_storage: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+
+class FileImport(Base):
+    __tablename__ = "file_import"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    exclusions: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    file: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

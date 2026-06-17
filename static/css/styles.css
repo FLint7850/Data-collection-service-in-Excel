@@ -888,6 +888,16 @@ select:focus {
   margin-top: 16px;
 }
 
+.file-import-exclusions-field textarea {
+  min-height: 132px;
+}
+
+.file-import-save-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .file-dropzone {
   display: grid;
   gap: 8px;
@@ -1777,6 +1787,7 @@ select:focus {
   .news-card-footer,
   .modal-site-row,
   .modal-actions,
+  .file-import-save-row,
   .file-import-selected,
   .file-import-actions {
     align-items: stretch;

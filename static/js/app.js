@@ -48,6 +48,9 @@ const modelStartMarker = document.querySelector("#modelStartMarker");
 const modelEndMarker = document.querySelector("#modelEndMarker");
 const modelReplaceRules = document.querySelector("#modelReplaceRules");
 const fileImportInput = document.querySelector("#fileImportInput");
+const fileImportExclusions = document.querySelector("#fileImportExclusions");
+const saveFileImportButton = document.querySelector("#saveFileImportButton");
+const fileImportSaveNotice = document.querySelector("#fileImportSaveNotice");
 const fileImportSelected = document.querySelector("#fileImportSelected");
 const fileImportName = document.querySelector("#fileImportName");
 const fileImportSize = document.querySelector("#fileImportSize");
@@ -882,10 +885,14 @@ function setFileImportProgress(percent, notice = "") {
 
 function renderFileImport() {
   const file = fileImportData?.file || null;
+  if (fileImportExclusions && document.activeElement !== fileImportExclusions) {
+    fileImportExclusions.value = fileImportData?.exclusions || "";
+  }
   fileImportName.textContent = file?.filename || "—";
   fileImportSize.textContent = file?.size ? formatFileSize(file.size) : "";
   fileImportSelected.classList.toggle("hidden", !file);
   fileImportActions.classList.toggle("hidden", !file);
+  if (saveFileImportButton) saveFileImportButton.disabled = fileImportUploading;
   clearFileImportButton.disabled = fileImportUploading || !file;
   compareFileImportButton.disabled = fileImportUploading || !file;
   downloadFileImportCsvButton.classList.add("disabled");
@@ -902,6 +909,27 @@ async function loadFileImport() {
   fileImportData = await requestJson("/api/file-import");
   fileImportLoaded = true;
   renderFileImport();
+}
+
+async function saveFileImport() {
+  if (!saveFileImportButton || !fileImportSaveNotice) return;
+  saveFileImportButton.disabled = true;
+  fileImportSaveNotice.textContent = "Сохраняю...";
+  fileImportData = await requestJson("/api/file-import", {
+    method: "PATCH",
+    body: JSON.stringify({
+      exclusions: fileImportExclusions?.value || "",
+      file: fileImportData?.file || null,
+    }),
+  });
+  fileImportLoaded = true;
+  renderFileImport();
+  fileImportSaveNotice.textContent = "Сохранено";
+  window.setTimeout(() => {
+    if (fileImportSaveNotice.textContent === "Сохранено") {
+      fileImportSaveNotice.textContent = "";
+    }
+  }, 1800);
 }
 
 function uploadFileImport(file) {
@@ -1857,38 +1885,57 @@ settingsTabButton.addEventListener("click", () => {
   renderAll();
 });
 
-fileImportInput.addEventListener("change", async () => {
-  const file = fileImportInput.files?.[0] || null;
-  if (!file) return;
-  fileImportUploading = true;
-  fileImportProgress.classList.remove("hidden");
-  setFileImportProgress(0, "Подготовка...");
-  renderFileImport();
-  try {
-    fileImportData = await uploadFileImport(file);
-    fileImportLoaded = true;
-    setFileImportProgress(100, "Файл выгружен");
-  } catch (error) {
-    fileImportInput.value = "";
-    fileImportNotice.textContent = error.message;
-  } finally {
-    fileImportUploading = false;
-    renderFileImport();
-  }
-});
+if (fileImportExclusions && fileImportSaveNotice) {
+  fileImportExclusions.addEventListener("input", () => {
+    fileImportSaveNotice.textContent = "";
+  });
+}
 
-clearFileImportButton.addEventListener("click", async () => {
-  clearFileImportButton.disabled = true;
-  fileImportNotice.textContent = "Удаляю файл...";
-  fileImportProgress.classList.remove("hidden");
-  setFileImportProgress(100, "Удаляю файл...");
-  try {
-    await deleteFileImport();
-  } catch (error) {
-    fileImportNotice.textContent = error.message;
-    clearFileImportButton.disabled = false;
-  }
-});
+if (saveFileImportButton && fileImportSaveNotice) {
+  saveFileImportButton.addEventListener("click", () => {
+    saveFileImport().catch((error) => {
+      fileImportSaveNotice.textContent = error.message;
+      saveFileImportButton.disabled = false;
+    });
+  });
+}
+
+if (fileImportInput) {
+  fileImportInput.addEventListener("change", async () => {
+    const file = fileImportInput.files?.[0] || null;
+    if (!file) return;
+    fileImportUploading = true;
+    fileImportProgress.classList.remove("hidden");
+    setFileImportProgress(0, "Подготовка...");
+    renderFileImport();
+    try {
+      fileImportData = await uploadFileImport(file);
+      fileImportLoaded = true;
+      setFileImportProgress(100, "Файл выгружен");
+    } catch (error) {
+      fileImportInput.value = "";
+      fileImportNotice.textContent = error.message;
+    } finally {
+      fileImportUploading = false;
+      renderFileImport();
+    }
+  });
+}
+
+if (clearFileImportButton) {
+  clearFileImportButton.addEventListener("click", async () => {
+    clearFileImportButton.disabled = true;
+    fileImportNotice.textContent = "Удаляю файл...";
+    fileImportProgress.classList.remove("hidden");
+    setFileImportProgress(100, "Удаляю файл...");
+    try {
+      await deleteFileImport();
+    } catch (error) {
+      fileImportNotice.textContent = error.message;
+      clearFileImportButton.disabled = false;
+    }
+  });
+}
 
 projectName.addEventListener("input", scheduleSaveActiveProject);
 startUrls.addEventListener("input", scheduleSaveActiveProject);

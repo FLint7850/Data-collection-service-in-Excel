@@ -6,7 +6,7 @@
   <title>Сервис сбора данных в Excel</title>
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/excel-service-logo.png') }}">
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='img/excel-service-logo.png') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v={{ static_version }}">
 </head>
 <body>
   <main class="app-shell">
@@ -289,6 +289,14 @@
           <h2>Выгрузка из CSV/XLSX</h2>
         </div>
         <div class="file-upload-shell">
+          <label class="field file-import-exclusions-field">
+            <span>Исключения</span>
+            <textarea id="fileImportExclusions" rows="5" placeholder="Автомобильный холодильник&#10;Гриль из чугуна&#10;Фотоэпилятор"></textarea>
+          </label>
+          <div class="file-import-save-row">
+            <button class="button secondary" id="saveFileImportButton" type="button">Сохранить</button>
+            <span class="save-notice" id="fileImportSaveNotice"></span>
+          </div>
           <label class="file-dropzone" id="fileDropzone">
             <input id="fileImportInput" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
             <span class="file-dropzone__title">Выберите CSV или XLSX файл</span>
@@ -398,6 +406,6 @@
     </section>
   </main>
 
-  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}?v={{ static_version }}"></script>
 </body>
 </html>
