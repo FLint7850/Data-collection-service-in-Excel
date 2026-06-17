@@ -152,22 +152,40 @@ if (Test-PortBusy -PortToCheck $Port) {
 $LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $LogDir = Join-Path $PSScriptRoot "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$OutputLogDir = Join-Path $LogDir "server-output"
-$ErrorLogDir = Join-Path $LogDir "server-error"
-New-Item -ItemType Directory -Force -Path $OutputLogDir, $ErrorLogDir | Out-Null
-$OutputLog = Join-Path $OutputLogDir "server-output-$Port-$LogStamp.log"
-$ErrorLog = Join-Path $ErrorLogDir "server-error-$Port-$LogStamp.log"
+$AppLog = Join-Path $LogDir "app.log"
+Add-Content -Path $AppLog -Encoding UTF8 -Value ""
+Add-Content -Path $AppLog -Encoding UTF8 -Value "[$(Get-Date -Format o)] Starting local server on port $Port"
 
 Write-Host "Starting Flask app..." -ForegroundColor Green
 $env:PORT = "$Port"
-$process = Start-Process `
-    -FilePath $venvPython `
-    -ArgumentList "app.py" `
-    -WorkingDirectory $PSScriptRoot `
-    -PassThru `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $OutputLog `
-    -RedirectStandardError $ErrorLog
+$script:AppLogWriter = [System.IO.StreamWriter]::new($AppLog, $true, [System.Text.UTF8Encoding]::new($false))
+$script:AppLogWriter.AutoFlush = $true
+$process = [System.Diagnostics.Process]::new()
+$process.StartInfo.FileName = (Resolve-Path $venvPython).Path
+$process.StartInfo.Arguments = "app.py"
+$process.StartInfo.WorkingDirectory = $PSScriptRoot
+$process.StartInfo.UseShellExecute = $false
+$process.StartInfo.CreateNoWindow = $true
+$process.StartInfo.RedirectStandardOutput = $true
+$process.StartInfo.RedirectStandardError = $true
+$process.StartInfo.Environment["PORT"] = "$Port"
+$outputHandler = [System.Diagnostics.DataReceivedEventHandler]{
+    param($sender, $eventArgs)
+    if ($eventArgs.Data) {
+        $script:AppLogWriter.WriteLine($eventArgs.Data)
+    }
+}
+$errorHandler = [System.Diagnostics.DataReceivedEventHandler]{
+    param($sender, $eventArgs)
+    if ($eventArgs.Data) {
+        $script:AppLogWriter.WriteLine($eventArgs.Data)
+    }
+}
+$process.add_OutputDataReceived($outputHandler)
+$process.add_ErrorDataReceived($errorHandler)
+[void]$process.Start()
+$process.BeginOutputReadLine()
+$process.BeginErrorReadLine()
 
 Write-Host "Waiting for $AppUrl ..." -ForegroundColor Cyan
 $ready = $false
@@ -184,19 +202,17 @@ for ($i = 0; $i -lt 40; $i++) {
 
 if (-not $ready) {
     Write-Host "The app did not start correctly." -ForegroundColor Red
-    if (Test-Path $ErrorLog) {
+    if (Test-Path $AppLog) {
         Write-Host ""
-        Write-Host "${ErrorLog}:" -ForegroundColor Yellow
-        Get-Content $ErrorLog -Tail 120
-    }
-    if (Test-Path $OutputLog) {
-        Write-Host ""
-        Write-Host "${OutputLog}:" -ForegroundColor Yellow
-        Get-Content $OutputLog -Tail 120
+        Write-Host "${AppLog}:" -ForegroundColor Yellow
+        Get-Content $AppLog -Tail 160
     }
     Write-Host ""
     Write-Host "Press Enter to close this window." -ForegroundColor Yellow
     Read-Host
+    if ($script:AppLogWriter) {
+        $script:AppLogWriter.Dispose()
+    }
     exit 1
 }
 
@@ -211,4 +227,9 @@ try {
     Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
 }
 catch {
+}
+finally {
+    if ($script:AppLogWriter) {
+        $script:AppLogWriter.Dispose()
+    }
 }

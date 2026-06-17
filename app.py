@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import csv
+import hashlib
 import html as html_lib
 import io
 import faulthandler
@@ -578,6 +579,211 @@ def read_logs_file() -> List[Dict[str, object]]:
     return [repair_mojibake(item) for item in data if isinstance(item, dict)]
 
 
+def get_log_auto_cleanup() -> bool:
+    with session_scope() as db_session:
+        app_setting = db_session.get(AppSetting, 1)
+        return bool(app_setting.auto_cleanup) if app_setting else False
+
+
+def set_log_auto_cleanup(value: bool) -> bool:
+    global LOG_AUTO_CLEANUP
+    LOG_AUTO_CLEANUP = bool(value)
+    with session_scope() as db_session:
+        app_setting = db_session.get(AppSetting, 1)
+        if app_setting is None:
+            app_setting = AppSetting(id=1)
+            db_session.add(app_setting)
+        app_setting.auto_cleanup = LOG_AUTO_CLEANUP
+    return LOG_AUTO_CLEANUP
+
+
+UNIFIED_LOG_RE = re.compile(r"^(?P<time>\S+) \[(?P<level>[^\]]+)\] (?P<project_name>.*?): (?P<message>.*)$")
+LOG_TAIL_LINES = 2000
+
+
+def log_time_from_path(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")
+    except OSError:
+        return datetime.now(MSK_TZ).isoformat(timespec="seconds")
+
+
+def read_tail_lines(path: Path, limit: int = LOG_TAIL_LINES) -> List[str]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    if limit > 0:
+        return lines[-limit:]
+    return lines
+
+
+def read_unified_log_file() -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    for line in read_tail_lines(UNIFIED_LOG_FILE):
+        line = line.strip()
+        if not line:
+            continue
+        match = UNIFIED_LOG_RE.match(line)
+        if match:
+            entries.append(
+                repair_mojibake(
+                    {
+                        "time": match.group("time"),
+                        "level": match.group("level").lower(),
+                        "project_name": match.group("project_name"),
+                        "message": match.group("message"),
+                    }
+                )
+            )
+            continue
+        entries.append(
+            repair_mojibake(
+                {
+                    "time": log_time_from_path(UNIFIED_LOG_FILE),
+                    "level": "info",
+                    "project_name": UNIFIED_LOG_FILE.name,
+                    "message": line,
+                }
+            )
+        )
+    return entries
+
+
+def read_plain_log_file(path: Path, project_name: str, level: str) -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    timestamp = log_time_from_path(path)
+    for line in read_tail_lines(path):
+        line = line.strip()
+        if not line:
+            continue
+        entries.append(
+            repair_mojibake(
+                {
+                    "time": timestamp,
+                    "level": level,
+                    "project_name": project_name,
+                    "message": line,
+                }
+            )
+        )
+    return entries
+
+
+def iter_server_log_files() -> Iterable[Path]:
+    for directory in (LOG_DIR / "server-output", LOG_DIR / "server-error"):
+        if not directory.exists():
+            continue
+        try:
+            files = sorted(
+                [path for path in directory.iterdir() if path.is_file()],
+                key=lambda item: item.stat().st_mtime,
+            )
+        except OSError:
+            continue
+        yield from files
+
+
+def combined_log_entries() -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    entries.extend(read_logs_file())
+    entries.extend(read_unified_log_file())
+    entries.extend(read_plain_log_file(LOG_DIR / "flask-error.log", "flask-error.log", "error"))
+    for path in iter_server_log_files():
+        level = "error" if path.parent.name == "server-error" else "info"
+        entries.extend(read_plain_log_file(path, path.name, level))
+
+    deduped: List[Dict[str, object]] = []
+    seen: Set[tuple[str, str, str, str]] = set()
+    for item in entries:
+        normalized = repair_mojibake(item)
+        key = (
+            str(normalized.get("time") or ""),
+            str(normalized.get("level") or ""),
+            str(normalized.get("project_name") or normalized.get("project_id") or ""),
+            str(normalized.get("message") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def is_recent_log_entry(item: Dict[str, object], cutoff: float) -> bool:
+    try:
+        return datetime.fromisoformat(str(item.get("time") or "")).timestamp() >= cutoff
+    except (TypeError, ValueError):
+        return True
+
+
+def log_line_timestamp(line: str) -> Optional[float]:
+    match = re.match(r"^(?:\[(?P<bracket>[^\]]+)\]|(?P<plain>\S+))", line.strip())
+    if not match:
+        return None
+    raw_value = match.group("bracket") or match.group("plain")
+    try:
+        return datetime.fromisoformat(raw_value).timestamp()
+    except ValueError:
+        return None
+
+
+def iter_runtime_log_files() -> Iterable[Path]:
+    for path in (LOGS_FILE, UNIFIED_LOG_FILE, LOG_DIR / "flask-error.log"):
+        if path.exists() and path.is_file():
+            yield path
+    yield from iter_server_log_files()
+
+
+def clear_runtime_log_files() -> None:
+    LOG_DIR.mkdir(exist_ok=True)
+    write_logs_file([])
+    for path in iter_runtime_log_files():
+        if path == LOGS_FILE:
+            continue
+        try:
+            if path.parent.name in {"server-output", "server-error"}:
+                path.unlink()
+            else:
+                path.write_text("", encoding="utf-8")
+        except OSError:
+            try:
+                path.write_text("", encoding="utf-8")
+            except OSError:
+                continue
+
+
+def prune_text_log_file(path: Path, cutoff: float) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    except OSError:
+        return
+    filtered_lines = []
+    for line in lines:
+        timestamp = log_line_timestamp(line)
+        if timestamp is None or timestamp >= cutoff:
+            filtered_lines.append(line)
+    if len(filtered_lines) == len(lines):
+        return
+    try:
+        path.write_text("".join(filtered_lines), encoding="utf-8")
+    except OSError:
+        return
+
+
+def prune_old_log_files(cutoff: float) -> None:
+    prune_text_log_file(UNIFIED_LOG_FILE, cutoff)
+    prune_text_log_file(LOG_DIR / "flask-error.log", cutoff)
+    for path in iter_server_log_files():
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
 def save_logs() -> None:
     with projects_lock:
         data = []
@@ -589,13 +795,20 @@ def save_logs() -> None:
 
 
 def logs_signature() -> str:
-    if not LOGS_FILE.exists():
-        return "missing"
-    try:
-        stat = LOGS_FILE.stat()
-    except OSError:
-        return "unavailable"
-    return f"{stat.st_mtime_ns}:{stat.st_size}"
+    parts = []
+    for path in iter_runtime_log_files():
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        try:
+            relative_path = path.relative_to(BASE_DIR)
+        except ValueError:
+            relative_path = path
+        parts.append(f"{relative_path}:{stat.st_mtime_ns}:{stat.st_size}")
+    if not parts:
+        return "empty"
+    return hashlib.sha256("|".join(sorted(parts)).encode("utf-8")).hexdigest()
 
 
 def load_logs() -> None:
@@ -1174,6 +1387,7 @@ def save_news_settings() -> None:
 
 
 def load_news_settings() -> None:
+    global LOG_AUTO_CLEANUP
     with news_lock:
         if news_settings:
             return
@@ -1187,6 +1401,7 @@ def load_news_settings() -> None:
             app_setting = session.get(AppSetting, 1)
             if app_setting:
                 settings["auto_cleanup"] = bool(app_setting.auto_cleanup)
+                LOG_AUTO_CLEANUP = bool(app_setting.auto_cleanup)
                 if isinstance(app_setting.smtp, dict):
                     settings["smtp"] = merge_smtp_settings(dict(settings["smtp"]), app_setting.smtp)
                 if isinstance(app_setting.feed_storage, list):
@@ -6722,39 +6937,39 @@ def api_project_restart(project_id: str):
 @app.get("/api/logs")
 def api_logs():
     ensure_storage()
-    auto_cleanup = False
-    with projects_lock:
-        auto_cleanup = any(bool(project.get("auto_cleanup")) for project in projects.values())
-    with news_lock:
-        auto_cleanup = auto_cleanup or bool(news_settings.get("auto_cleanup"))
+    global LOG_AUTO_CLEANUP
+    auto_cleanup = get_log_auto_cleanup()
+    LOG_AUTO_CLEANUP = auto_cleanup
 
-    all_logs = read_logs_file()
+    json_logs = read_logs_file()
     if auto_cleanup:
         cutoff = time.time() - 7 * 24 * 60 * 60
         filtered_logs = [
             item
-            for item in all_logs
-            if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
+            for item in json_logs
+            if is_recent_log_entry(item, cutoff)
         ]
-        if len(filtered_logs) != len(all_logs):
-            all_logs = filtered_logs
-            write_logs_file(all_logs)
+        if len(filtered_logs) != len(json_logs):
+            json_logs = filtered_logs
+            write_logs_file(json_logs)
+        prune_old_log_files(cutoff)
         with projects_lock:
             for project in projects.values():
                 logs = project.get("logs", [])
                 project["logs"] = [
                     item
                     for item in logs
-                    if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
+                    if is_recent_log_entry(item, cutoff)
                 ]
         with news_lock:
             logs = news_settings.get("logs", [])
             news_settings["logs"] = [
                 item
                 for item in logs
-                if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
+                if is_recent_log_entry(item, cutoff)
             ]
 
+    all_logs = combined_log_entries()
     all_logs.sort(key=lambda item: item.get("time", ""))
     return jsonify(
         {
@@ -6773,7 +6988,7 @@ def api_clear_logs():
     with news_lock:
         news_settings["logs"] = []
         save_news_settings()
-    write_logs_file([])
+    clear_runtime_log_files()
     return jsonify({"ok": True})
 
 
@@ -6781,14 +6996,9 @@ def api_clear_logs():
 def api_logs_settings():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
-    auto_cleanup = bool(payload.get("auto_cleanup"))
-    with projects_lock:
-        for project in projects.values():
-            project["auto_cleanup"] = auto_cleanup
-        save_projects()
+    auto_cleanup = set_log_auto_cleanup(bool(payload.get("auto_cleanup")))
     with news_lock:
         news_settings["auto_cleanup"] = auto_cleanup
-        save_news_settings()
     return jsonify({"auto_cleanup": auto_cleanup})
 
 
