@@ -289,10 +289,16 @@
           <h2>Выгрузка из CSV/XLSX</h2>
         </div>
         <div class="file-upload-shell">
-          <label class="field file-import-exclusions-field">
-            <span>Исключения</span>
-            <textarea id="fileImportExclusions" rows="5" placeholder="Автомобильный холодильник&#10;Гриль из чугуна&#10;Фотоэпилятор"></textarea>
-          </label>
+          <div class="file-import-fields-grid">
+            <label class="field file-import-exclusions-field">
+              <span>Исключения</span>
+              <textarea id="fileImportExclusions" rows="5" placeholder="Автомобильный холодильник&#10;Гриль из чугуна&#10;Фотоэпилятор"></textarea>
+            </label>
+            <label class="field">
+              <span>Название столбца модели</span>
+              <input id="fileImportModelField" type="text" autocomplete="off" placeholder="Модель">
+            </label>
+          </div>
           <div class="file-import-save-row">
             <button class="button secondary" id="saveFileImportButton" type="button">Сохранить</button>
             <span class="save-notice" id="fileImportSaveNotice"></span>

@@ -49,6 +49,7 @@ const modelEndMarker = document.querySelector("#modelEndMarker");
 const modelReplaceRules = document.querySelector("#modelReplaceRules");
 const fileImportInput = document.querySelector("#fileImportInput");
 const fileImportExclusions = document.querySelector("#fileImportExclusions");
+const fileImportModelField = document.querySelector("#fileImportModelField");
 const saveFileImportButton = document.querySelector("#saveFileImportButton");
 const fileImportSaveNotice = document.querySelector("#fileImportSaveNotice");
 const fileImportSelected = document.querySelector("#fileImportSelected");
@@ -888,6 +889,9 @@ function renderFileImport() {
   if (fileImportExclusions && document.activeElement !== fileImportExclusions) {
     fileImportExclusions.value = fileImportData?.exclusions || "";
   }
+  if (fileImportModelField && document.activeElement !== fileImportModelField) {
+    fileImportModelField.value = fileImportData?.model_field || "";
+  }
   fileImportName.textContent = file?.filename || "—";
   fileImportSize.textContent = file?.size ? formatFileSize(file.size) : "";
   fileImportSelected.classList.toggle("hidden", !file);
@@ -919,6 +923,7 @@ async function saveFileImport() {
     method: "PATCH",
     body: JSON.stringify({
       exclusions: fileImportExclusions?.value || "",
+      model_field: fileImportModelField?.value || "",
       file: fileImportData?.file || null,
     }),
   });
@@ -1887,6 +1892,12 @@ settingsTabButton.addEventListener("click", () => {
 
 if (fileImportExclusions && fileImportSaveNotice) {
   fileImportExclusions.addEventListener("input", () => {
+    fileImportSaveNotice.textContent = "";
+  });
+}
+
+if (fileImportModelField && fileImportSaveNotice) {
+  fileImportModelField.addEventListener("input", () => {
     fileImportSaveNotice.textContent = "";
   });
 }

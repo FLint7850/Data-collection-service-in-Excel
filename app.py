@@ -4628,13 +4628,17 @@ def get_file_import_row(db_session=None) -> FileImport:
     db = db_session or g.db
     row = db.get(FileImport, 1)
     if row is None:
-        row = FileImport(id=1, exclusions=[], file={})
+        row = FileImport(id=1, exclusions=[], model_field="", file={})
         db.add(row)
         db.flush()
     else:
         normalized_exclusions = normalize_file_import_exclusions(row.exclusions)
         if row.exclusions != normalized_exclusions:
             row.exclusions = normalized_exclusions
+            db.flush()
+        normalized_model_field = clean_text(str(row.model_field or ""))
+        if row.model_field != normalized_model_field:
+            row.model_field = normalized_model_field
             db.flush()
     if not isinstance(row.file, dict) or not row.file.get("stored_filename"):
         stored_files = stored_file_import_files()
@@ -4668,12 +4672,14 @@ def public_file_import_state() -> Dict[str, object]:
     file_meta = row.file if isinstance(row.file, dict) else {}
     exclusions = normalize_file_import_exclusions(row.exclusions)
     exclusions_text = "\n".join(exclusions)
+    model_field = clean_text(str(row.model_field or ""))
     if not path:
-        return {"file": None, "exclusions": exclusions_text, "exclusions_list": exclusions}
+        return {"file": None, "exclusions": exclusions_text, "exclusions_list": exclusions, "model_field": model_field}
     stat = path.stat()
     return {
         "exclusions": exclusions_text,
         "exclusions_list": exclusions,
+        "model_field": model_field,
         "file": {
             "filename": output_text(str(file_meta.get("original_filename") or path.name)),
             "stored_filename": path.name,
@@ -6528,6 +6534,8 @@ def api_update_file_import():
     row = get_file_import_row()
     if "exclusions" in payload:
         row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
+    if "model_field" in payload:
+        row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
     if "file" in payload:
         file_payload = payload.get("file")
         if not file_payload:
