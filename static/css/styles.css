@@ -888,13 +888,6 @@ select:focus {
   margin-top: 16px;
 }
 
-.file-import-fields-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, 1fr);
-  gap: 14px;
-  align-items: start;
-}
-
 .file-import-exclusions-field textarea {
   min-height: 132px;
 }
@@ -1787,10 +1780,6 @@ select:focus {
   .news-recipients-field,
   .news-wide-field {
     grid-column: auto;
-  }
-
-  .file-import-fields-grid {
-    grid-template-columns: 1fr;
   }
 
   .section-title-row,
