@@ -406,14 +406,6 @@ def file_import_exclusions_text(value: object) -> str:
     return "\n".join(normalize_file_import_exclusions(value))
 
 
-def normalize_file_import_replace_rules(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        return "\n".join(str(item or "") for item in value).strip()
-    return str(value or "").strip()
-
-
 def normalize_emails(value: object) -> List[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\n,;]+", value)
@@ -4612,420 +4604,151 @@ FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx"}
 CYRILLIC_MODEL_TRANSLATION = str.maketrans(
     {
         "А": "A",
-        "а": "a",
         "В": "B",
         "Е": "E",
-        "е": "e",
         "К": "K",
-        "к": "k",
         "М": "M",
-        "м": "m",
         "Н": "H",
         "О": "O",
-        "о": "o",
         "Р": "P",
-        "р": "p",
         "С": "C",
-        "с": "c",
         "Т": "T",
-        "У": "Y",
-        "у": "y",
         "Х": "X",
+        "а": "a",
+        "е": "e",
+        "к": "k",
+        "м": "m",
+        "н": "h",
+        "о": "o",
+        "р": "p",
+        "с": "c",
+        "т": "t",
         "х": "x",
     }
 )
-CONFUSABLE_CYRILLIC_CHARS = set("АаВЕеКкМмНОоРрСсТУуХх")
-SUPPLIER_MODEL_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:[./_\-][A-Za-zА-Яа-яЁё0-9]+)*")
-SUPPLIER_MODEL_ALLOWED_CHARS_RE = re.compile(r"[^A-Za-zА-Яа-яЁё0-9.\-/_\s&]+")
+
+
+SUPPLIER_MODEL_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*")
 
 
 def normalize_model_letters(value: str) -> str:
     return str(value or "").translate(CYRILLIC_MODEL_TRANSLATION)
 
 
-def fix_cyrillic_confusables_in_model_tokens(value: str) -> str:
-    """Исправляет русские буквы-двойники только внутри токенов, похожих на модель/бренд."""
-    text = str(value or "")
-
-    def replace_token(match: re.Match) -> str:
-        token = match.group(0)
-        cyrillic_chars = re.findall(r"[А-Яа-яЁё]", token)
-        if not cyrillic_chars:
-            return token
-
-        has_latin_or_digit = bool(re.search(r"[A-Za-z0-9]", token))
-        if not has_latin_or_digit:
-            return token
-
-        if not all(char in CONFUSABLE_CYRILLIC_CHARS for char in cyrillic_chars):
-            return token
-
-        return normalize_model_letters(token)
-
-    return re.sub(
-        r"[A-Za-zА-Яа-яЁё0-9]+(?:[./_\-][A-Za-zА-Яа-яЁё0-9]+)*",
-        replace_token,
-        text,
-    )
+def normalize_feed_vendor_code_for_supplier_compare(value: str) -> str:
+    value = normalize_model_letters(clean_text(str(value or "")))
+    value = re.sub(r"[^A-Za-z0-9\-\s]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value.upper()
 
 
-def remove_bracketed_text(value: str) -> str:
-    text = str(value or "")
-    text = re.sub(r"\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*", " ", text)
-    return clean_text(text)
+def compact_supplier_compare_key(value: str) -> str:
+    return re.sub(r"[\s\-]+", "", normalize_feed_vendor_code_for_supplier_compare(value))
 
 
-def remove_cyrillic_words(value: str) -> str:
-    text = str(value or "")
-    text = re.sub(r"(?<![A-Za-z0-9])[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)*(?![A-Za-z0-9])", " ", text)
-    text = re.sub(r"[А-Яа-яЁё]+", " ", text)
-    return clean_text(text)
-
-
-def supplier_brand_patterns() -> List[tuple[str, str]]:
-    """Строит regex-бренды из таблицы brands. Поддерживает бренды из нескольких слов и '&'."""
-    patterns: List[tuple[str, str]] = []
-
-    for brand in sorted(model_brand_names(), key=len, reverse=True):
-        brand_text = clean_text(str(brand or ""))
-        if not brand_text:
-            continue
-
-        brand_text = fix_cyrillic_confusables_in_model_tokens(brand_text)
-        parts = re.split(r"\s+", brand_text)
-        regex_parts = []
-
-        for part in parts:
-            if not part:
-                continue
-            if part == "&":
-                regex_parts.append(r"(?:&|and)")
-                continue
-            regex_parts.append(re.escape(part))
-
-        if regex_parts:
-            pattern = r"\s+".join(regex_parts)
-            pattern = pattern.replace(r"\&", r"(?:\s*&\s*|\s+and\s+)")
-            patterns.append((brand_text, pattern))
-
-    return patterns
-
-
-def clean_supplier_model_text(value: str) -> str:
-    text = html_lib.unescape(str(value or ""))
-    text = text.replace("\\", "/")
-    text = re.sub(r"[–—−]", "-", text)
-    text = SUPPLIER_MODEL_ALLOWED_CHARS_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = text.strip(" \t\r\n-—–.,;:()[]{}\"'")
-    text = re.sub(r"\s*/\s*", "/", text)
-    text = re.sub(r"\s*\.\s*", ".", text)
-    text = re.sub(r"\s*-\s*", "-", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def looks_like_supplier_model(value: str) -> bool:
-    text = clean_supplier_model_text(value)
-    if not text:
-        return False
-    if not any(char.isdigit() for char in text):
-        return False
-    if not re.search(r"[A-Za-z]", text):
-        return False
-    return bool(re.fullmatch(r"[A-Za-z0-9.\-/_]+(?:\s+[A-Za-z0-9.\-/_]+)*", text))
-
-
-def normalize_feed_vendor_code_for_supplier_compare(value: str, replace_rules: str = "") -> str:
-    text = clean_text(str(value or ""))
-    if not text:
-        return ""
-
-    if replace_rules:
-        text = apply_replace_rules(text, replace_rules)
-
-    text = strip_html_to_text(text)
-    text = fix_cyrillic_confusables_in_model_tokens(text)
-    text = remove_bracketed_text(text)
-    text = re.split(r"[,;]", text, maxsplit=1)[0]
-    return clean_supplier_model_text(text)
-
-
-def supplier_compare_keys(value: str, replace_rules: str = "") -> Set[str]:
-    normalized = normalize_feed_vendor_code_for_supplier_compare(value, replace_rules)
-    return {normalized} if normalized else set()
+def supplier_compare_keys(value: str) -> Set[str]:
+    normalized = normalize_feed_vendor_code_for_supplier_compare(value)
+    compact = compact_supplier_compare_key(normalized)
+    keys = {normalized, compact}
+    keys.discard("")
+    return keys
 
 
 def supplier_exclusion_matches(value: str, exclusions: Iterable[str]) -> bool:
     raw = clean_text(str(value or ""))
-    raw_lower = raw.casefold()
-    normalized_lower = fix_cyrillic_confusables_in_model_tokens(raw).casefold()
-
+    raw_lower = raw.lower()
+    normalized_lower = normalize_model_letters(raw).lower()
     for exclusion in exclusions:
         pattern = clean_text(str(exclusion or ""))
         if not pattern:
             continue
-
-        pattern_lower = pattern.casefold()
-        normalized_pattern = fix_cyrillic_confusables_in_model_tokens(pattern).casefold()
-
+        pattern_lower = pattern.lower()
+        normalized_pattern = normalize_model_letters(pattern).lower()
         if pattern_lower in raw_lower or normalized_pattern in normalized_lower:
             return True
-
     return False
 
 
-def supplier_alpha_tail_looks_descriptive(tokens: List[str]) -> bool:
-    """Определяет английский описательный хвост после основного кода модели.
-
-    Это не список цветов/категорий. Правило общее:
-    - хвост должен состоять только из обычных английских слов;
-    - короткие модельные суффиксы B/W/X/EL/GR/BP и т.п. не считаются описанием;
-    - наличие короткого UPPERCASE-токена обычно означает часть модели.
-    """
-    if not tokens:
-        return False
-
-    if not all(re.fullmatch(r"[A-Za-z]+", token) for token in tokens):
-        return False
-
-    for token in tokens:
-        if token.isupper() and len(token) <= 4:
-            return False
-
-    if len(tokens) == 1 and len(tokens[0]) <= 3:
-        return False
-
-    return True
-
-
-def trim_supplier_descriptive_tail(value: str) -> str:
-    """Убирает английское описание после цельного кода модели, не используя списки цветов."""
-    model = clean_supplier_model_text(value)
-    tokens = model.split()
-
-    if len(tokens) <= 1:
-        return model
-
-    first = tokens[0]
-    first_compact = re.sub(r"[^A-Za-z0-9]", "", first)
-    first_is_compact_model = (
-        len(first_compact) >= 4
-        and any(char.isdigit() for char in first_compact)
-        and bool(re.search(r"[A-Za-z]", first_compact))
-    )
-
-    if not first_is_compact_model:
-        return model
-
-    tail = tokens[1:]
-    if supplier_alpha_tail_looks_descriptive(tail):
-        return first
-
-    return model
-
-
-def extract_supplier_model_after_brand(value: str) -> str:
-    text = clean_text(str(value or ""))
-    if not text:
-        return ""
-
-    # Скобочные комментарии и цвет после запятой не относятся к модели.
-    head = remove_bracketed_text(text)
-    head = re.split(r"[,;]", head, maxsplit=1)[0]
-    head = clean_text(head)
-
-    for _brand, pattern in supplier_brand_patterns():
-        match = re.search(
-            rf"(?<![A-Za-zА-Яа-яЁё0-9])(?:{pattern})(?![A-Za-zА-Яа-яЁё0-9])\s+(.+)$",
-            head,
-            flags=re.IGNORECASE,
-        )
-
-        if not match:
-            continue
-
-        candidate = clean_supplier_model_text(remove_cyrillic_words(match.group(1)))
-        candidate = trim_supplier_descriptive_tail(candidate)
-
-        if looks_like_supplier_model(candidate):
-            return candidate
-
-    return ""
-
-
 def supplier_token_info(token: str) -> Dict[str, object]:
-    normalized = clean_supplier_model_text(fix_cyrillic_confusables_in_model_tokens(token))
-    uppercase_count = sum(1 for char in normalized if char.isupper())
-
+    normalized = normalize_model_letters(token)
     return {
         "raw": token,
         "normalized": normalized,
+        "upper": normalized.upper(),
         "has_digit": any(char.isdigit() for char in normalized),
         "has_latin": bool(re.search(r"[A-Za-z]", normalized)),
-        "is_allowed": bool(re.fullmatch(r"[A-Za-z0-9.\-/_]+", normalized)),
-        "is_alpha": bool(re.fullmatch(r"[A-Za-z]{1,12}", normalized)),
-        "is_alpha_suffix": bool(re.fullmatch(r"[A-Za-z]{1,8}", normalized)),
-        "is_model_prefix": bool(
-            re.fullmatch(r"[A-Za-z][A-Za-z.\-/_]{0,11}", normalized)
-            and (
-                len(normalized.replace("-", "").replace("/", "").replace("_", "").replace(".", "")) <= 4
-                or "-" in normalized
-                or "/" in normalized
-                or uppercase_count >= 2 and not normalized.isupper()
-            )
-        ),
+        "is_allowed": bool(re.fullmatch(r"[A-Za-z0-9-]+", normalized)),
+        "is_upper_alpha": bool(re.fullmatch(r"[A-ZА-ЯЁ]{2,8}", token)) or bool(re.fullmatch(r"[A-Z]{2,8}", normalized)),
     }
 
 
 def is_strong_supplier_model_token(info: Dict[str, object]) -> bool:
     normalized = str(info.get("normalized") or "")
-    if not info.get("is_allowed"):
+    if not info.get("is_allowed") or not info.get("has_digit"):
         return False
-    if not info.get("has_digit") or not info.get("has_latin"):
+    if len(normalized.replace("-", "")) < 3:
         return False
-    return len(re.sub(r"[^A-Za-z0-9]", "", normalized)) >= 3
+    return bool(info.get("has_latin")) or "-" in normalized
 
 
-def is_numeric_supplier_model_token(value: str) -> bool:
-    return bool(re.fullmatch(r"\d+(?:[.\-]\d+)*[A-Za-z]?", value))
-
-
-def can_start_supplier_model_group(tokens: List[Dict[str, object]], index: int) -> bool:
+def is_supplier_model_group_start(tokens: List[Dict[str, object]], index: int) -> bool:
     info = tokens[index]
-    normalized = str(info.get("normalized") or "")
-
     if is_strong_supplier_model_token(info):
         return True
-
-    if not info.get("is_allowed") or not info.get("has_latin") or not info.get("is_model_prefix"):
+    if not info.get("is_allowed") or not info.get("has_latin") or not info.get("is_upper_alpha"):
         return False
-
-    # Префикс модели без цифр допустим, если следом идет числовая или сильная часть модели.
-    for next_info in tokens[index + 1:index + 4]:
+    normalized = str(info.get("normalized") or "")
+    if not (2 <= len(normalized) <= 6):
+        return False
+    for next_info in tokens[index + 1:index + 3]:
         next_value = str(next_info.get("normalized") or "")
-        if is_strong_supplier_model_token(next_info) or is_numeric_supplier_model_token(next_value):
+        if re.fullmatch(r"\d{2,}", next_value):
             return True
-
     return False
 
 
 def can_extend_supplier_model_group(info: Dict[str, object], has_group_digit: bool) -> bool:
     normalized = str(info.get("normalized") or "")
     raw = str(info.get("raw") or "")
-
-    if not normalized or not info.get("is_allowed"):
-        return False
-
-    # Не добавляем русские обозначения напряжения/единиц как часть модели: 12В, 24В, 220В.
     if has_group_digit and re.fullmatch(r"\d+\s*[А-Яа-яЁё]{1,3}", raw):
         return False
-
+    if not info.get("is_allowed"):
+        return False
     if is_strong_supplier_model_token(info):
         return True
-
-    if is_numeric_supplier_model_token(normalized):
+    if re.fullmatch(r"\d{2,}", normalized):
         return True
-
-    if has_group_digit and info.get("is_alpha_suffix"):
+    if has_group_digit and info.get("is_upper_alpha") and 1 <= len(normalized) <= 4:
         return True
-
-    if not has_group_digit and info.get("is_model_prefix"):
-        return True
-
     return False
 
 
-def build_supplier_model_group(tokens: List[Dict[str, object]], index: int) -> str:
-    if not can_start_supplier_model_group(tokens, index):
+def extract_supplier_model_from_name(value: str) -> str:
+    text = clean_text(str(value or ""))
+    if not text:
         return ""
-
-    group: List[Dict[str, object]] = []
-    has_group_digit = False
-
-    for info in tokens[index:]:
-        if not group:
+    text = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", " ", text)
+    text = re.split(r"[,;]", text, maxsplit=1)[0]
+    tokens = [supplier_token_info(match.group(0)) for match in SUPPLIER_MODEL_TOKEN_RE.finditer(text)]
+    for index in range(len(tokens)):
+        if not is_supplier_model_group_start(tokens, index):
+            continue
+        group: List[Dict[str, object]] = []
+        has_group_digit = False
+        for info in tokens[index:]:
+            if not group:
+                group.append(info)
+                has_group_digit = has_group_digit or bool(info.get("has_digit"))
+                continue
+            if not can_extend_supplier_model_group(info, has_group_digit):
+                break
             group.append(info)
             has_group_digit = has_group_digit or bool(info.get("has_digit"))
+        if not any(bool(item.get("has_digit")) for item in group):
             continue
-
-        if not can_extend_supplier_model_group(info, has_group_digit):
-            break
-
-        group.append(info)
-        has_group_digit = has_group_digit or bool(info.get("has_digit"))
-
-    model = clean_supplier_model_text(" ".join(str(item.get("normalized") or "") for item in group))
-    model = trim_supplier_descriptive_tail(model)
-
-    return model if looks_like_supplier_model(model) else ""
-
-
-def should_skip_possible_unknown_brand(tokens: List[Dict[str, object]], index: int) -> bool:
-    """Не даёт fallback принять неизвестный бренд как часть модели.
-
-    Пример после удаления кириллицы:
-    "LEX EDP 671 GR MAX" -> нужно начинать с EDP, а не с LEX.
-    """
-    if index + 2 >= len(tokens):
-        return False
-
-    current = str(tokens[index].get("normalized") or "")
-    next_value = str(tokens[index + 1].get("normalized") or "")
-    after_next_value = str(tokens[index + 2].get("normalized") or "")
-
-    if not re.fullmatch(r"[A-Za-z]{2,8}", current):
-        return False
-
-    if not re.fullmatch(r"[A-Za-z]{2,8}", next_value):
-        return False
-
-    if not is_numeric_supplier_model_token(after_next_value) and not is_strong_supplier_model_token(tokens[index + 2]):
-        return False
-
-    return bool(build_supplier_model_group(tokens, index + 1))
-
-
-def extract_supplier_model_by_tokens(value: str) -> str:
-    text = clean_text(str(value or ""))
-    if not text:
-        return ""
-
-    text = remove_bracketed_text(text)
-    text = re.split(r"[,;]", text, maxsplit=1)[0]
-    text = remove_cyrillic_words(text)
-    text = clean_supplier_model_text(text)
-
-    tokens = [supplier_token_info(match.group(0)) for match in SUPPLIER_MODEL_TOKEN_RE.finditer(text)]
-
-    for index in range(len(tokens)):
-        if should_skip_possible_unknown_brand(tokens, index):
-            continue
-
-        model = build_supplier_model_group(tokens, index)
-        if model:
-            return model
-
+        model = " ".join(str(item.get("normalized") or "") for item in group)
+        return normalize_feed_vendor_code_for_supplier_compare(model)
     return ""
-
-
-def extract_supplier_model_from_name(value: str, replace_rules: str = "") -> str:
-    text = clean_text(str(value or ""))
-    if not text:
-        return ""
-
-    if replace_rules:
-        text = apply_replace_rules(text, replace_rules)
-
-    text = strip_html_to_text(text)
-    text = fix_cyrillic_confusables_in_model_tokens(text)
-    text = remove_bracketed_text(text)
-
-    model = extract_supplier_model_after_brand(text)
-    if model:
-        return model
-
-    return extract_supplier_model_by_tokens(text)
 
 
 def clear_file_import_storage() -> None:
@@ -5055,7 +4778,7 @@ def get_file_import_row(db_session=None) -> FileImport:
     db = db_session or g.db
     row = db.get(FileImport, 1)
     if row is None:
-        row = FileImport(id=1, exclusions=[], model_field="", replace_rules="", file={})
+        row = FileImport(id=1, exclusions=[], model_field="", file={})
         db.add(row)
         db.flush()
     else:
@@ -5066,10 +4789,6 @@ def get_file_import_row(db_session=None) -> FileImport:
         normalized_model_field = clean_text(str(row.model_field or ""))
         if row.model_field != normalized_model_field:
             row.model_field = normalized_model_field
-            db.flush()
-        normalized_replace_rules = normalize_file_import_replace_rules(getattr(row, "replace_rules", ""))
-        if getattr(row, "replace_rules", "") != normalized_replace_rules:
-            row.replace_rules = normalized_replace_rules
             db.flush()
     if not isinstance(row.file, dict) or not row.file.get("stored_filename"):
         stored_files = stored_file_import_files()
@@ -5118,7 +4837,6 @@ def public_file_import_state() -> Dict[str, object]:
     exclusions = normalize_file_import_exclusions(row.exclusions)
     exclusions_text = "\n".join(exclusions)
     model_field = clean_text(str(row.model_field or ""))
-    replace_rules = normalize_file_import_replace_rules(getattr(row, "replace_rules", ""))
     compare_result = None
     if compare_path:
         compare_stat = compare_path.stat()
@@ -5135,14 +4853,12 @@ def public_file_import_state() -> Dict[str, object]:
             "exclusions": exclusions_text,
             "exclusions_list": exclusions,
             "model_field": model_field,
-            "replace_rules": replace_rules,
         }
     stat = path.stat()
     return {
         "exclusions": exclusions_text,
         "exclusions_list": exclusions,
         "model_field": model_field,
-        "replace_rules": replace_rules,
         "compare_result": compare_result,
         "file": {
             "filename": output_text(str(file_meta.get("original_filename") or path.name)),
@@ -5248,26 +4964,26 @@ def read_supplier_file_rows(path: Path, model_field: str) -> List[Dict[str, obje
     return result
 
 
-def parse_supplier_compare_feed_codes_from_xml(content: bytes, replace_rules: str = "") -> Set[str]:
+def parse_supplier_compare_feed_codes_from_xml(content: bytes) -> Set[str]:
     codes: Set[str] = set()
     try:
         for _event, node in ET.iterparse(io.BytesIO(content), events=("end",)):
             children = list(node)
             if children:
-                vendor_code = ""
+                values: Dict[str, str] = {}
                 for child in children:
                     key = str(child.tag).split("}")[-1].lower()
-                    if key == "vendorcode":
-                        vendor_code = clean_text(child.text or "")
-                        break
-                codes.update(supplier_compare_keys(vendor_code, replace_rules))
+                    if key in {"vendorcode", "model"}:
+                        values[key] = clean_text(child.text or "")
+                for value in values.values():
+                    codes.update(supplier_compare_keys(value))
                 node.clear()
     except ET.ParseError:
         raise
     return codes
 
 
-def fetch_supplier_compare_feed_code_sets(replace_rules: str = "") -> tuple[Set[str], List[Dict[str, object]], List[Dict[str, object]]]:
+def fetch_supplier_compare_feed_code_sets() -> tuple[Set[str], List[Dict[str, object]], List[Dict[str, object]]]:
     downloaded_feeds = download_feed_files()
     all_codes: Set[str] = set()
     feeds: List[Dict[str, object]] = []
@@ -5276,7 +4992,7 @@ def fetch_supplier_compare_feed_code_sets(replace_rules: str = "") -> tuple[Set[
         filename = str(feed.get("filename") or "")
         path = source_feed_dir(str(feed.get("source") or "")) / filename
         try:
-            feed_codes = parse_supplier_compare_feed_codes_from_xml(path.read_bytes(), replace_rules)
+            feed_codes = parse_supplier_compare_feed_codes_from_xml(path.read_bytes())
             all_codes.update(feed_codes)
             feeds.append({**feed, "codes_count": len(feed_codes)})
             feed_code_sets.append({**feed, "codes_count": len(feed_codes), "codes": feed_codes})
@@ -5299,9 +5015,8 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
     if not model_field:
         raise ValueError("Укажите название столбца модели")
     exclusions = normalize_file_import_exclusions(row.exclusions)
-    replace_rules = normalize_file_import_replace_rules(getattr(row, "replace_rules", ""))
     supplier_rows = read_supplier_file_rows(path, model_field)
-    feed_codes, local_feeds, feed_code_sets = fetch_supplier_compare_feed_code_sets(replace_rules)
+    feed_codes, local_feeds, feed_code_sets = fetch_supplier_compare_feed_code_sets()
 
     result_rows: List[Dict[str, object]] = []
     processed = 0
@@ -5315,7 +5030,7 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
             excluded += 1
             continue
         processed += 1
-        model = extract_supplier_model_from_name(name, replace_rules)
+        model = extract_supplier_model_from_name(name)
         if not model:
             empty_model += 1
             result_rows.append(
@@ -5328,7 +5043,7 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
                 }
             )
             continue
-        keys = supplier_compare_keys(model, replace_rules)
+        keys = supplier_compare_keys(model)
         matched = bool(keys & feed_codes)
         if matched:
             found += 1
@@ -7228,9 +6943,6 @@ def api_update_file_import():
         remove_file_import_result()
     if "model_field" in payload:
         row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
-        remove_file_import_result()
-    if "replace_rules" in payload:
-        row.replace_rules = normalize_file_import_replace_rules(payload.get("replace_rules"))
         remove_file_import_result()
     if "file" in payload:
         file_payload = payload.get("file")
