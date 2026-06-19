@@ -49,6 +49,7 @@ const modelEndMarker = document.querySelector("#modelEndMarker");
 const modelReplaceRules = document.querySelector("#modelReplaceRules");
 const fileImportInput = document.querySelector("#fileImportInput");
 const fileImportExclusions = document.querySelector("#fileImportExclusions");
+const fileImportModelField = document.querySelector("#fileImportModelField");
 const saveFileImportButton = document.querySelector("#saveFileImportButton");
 const fileImportSaveNotice = document.querySelector("#fileImportSaveNotice");
 const fileImportSelected = document.querySelector("#fileImportSelected");
@@ -888,6 +889,9 @@ function renderFileImport() {
   if (fileImportExclusions && document.activeElement !== fileImportExclusions) {
     fileImportExclusions.value = fileImportData?.exclusions || "";
   }
+  if (fileImportModelField && document.activeElement !== fileImportModelField) {
+    fileImportModelField.value = fileImportData?.model_field || "";
+  }
   fileImportName.textContent = file?.filename || "—";
   fileImportSize.textContent = file?.size ? formatFileSize(file.size) : "";
   fileImportSelected.classList.toggle("hidden", !file);
@@ -895,9 +899,15 @@ function renderFileImport() {
   if (saveFileImportButton) saveFileImportButton.disabled = fileImportUploading;
   clearFileImportButton.disabled = fileImportUploading || !file;
   compareFileImportButton.disabled = fileImportUploading || !file;
-  downloadFileImportCsvButton.classList.add("disabled");
-  downloadFileImportCsvButton.setAttribute("aria-disabled", "true");
-  downloadFileImportCsvButton.href = "#";
+  if (fileImportData?.result_ready) {
+    downloadFileImportCsvButton.classList.remove("disabled");
+    downloadFileImportCsvButton.setAttribute("aria-disabled", "false");
+    downloadFileImportCsvButton.href = "/api/file-import/download";
+  } else {
+    downloadFileImportCsvButton.classList.add("disabled");
+    downloadFileImportCsvButton.setAttribute("aria-disabled", "true");
+    downloadFileImportCsvButton.href = "#";
+  }
   fileImportInput.disabled = fileImportUploading;
   if (!fileImportUploading && !file) {
     fileImportProgress.classList.add("hidden");
@@ -919,6 +929,7 @@ async function saveFileImport() {
     method: "PATCH",
     body: JSON.stringify({
       exclusions: fileImportExclusions?.value || "",
+      model_field: fileImportModelField?.value || "",
       file: fileImportData?.file || null,
     }),
   });
@@ -959,6 +970,16 @@ function uploadFileImport(file) {
 async function deleteFileImport() {
   fileImportData = await requestJson("/api/file-import", { method: "DELETE" });
   fileImportInput.value = "";
+  renderFileImport();
+}
+
+async function compareFileImport() {
+  compareFileImportButton.disabled = true;
+  fileImportProgress.classList.remove("hidden");
+  setFileImportProgress(20, "Сравниваю с фидами...");
+  fileImportData = await requestJson("/api/file-import/compare", { method: "POST" });
+  const summary = fileImportData?.summary || {};
+  setFileImportProgress(100, `Готово. Missing: ${Number(summary.missing_rows || 0)}`);
   renderFileImport();
 }
 
@@ -1891,6 +1912,12 @@ if (fileImportExclusions && fileImportSaveNotice) {
   });
 }
 
+if (fileImportModelField && fileImportSaveNotice) {
+  fileImportModelField.addEventListener("input", () => {
+    fileImportSaveNotice.textContent = "";
+  });
+}
+
 if (saveFileImportButton && fileImportSaveNotice) {
   saveFileImportButton.addEventListener("click", () => {
     saveFileImport().catch((error) => {
@@ -1933,6 +1960,18 @@ if (clearFileImportButton) {
     } catch (error) {
       fileImportNotice.textContent = error.message;
       clearFileImportButton.disabled = false;
+    }
+  });
+}
+
+if (compareFileImportButton) {
+  compareFileImportButton.addEventListener("click", async () => {
+    try {
+      await saveFileImport();
+      await compareFileImport();
+    } catch (error) {
+      fileImportNotice.textContent = error.message;
+      compareFileImportButton.disabled = false;
     }
   });
 }
