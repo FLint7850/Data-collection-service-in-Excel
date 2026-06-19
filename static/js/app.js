@@ -899,10 +899,9 @@ function renderFileImport() {
   if (saveFileImportButton) saveFileImportButton.disabled = fileImportUploading;
   clearFileImportButton.disabled = fileImportUploading || !file;
   compareFileImportButton.disabled = fileImportUploading || !file;
-  const compareResult = fileImportData?.compare_result || null;
-  downloadFileImportCsvButton.classList.toggle("disabled", !compareResult);
-  downloadFileImportCsvButton.setAttribute("aria-disabled", compareResult ? "false" : "true");
-  downloadFileImportCsvButton.href = compareResult?.download_url || "#";
+  downloadFileImportCsvButton.classList.add("disabled");
+  downloadFileImportCsvButton.setAttribute("aria-disabled", "true");
+  downloadFileImportCsvButton.href = "#";
   fileImportInput.disabled = fileImportUploading;
   if (!fileImportUploading && !file) {
     fileImportProgress.classList.add("hidden");
@@ -965,20 +964,6 @@ function uploadFileImport(file) {
 async function deleteFileImport() {
   fileImportData = await requestJson("/api/file-import", { method: "DELETE" });
   fileImportInput.value = "";
-  renderFileImport();
-}
-
-async function compareFileImport() {
-  if (!compareFileImportButton || !fileImportNotice) return;
-  compareFileImportButton.disabled = true;
-  fileImportProgress.classList.remove("hidden");
-  setFileImportProgress(20, "Сравниваю с фидами...");
-  fileImportData = await requestJson("/api/file-import/compare", { method: "POST" });
-  const summary = fileImportData?.summary || {};
-  const found = Number(summary.found_rows || 0);
-  const missing = Number(summary.missing_rows || 0);
-  const empty = Number(summary.model_not_found_rows || 0);
-  setFileImportProgress(100, `CSV сформирован: найдено ${found}, не найдено ${missing}, без модели ${empty}`);
   renderFileImport();
 }
 
@@ -1959,17 +1944,6 @@ if (clearFileImportButton) {
     } catch (error) {
       fileImportNotice.textContent = error.message;
       clearFileImportButton.disabled = false;
-    }
-  });
-}
-
-if (compareFileImportButton) {
-  compareFileImportButton.addEventListener("click", async () => {
-    try {
-      await compareFileImport();
-    } catch (error) {
-      fileImportNotice.textContent = error.message;
-      compareFileImportButton.disabled = false;
     }
   });
 }

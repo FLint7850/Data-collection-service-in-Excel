@@ -4601,156 +4601,6 @@ def safe_filename(value: str) -> str:
 FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx"}
 
 
-CYRILLIC_MODEL_TRANSLATION = str.maketrans(
-    {
-        "А": "A",
-        "В": "B",
-        "Е": "E",
-        "К": "K",
-        "М": "M",
-        "Н": "H",
-        "О": "O",
-        "Р": "P",
-        "С": "C",
-        "Т": "T",
-        "Х": "X",
-        "а": "a",
-        "е": "e",
-        "к": "k",
-        "м": "m",
-        "н": "h",
-        "о": "o",
-        "р": "p",
-        "с": "c",
-        "т": "t",
-        "х": "x",
-    }
-)
-
-
-SUPPLIER_MODEL_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*")
-
-
-def normalize_model_letters(value: str) -> str:
-    return str(value or "").translate(CYRILLIC_MODEL_TRANSLATION)
-
-
-def normalize_feed_vendor_code_for_supplier_compare(value: str) -> str:
-    value = normalize_model_letters(clean_text(str(value or "")))
-    value = re.sub(r"[^A-Za-z0-9\-\s]+", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value.upper()
-
-
-def compact_supplier_compare_key(value: str) -> str:
-    return re.sub(r"[\s\-]+", "", normalize_feed_vendor_code_for_supplier_compare(value))
-
-
-def supplier_compare_keys(value: str) -> Set[str]:
-    normalized = normalize_feed_vendor_code_for_supplier_compare(value)
-    compact = compact_supplier_compare_key(normalized)
-    keys = {normalized, compact}
-    keys.discard("")
-    return keys
-
-
-def supplier_exclusion_matches(value: str, exclusions: Iterable[str]) -> bool:
-    raw = clean_text(str(value or ""))
-    raw_lower = raw.lower()
-    normalized_lower = normalize_model_letters(raw).lower()
-    for exclusion in exclusions:
-        pattern = clean_text(str(exclusion or ""))
-        if not pattern:
-            continue
-        pattern_lower = pattern.lower()
-        normalized_pattern = normalize_model_letters(pattern).lower()
-        if pattern_lower in raw_lower or normalized_pattern in normalized_lower:
-            return True
-    return False
-
-
-def supplier_token_info(token: str) -> Dict[str, object]:
-    normalized = normalize_model_letters(token)
-    return {
-        "raw": token,
-        "normalized": normalized,
-        "upper": normalized.upper(),
-        "has_digit": any(char.isdigit() for char in normalized),
-        "has_latin": bool(re.search(r"[A-Za-z]", normalized)),
-        "is_allowed": bool(re.fullmatch(r"[A-Za-z0-9-]+", normalized)),
-        "is_upper_alpha": bool(re.fullmatch(r"[A-ZА-ЯЁ]{2,8}", token)) or bool(re.fullmatch(r"[A-Z]{2,8}", normalized)),
-    }
-
-
-def is_strong_supplier_model_token(info: Dict[str, object]) -> bool:
-    normalized = str(info.get("normalized") or "")
-    if not info.get("is_allowed") or not info.get("has_digit"):
-        return False
-    if len(normalized.replace("-", "")) < 3:
-        return False
-    return bool(info.get("has_latin")) or "-" in normalized
-
-
-def is_supplier_model_group_start(tokens: List[Dict[str, object]], index: int) -> bool:
-    info = tokens[index]
-    if is_strong_supplier_model_token(info):
-        return True
-    if not info.get("is_allowed") or not info.get("has_latin") or not info.get("is_upper_alpha"):
-        return False
-    normalized = str(info.get("normalized") or "")
-    if not (2 <= len(normalized) <= 6):
-        return False
-    for next_info in tokens[index + 1:index + 3]:
-        next_value = str(next_info.get("normalized") or "")
-        if re.fullmatch(r"\d{2,}", next_value):
-            return True
-    return False
-
-
-def can_extend_supplier_model_group(info: Dict[str, object], has_group_digit: bool) -> bool:
-    normalized = str(info.get("normalized") or "")
-    raw = str(info.get("raw") or "")
-    if has_group_digit and re.fullmatch(r"\d+\s*[А-Яа-яЁё]{1,3}", raw):
-        return False
-    if not info.get("is_allowed"):
-        return False
-    if is_strong_supplier_model_token(info):
-        return True
-    if re.fullmatch(r"\d{2,}", normalized):
-        return True
-    if has_group_digit and info.get("is_upper_alpha") and 1 <= len(normalized) <= 4:
-        return True
-    return False
-
-
-def extract_supplier_model_from_name(value: str) -> str:
-    text = clean_text(str(value or ""))
-    if not text:
-        return ""
-    text = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", " ", text)
-    text = re.split(r"[,;]", text, maxsplit=1)[0]
-    tokens = [supplier_token_info(match.group(0)) for match in SUPPLIER_MODEL_TOKEN_RE.finditer(text)]
-    for index in range(len(tokens)):
-        if not is_supplier_model_group_start(tokens, index):
-            continue
-        group: List[Dict[str, object]] = []
-        has_group_digit = False
-        for info in tokens[index:]:
-            if not group:
-                group.append(info)
-                has_group_digit = has_group_digit or bool(info.get("has_digit"))
-                continue
-            if not can_extend_supplier_model_group(info, has_group_digit):
-                break
-            group.append(info)
-            has_group_digit = has_group_digit or bool(info.get("has_digit"))
-        if not any(bool(item.get("has_digit")) for item in group):
-            continue
-        model = " ".join(str(item.get("normalized") or "") for item in group)
-        return normalize_feed_vendor_code_for_supplier_compare(model)
-    return ""
-
-
 def clear_file_import_storage() -> None:
     FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     for path in FILE_IMPORT_DIR.iterdir():
@@ -4816,282 +4666,26 @@ def current_file_import_path() -> Optional[Path]:
     return path
 
 
-def current_file_import_compare_path() -> Optional[Path]:
-    row = get_file_import_row()
-    file_meta = row.file if isinstance(row.file, dict) else {}
-    filename = str(file_meta.get("result_filename") or "").strip()
-    if not filename:
-        return None
-    path = (EXPORT_DIR / filename).resolve()
-    base_dir = EXPORT_DIR.resolve()
-    if base_dir not in path.parents or not path.exists() or not path.is_file():
-        return None
-    return path
-
-
 def public_file_import_state() -> Dict[str, object]:
     row = get_file_import_row()
     path = current_file_import_path()
-    compare_path = current_file_import_compare_path()
     file_meta = row.file if isinstance(row.file, dict) else {}
     exclusions = normalize_file_import_exclusions(row.exclusions)
     exclusions_text = "\n".join(exclusions)
     model_field = clean_text(str(row.model_field or ""))
-    compare_result = None
-    if compare_path:
-        compare_stat = compare_path.stat()
-        compare_result = {
-            "filename": compare_path.name,
-            "size": compare_stat.st_size,
-            "download_url": "/api/file-import/result",
-            "created_at": datetime.fromtimestamp(compare_stat.st_mtime, MSK_TZ).isoformat(timespec="seconds"),
-        }
     if not path:
-        return {
-            "file": None,
-            "compare_result": compare_result,
-            "exclusions": exclusions_text,
-            "exclusions_list": exclusions,
-            "model_field": model_field,
-        }
+        return {"file": None, "exclusions": exclusions_text, "exclusions_list": exclusions, "model_field": model_field}
     stat = path.stat()
     return {
         "exclusions": exclusions_text,
         "exclusions_list": exclusions,
         "model_field": model_field,
-        "compare_result": compare_result,
         "file": {
             "filename": output_text(str(file_meta.get("original_filename") or path.name)),
             "stored_filename": path.name,
             "size": stat.st_size,
             "uploaded_at": str(file_meta.get("uploaded_at") or datetime.fromtimestamp(stat.st_mtime, MSK_TZ).isoformat(timespec="seconds")),
         }
-    }
-
-
-def file_import_result_filename(source_filename: str) -> str:
-    source_name = Path(source_filename or "file").stem
-    safe_source = safe_filename(source_name)
-    timestamp = datetime.now(MSK_TZ).strftime("%d-%m-%Y_%H-%M-%S")
-    return f"Новинки_{safe_source}_{timestamp}.csv"
-
-
-def file_import_result_path(source_filename: str) -> Path:
-    EXPORT_DIR.mkdir(exist_ok=True)
-    return EXPORT_DIR / file_import_result_filename(source_filename)
-
-
-def remove_file_import_result() -> None:
-    row = get_file_import_row()
-    file_meta = dict(row.file) if isinstance(row.file, dict) else {}
-    filename = str(file_meta.get("result_filename") or "").strip()
-    if not filename:
-        return
-    path = (EXPORT_DIR / filename).resolve()
-    if EXPORT_DIR.resolve() in path.parents and path.exists() and path.is_file():
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    file_meta.pop("result_filename", None)
-    file_meta.pop("result_created_at", None)
-    row.file = file_meta
-
-
-def decode_csv_bytes(content: bytes) -> str:
-    try:
-        import chardet
-
-        detected = chardet.detect(content)
-        encoding = detected.get("encoding") or "utf-8-sig"
-    except Exception:
-        encoding = "utf-8-sig"
-    for candidate in [encoding, "utf-8-sig", "utf-8", "cp1251"]:
-        try:
-            return content.decode(candidate)
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return content.decode("utf-8", errors="replace")
-
-
-def normalize_header_name(value: object) -> str:
-    return clean_text(str(value or "")).casefold()
-
-
-def find_required_column(headers: List[object], column_name: str) -> int:
-    expected = normalize_header_name(column_name)
-    if not expected:
-        raise ValueError("Укажите название столбца модели")
-    for index, header in enumerate(headers):
-        if normalize_header_name(header) == expected:
-            return index
-    raise ValueError(f"Столбец модели не найден: {column_name}")
-
-
-def read_supplier_file_rows(path: Path, model_field: str) -> List[Dict[str, object]]:
-    if path.suffix.lower() == ".csv":
-        text = decode_csv_bytes(path.read_bytes())
-        sample = text[:4096]
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,|\t,")
-        except csv.Error:
-            dialect = csv.excel
-            dialect.delimiter = ";"
-        reader = csv.reader(io.StringIO(text), dialect)
-        rows = list(reader)
-    elif path.suffix.lower() == ".xlsx":
-        from openpyxl import load_workbook
-
-        workbook = load_workbook(path, read_only=True, data_only=True)
-        sheet = workbook.active
-        rows = [list(row) for row in sheet.iter_rows(values_only=True)]
-        workbook.close()
-    else:
-        raise ValueError("Можно обработать только CSV или XLSX")
-
-    header_index = next((index for index, row in enumerate(rows) if any(clean_text(str(cell or "")) for cell in row)), None)
-    if header_index is None:
-        return []
-    headers = rows[header_index]
-    model_index = find_required_column(headers, model_field)
-    result = []
-    for row_number, row in enumerate(rows[header_index + 1:], start=header_index + 2):
-        value = row[model_index] if model_index < len(row) else ""
-        name = clean_text(str(value or ""))
-        if not name:
-            continue
-        result.append({"row_number": row_number, "name": name})
-    return result
-
-
-def parse_supplier_compare_feed_codes_from_xml(content: bytes) -> Set[str]:
-    codes: Set[str] = set()
-    try:
-        for _event, node in ET.iterparse(io.BytesIO(content), events=("end",)):
-            children = list(node)
-            if children:
-                values: Dict[str, str] = {}
-                for child in children:
-                    key = str(child.tag).split("}")[-1].lower()
-                    if key in {"vendorcode", "model"}:
-                        values[key] = clean_text(child.text or "")
-                for value in values.values():
-                    codes.update(supplier_compare_keys(value))
-                node.clear()
-    except ET.ParseError:
-        raise
-    return codes
-
-
-def fetch_supplier_compare_feed_code_sets() -> tuple[Set[str], List[Dict[str, object]], List[Dict[str, object]]]:
-    downloaded_feeds = download_feed_files()
-    all_codes: Set[str] = set()
-    feeds: List[Dict[str, object]] = []
-    feed_code_sets: List[Dict[str, object]] = []
-    for feed in downloaded_feeds:
-        filename = str(feed.get("filename") or "")
-        path = source_feed_dir(str(feed.get("source") or "")) / filename
-        try:
-            feed_codes = parse_supplier_compare_feed_codes_from_xml(path.read_bytes())
-            all_codes.update(feed_codes)
-            feeds.append({**feed, "codes_count": len(feed_codes)})
-            feed_code_sets.append({**feed, "codes_count": len(feed_codes), "codes": feed_codes})
-        except Exception as exc:
-            feeds.append({**feed, "codes_count": 0, "error": str(exc)})
-            feed_code_sets.append({**feed, "codes_count": 0, "codes": set(), "error": str(exc)})
-    with news_lock:
-        news_settings["feed_storage"] = feeds
-        save_news_settings()
-    save_logs()
-    return all_codes, feeds, feed_code_sets
-
-
-def compare_file_import_with_feeds() -> Dict[str, object]:
-    row = get_file_import_row()
-    path = current_file_import_path()
-    if not path:
-        raise ValueError("Файл не загружен")
-    model_field = clean_text(str(row.model_field or ""))
-    if not model_field:
-        raise ValueError("Укажите название столбца модели")
-    exclusions = normalize_file_import_exclusions(row.exclusions)
-    supplier_rows = read_supplier_file_rows(path, model_field)
-    feed_codes, local_feeds, feed_code_sets = fetch_supplier_compare_feed_code_sets()
-
-    result_rows: List[Dict[str, object]] = []
-    processed = 0
-    excluded = 0
-    empty_model = 0
-    found = 0
-    missing = 0
-    for item in supplier_rows:
-        name = str(item.get("name") or "")
-        if supplier_exclusion_matches(name, exclusions):
-            excluded += 1
-            continue
-        processed += 1
-        model = extract_supplier_model_from_name(name)
-        if not model:
-            empty_model += 1
-            result_rows.append(
-                {
-                    "row_number": item.get("row_number"),
-                    "name": name,
-                    "model": "",
-                    "status": "model_not_found",
-                    "missing_on": "",
-                }
-            )
-            continue
-        keys = supplier_compare_keys(model)
-        matched = bool(keys & feed_codes)
-        if matched:
-            found += 1
-            continue
-        else:
-            missing += 1
-            status = "missing"
-            missing_feeds = []
-            for feed in feed_code_sets:
-                codes = feed.get("codes", set())
-                if not isinstance(codes, set):
-                    codes = set(codes) if isinstance(codes, list) else set()
-                if not (keys & codes):
-                    missing_feeds.append(str(feed.get("source_label") or feed.get("url") or "Фид"))
-            missing_on = ", ".join(missing_feeds)
-        result_rows.append(
-            {
-                "row_number": item.get("row_number"),
-                "name": name,
-                "model": model,
-                "status": status,
-                "missing_on": missing_on,
-            }
-        )
-
-    file_meta = dict(row.file) if isinstance(row.file, dict) else {}
-    original_filename = str(file_meta.get("original_filename") or file_meta.get("filename") or path.name)
-    remove_file_import_result()
-    result_path = file_import_result_path(original_filename)
-    with result_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=["row_number", "name", "model", "status", "missing_on"], delimiter=";")
-        writer.writeheader()
-        writer.writerows(result_rows)
-
-    file_meta = dict(row.file) if isinstance(row.file, dict) else {}
-    file_meta["result_filename"] = result_path.name
-    file_meta["result_created_at"] = datetime.now(MSK_TZ).isoformat(timespec="seconds")
-    row.file = file_meta
-
-    return {
-        "total_rows": len(supplier_rows),
-        "processed_rows": processed,
-        "excluded_rows": excluded,
-        "model_not_found_rows": empty_model,
-        "found_rows": found,
-        "missing_rows": missing,
-        "feeds_count": len(local_feeds),
-        "feed_codes_count": len(feed_codes),
     }
 
 
@@ -6940,10 +6534,8 @@ def api_update_file_import():
     row = get_file_import_row()
     if "exclusions" in payload:
         row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
-        remove_file_import_result()
     if "model_field" in payload:
         row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
-        remove_file_import_result()
     if "file" in payload:
         file_payload = payload.get("file")
         if not file_payload:
@@ -6959,29 +6551,6 @@ def api_update_file_import():
                     "uploaded_at": str(file_payload.get("uploaded_at") or datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")),
                 }
     return jsonify(public_file_import_state())
-
-
-@app.post("/api/file-import/compare")
-def api_compare_file_import():
-    ensure_storage()
-    try:
-        summary = compare_file_import_with_feeds()
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"error": f"Не удалось сравнить файл: {exc}"}), 500
-    state = public_file_import_state()
-    state["summary"] = summary
-    return jsonify(state)
-
-
-@app.get("/api/file-import/result")
-def api_download_file_import_result():
-    ensure_storage()
-    path = current_file_import_compare_path()
-    if not path:
-        return jsonify({"error": "CSV сравнения еще не сформирован"}), 404
-    return send_file(path, as_attachment=True, download_name=output_text(path.name))
 
 
 @app.post("/api/file-import")
