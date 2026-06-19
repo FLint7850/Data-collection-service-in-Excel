@@ -228,13 +228,16 @@ def migrate_file_import_table(connection) -> None:
 
     rows = [dict(row) for row in connection.execute(text("SELECT * FROM file_import")).mappings().all()]
     if columns.get("exclusions") == "JSON" and "model_field" in columns:
+        if "replace_rules" not in columns:
+            connection.execute(text("ALTER TABLE file_import ADD COLUMN replace_rules TEXT NOT NULL DEFAULT ''"))
         for row in rows:
             connection.execute(
-                text("UPDATE file_import SET exclusions = json(:exclusions), model_field = :model_field WHERE id = :id"),
+                text("UPDATE file_import SET exclusions = json(:exclusions), model_field = :model_field, replace_rules = :replace_rules WHERE id = :id"),
                 {
                     "id": row.get("id"),
                     "exclusions": json.dumps(_string_array_from_lines(row.get("exclusions")), ensure_ascii=False),
                     "model_field": str(row.get("model_field") or "").strip(),
+                    "replace_rules": str(row.get("replace_rules") or "").strip(),
                 },
             )
         return
@@ -246,6 +249,7 @@ def migrate_file_import_table(connection) -> None:
             "id INTEGER NOT NULL PRIMARY KEY, "
             "exclusions JSON NOT NULL DEFAULT '[]', "
             "model_field VARCHAR(255) NOT NULL DEFAULT '', "
+            "replace_rules TEXT NOT NULL DEFAULT '', "
             "file JSON NOT NULL DEFAULT '{}', "
             "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
             "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
@@ -256,13 +260,14 @@ def migrate_file_import_table(connection) -> None:
         connection.execute(
             text(
                 "INSERT INTO file_import_migration_tmp "
-                "(id, exclusions, model_field, file, created_at, updated_at) "
-                "VALUES (:id, json(:exclusions), :model_field, json(:file), :created_at, :updated_at)"
+                "(id, exclusions, model_field, replace_rules, file, created_at, updated_at) "
+                "VALUES (:id, json(:exclusions), :model_field, :replace_rules, json(:file), :created_at, :updated_at)"
             ),
             {
                 "id": row.get("id"),
                 "exclusions": json.dumps(_string_array_from_lines(row.get("exclusions")), ensure_ascii=False),
                 "model_field": str(row.get("model_field") or "").strip(),
+                "replace_rules": str(row.get("replace_rules") or "").strip(),
                 "file": json.dumps(_json_or_default(row.get("file"), {}), ensure_ascii=False),
                 "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
                 "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
