@@ -119,6 +119,51 @@ function enableDetailsAnimation(details) {
 enableDetailsAnimation(fileImportExclusionsDetails);
 enableDetailsAnimation(fileImportRulesDetails);
 
+function animateNewsGroup(list, collapse) {
+  if (!list) return;
+
+  list._toggleAnimation?.commitStyles?.();
+  list._toggleAnimation?.cancel();
+  const duration = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 220;
+
+  if (collapse) {
+    const height = list.getBoundingClientRect().height;
+    list.style.height = `${height}px`;
+    list._toggleAnimation = list.animate(
+      [
+        { height: `${height}px`, opacity: 1, transform: "translateY(0)" },
+        { height: "0px", opacity: 0, transform: "translateY(-4px)" },
+      ],
+      { duration, easing: "ease-in-out" },
+    );
+    list._toggleAnimation.onfinish = () => {
+      list.classList.add("news-brand-grid--collapsed");
+      list.style.height = "";
+      list.style.opacity = "";
+      list.style.transform = "";
+      list._toggleAnimation = null;
+    };
+    return;
+  }
+
+  list.classList.remove("news-brand-grid--collapsed");
+  const height = list.getBoundingClientRect().height;
+  list.style.height = "0px";
+  list._toggleAnimation = list.animate(
+    [
+      { height: "0px", opacity: 0, transform: "translateY(-4px)" },
+      { height: `${height}px`, opacity: 1, transform: "translateY(0)" },
+    ],
+    { duration, easing: "ease-in-out" },
+  );
+  list._toggleAnimation.onfinish = () => {
+    list.style.height = "";
+    list.style.opacity = "";
+    list.style.transform = "";
+    list._toggleAnimation = null;
+  };
+}
+
 const logsList = document.querySelector("#logsList");
 const clearLogsButton = document.querySelector("#clearLogsButton");
 const refreshLogsButton = document.querySelector("#refreshLogsButton");
@@ -2250,7 +2295,7 @@ newsGroups.addEventListener("click", (event) => {
     } else {
       collapsedNewsGroups.add(group);
     }
-    list?.classList.toggle("news-brand-grid--collapsed", nextCollapsed);
+    animateNewsGroup(list, nextCollapsed);
     toggleButton.setAttribute("aria-expanded", nextCollapsed ? "false" : "true");
     if (icon) icon.textContent = nextCollapsed ? "▸" : "▾";
     return;

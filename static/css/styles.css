@@ -1067,11 +1067,10 @@ select:focus {
   opacity: 1;
   overflow: hidden;
   transform: translateY(0);
-  transition: max-height 280ms ease, opacity 220ms ease, transform 220ms ease, margin-top 220ms ease;
 }
 
 .news-brand-grid--collapsed {
-  max-height: 0;
+  height: 0;
   opacity: 0;
   margin-top: 0;
   pointer-events: none;
