@@ -293,16 +293,22 @@
             <span>Название столбца с моделью</span>
             <input id="fileImportModelField" type="text" placeholder="name">
           </label>
-          <label class="field file-import-exclusions-field">
-            <span>Исключения</span>
-            <textarea id="fileImportExclusions" rows="5" placeholder="Автомобильный холодильник&#10;Гриль из чугуна&#10;Фотоэпилятор"></textarea>
-          </label>
+          <details class="settings-details file-import-exclusions">
+            <summary>Исключения</summary>
+            <div class="settings-details__content">
+              <label class="field file-import-exclusions-field">
+                <textarea id="fileImportExclusions" rows="5" placeholder="Автомобильный холодильник&#10;Гриль из чугуна&#10;Фотоэпилятор"></textarea>
+              </label>
+            </div>
+          </details>
           <details class="settings-details file-import-rules">
             <summary>Правила поиск/замены</summary>
-            <div class="selector-grid">
-              <label class="field modal-wide-field">
-                <textarea id="fileImportModelReplaceRules" rows="5" placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|&#10;{reg[#\s{2,}#]}| "></textarea>
-              </label>
+            <div class="settings-details__content">
+              <div class="selector-grid">
+                <label class="field modal-wide-field">
+                  <textarea id="fileImportModelReplaceRules" rows="5" placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|&#10;{reg[#\s{2,}#]}| "></textarea>
+                </label>
+              </div>
             </div>
           </details>
           <div class="file-import-save-row">

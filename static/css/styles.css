@@ -549,7 +549,6 @@ select:focus {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel-soft);
-  margin-top: 10px;
 }
 
 .settings-details summary {
@@ -890,6 +889,14 @@ select:focus {
 
 .file-import-exclusions-field textarea {
   min-height: 132px;
+}
+
+.file-import-panel .settings-details__content {
+  overflow: hidden;
+}
+
+.file-import-exclusions .file-import-exclusions-field {
+  padding: 0 14px 14px;
 }
 
 .file-import-save-row {

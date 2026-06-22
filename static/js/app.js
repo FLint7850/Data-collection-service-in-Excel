@@ -49,6 +49,8 @@ const modelEndMarker = document.querySelector("#modelEndMarker");
 const modelReplaceRules = document.querySelector("#modelReplaceRules");
 const fileImportInput = document.querySelector("#fileImportInput");
 const fileImportExclusions = document.querySelector("#fileImportExclusions");
+const fileImportExclusionsDetails = document.querySelector(".file-import-exclusions");
+const fileImportRulesDetails = document.querySelector(".file-import-rules");
 const fileImportModelField = document.querySelector("#fileImportModelField");
 const fileImportModelReplaceRules = document.querySelector("#fileImportModelReplaceRules");
 const saveFileImportButton = document.querySelector("#saveFileImportButton");
@@ -64,6 +66,58 @@ const fileImportNotice = document.querySelector("#fileImportNotice");
 const fileImportActions = document.querySelector("#fileImportActions");
 const compareFileImportButton = document.querySelector("#compareFileImportButton");
 const downloadFileImportCsvButton = document.querySelector("#downloadFileImportCsvButton");
+
+function enableDetailsAnimation(details) {
+  if (!details) return;
+
+  const summary = details.querySelector("summary");
+  const content = details.querySelector(".settings-details__content");
+  if (!summary || !content) return;
+
+  let animation = null;
+  const duration = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 220;
+
+  summary.addEventListener("click", (event) => {
+    event.preventDefault();
+
+    if (animation) {
+      animation.commitStyles?.();
+      animation.cancel();
+    }
+
+    const startHeight = content.getBoundingClientRect().height;
+    if (details.open) {
+      content.style.height = `${startHeight}px`;
+      animation = content.animate(
+        [{ height: `${startHeight}px`, opacity: 1 }, { height: "0px", opacity: 0 }],
+        { duration, easing: "ease-in-out" },
+      );
+      animation.onfinish = () => {
+        details.open = false;
+        content.style.height = "";
+        content.style.opacity = "";
+        animation = null;
+      };
+      return;
+    }
+
+    details.open = true;
+    const endHeight = content.getBoundingClientRect().height;
+    content.style.height = "0px";
+    animation = content.animate(
+      [{ height: "0px", opacity: 0 }, { height: `${endHeight}px`, opacity: 1 }],
+      { duration, easing: "ease-in-out" },
+    );
+    animation.onfinish = () => {
+      content.style.height = "";
+      content.style.opacity = "";
+      animation = null;
+    };
+  });
+}
+
+enableDetailsAnimation(fileImportExclusionsDetails);
+enableDetailsAnimation(fileImportRulesDetails);
 
 const logsList = document.querySelector("#logsList");
 const clearLogsButton = document.querySelector("#clearLogsButton");
