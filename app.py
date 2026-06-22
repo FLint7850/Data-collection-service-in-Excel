@@ -406,6 +406,10 @@ def file_import_exclusions_text(value: object) -> str:
     return "\n".join(normalize_file_import_exclusions(value))
 
 
+def normalize_file_import_rules_text(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def normalize_emails(value: object) -> List[str]:
     if isinstance(value, str):
         raw_items = re.split(r"[\n,;]+", value)
@@ -4628,7 +4632,13 @@ def get_file_import_row(db_session=None) -> FileImport:
     db = db_session or g.db
     row = db.get(FileImport, 1)
     if row is None:
-        row = FileImport(id=1, exclusions=[], model_field="", file={})
+        row = FileImport(
+            id=1,
+            exclusions=[],
+            model_field="",
+            replace_rules="",
+            file={},
+        )
         db.add(row)
         db.flush()
     else:
@@ -4639,6 +4649,10 @@ def get_file_import_row(db_session=None) -> FileImport:
         normalized_model_field = clean_text(str(getattr(row, "model_field", "") or ""))
         if row.model_field != normalized_model_field:
             row.model_field = normalized_model_field
+            db.flush()
+        normalized_replace_rules = normalize_file_import_rules_text(getattr(row, "replace_rules", ""))
+        if row.replace_rules != normalized_replace_rules:
+            row.replace_rules = normalized_replace_rules
             db.flush()
     if not isinstance(row.file, dict) or not row.file.get("stored_filename"):
         stored_files = stored_file_import_files()
@@ -4696,6 +4710,7 @@ def public_file_import_state() -> Dict[str, object]:
     exclusions = normalize_file_import_exclusions(row.exclusions)
     exclusions_text = "\n".join(exclusions)
     model_field = clean_text(str(row.model_field or ""))
+    replace_rules = normalize_file_import_rules_text(row.replace_rules)
     result_filename = Path(str(row.export_path or file_meta.get("result_filename") or "")).name
     if not path:
         return {
@@ -4703,6 +4718,7 @@ def public_file_import_state() -> Dict[str, object]:
             "exclusions": exclusions_text,
             "exclusions_list": exclusions,
             "model_field": model_field,
+            "replace_rules": replace_rules,
             "result_filename": result_filename,
             "result_ready": bool(resolve_file_import_export_path(result_filename)),
         }
@@ -4711,6 +4727,7 @@ def public_file_import_state() -> Dict[str, object]:
         "exclusions": exclusions_text,
         "exclusions_list": exclusions,
         "model_field": model_field,
+        "replace_rules": replace_rules,
         "result_filename": result_filename,
         "result_ready": bool(resolve_file_import_export_path(result_filename)),
         "file": {
@@ -4787,6 +4804,13 @@ def read_file_import_rows(path: Path, model_field: str) -> List[Dict[str, object
         brand = clean_text(str(row[brand_index] if brand_index is not None and brand_index < len(row) else ""))
         result.append({"row_number": row_number, "name": source, "brand": brand})
     return result
+
+
+def prepare_file_import_model(value: str, replace_rules: str) -> str:
+    return prepare_rule_model(
+        str(value or ""),
+        {"model_replace_rules": normalize_file_import_rules_text(replace_rules)},
+    )
 
 
 VISUAL_MODEL_TRANSLATION = str.maketrans(
@@ -5134,6 +5158,7 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
         raise ValueError("Укажите название столбца модели")
 
     exclusions = normalize_file_import_exclusions(row.exclusions)
+    replace_rules = normalize_file_import_rules_text(row.replace_rules)
     source_rows = read_file_import_rows(path, model_field)
     feed_indexes = build_file_import_feed_indexes()
 
@@ -5146,7 +5171,8 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
             excluded += 1
             continue
         processed += 1
-        candidates = generate_model_candidates(name, brand)
+        prepared_model = prepare_file_import_model(name, replace_rules)
+        candidates = generate_model_candidates(prepared_model, brand)
         if not candidates:
             empty_model += 1
             result_rows.append(
@@ -7057,6 +7083,8 @@ def api_update_file_import():
         row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
     if "model_field" in payload:
         row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
+    if "replace_rules" in payload:
+        row.replace_rules = normalize_file_import_rules_text(payload.get("replace_rules"))
     if "file" in payload:
         file_payload = payload.get("file")
         if not file_payload:

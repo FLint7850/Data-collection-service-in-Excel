@@ -297,6 +297,14 @@
             <span>Исключения</span>
             <textarea id="fileImportExclusions" rows="5" placeholder="Автомобильный холодильник&#10;Гриль из чугуна&#10;Фотоэпилятор"></textarea>
           </label>
+          <details class="settings-details file-import-rules">
+            <summary>Правила поиск/замены</summary>
+            <div class="selector-grid">
+              <label class="field modal-wide-field">
+                <textarea id="fileImportModelReplaceRules" rows="5" placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|&#10;{reg[#\s{2,}#]}| "></textarea>
+              </label>
+            </div>
+          </details>
           <div class="file-import-save-row">
             <button class="button secondary" id="saveFileImportButton" type="button">Сохранить</button>
             <span class="save-notice" id="fileImportSaveNotice"></span>

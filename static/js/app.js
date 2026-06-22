@@ -50,6 +50,7 @@ const modelReplaceRules = document.querySelector("#modelReplaceRules");
 const fileImportInput = document.querySelector("#fileImportInput");
 const fileImportExclusions = document.querySelector("#fileImportExclusions");
 const fileImportModelField = document.querySelector("#fileImportModelField");
+const fileImportModelReplaceRules = document.querySelector("#fileImportModelReplaceRules");
 const saveFileImportButton = document.querySelector("#saveFileImportButton");
 const fileImportSaveNotice = document.querySelector("#fileImportSaveNotice");
 const fileImportSelected = document.querySelector("#fileImportSelected");
@@ -892,6 +893,9 @@ function renderFileImport() {
   if (fileImportModelField && document.activeElement !== fileImportModelField) {
     fileImportModelField.value = fileImportData?.model_field || "";
   }
+  if (fileImportModelReplaceRules && document.activeElement !== fileImportModelReplaceRules) {
+    fileImportModelReplaceRules.value = fileImportData?.replace_rules || "";
+  }
   fileImportName.textContent = file?.filename || "—";
   fileImportSize.textContent = file?.size ? formatFileSize(file.size) : "";
   fileImportSelected.classList.toggle("hidden", !file);
@@ -930,6 +934,7 @@ async function saveFileImport() {
     body: JSON.stringify({
       exclusions: fileImportExclusions?.value || "",
       model_field: fileImportModelField?.value || "",
+      replace_rules: fileImportModelReplaceRules?.value || "",
       file: fileImportData?.file || null,
     }),
   });
@@ -1916,6 +1921,14 @@ if (fileImportModelField && fileImportSaveNotice) {
   fileImportModelField.addEventListener("input", () => {
     fileImportSaveNotice.textContent = "";
   });
+}
+
+for (const field of [fileImportModelReplaceRules]) {
+  if (field && fileImportSaveNotice) {
+    field.addEventListener("input", () => {
+      fileImportSaveNotice.textContent = "";
+    });
+  }
 }
 
 if (saveFileImportButton && fileImportSaveNotice) {
