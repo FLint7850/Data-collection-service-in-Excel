@@ -80,7 +80,7 @@ Write-Host "Upgrading pip..." -ForegroundColor Cyan
 
 Write-Host "Installing dependencies..." -ForegroundColor Cyan
 $env:STATIC_DEPS = "true"
-& $venvPython -m pip install -r requirements.txt
+& $venvPython -m pip install -r requirements-all.txt
 
 if ($createdVenv -or $ForceBrowserSetup) {
     Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan

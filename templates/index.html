@@ -424,6 +424,10 @@
     </section>
   </main>
 
-  <script src="{{ url_for('static', filename='js/app.js') }}?v={{ static_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app/core.js') }}?v={{ static_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app/settings.js') }}?v={{ static_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app/news.js') }}?v={{ static_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app/workspace.js') }}?v={{ static_version }}"></script>
+  <script src="{{ url_for('static', filename='js/app/events.js') }}?v={{ static_version }}"></script>
 </body>
 </html>
