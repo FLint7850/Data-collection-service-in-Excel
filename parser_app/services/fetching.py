@@ -1,87 +1,139 @@
 """HTTP and browser fetching engines."""
 
-from importlib import import_module
-from types import ModuleType
+
 
 from parser_app.runtime import *  # noqa: F401,F403
 
 
-# Importing botasaurus.request may download its native transport on first use.
-# Keep that work lazy, while the decorated tasks themselves live at module level
-# in botasaurus_tasks.py and are therefore registered only once per process.
-_BOTASAURUS_TASKS: Optional[ModuleType] = None
-_BOTASAURUS_TASKS_LOCK = threading.Lock()
-
-
-def _load_botasaurus_tasks() -> Optional[ModuleType]:
-    global _BOTASAURUS_TASKS
-    if _BOTASAURUS_TASKS is not None:
-        return _BOTASAURUS_TASKS
-
-    with _BOTASAURUS_TASKS_LOCK:
-        if _BOTASAURUS_TASKS is not None:
-            return _BOTASAURUS_TASKS
-        try:
-            module = import_module("parser_app.services.botasaurus_tasks")
-        except ModuleNotFoundError as error:
-            if error.name and error.name.startswith("botasaurus"):
-                return None
-            raise
-        _BOTASAURUS_TASKS = module
-        return module
-
-
-def _normalize_botasaurus_result(result: object) -> object:
-    if isinstance(result, list):
-        return result[0] if result else None
-    return result
-
 
 def fetch_with_botasaurus_request(url: str) -> Optional[str]:
-    """Browser-like HTTP request through a single registered Botasaurus task."""
-    tasks = _load_botasaurus_tasks()
-    if tasks is None:
+    """Fallback через Botasaurus Request: браузероподобный HTTP-запрос с Google Referrer."""
+    try:
+        from botasaurus.request import Request
+        from botasaurus.request import request as botasaurus_request
+    except ImportError:
         return None
 
-    result = _normalize_botasaurus_result(tasks.request_html(url))
+    @botasaurus_request(max_retry=MAX_RETRIES, output=None, create_error_logs=False)
+    def _fetch_html(request_client: Request, target_url: str):
+        response = request_client.get(target_url)
+        response.raise_for_status()
+        return {
+            "content_type": response.headers.get("content-type", ""),
+            "text": response.text,
+        }
+
+    try:
+        result = _fetch_html(url)
+    except Exception:
+        return None
+
+    if isinstance(result, list):
+        result = result[0] if result else None
     if not isinstance(result, dict):
         return None
 
-    content_type = str(result.get("content_type") or "")
-    html = str(result.get("text") or "")
+    content_type = result.get("content_type", "")
+    html = result.get("text", "")
     if html and ("text/html" in content_type or "application/xhtml" in content_type or not content_type):
         return html
     return None
 
-
 def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optional[str]:
-    """Render a page through the shared headless Botasaurus task."""
-    tasks = _load_botasaurus_tasks()
-    if tasks is None:
+    """Fallback через Botasaurus Browser для страниц, которым нужен настоящий рендеринг."""
+    try:
+        from botasaurus.browser import Driver
+        from botasaurus.browser import browser
+    except ImportError:
         return None
 
-    with HEADLESS_BROWSER_SEMAPHORE:
-        result = tasks.browser_html({"url": url, "navigation": navigation})
-    result = _normalize_botasaurus_result(result)
-    return result if isinstance(result, str) and result.strip() else None
+    @browser(
+        headless=True,
+        add_arguments=[
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--blink-settings=imagesEnabled=false",
+        ],
+        window_size=[1280, 720],
+        block_images_and_css=True,
+        wait_for_complete_page_load=False,
+        max_retry=1,
+        output=None,
+        close_on_crash=True,
+        create_error_logs=False,
+    )
+    def _render_html(driver: Driver, target_url: str):
+        if navigation == "direct" and hasattr(driver, "get"):
+            driver.get(target_url)
+        else:
+            driver.google_get(target_url)
+        driver.sleep(2)
+        for _ in range(4):
+            try:
+                driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                break
+            driver.sleep(0.8)
+        return driver.page_html
 
+    try:
+        with HEADLESS_BROWSER_SEMAPHORE:
+            result = _render_html(url)
+    except Exception:
+        return None
+
+    if isinstance(result, list):
+        result = result[0] if result else None
+    return result if isinstance(result, str) and result.strip() else None
 
 def fetch_with_botasaurus_visible_browser(url: str) -> Optional[str]:
-    """Compatible hidden variant of the legacy botasaurus-visible method."""
+    """Совместимый скрытый вариант старого botasaurus-visible для автопереключения."""
     return fetch_with_botasaurus_browser(url, "direct")
 
-
 def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
-    """Manual diagnostics: opens a visible browser only when explicitly selected."""
-    tasks = _load_botasaurus_tasks()
-    if tasks is None:
+    """Ручной диагностический режим: открывает видимый браузер только при явном выборе."""
+    try:
+        from botasaurus.browser import Driver
+        from botasaurus.browser import browser
+    except ImportError:
         return None
 
-    with VISIBLE_BROWSER_LOCK:
-        result = tasks.visible_browser_html(url)
-    result = _normalize_botasaurus_result(result)
-    return result if isinstance(result, str) and result.strip() else None
+    @browser(
+        headless=False,
+        profile="protected_sites_debug_visible",
+        window_size=[1280, 720],
+        add_arguments=["--window-position=40,40"],
+        block_images_and_css=False,
+        wait_for_complete_page_load=True,
+        reuse_driver=False,
+        output=None,
+        close_on_crash=True,
+        create_error_logs=False,
+        max_retry=1,
+    )
+    def _render_html(driver: Driver, target_url: str):
+        driver.get(target_url)
+        driver.sleep(8)
+        for _ in range(3):
+            try:
+                driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                break
+            driver.sleep(0.8)
+        return driver.page_html
 
+    try:
+        with VISIBLE_BROWSER_LOCK:
+            result = _render_html(url)
+    except Exception:
+        return None
+
+    if isinstance(result, list):
+        result = result[0] if result else None
+    return result if isinstance(result, str) and result.strip() else None
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
     try:
@@ -135,9 +187,11 @@ def fetch_with_crawl4ai(url: str) -> Optional[str]:
             html = getattr(result, "html", "") or getattr(result, "cleaned_html", "")
             return html if isinstance(html, str) else None
 
-    with HEADLESS_BROWSER_SEMAPHORE:
-        return asyncio.run(_fetch())
-
+    try:
+        with HEADLESS_BROWSER_SEMAPHORE:
+            return asyncio.run(_fetch())
+    except Exception:
+        return None
 
 def fetch_with_firecrawl(url: str) -> Optional[str]:
     api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()

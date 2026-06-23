@@ -3,17 +3,12 @@
 
 
 from parser_app.runtime import *  # noqa: F401,F403
-from werkzeug.exceptions import HTTPException
 
 
 
 @app.errorhandler(Exception)
 def log_unhandled_exception(error: Exception):
-    # Normal HTTP responses such as a missing favicon are not application errors.
-    if isinstance(error, HTTPException):
-        return error
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
     with (LOG_DIR / "flask-error.log").open("a", encoding="utf-8") as error_file:
         error_file.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {request.method} {request.path}\n")
         error_file.write("".join(traceback.format_exception(type(error), error, error.__traceback__)))

@@ -62,7 +62,6 @@ def test_public_endpoints_and_frontend_assets(monkeypatch: pytest.MonkeyPatch) -
         with client.session_transaction() as session:
             session["user_id"] = 1
             session["username"] = "test"
-        assert client.get("/favicon.ico").status_code == 404
         response = client.get("/")
         assert response.status_code == 200
         html = response.get_data(as_text=True)

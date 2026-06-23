@@ -228,59 +228,12 @@ class ProductSiteCrawler:
             self.connection_method_state["active_method"] = current
             self.active_connection_method = current
 
-    def html_has_expected_content(self, url: str, html: str) -> bool:
-        """Reject technically non-empty pages that contain no usable project data.
-
-        Browser engines can return a consent shell, navigation-only document or a
-        partially rendered SPA. Treating that as success stops fallback too early
-        and produces a completed project with an empty CSV.
-        """
-        if not html or looks_blocked_or_empty(html):
-            return False
-
-        # A known product page is parsed later with project rules. At this point a
-        # complete, non-blocked document is enough; demanding a price here would
-        # incorrectly reject pages where price is injected into a custom selector.
-        if self.is_current_product_page(url):
-            return True
-
-        requires_catalog_signals = self.is_start_url_path(url) or is_catalog_url(url)
-        if not requires_catalog_signals:
-            return True
-
-        if PRICE_RE.search(html):
-            return True
-
-        if extract_listing_products(url, html, self.extraction_rules, self.product_url_filters):
-            return True
-
-        # A category without inline prices is still useful when it exposes links to
-        # product pages. This also supports sites whose prices appear only on detail pages.
-        soup = BeautifulSoup(html, "html.parser")
-        for link in soup.select("a[href]"):
-            product_url = canonicalize_product_url_by_filters(
-                normalize_url(link.get("href", ""), url),
-                self.product_url_filters,
-            )
-            if not product_url or product_url == url or not same_site(product_url, self.root_netloc):
-                continue
-            if self.is_product_url(product_url) and self.is_product_allowed(product_url):
-                return True
-
-        return False
-
     def fetch_with_connection_method(self, url: str, method: str) -> Optional[str]:
         self.log(f"Пробую метод подключения {method} для {url}", "info")
         html = self.fetch_by_method_with_timeout(url, method)
-        if html and self.html_has_expected_content(url, html):
-            return html
         if html and not looks_blocked_or_empty(html):
-            self.log(
-                f"Метод подключения {method} вернул HTML без товаров, цен или товарных ссылок для {url}",
-                "warning",
-            )
-        else:
-            self.log(f"Метод подключения {method} не сработал для {url}", "warning")
+            return html
+        self.log(f"Метод подключения {method} не сработал для {url}", "warning")
         return None
 
     def fetch(self, url: str) -> Optional[str]:
@@ -311,8 +264,6 @@ class ProductSiteCrawler:
         for method in self.fallback_method_sequence():
             if self.stop_signal.is_set():
                 return None
-            if method == current_method:
-                continue
             last_method = method
             html = self.fetch_with_connection_method(url, method)
             if html:
