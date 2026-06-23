@@ -1,73 +1,115 @@
 # Сервис сбора данных в Excel
 
-Flask-сервис для обхода каталогов, извлечения моделей и цен, сравнения с XML-фидами, мониторинга новинок и выгрузки CSV.
+Локальный Flask-сервис для обхода каталогов, сбора моделей и цен, управления исключениями и выгрузки CSV.
 
-## Локальный запуск Windows
+## Быстрый запуск в PowerShell
 
-Дважды нажмите:
+Самый простой вариант: дважды нажмите файл:
 
 ```text
 START_PARSER.cmd
 ```
 
-Скрипт создаст `.venv`, установит зависимости, подготовит Chromium и откроет приложение. Порт берётся из `.env`; локальный скрипт при занятом `5055` попробует следующий свободный порт.
-
-Ручной запуск:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\run.ps1
-```
-
-## Production
-
-```bash
-python -m venv .venv
-python -m pip install -r requirements.txt
-# Для всех дополнительных движков: python -m pip install -r requirements-all.txt
-python -m playwright install chromium
-python run_production.py
-```
-
-Перед запуском скопируйте `.env.example` в `.env` и задайте безопасные `FLASK_SECRET_KEY`, логин и пароль первого пользователя.
-
-Полная инструкция: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-
-## Структура
-
-Монолитные `app.py` и `static/js/app.js` разделены по областям ответственности:
-
-- `parser_app/services/` — бизнес-логика;
-- `parser_app/routes/` — HTTP API;
-- `parser_app/runtime.py` — конфигурация и разделяемое состояние;
-- `static/js/app/` — frontend по функциональным модулям;
-- `tests/` — smoke, initialization, normalization и production checks.
-
-Подробно: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
-## Проверки перед коммитом
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest
-ruff check app.py wsgi.py run_production.py parser_app db.py models.py alembic tests
-```
-
-## Дополнительные движки
-
-`requirements.txt` содержит основной production-набор. Тяжёлые дополнительные движки вынесены в `requirements_optional_parsers.txt`; полный набор устанавливается через `requirements-all.txt`. Локальные Windows-скрипты используют полный набор и сохраняют прежнее поведение.
+Он сам перейдет в папку проекта, создаст виртуальное окружение, установит зависимости и откроет `http://127.0.0.1:5000`.
 
 ## Публичная ссылка через xTunnel
 
-Используйте:
+Для доступа с других компьютеров используйте:
 
 ```text
 START_PUBLIC_PARSER.cmd
 ```
 
-Перед первым запуском выполните `INSTALL_XTUNNEL.cmd` и активируйте xTunnel. Публичный туннель предназначен для временного доступа, а не для постоянного production-развёртывания.
+Перед первым запуском нужно один раз установить и активировать xTunnel.
 
-## Дополнительные документы
+Самый простой способ для этого проекта:
 
-- `REFACTOR_REPORT.md` — полный отчёт о рефакторинге и выполненных проверках.
-- `docs/ARCHITECTURE.md` — устройство проекта.
-- `docs/DEPLOYMENT.md` — production-развёртывание.
+```text
+INSTALL_XTUNNEL.cmd
+```
+
+Он скачает официальный Windows x64 архив xTunnel в папку проекта и предложит вставить ключ активации.
+
+Альтернативный способ установки в Windows через Chocolatey:
+
+```powershell
+choco source add -n=xtunnel -s="https://www.myget.org/F/xtunnel/api/v2"
+choco install xtunnel
+xtunnel register YOUR_KEY
+```
+
+После запуска `START_PUBLIC_PARSER.cmd` скопируйте публичную HTTPS-ссылку из окна xTunnel и отправьте ее другим пользователям. Окно нельзя закрывать, пока ссылка нужна.
+
+Для текущей активации публичный запуск использует:
+
+```powershell
+xtunnel http PORT --tunnel-host tunnel4.com
+```
+
+Если установлен Python 3.10+, выполните из папки проекта:
+
+```powershell
+.\run.ps1
+```
+
+Если PowerShell блокирует запуск скриптов:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+После запуска откройте:
+
+```text
+http://127.0.0.1:5000
+```
+
+## Ручной запуск
+
+Команда `pip` может отсутствовать в PATH. Надежнее запускать pip через Python:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
+```
+
+Если команда `python` тоже не найдена, установите Python 3.10+ с https://www.python.org/downloads/ и отметьте пункт `Add python.exe to PATH` при установке.
+
+## Если сайт отдает пустую страницу или блокировку
+
+В проект подключен fallback через Botasaurus. Обычный `requests` используется первым, а при подозрении на блокировку или пустой JS-шаблон приложение пробует:
+
+1. `botasaurus.request` для браузероподобного HTTP-запроса.
+2. `botasaurus.browser` для headless-рендеринга страницы.
+
+После обновления зависимостей просто перезапустите:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+## Скорость сбора
+
+В каждом проекте есть поле `Потоки`. Рекомендуемые значения:
+
+- `3-4` для спокойной проверки одной категории.
+- `6-8` для ускоренного сбора, если сайт отвечает стабильно.
+- `10-16` только если нет ошибок, зависаний и блокировок.
+
+Кнопка `Приостановить с результатом` останавливает текущий сбор и формирует CSV из уже найденных товаров.
+
+## Проекты и несколько ссылок
+
+В интерфейсе можно создать несколько вкладок-проектов. Каждый проект хранит:
+
+- название;
+- список стартовых URL, по одному на строку;
+- исключения;
+- количество потоков;
+- собственный прогресс;
+- последний CSV-файл;
+- собственные логи.
+
+Проекты можно запускать параллельно. Для просмотра всех событий откройте вкладку `Логи`. Там же можно включить автоочистку логов старше 7 суток или очистить логи вручную.

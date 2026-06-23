@@ -2,4 +2,3 @@ crawl4ai
 firecrawl-py
 scrapy
 crawlee[all]
-scrapegraphai

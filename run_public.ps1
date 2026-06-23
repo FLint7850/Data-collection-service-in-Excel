@@ -148,7 +148,7 @@ $ForceBrowserSetup = $env:FORCE_BROWSER_SETUP -eq "1"
 
 Write-Host "Installing dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install -r requirements-all.txt
+& $venvPython -m pip install -r requirements.txt
 
 if ($createdVenv -or $ForceBrowserSetup) {
     Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan

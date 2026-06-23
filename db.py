@@ -1,5 +1,4 @@
 import json
-import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -10,9 +9,8 @@ from models import Base
 
 
 BASE_DIR = Path(__file__).resolve().parent
-_raw_db_path = Path(os.environ.get("DATABASE_PATH", "data/app.db"))
-DB_PATH = _raw_db_path if _raw_db_path.is_absolute() else BASE_DIR / _raw_db_path
-DATA_DIR = DB_PATH.parent
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
 DEFAULT_BRAND_STATE = {
     "status": "idle",
