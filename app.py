@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from email.message import EmailMessage
 from fnmatch import fnmatch
+from functools import lru_cache
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Deque, Dict, Hashable, Iterable, List, Optional, Set
@@ -101,6 +102,22 @@ def env_path(name: str, default: str) -> Path:
     value = env_str(name, default)
     path = Path(value)
     return path if path.is_absolute() else BASE_DIR / path
+
+
+@lru_cache(maxsize=1)
+def botasaurus_browser_executable() -> Optional[str]:
+    """Return the Chromium executable downloaded by Playwright, if available."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        try:
+            executable = Path(playwright.chromium.executable_path)
+        finally:
+            playwright.stop()
+        return str(executable) if executable.is_file() else None
+    except Exception:
+        return None
 
 
 LOG_DIR = env_path("LOG_DIR", "logs")
@@ -3458,8 +3475,11 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
     except ImportError:
         return None
 
+    chrome_executable_path = botasaurus_browser_executable()
+
     @browser(
         headless=True,
+        chrome_executable_path=chrome_executable_path,
         add_arguments=[
             "--headless=new",
             "--disable-gpu",
@@ -3514,8 +3534,11 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
     except ImportError:
         return None
 
+    chrome_executable_path = botasaurus_browser_executable()
+
     @browser(
         headless=False,
+        chrome_executable_path=chrome_executable_path,
         profile="protected_sites_debug_visible",
         window_size=[1280, 720],
         add_arguments=["--window-position=40,40"],
