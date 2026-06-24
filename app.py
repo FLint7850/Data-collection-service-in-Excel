@@ -135,6 +135,8 @@ MAX_CRAWL_WORKERS_PER_SCAN = env_int("MAX_CRAWL_WORKERS_PER_SCAN", 6, minimum=1,
 MAX_CONCURRENT_SCANS = env_int("MAX_CONCURRENT_SCANS", 3, minimum=1, maximum=16)
 BROWSER_MAX_CONCURRENT = env_int("BROWSER_MAX_CONCURRENT", 2, minimum=1, maximum=8)
 FEED_WORKER_COUNT = env_int("FEED_WORKER_COUNT", 6, minimum=1, maximum=12)
+FEED_SNAPSHOT_CACHE_SECONDS = env_int("FEED_SNAPSHOT_CACHE_SECONDS", 120, minimum=0, maximum=3600)
+FEED_SNAPSHOT_RETAIN = env_int("FEED_SNAPSHOT_RETAIN", 3, minimum=2, maximum=10)
 NEWS_ENRICH_WORKER_COUNT = env_int("NEWS_ENRICH_WORKER_COUNT", 8, minimum=1, maximum=16)
 NEWS_SCAN_STALL_TIMEOUT = env_int("NEWS_SCAN_STALL_TIMEOUT", 180, minimum=1)
 SCHEDULE_DUE_GRACE_SECONDS = env_int("SCHEDULE_DUE_GRACE_SECONDS", 90, minimum=0)
@@ -237,7 +239,8 @@ LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
 HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(BROWSER_MAX_CONCURRENT)
 BOTASAURUS_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BOTASAURUS_REQUEST_MAX_CONCURRENT)
-FEED_STORAGE_LOCK = threading.Lock()
+FEED_STORAGE_LOCK = threading.RLock()
+feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
 UNIFIED_LOG_LOCK = threading.Lock()
 connection_method_cache_lock = threading.Lock()
 connection_method_cache: Dict[str, object] = {"loaded_at": 0.0, "codes": []}
@@ -1200,11 +1203,6 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     state = item.get("state", {})
     monitor["state"] = {**make_news_state(), **state} if isinstance(state, dict) else make_news_state()
     monitor["state"].pop("last_feeds", None)
-    if monitor["state"].get("status") in {"running", "queued", "pausing", "stopping"}:
-        monitor["state"]["status"] = "error"
-        monitor["state"]["stage"] = "Прервано"
-        monitor["state"]["error"] = "Сканирование было прервано перезапуском сервера. Запустите его снова."
-        monitor["state"]["currenturl"] = ""
     monitor["brand_state"] = dict(monitor["state"])
     monitor["collapsed"] = bool(item.get("collapsed", True))
     return monitor
@@ -1279,17 +1277,36 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "known_new_products": row.known_new_products or {},
         "state": dict(brand_state),
     }
-    if monitor["state"].get("status") in {"running", "queued", "pausing", "stopping"}:
-        monitor["state"]["status"] = "error"
-        monitor["state"]["stage"] = "Прервано"
-        monitor["state"]["error"] = "Сканирование было прервано перезапуском сервера. Запустите его снова."
-        monitor["state"]["currenturl"] = ""
-        monitor["state"]["queue_size"] = 0
-        monitor["state"]["active_tasks"] = 0
-        monitor["state"]["active_urls"] = []
-        monitor["state"]["in_memory_products"] = 0
-        monitor["brand_state"] = dict(monitor["state"])
     return monitor
+
+
+def recover_interrupted_news_scans(monitors: Iterable[Dict[str, object]]) -> None:
+    """Mark only scans inherited from a previous process as interrupted.
+
+    This is called once during application startup, never during scheduler reloads.
+    """
+    for monitor in monitors:
+        state = monitor.get("state")
+        if not isinstance(state, dict) or state.get("status") not in {"running", "queued", "pausing", "stopping"}:
+            continue
+        state.update(
+            {
+                "status": "error",
+                "stage": "Прервано",
+                "error": "Сканирование было прервано перезапуском сервера. Запустите его снова.",
+                "currenturl": "",
+                "queue_size": 0,
+                "active_tasks": 0,
+                "active_urls": [],
+                "in_memory_products": 0,
+            }
+        )
+        state["stage"] = "\u041f\u0440\u0435\u0440\u0432\u0430\u043d\u043e"
+        state["error"] = (
+            "\u0421\u043a\u0430\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435 \u0431\u044b\u043b\u043e \u043f\u0440\u0435\u0440\u0432\u0430\u043d\u043e "
+            "\u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u043e\u043c \u0441\u0435\u0440\u0432\u0435\u0440\u0430. \u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0435\u0433\u043e \u0441\u043d\u043e\u0432\u0430."
+        )
+        monitor["brand_state"] = dict(state)
 
 
 def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
@@ -1520,6 +1537,7 @@ def load_news_settings() -> None:
                 settings["feed_url"] = feed_urls[0]
                 settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
             settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
+            recover_interrupted_news_scans(settings["monitors"])
             ensure_brand_primary_flags(settings["monitors"])
             settings["logs"] = load_news_logs_from_file()
         news_settings.update(settings)
@@ -3818,19 +3836,25 @@ print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("as
 
 
 class PlaywrightHeadlessRenderer:
-    """Один скрытый Chromium внутри сервиса; на каждый URL открывается только новая page."""
+    """Small pool of isolated Chromium workers for fallback rendering."""
 
     def __init__(self) -> None:
         self.jobs: Queue = Queue()
-        self.thread: Optional[threading.Thread] = None
+        self.threads: List[threading.Thread] = []
         self.lock = threading.Lock()
 
     def ensure_started(self) -> None:
         with self.lock:
-            if self.thread and self.thread.is_alive():
-                return
-            self.thread = threading.Thread(target=self._worker, name="playwright-headless-renderer", daemon=True)
-            self.thread.start()
+            self.threads = [thread for thread in self.threads if thread.is_alive()]
+            while len(self.threads) < BROWSER_MAX_CONCURRENT:
+                worker_number = len(self.threads) + 1
+                thread = threading.Thread(
+                    target=self._worker,
+                    name=f"playwright-headless-renderer-{worker_number}",
+                    daemon=True,
+                )
+                self.threads.append(thread)
+                thread.start()
 
     def fetch(self, url: str, timeout_seconds: int) -> Optional[str]:
         self.ensure_started()
@@ -4257,7 +4281,10 @@ class ProductSiteCrawler:
             last_method = method
             html = self.fetch_with_connection_method(url, method)
             if html:
-                if method != current_method:
+                # Browser renderers are scarce shared resources. A successful
+                # browser fallback helps this URL, but must not force every
+                # following URL of the scan into the browser queue.
+                if method != current_method and method not in BROWSER_RENDER_METHODS:
                     self.set_active_connection_method(method)
                     self.log(f"Автопереключение подключения: {method} для {url}", "warning")
                 return html
@@ -5197,9 +5224,10 @@ def build_file_import_feed_indexes() -> List[Dict[str, object]]:
     downloaded_feeds = download_feed_files()
     feed_indexes: List[Dict[str, object]] = []
     for feed in downloaded_feeds:
-        filename = str(feed.get("filename") or "")
-        path = source_feed_dir(str(feed.get("source") or "")) / filename
+        path = feed_snapshot_path(feed)
         try:
+            if path is None:
+                raise FileNotFoundError("Не задан путь к snapshot фида")
             index = build_feed_index_from_xml(path.read_bytes(), feed)
             feed_indexes.append({**feed, "index": index, "codes_count": len(index)})
         except Exception as exc:
@@ -5487,6 +5515,28 @@ def source_feed_dir(source: str) -> Path:
     return FEED_DIR / safe_filename(source)
 
 
+def feed_snapshots_dir() -> Path:
+    return FEED_DIR / ".snapshots"
+
+
+def feed_snapshot_path(feed: Dict[str, object]) -> Optional[Path]:
+    snapshot_value = str(feed.get("snapshot") or "").strip()
+    source_value = str(feed.get("source") or "").strip()
+    filename = Path(str(feed.get("filename") or "")).name
+    if not source_value or not filename:
+        return None
+    if not snapshot_value:
+        # Backward compatibility for feed metadata written before snapshots.
+        legacy_root = source_feed_dir(source_value).resolve()
+        legacy_path = (legacy_root / filename).resolve()
+        return legacy_path if legacy_root in legacy_path.parents else None
+    snapshot = safe_filename(snapshot_value)
+    source = safe_filename(source_value)
+    path = (feed_snapshots_dir() / snapshot / source / filename).resolve()
+    snapshot_root = (feed_snapshots_dir() / snapshot).resolve()
+    return path if snapshot_root in path.parents else None
+
+
 def local_feed_filename(kind: str, index: int, url: str) -> str:
     parsed = urlparse(url)
     raw_name = Path(parsed.path).name or kind
@@ -5535,22 +5585,26 @@ def trigger_feed_generation(generate_url: str) -> None:
         pass
 
 
-def download_feed_site(index: int, site: Dict[str, str]) -> Optional[Dict[str, object]]:
+def download_feed_site(index: int, site: Dict[str, str], snapshot_dir: Path, snapshot: str) -> Optional[Dict[str, object]]:
     url = site["feed_url"]
     try:
         response = make_feed_session().get(url, timeout=60)
         response.raise_for_status()
         source = feed_source_key(url)
-        feed_dir = source_feed_dir(source)
+        feed_dir = snapshot_dir / source
+        feed_dir.mkdir(parents=True, exist_ok=True)
         filename = local_feed_filename("feed", index, url)
         path = feed_dir / filename
-        path.write_bytes(response.content)
+        temporary_path = path.with_suffix(path.suffix + ".part")
+        temporary_path.write_bytes(response.content)
+        os.replace(temporary_path, path)
         return {
             "kind": "feed",
             "source": source,
             "source_label": site.get("name") or feed_source_label(url),
             "url": url,
             "filename": filename,
+            "snapshot": snapshot,
             "size": path.stat().st_size,
             "downloaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         }
@@ -5558,31 +5612,75 @@ def download_feed_site(index: int, site: Dict[str, str]) -> Optional[Dict[str, o
         return None
 
 
+def cleanup_feed_snapshots() -> None:
+    snapshots_dir = feed_snapshots_dir()
+    if not snapshots_dir.exists():
+        return
+    try:
+        snapshots = sorted(
+            [path for path in snapshots_dir.iterdir() if path.is_dir()],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for path in snapshots[FEED_SNAPSHOT_RETAIN:]:
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            # Windows can keep a file open while it is being downloaded. Keep this
+            # old immutable snapshot and retry cleanup after a future refresh.
+            continue
+
+
 def download_feed_files() -> List[Dict[str, object]]:
     with news_lock:
         own_sites = own_sites_from_settings(news_settings)
         feed_urls = [site["feed_url"] for site in own_sites]
         generate_urls = [site["feed_generate_url"] for site in own_sites if site.get("feed_generate_url")]
-    downloaded: List[Dict[str, object]] = []
+    signature = tuple((site["feed_url"], site.get("feed_generate_url", "")) for site in own_sites)
     with FEED_STORAGE_LOCK:
-        expected_sources = {feed_source_key(url) for url in feed_urls}
-        if FEED_DIR.exists():
-            for child in FEED_DIR.iterdir():
-                if child.is_dir() and child.name not in expected_sources:
-                    shutil.rmtree(child, ignore_errors=True)
-        for source in expected_sources:
-            clear_source_feeds(source)
+        cache_feeds = feed_snapshot_cache.get("feeds")
+        cache_age = time.time() - float(feed_snapshot_cache.get("created_at") or 0.0)
+        if (
+            signature == feed_snapshot_cache.get("signature")
+            and cache_age <= FEED_SNAPSHOT_CACHE_SECONDS
+            and isinstance(cache_feeds, list)
+            and cache_feeds
+            and all((path := feed_snapshot_path(feed)) and path.exists() for feed in cache_feeds if isinstance(feed, dict))
+        ):
+            return [dict(feed) for feed in cache_feeds if isinstance(feed, dict)]
+
         if generate_urls:
             with ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(generate_urls))) as executor:
                 list(executor.map(trigger_feed_generation, generate_urls))
+
+        snapshot = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        snapshot_dir = feed_snapshots_dir() / snapshot
+        snapshot_dir.mkdir(parents=True, exist_ok=False)
+        downloaded: List[Dict[str, object]] = []
         if own_sites:
             with ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(own_sites))) as executor:
-                futures = [executor.submit(download_feed_site, index, site) for index, site in enumerate(own_sites, start=1)]
+                futures = [
+                    executor.submit(download_feed_site, index, site, snapshot_dir, snapshot)
+                    for index, site in enumerate(own_sites, start=1)
+                ]
                 for future in futures:
                     feed = future.result()
                     if feed:
                         downloaded.append(feed)
-    return downloaded
+        if not downloaded:
+            try:
+                shutil.rmtree(snapshot_dir)
+            except OSError:
+                pass
+            return []
+
+        feed_snapshot_cache.update(
+            {"signature": signature, "created_at": time.time(), "feeds": [dict(feed) for feed in downloaded]}
+        )
+        cleanup_feed_snapshots()
+        return downloaded
 
 
 def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
@@ -5596,9 +5694,10 @@ def fetch_existing_vendor_code_sets() -> tuple[Set[str], List[Dict[str, object]]
     feeds: List[Dict[str, object]] = []
     feed_code_sets: List[Dict[str, object]] = []
     for feed in downloaded_feeds:
-        filename = str(feed.get("filename") or "")
-        path = source_feed_dir(str(feed.get("source") or "")) / filename
+        path = feed_snapshot_path(feed)
         try:
+            if path is None:
+                raise FileNotFoundError("Не задан путь к snapshot фида")
             feed_codes = parse_vendor_codes_from_xml(path.read_bytes())
             codes.update(feed_codes)
             feeds.append({**feed, "codes_count": len(feed_codes)})
@@ -7180,9 +7279,17 @@ def api_download_news_feed(source: str, filename: str):
     }
     if filename not in allowed_names:
         return jsonify({"error": "Фид не найден"}), 404
-    feed_dir = source_feed_dir(source).resolve()
-    path = (feed_dir / filename).resolve()
-    if feed_dir not in path.parents or not path.exists():
+    feed = next(
+        (
+            item for item in news_settings.get("feed_storage", [])
+            if isinstance(item, dict)
+            and str(item.get("source") or "") == source
+            and str(item.get("filename") or "") == filename
+        ),
+        None,
+    )
+    path = feed_snapshot_path(feed) if isinstance(feed, dict) else None
+    if path is None or not path.exists():
         return jsonify({"error": "Фид не найден"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
 
