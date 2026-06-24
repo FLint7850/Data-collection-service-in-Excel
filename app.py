@@ -16,13 +16,15 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from email.message import EmailMessage
 from fnmatch import fnmatch
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, Hashable, Iterable, List, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urldefrag, urljoin, urlparse, urlunparse
 import xml.etree.ElementTree as ET
 
@@ -128,6 +130,10 @@ REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 20, minimum=1)
 CONNECTION_METHOD_TIMEOUT_SECONDS = env_int("CONNECTION_METHOD_TIMEOUT_SECONDS", 60, minimum=1)
 REQUEST_DELAY_SECONDS = env_float("REQUEST_DELAY_SECONDS", 0.05, minimum=0.0)
 MAX_RETRIES = env_int("MAX_RETRIES", 3, minimum=1)
+BOTASAURUS_REQUEST_MAX_CONCURRENT = env_int("BOTASAURUS_REQUEST_MAX_CONCURRENT", 1, minimum=1, maximum=4)
+MAX_CRAWL_WORKERS_PER_SCAN = env_int("MAX_CRAWL_WORKERS_PER_SCAN", 6, minimum=1, maximum=16)
+MAX_CONCURRENT_SCANS = env_int("MAX_CONCURRENT_SCANS", 3, minimum=1, maximum=16)
+BROWSER_MAX_CONCURRENT = env_int("BROWSER_MAX_CONCURRENT", 2, minimum=1, maximum=8)
 FEED_WORKER_COUNT = env_int("FEED_WORKER_COUNT", 6, minimum=1, maximum=12)
 NEWS_ENRICH_WORKER_COUNT = env_int("NEWS_ENRICH_WORKER_COUNT", 8, minimum=1, maximum=16)
 NEWS_SCAN_STALL_TIMEOUT = env_int("NEWS_SCAN_STALL_TIMEOUT", 180, minimum=1)
@@ -175,7 +181,6 @@ def open_request_db_session() -> None:
 
 
 def ensure_default_user() -> None:
-    init_db()
     with session_scope() as db_session:
         existing_user = db_session.scalar(select(User.id).limit(1))
         if existing_user:
@@ -230,7 +235,8 @@ news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
-HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
+HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(BROWSER_MAX_CONCURRENT)
+BOTASAURUS_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BOTASAURUS_REQUEST_MAX_CONCURRENT)
 FEED_STORAGE_LOCK = threading.Lock()
 UNIFIED_LOG_LOCK = threading.Lock()
 connection_method_cache_lock = threading.Lock()
@@ -240,6 +246,82 @@ news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
 NEWS_TRANSITION_TIMEOUT_SECONDS = 180
+
+
+@dataclass(frozen=True)
+class ScanTask:
+    key: Hashable
+    run: Callable[[], None]
+    on_start: Optional[Callable[[threading.Thread], None]] = None
+    on_finish: Optional[Callable[[threading.Thread], None]] = None
+
+
+class ScanDispatcher:
+    """Bounded FIFO queue shared by full project and news scans."""
+
+    def __init__(self, max_concurrent: int) -> None:
+        self.max_concurrent = max(1, max_concurrent)
+        self._queue: Deque[ScanTask] = deque()
+        self._queued: Set[Hashable] = set()
+        self._active: Set[Hashable] = set()
+        self._lock = threading.RLock()
+
+    def enqueue(
+        self,
+        key: Hashable,
+        run: Callable[[], None],
+        *,
+        on_start: Optional[Callable[[threading.Thread], None]] = None,
+        on_finish: Optional[Callable[[threading.Thread], None]] = None,
+    ) -> bool:
+        with self._lock:
+            if key in self._queued or key in self._active:
+                return False
+            self._queued.add(key)
+            self._queue.append(ScanTask(key, run, on_start, on_finish))
+        self._dispatch()
+        return True
+
+    def cancel(self, key: Hashable) -> bool:
+        with self._lock:
+            if key not in self._queued:
+                return False
+            self._queued.remove(key)
+            return True
+
+    def contains(self, key: Hashable) -> bool:
+        with self._lock:
+            return key in self._queued or key in self._active
+
+    def _dispatch(self) -> None:
+        while True:
+            with self._lock:
+                if len(self._active) >= self.max_concurrent or not self._queue:
+                    return
+                task = self._queue.popleft()
+                if task.key not in self._queued:
+                    continue
+                self._queued.remove(task.key)
+                self._active.add(task.key)
+            threading.Thread(target=self._run, args=(task,), daemon=True).start()
+
+    def _run(self, task: ScanTask) -> None:
+        thread = threading.current_thread()
+        try:
+            if task.on_start:
+                task.on_start(thread)
+            task.run()
+        finally:
+            try:
+                if task.on_finish:
+                    task.on_finish(thread)
+            finally:
+                with self._lock:
+                    self._active.discard(task.key)
+            self._dispatch()
+
+
+scan_dispatcher = ScanDispatcher(MAX_CONCURRENT_SCANS)
 BROWSER_RENDER_METHODS = {
     "botasaurus-browser",
     "botasaurus-browser-direct",
@@ -306,17 +388,28 @@ def make_state(thread_count: int = 4) -> Dict[str, object]:
     }
 
 
+_storage_init_lock = threading.RLock()
+_storage_initialized = False
+
+
 def ensure_storage() -> None:
     """Создает рабочие файлы при первом запуске."""
-    EXPORT_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
-    FEED_DIR.mkdir(exist_ok=True)
-    FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    init_db()
-    ensure_default_user()
-    load_projects()
-    load_news_settings()
-    start_news_scheduler()
+    global _storage_initialized
+    if _storage_initialized:
+        return
+    with _storage_init_lock:
+        if _storage_initialized:
+            return
+        EXPORT_DIR.mkdir(exist_ok=True)
+        LOG_DIR.mkdir(exist_ok=True)
+        FEED_DIR.mkdir(exist_ok=True)
+        FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+        init_db()
+        ensure_default_user()
+        load_projects()
+        load_news_settings()
+        start_news_scheduler()
+        _storage_initialized = True
 
 
 def normalize_start_urls(value: object, allow_empty: bool = False) -> List[str]:
@@ -3316,10 +3409,14 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
             "text": response.text,
         }
 
-    try:
-        result = _fetch_html(url)
-    except Exception:
-        return None
+    # Botasaurus Request keeps mutable process-level state on Windows. Serializing
+    # this connector avoids intermittent OSError: [Errno 22] Invalid argument
+    # while regular HTTP crawling remains parallel.
+    with BOTASAURUS_REQUEST_SEMAPHORE:
+        try:
+            result = _fetch_html(url)
+        except Exception:
+            return None
 
     if isinstance(result, list):
         result = result[0] if result else None
@@ -3913,7 +4010,7 @@ class ProductSiteCrawler:
         self.run_id = run_id
         self.stop_signal = stop_signal
         self.finish_signal = finish_signal
-        self.thread_count = max(1, min(int(thread_count or 4), 16))
+        self.thread_count = max(1, min(int(thread_count or 4), MAX_CRAWL_WORKERS_PER_SCAN))
         self.start_urls = normalize_start_urls(start_urls)
         self.start_url = self.start_urls[0]
         self.root_netloc = urlparse(self.start_url).netloc
@@ -4116,8 +4213,10 @@ class ProductSiteCrawler:
             self.active_connection_method = current
 
     def fetch_with_connection_method(self, url: str, method: str) -> Optional[str]:
+        self.last_progress_at = time.time()
         self.log(f"Пробую метод подключения {method} для {url}", "info")
         html = self.fetch_by_method_with_timeout(url, method)
+        self.last_progress_at = time.time()
         if html and not looks_blocked_or_empty(html):
             return html
         self.log(f"Метод подключения {method} не сработал для {url}", "warning")
@@ -4151,6 +4250,8 @@ class ProductSiteCrawler:
         for method in self.fallback_method_sequence():
             if self.stop_signal.is_set():
                 return None
+            if method == current_method:
+                continue
             last_method = method
             html = self.fetch_with_connection_method(url, method)
             if html:
@@ -5668,6 +5769,29 @@ def news_monitor_thread_alive(monitor_id: object) -> bool:
     return isinstance(thread, threading.Thread) and thread.is_alive()
 
 
+def enqueue_news_scan(monitor_id: str, manual: bool) -> bool:
+    monitor_id = str(monitor_id)
+
+    def run() -> None:
+        monitor = get_news_monitor(monitor_id)
+        state = monitor.get("state", {}) if monitor else {}
+        if monitor and state.get("status") == "queued":
+            scan_news_monitor(monitor_id, manual)
+
+    def on_start(thread: threading.Thread) -> None:
+        with news_lock:
+            news_scan_threads[monitor_id] = thread
+
+    def on_finish(thread: threading.Thread) -> None:
+        with news_lock:
+            if news_scan_threads.get(monitor_id) is thread:
+                news_scan_threads.pop(monitor_id, None)
+
+    return scan_dispatcher.enqueue(
+        ("news", monitor_id), run, on_start=on_start, on_finish=on_finish
+    )
+
+
 def transition_requested_at(monitor: Dict[str, object]) -> Optional[datetime]:
     state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     for key in ("stop_requested_at", "finished_at", "started_at"):
@@ -6680,10 +6804,7 @@ def start_news_scheduler() -> None:
                     if due_ids:
                         save_news_settings()
                 for monitor_id in due_ids:
-                    thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, False), daemon=True)
-                    with news_lock:
-                        news_scan_threads[monitor_id] = thread
-                    thread.start()
+                    enqueue_news_scan(monitor_id, manual=False)
             except Exception:
                 pass
             time.sleep(30)
@@ -6694,7 +6815,7 @@ def start_news_scheduler() -> None:
 
 @app.route("/login", methods=["GET", "POST"])
 def login() -> str | Response:
-    ensure_default_user()
+    ensure_storage()
     if session.get("user_id"):
         return redirect(url_for("index"))
     error = ""
@@ -6919,10 +7040,8 @@ def api_scan_news_monitor(monitor_id: str):
         sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
-    thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True)
-    with news_lock:
-        news_scan_threads[monitor_id] = thread
-    thread.start()
+    if not enqueue_news_scan(monitor_id, manual=True):
+        return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     return jsonify({"monitor": response_monitor})
 
 
@@ -6970,10 +7089,8 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
-    thread = threading.Thread(target=scan_news_monitor, args=(monitor_id, True), daemon=True)
-    with news_lock:
-        news_scan_threads[monitor_id] = thread
-    thread.start()
+    if not enqueue_news_scan(monitor_id, manual=True):
+        return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
     return jsonify({"monitor": response_monitor})
 
@@ -7323,6 +7440,9 @@ def api_project_delete_product_url_filter(project_id: str, index: int):
 
 
 def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str, object]:
+    task_key = ("project", str(project["id"]))
+    if scan_dispatcher.contains(task_key):
+        raise RuntimeError("Сбор уже выполняется или ожидает очереди")
     worker = project.get("worker_thread")
     state = project.get("state", {})
     if isinstance(worker, threading.Thread) and worker.is_alive():
@@ -7342,7 +7462,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.run_id = int(project["run_id"])
         crawler.stop_signal = project["stop_event"]
         crawler.finish_signal = project["finish_event"]
-        crawler.thread_count = parse_thread_count(project.get("thread_count", 4))
+        crawler.thread_count = min(parse_thread_count(project.get("thread_count", 4)), MAX_CRAWL_WORKERS_PER_SCAN)
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
         crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)
@@ -7352,7 +7472,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.connection_method_state["active_method"] = crawler.connection_method
         crawler.excel_finalized = False
     else:
-        reset_project_state(project, "running")
+        reset_project_state(project, "queued")
         crawler = ProductSiteCrawler(
             list(project.get("start_urls", [DEFAULT_START_URL])),
             int(project["run_id"]),
@@ -7370,14 +7490,24 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
 
     def target() -> None:
         try:
+            if resume:
+                update_project_state(project, status="running", error="")
+            else:
+                reset_project_state(project, "running")
             crawler.run(resume=resume)
         except Exception as exc:  # noqa: BLE001
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
             add_project_log(project, f"Критическая ошибка: {exc}", "error")
 
-    worker_thread = threading.Thread(target=target, daemon=True)
-    project["worker_thread"] = worker_thread
-    worker_thread.start()
+    def on_start(thread: threading.Thread) -> None:
+        project["worker_thread"] = thread
+
+    def on_finish(thread: threading.Thread) -> None:
+        if project.get("worker_thread") is thread:
+            project["worker_thread"] = None
+
+    if not scan_dispatcher.enqueue(task_key, target, on_start=on_start, on_finish=on_finish):
+        raise RuntimeError("Сбор уже выполняется или ожидает очереди")
     add_project_log(project, "Продолжение поставлено в очередь" if resume else "Сбор поставлен в очередь запуска", "info")
     return project["state"]
 
@@ -7469,6 +7599,7 @@ def api_project_stop(project_id: str):
     project = get_project(project_id)
     if not project:
         return jsonify({"error": "Проект не найден"}), 404
+    scan_dispatcher.cancel(("project", str(project["id"])))
     stop_event = project.get("stop_event")
     if isinstance(stop_event, threading.Event):
         stop_event.set()
