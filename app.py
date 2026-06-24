@@ -2283,7 +2283,7 @@ MODEL_COLOR_WORDS = {
 
 
 def model_tokens_after_brand(value: str) -> str:
-    tokens = re.findall(r"[A-Za-z\u0400-\u04FF0-9]+(?:[./_-][A-Za-z\u0400-\u04FF0-9]+)*", clean_text(value))
+    tokens = re.findall(r"[A-Za-z\u0400-\u04FF0-9]+(?:[./_@-][A-Za-z\u0400-\u04FF0-9]+)*", clean_text(value))
     if not tokens:
         return ""
     brands = model_brand_names()
@@ -2344,7 +2344,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
 
     if (
         re.fullmatch(
-            r"[A-Za-z0-9./_-]+(?:\s+-\s+|\s+[A-Za-z0-9./_-]+){0,8}",
+            r"[A-Za-z0-9./_@-]+(?:\s+-\s+|\s+[A-Za-z0-9./_@-]+){0,8}",
             mixed_case_model,
         )
         and any(char.isdigit() for char in mixed_case_model)
@@ -2357,7 +2357,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
     brands_regex = known_brand_regex()
     if brands_regex:
         brand_match = re.search(
-            rf"\b(?:{brands_regex})\b\s+([A-Z0-9][A-Z0-9./\\_-]{{2,}})",
+            rf"\b(?:{brands_regex})\b\s+([A-Z0-9][A-Z0-9./_@\\-]{{2,}})",
             text,
             re.IGNORECASE,
         )
@@ -2369,7 +2369,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
         return generic_brand_model
 
     latin_model_text = text.replace("\\", "/")
-    latin_model_tokens = re.findall(r"[A-Za-z0-9./_-]+", latin_model_text)
+    latin_model_tokens = re.findall(r"[A-Za-z0-9./_@-]+", latin_model_text)
     if (
         latin_model_tokens
         and " ".join(latin_model_tokens).strip() == re.sub(r"\s+", " ", latin_model_text).strip()
@@ -2381,14 +2381,14 @@ def normalize_model(value: str, product_url: str = "") -> str:
     ):
         return " ".join(token.strip(" .,/\\_-").upper() for token in latin_model_tokens if token.strip(" .,/\\_-"))
 
-    ascii_tokens = re.findall(r"[A-Za-z0-9]+(?:[./_-][A-Za-z0-9]+)*", text)
+    ascii_tokens = re.findall(r"[A-Za-z0-9]+(?:[./_@-][A-Za-z0-9]+)*", text)
     for start_index in range(max(0, len(ascii_tokens) - 6), len(ascii_tokens)):
         candidate_tokens = [token.strip(" .,/\\_-") for token in ascii_tokens[start_index:] if token.strip(" .,/\\_-")]
         if not (2 <= len(candidate_tokens) <= 6):
             continue
         if not any(any(char.isdigit() for char in token) for token in candidate_tokens):
             continue
-        if not all(re.fullmatch(r"[A-Z0-9./_-]+", token) for token in candidate_tokens):
+        if not all(re.fullmatch(r"[A-Z0-9./_@-]+", token) for token in candidate_tokens):
             continue
         if candidate_tokens[0].upper() in model_brand_names() or candidate_tokens[0].upper() in {"SERIE", "SERIES"}:
             continue
@@ -2404,7 +2404,7 @@ def normalize_model(value: str, product_url: str = "") -> str:
         *model_brand_names(),
     }
     code_tokens = []
-    for token in re.findall(r"[A-Z\u0400-\u04FF0-9][A-Z\u0400-\u04FF0-9./\\_-]{2,}", text, flags=re.IGNORECASE):
+    for token in re.findall(r"[A-Z\u0400-\u04FF0-9][A-Z\u0400-\u04FF0-9./_@\\-]{2,}", text, flags=re.IGNORECASE):
         cleaned = token.strip(" .,/\\_-")
         if cleaned.upper() in ignored_tokens:
             continue
