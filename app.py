@@ -2336,9 +2336,11 @@ def normalize_model(value: str, product_url: str = "") -> str:
     # Сохраняем регистр и разделители моделей, которые уже выглядят как готовая модель.
     mixed_case_model = text.replace("\\", "/")
     mixed_case_model = re.sub(r"[–—]", "-", mixed_case_model)
+    mixed_case_model = re.sub(r"\s*([/_.+])\s*", r"\1", mixed_case_model)
     mixed_case_model = re.sub(r"\s+-\s+", " - ", mixed_case_model)
     mixed_case_model = re.sub(r"\s{2,}", " ", mixed_case_model).strip()
     mixed_case_model = mixed_case_model.rstrip(".")
+    text = mixed_case_model
 
     if (
         re.fullmatch(
