@@ -565,6 +565,7 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
         "thread_count": 4,
         "exclusions": DEFAULT_EXCLUSIONS.copy(),
         "product_url_filters": [],
+        "product_url_exclusions": [],
         "extraction_rules": {},
         "state": make_state(4),
         "logs": [],
@@ -591,6 +592,7 @@ def public_project(project: Dict[str, object]) -> Dict[str, object]:
         "thread_count": project["thread_count"],
         "exclusions": project["exclusions"],
         "product_url_filters": project.get("product_url_filters", []),
+        "product_url_exclusions": project.get("product_url_exclusions", []),
         "extraction_rules": project.get("extraction_rules", {}),
         "state": state,
         "auto_cleanup": project.get("auto_cleanup", False),
@@ -608,6 +610,7 @@ def project_model_to_dict(row: Project) -> Dict[str, object]:
         "thread_count": thread_count,
         "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
+        "product_url_exclusions": normalize_patterns(getattr(row, "product_url_exclusions", None) or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "state": {**make_state(thread_count), **(row.state or {})},
         "logs": [],
@@ -637,6 +640,7 @@ def upsert_project_model(session, project: Dict[str, object]) -> int:
     row.thread_count = parse_thread_count(project.get("thread_count", 4))
     row.exclusions = normalize_patterns(project.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(project.get("product_url_filters", []))
+    row.product_url_exclusions = normalize_patterns(project.get("product_url_exclusions", []))
     row.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
     row.state = dict(project.get("state") or make_state(row.thread_count))
     row.auto_cleanup = bool(project.get("auto_cleanup", False))
@@ -1150,6 +1154,7 @@ def make_news_monitor(group: str, brand: str, urls: List[str], site_url: str = "
         "auto_connection_fallback": True,
         "exclusions": DEFAULT_EXCLUSIONS.copy(),
         "product_url_filters": [],
+        "product_url_exclusions": [],
         "extraction_rules": {},
         "selector_settings": {},
         "seen_models": [],
@@ -1212,6 +1217,7 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     monitor["auto_connection_fallback"] = bool(item.get("auto_connection_fallback", True))
     monitor["exclusions"] = normalize_patterns(item.get("exclusions", DEFAULT_EXCLUSIONS))
     monitor["product_url_filters"] = normalize_patterns(item.get("product_url_filters", []))
+    monitor["product_url_exclusions"] = normalize_patterns(item.get("product_url_exclusions", []))
     monitor["extraction_rules"] = normalize_extraction_rules(item.get("extraction_rules", {}))
     monitor["selector_settings"] = normalize_selector_settings(item.get("selector_settings", {}))
     monitor["seen_models"] = [normalize_model_key(str(value)) for value in item.get("seen_models", []) if str(value).strip()]
@@ -1288,6 +1294,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "auto_connection_fallback": bool(row.auto_connection_fallback),
         "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
+        "product_url_exclusions": normalize_patterns(getattr(row, "product_url_exclusions", None) or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "selector_settings": normalize_selector_settings(row.selector_settings or {}),
         "seen_models": [normalize_model_key(str(value)) for value in (row.seen_models or []) if str(value).strip()],
@@ -1376,6 +1383,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
     row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
+    row.product_url_exclusions = normalize_patterns(normalized.get("product_url_exclusions", []))
     row.extraction_rules = normalize_extraction_rules(normalized.get("extraction_rules", {}))
     row.selector_settings = normalize_selector_settings(normalized.get("selector_settings", {}))
     row.seen_models = [normalize_model_key(str(value)) for value in normalized.get("seen_models", []) if str(value).strip()]
@@ -2211,6 +2219,16 @@ def product_url_matches_filters(url: str, filters: Iterable[str]) -> bool:
     parsed = urlparse(url)
     haystack = f"{url} {parsed.path}".lower()
     return any(pattern in haystack or fnmatch(haystack, pattern) for pattern in patterns)
+
+
+def product_url_matches_any(url: str, patterns: Iterable[str]) -> bool:
+    normalized_patterns = [str(pattern).strip().lower() for pattern in patterns if str(pattern).strip()]
+    if not normalized_patterns:
+        return False
+
+    parsed = urlparse(url)
+    haystack = f"{url} {parsed.path}".lower()
+    return any(pattern in haystack or fnmatch(haystack, pattern) for pattern in normalized_patterns)
 
 
 def product_url_filter_patterns(
@@ -4050,6 +4068,7 @@ class ProductSiteCrawler:
         project: Optional[Dict[str, object]] = None,
         exclusions: Optional[List[str]] = None,
         product_url_filters: Optional[List[str]] = None,
+        product_url_exclusions: Optional[List[str]] = None,
         extraction_rules: Optional[Dict[str, str]] = None,
         connection_method: str = "requests",
         auto_connection_fallback: bool = True,
@@ -4067,6 +4086,7 @@ class ProductSiteCrawler:
         self.exclusions = exclusions if exclusions is not None else DEFAULT_EXCLUSIONS.copy()
         self.extraction_rules = normalize_extraction_rules(extraction_rules or {})
         self.product_url_filters = product_url_filter_patterns(product_url_filters or [], self.extraction_rules)
+        self.product_url_exclusions = normalize_patterns(product_url_exclusions or [])
         self.connection_method = normalize_connection_method(connection_method)
         self.auto_connection_fallback = bool(auto_connection_fallback)
         self.allow_empty_price = bool(allow_empty_price)
@@ -4336,10 +4356,10 @@ class ProductSiteCrawler:
         return matched
 
     def is_product_allowed(self, url: str) -> bool:
-        return product_url_matches_filters(url, self.product_url_filters)
+        return product_url_matches_filters(url, self.product_url_filters) and not product_url_matches_any(url, self.product_url_exclusions)
 
     def is_filter_marked_product(self, url: str) -> bool:
-        return bool(self.product_url_filters) and product_url_matches_filters(url, self.product_url_filters)
+        return bool(self.product_url_filters) and self.is_product_allowed(url)
 
     def is_product_url(self, url: str) -> bool:
         return is_product_url_for_filters(url, self.product_url_filters)
@@ -4357,7 +4377,7 @@ class ProductSiteCrawler:
         return False
 
     def is_current_product_page(self, url: str) -> bool:
-        return self.is_product_url(url) and not self.is_start_url_path(url)
+        return self.is_product_url(url) and self.is_product_allowed(url) and not self.is_start_url_path(url)
 
     def remember_listing_price(self, product_url: str, price: str) -> None:
         product_url = canonicalize_product_url_by_filters(product_url, self.product_url_filters)
@@ -4547,6 +4567,8 @@ class ProductSiteCrawler:
 
         for product in listing_products:
             product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
+            if product_url and not self.is_product_allowed(product_url):
+                continue
             product["url"] = product_url
             self.remember_listing_price(product_url, product.get("price", ""))
             self.enqueue(product_url, force=True)
@@ -6105,6 +6127,7 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
         project=None,
         exclusions=list(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
         product_url_filters=list(monitor.get("product_url_filters", [])),
+        product_url_exclusions=list(monitor.get("product_url_exclusions", [])),
         extraction_rules=normalize_extraction_rules(monitor.get("extraction_rules", {})),
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
@@ -7124,6 +7147,8 @@ def api_update_news_monitor(monitor_id: str):
             monitor["exclusions"] = exclusions
         if "product_url_filters" in payload:
             monitor["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
+        if "product_url_exclusions" in payload:
+            monitor["product_url_exclusions"] = normalize_patterns(payload.get("product_url_exclusions"))
         if "extraction_rules" in payload:
             monitor["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
         if "selector_settings" in payload:
@@ -7458,6 +7483,8 @@ def api_update_project(project_id: str):
             project["start_urls"] = normalize_start_urls(payload.get("start_urls"))
         if "product_url_filters" in payload:
             project["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
+        if "product_url_exclusions" in payload:
+            project["product_url_exclusions"] = normalize_patterns(payload.get("product_url_exclusions"))
         if "extraction_rules" in payload:
             project["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
         if "thread_count" in payload:
@@ -7571,6 +7598,45 @@ def api_project_delete_product_url_filter(project_id: str, index: int):
     return jsonify({"product_url_filters": project.get("product_url_filters", [])})
 
 
+@app.get("/api/projects/<project_id>/product-url-exclusions")
+def api_project_product_url_exclusions(project_id: str):
+    project = get_project(project_id)
+    if not project:
+        return jsonify({"error": "Проект не найден"}), 404
+    return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
+
+
+@app.post("/api/projects/<project_id>/product-url-exclusions")
+def api_project_add_product_url_exclusion(project_id: str):
+    project = get_project(project_id)
+    if not project:
+        return jsonify({"error": "Проект не найден"}), 404
+    payload = request.get_json(silent=True) or {}
+    pattern = str(payload.get("pattern", "")).strip()
+    if not pattern:
+        return jsonify({"error": "Пустое исключение товарной ссылки"}), 400
+    with projects_lock:
+        exclusions = project.setdefault("product_url_exclusions", [])
+        if pattern not in exclusions:
+            exclusions.append(pattern)
+            save_projects()
+    return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
+
+
+@app.delete("/api/projects/<project_id>/product-url-exclusions/<int:index>")
+def api_project_delete_product_url_exclusion(project_id: str, index: int):
+    project = get_project(project_id)
+    if not project:
+        return jsonify({"error": "Проект не найден"}), 404
+    with projects_lock:
+        exclusions = project.setdefault("product_url_exclusions", [])
+        if index < 0 or index >= len(exclusions):
+            return jsonify({"error": "Исключение товарной ссылки не найдено"}), 404
+        exclusions.pop(index)
+        save_projects()
+    return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
+
+
 def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str, object]:
     task_key = ("project", str(project["id"]))
     if scan_dispatcher.contains(task_key):
@@ -7598,6 +7664,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
         crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)
+        crawler.product_url_exclusions = normalize_patterns(project.get("product_url_exclusions", []))
         crawler.connection_method = normalize_connection_method(project.get("connection_method"))
         crawler.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
         crawler.active_connection_method = crawler.connection_method
@@ -7614,6 +7681,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             project=project,
             exclusions=list(project.get("exclusions", DEFAULT_EXCLUSIONS)),
             product_url_filters=list(project.get("product_url_filters", [])),
+            product_url_exclusions=list(project.get("product_url_exclusions", [])),
             extraction_rules=normalize_extraction_rules(project.get("extraction_rules", {})),
             connection_method=project.get("connection_method", "requests"),
             auto_connection_fallback=bool(project.get("auto_connection_fallback", True)),
@@ -7656,6 +7724,8 @@ def api_project_start(project_id: str):
             project["start_urls"] = normalize_start_urls(payload.get("start_urls"))
         if "product_url_filters" in payload:
             project["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
+        if "product_url_exclusions" in payload:
+            project["product_url_exclusions"] = normalize_patterns(payload.get("product_url_exclusions"))
         if "extraction_rules" in payload:
             project["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
         if "thread_count" in payload:

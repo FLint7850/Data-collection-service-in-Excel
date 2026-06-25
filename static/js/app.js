@@ -40,6 +40,9 @@ const exclusionList = document.querySelector("#exclusionList");
 const productUrlFilterForm = document.querySelector("#productUrlFilterForm");
 const productUrlFilterInput = document.querySelector("#productUrlFilterInput");
 const productUrlFilterList = document.querySelector("#productUrlFilterList");
+const productUrlExclusionForm = document.querySelector("#productUrlExclusionForm");
+const productUrlExclusionInput = document.querySelector("#productUrlExclusionInput");
+const productUrlExclusionList = document.querySelector("#productUrlExclusionList");
 const productCardSelector = document.querySelector("#productCardSelector");
 const productUrlSelector = document.querySelector("#productUrlSelector");
 const modelSelector = document.querySelector("#modelSelector");
@@ -561,6 +564,7 @@ function renderProjectForm(project) {
   isHydratingForm = false;
   renderExclusions(project.exclusions || []);
   renderProductUrlFilters(project.product_url_filters || []);
+  renderProductUrlExclusions(project.product_url_exclusions || []);
 }
 
 function renderState(project) {
@@ -646,6 +650,35 @@ function renderProductUrlFilters(items) {
 
     item.append(text, button);
     productUrlFilterList.append(item);
+  });
+}
+
+function renderProductUrlExclusions(items) {
+  if (!productUrlExclusionList) return;
+  productUrlExclusionList.innerHTML = "";
+  items.forEach((pattern, index) => {
+    const item = document.createElement("li");
+    item.className = "exclusion-item";
+
+    const text = document.createElement("span");
+    text.className = "exclusion-pattern";
+    text.textContent = pattern;
+
+    const button = document.createElement("button");
+    button.className = "remove-button";
+    button.type = "button";
+    button.setAttribute("aria-label", "Удалить исключение товарной ссылки");
+    button.textContent = "×";
+    button.addEventListener("click", async () => {
+      const project = activeProject();
+      if (!project) return;
+      const data = await requestJson(`/api/projects/${project.id}/product-url-exclusions/${index}`, { method: "DELETE" });
+      project.product_url_exclusions = data.product_url_exclusions || [];
+      renderProductUrlExclusions(project.product_url_exclusions);
+    });
+
+    item.append(text, button);
+    productUrlExclusionList.append(item);
   });
 }
 
@@ -1602,6 +1635,10 @@ function renderNewsModal() {
         <span>Фильтр товарных ссылок</span>
         <textarea data-field="product_url_filters" rows="2">${escapeHtml((monitor.product_url_filters || []).join("\n"))}</textarea>
       </label>
+      <label class="field modal-wide-field">
+        <span>Исключения товарных ссылок</span>
+        <textarea data-field="product_url_exclusions" rows="2" placeholder="/recommend">${escapeHtml((monitor.product_url_exclusions || []).join("\n"))}</textarea>
+      </label>
       </div>
     </div>
 
@@ -1907,6 +1944,7 @@ async function saveActiveProject() {
     name: projectName.value.trim() || project.name,
     start_urls: startUrls.value,
     product_url_filters: project.product_url_filters || [],
+    product_url_exclusions: project.product_url_exclusions || [],
     extraction_rules: {
       product_card_selector: productCardSelector.value.trim(),
       product_url_selector: productUrlSelector.value.trim(),
@@ -2573,6 +2611,7 @@ startButton.addEventListener("click", async () => {
       body: JSON.stringify({
         start_urls: startUrls.value,
         product_url_filters: project.product_url_filters || [],
+        product_url_exclusions: project.product_url_exclusions || [],
         extraction_rules: {
           product_card_selector: productCardSelector.value.trim(),
           product_url_selector: productUrlSelector.value.trim(),
@@ -2681,6 +2720,27 @@ productUrlFilterForm.addEventListener("submit", async (event) => {
     errorText.textContent = error.message;
   }
 });
+
+if (productUrlExclusionForm) {
+  productUrlExclusionForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const project = activeProject();
+    const pattern = productUrlExclusionInput.value.trim();
+    if (!project || !pattern) return;
+
+    try {
+      const data = await requestJson(`/api/projects/${project.id}/product-url-exclusions`, {
+        method: "POST",
+        body: JSON.stringify({ pattern }),
+      });
+      project.product_url_exclusions = data.product_url_exclusions || [];
+      productUrlExclusionInput.value = "";
+      renderProductUrlExclusions(project.product_url_exclusions);
+    } catch (error) {
+      errorText.textContent = error.message;
+    }
+  });
+}
 
 downloadButton.addEventListener("click", (event) => {
   if (downloadButton.classList.contains("disabled")) {

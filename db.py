@@ -148,6 +148,7 @@ def migrate_schema(connection) -> None:
     migrate_app_settings_current_table(connection)
     migrate_news_tables(connection)
     migrate_donor_start_urls(connection)
+    migrate_donors_table(connection)
     migrate_projects_table(connection)
     migrate_file_import_table(connection)
 
@@ -387,6 +388,7 @@ def migrate_news_tables(connection) -> None:
             "auto_connection_fallback BOOLEAN NOT NULL DEFAULT 1, "
             "exclusions JSON NOT NULL DEFAULT '[]', "
             "product_url_filters JSON NOT NULL DEFAULT '[]', "
+            "product_url_exclusions JSON NOT NULL DEFAULT '[]', "
             "extraction_rules JSON NOT NULL DEFAULT '{}', "
             "selector_settings JSON NOT NULL DEFAULT '{}', "
             "seen_models JSON NOT NULL DEFAULT '[]', "
@@ -464,9 +466,9 @@ def migrate_news_tables(connection) -> None:
             text(
                 "INSERT INTO donors "
                 "(id, legacy_id, brand_id, site_url, start_urls, thread_count, connection_id, auto_connection_fallback, exclusions, "
-                "product_url_filters, extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
+                "product_url_filters, product_url_exclusions, extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
                 "VALUES (:id, :legacy_id, :brand_id, :site_url, json(:start_urls), :thread_count, :connection_id, :auto_connection_fallback, json(:exclusions), "
-                "json(:product_url_filters), json(:extraction_rules), json(:selector_settings), json(:seen_models), json(:known_new_products), :created_at, :updated_at)"
+                "json(:product_url_filters), json(:product_url_exclusions), json(:extraction_rules), json(:selector_settings), json(:seen_models), json(:known_new_products), :created_at, :updated_at)"
             ),
             {
                 "id": donor_id if isinstance(donor_id, int) or str(donor_id).isdigit() else None,
@@ -479,6 +481,7 @@ def migrate_news_tables(connection) -> None:
                 "auto_connection_fallback": _bool_value(row.get("auto_connection_fallback"), True),
                 "exclusions": json.dumps(_json_or_default(row.get("exclusions"), []), ensure_ascii=False),
                 "product_url_filters": json.dumps(_json_or_default(row.get("product_url_filters"), []), ensure_ascii=False),
+                "product_url_exclusions": json.dumps(_json_or_default(row.get("product_url_exclusions"), []), ensure_ascii=False),
                 "extraction_rules": json.dumps(_json_or_default(row.get("extraction_rules"), {}), ensure_ascii=False),
                 "selector_settings": json.dumps(_json_or_default(row.get("selector_settings"), {}), ensure_ascii=False),
                 "seen_models": json.dumps(_json_or_default(row.get("seen_models"), []), ensure_ascii=False),
@@ -508,6 +511,9 @@ def migrate_projects_table(connection) -> None:
         return
     if "exclusions" not in columns:
         connection.execute(text("ALTER TABLE projects ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
+        columns = table_columns(connection, "projects")
+    if "product_url_exclusions" not in columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN product_url_exclusions JSON NOT NULL DEFAULT '[]'"))
         columns = table_columns(connection, "projects")
     if "legacy_id" not in columns:
         connection.execute(text("ALTER TABLE projects ADD COLUMN legacy_id VARCHAR(32) NOT NULL DEFAULT ''"))
@@ -539,16 +545,34 @@ def migrate_donors_table(connection) -> None:
     if "legacy_id" not in columns:
         connection.execute(text("ALTER TABLE donors ADD COLUMN legacy_id VARCHAR(32) NOT NULL DEFAULT ''"))
         columns = table_columns(connection, "donors")
-    if "connection_method_id" not in columns:
-        connection.execute(text("ALTER TABLE donors ADD COLUMN connection_method_id INTEGER"))
+
+    if "connection_id" not in columns:
+        if "connection_method_id" in columns:
+            connection.execute(text("ALTER TABLE donors RENAME COLUMN connection_method_id TO connection_id"))
+        else:
+            connection.execute(text("ALTER TABLE donors ADD COLUMN connection_id INTEGER"))
         columns = table_columns(connection, "donors")
-    connection.execute(
-        text(
-            "UPDATE donors SET connection_method_id = "
-            "(SELECT id FROM connection_methods WHERE code = COALESCE(NULLIF(donors.connection_method, ''), 'requests') LIMIT 1) "
-            "WHERE connection_method_id IS NULL"
+
+    if "product_url_exclusions" not in columns:
+        connection.execute(text("ALTER TABLE donors ADD COLUMN product_url_exclusions JSON NOT NULL DEFAULT '[]'"))
+        columns = table_columns(connection, "donors")
+
+    if "connection_method" in columns:
+        connection.execute(
+            text(
+                "UPDATE donors SET connection_id = "
+                "(SELECT id FROM connection_methods WHERE code = COALESCE(NULLIF(donors.connection_method, ''), 'requests') LIMIT 1) "
+                "WHERE connection_id IS NULL"
+            )
         )
-    )
+    else:
+        connection.execute(
+            text(
+                "UPDATE donors SET connection_id = "
+                "(SELECT id FROM connection_methods WHERE code = 'requests' LIMIT 1) "
+                "WHERE connection_id IS NULL"
+            )
+        )
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
 
 
