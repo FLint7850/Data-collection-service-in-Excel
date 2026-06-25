@@ -756,16 +756,6 @@ def read_unified_log_file() -> List[Dict[str, object]]:
                 )
             )
             continue
-        entries.append(
-            repair_mojibake(
-                {
-                    "time": log_time_from_path(UNIFIED_LOG_FILE),
-                    "level": "info",
-                    "project_name": UNIFIED_LOG_FILE.name,
-                    "message": line,
-                }
-            )
-        )
     return entries
 
 
@@ -775,6 +765,8 @@ def read_plain_log_file(path: Path, project_name: str, level: str) -> List[Dict[
     for line in read_tail_lines(path):
         line = line.strip()
         if not line:
+            continue
+        if "PermissionError" in line and "app.log" in line:
             continue
         entries.append(
             repair_mojibake(
@@ -806,7 +798,6 @@ def iter_server_log_files() -> Iterable[Path]:
 def combined_log_entries() -> List[Dict[str, object]]:
     entries: List[Dict[str, object]] = []
     entries.extend(read_logs_file())
-    entries.extend(read_unified_log_file())
     entries.extend(read_plain_log_file(LOG_DIR / "flask-error.log", "flask-error.log", "error"))
     for path in iter_server_log_files():
         level = "error" if path.parent.name == "server-error" else "info"
@@ -3839,8 +3830,15 @@ print(marker + base64.b64encode(SinglePageSpider.body).decode("ascii"))
 CRAWLEE_FETCH_SCRIPT = r"""
 import asyncio
 import base64
+import os
+import shutil
 import sys
+import tempfile
+import uuid
 from datetime import timedelta
+
+storage_dir = os.path.join(tempfile.gettempdir(), "parser-crawlee", uuid.uuid4().hex)
+os.environ["CRAWLEE_STORAGE_DIR"] = storage_dir
 
 from crawlee.crawlers._http import HttpCrawler
 
@@ -3867,7 +3865,10 @@ async def main():
     print(marker + base64.b64encode(result["body"]).decode("ascii"))
 
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+finally:
+    shutil.rmtree(storage_dir, ignore_errors=True)
 """
 
 PLAYWRIGHT_FETCH_SCRIPT = r"""
