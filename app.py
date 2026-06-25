@@ -3593,6 +3593,9 @@ class BotasaurusBrowserSession:
     def __init__(self, stop_signal: Optional[threading.Event] = None) -> None:
         self.stop_signal = stop_signal
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._active_driver = None
+        self._closed = False
         self._renderer = self._create_renderer()
 
     def _create_renderer(self):
@@ -3625,20 +3628,27 @@ class BotasaurusBrowserSession:
             create_error_logs=False,
         )
         def _render_html(driver: Driver, payload: Dict[str, str]):
-            target_url = str(payload.get("url") or "")
-            navigation = str(payload.get("navigation") or "direct")
-            if navigation == "google":
-                driver.google_get(target_url)
-            else:
-                driver.get(target_url)
-            driver.sleep(2)
-            for _ in range(4):
-                try:
-                    driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
-                except Exception:
-                    break
-                driver.sleep(0.8)
-            return driver.page_html
+            with self._state_lock:
+                self._active_driver = driver
+            try:
+                target_url = str(payload.get("url") or "")
+                navigation = str(payload.get("navigation") or "direct")
+                if navigation == "google":
+                    driver.google_get(target_url)
+                else:
+                    driver.get(target_url)
+                driver.sleep(2)
+                for _ in range(4):
+                    try:
+                        driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
+                    except Exception:
+                        break
+                    driver.sleep(0.8)
+                return driver.page_html
+            finally:
+                with self._state_lock:
+                    if self._active_driver is driver:
+                        self._active_driver = None
 
         return _render_html
 
@@ -3647,10 +3657,16 @@ class BotasaurusBrowserSession:
             return None
         if self._renderer is None:
             return None
+        with self._state_lock:
+            if self._closed:
+                return None
         navigation = "google" if method == "botasaurus-browser" else "direct"
         with self._lock:
             if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
                 return None
+            with self._state_lock:
+                if self._closed:
+                    return None
             try:
                 result = self._renderer({"url": url, "navigation": navigation})
             except Exception:
@@ -3660,12 +3676,22 @@ class BotasaurusBrowserSession:
         return result if isinstance(result, str) and result.strip() else None
 
     def close(self) -> None:
+        with self._state_lock:
+            self._closed = True
+            active_driver = self._active_driver
+        if active_driver is not None:
+            try:
+                active_driver.close()
+            except Exception:
+                pass
         renderer = self._renderer
         if renderer is not None and hasattr(renderer, "close"):
             try:
                 renderer.close()
             except Exception:
                 pass
+        with self._state_lock:
+            self._active_driver = None
 
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
@@ -7762,7 +7788,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.run_id = int(project["run_id"])
         crawler.stop_signal = project["stop_event"]
         crawler.finish_signal = project["finish_event"]
-        crawler.browser_session.stop_signal = project["stop_event"]
+        crawler.browser_session = BotasaurusBrowserSession(project["stop_event"])
         crawler.thread_count = min(parse_thread_count(project.get("thread_count", 4)), MAX_CRAWL_WORKERS_PER_SCAN)
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
