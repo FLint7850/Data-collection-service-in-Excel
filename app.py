@@ -150,7 +150,6 @@ MAX_RETRIES = env_int("MAX_RETRIES", 3, minimum=1)
 BOTASAURUS_REQUEST_MAX_CONCURRENT = env_int("BOTASAURUS_REQUEST_MAX_CONCURRENT", 1, minimum=1, maximum=4)
 MAX_CRAWL_WORKERS_PER_SCAN = env_int("MAX_CRAWL_WORKERS_PER_SCAN", 6, minimum=1, maximum=16)
 MAX_CONCURRENT_SCANS = env_int("MAX_CONCURRENT_SCANS", 3, minimum=1, maximum=16)
-BROWSER_MAX_CONCURRENT = env_int("BROWSER_MAX_CONCURRENT", 2, minimum=1, maximum=8)
 FEED_WORKER_COUNT = env_int("FEED_WORKER_COUNT", 6, minimum=1, maximum=12)
 FEED_SNAPSHOT_CACHE_SECONDS = env_int("FEED_SNAPSHOT_CACHE_SECONDS", 120, minimum=0, maximum=3600)
 FEED_SNAPSHOT_RETAIN = env_int("FEED_SNAPSHOT_RETAIN", 3, minimum=2, maximum=10)
@@ -254,7 +253,6 @@ news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
-HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(BROWSER_MAX_CONCURRENT)
 BOTASAURUS_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BOTASAURUS_REQUEST_MAX_CONCURRENT)
 FEED_STORAGE_LOCK = threading.RLock()
 feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
@@ -3529,8 +3527,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
         return driver.page_html
 
     try:
-        with HEADLESS_BROWSER_SEMAPHORE:
-            result = _render_html(url)
+        result = _render_html(url)
     except Exception:
         return None
 
@@ -3590,6 +3587,87 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
     return result if isinstance(result, str) and result.strip() else None
 
 
+class BotasaurusBrowserSession:
+    """One reusable Botasaurus browser owned by one project/news scan."""
+
+    def __init__(self, stop_signal: Optional[threading.Event] = None) -> None:
+        self.stop_signal = stop_signal
+        self._lock = threading.Lock()
+        self._renderer = self._create_renderer()
+
+    def _create_renderer(self):
+        try:
+            from botasaurus.browser import Driver
+            from botasaurus.browser import browser
+        except ImportError:
+            return None
+
+        chrome_executable_path = botasaurus_browser_executable()
+
+        @browser(
+            headless=True,
+            chrome_executable_path=chrome_executable_path,
+            add_arguments=[
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--blink-settings=imagesEnabled=false",
+            ],
+            window_size=[1280, 720],
+            block_images_and_css=True,
+            wait_for_complete_page_load=False,
+            reuse_driver=True,
+            max_retry=1,
+            output=None,
+            close_on_crash=True,
+            create_error_logs=False,
+        )
+        def _render_html(driver: Driver, payload: Dict[str, str]):
+            target_url = str(payload.get("url") or "")
+            navigation = str(payload.get("navigation") or "direct")
+            if navigation == "google":
+                driver.google_get(target_url)
+            else:
+                driver.get(target_url)
+            driver.sleep(2)
+            for _ in range(4):
+                try:
+                    driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    break
+                driver.sleep(0.8)
+            return driver.page_html
+
+        return _render_html
+
+    def fetch(self, url: str, method: str) -> Optional[str]:
+        if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+            return None
+        if self._renderer is None:
+            return None
+        navigation = "google" if method == "botasaurus-browser" else "direct"
+        with self._lock:
+            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                return None
+            try:
+                result = self._renderer({"url": url, "navigation": navigation})
+            except Exception:
+                return None
+        if isinstance(result, list):
+            result = result[0] if result else None
+        return result if isinstance(result, str) and result.strip() else None
+
+    def close(self) -> None:
+        renderer = self._renderer
+        if renderer is not None and hasattr(renderer, "close"):
+            try:
+                renderer.close()
+            except Exception:
+                pass
+
+
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
     try:
         import asyncio
@@ -3643,8 +3721,7 @@ def fetch_with_crawl4ai(url: str) -> Optional[str]:
             return html if isinstance(html, str) else None
 
     try:
-        with HEADLESS_BROWSER_SEMAPHORE:
-            return asyncio.run(_fetch())
+        return asyncio.run(_fetch())
     except Exception:
         return None
 
@@ -3887,7 +3964,7 @@ class PlaywrightHeadlessRenderer:
     def ensure_started(self) -> None:
         with self.lock:
             self.threads = [thread for thread in self.threads if thread.is_alive()]
-            while len(self.threads) < BROWSER_MAX_CONCURRENT:
+            while len(self.threads) < 1:
                 worker_number = len(self.threads) + 1
                 thread = threading.Thread(
                     target=self._worker,
@@ -4044,8 +4121,7 @@ def fetch_with_playwright(url: str) -> Optional[str]:
         import playwright  # noqa: F401
     except ImportError:
         return None
-    with HEADLESS_BROWSER_SEMAPHORE:
-        return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
+    return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
 
 
 def fetch_with_scrapegraphai(url: str) -> Optional[str]:
@@ -4053,8 +4129,7 @@ def fetch_with_scrapegraphai(url: str) -> Optional[str]:
         import scrapegraphai  # noqa: F401
     except ImportError:
         return None
-    with HEADLESS_BROWSER_SEMAPHORE:
-        return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
+    return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
 
 
 class ProductSiteCrawler:
@@ -4074,6 +4149,8 @@ class ProductSiteCrawler:
         auto_connection_fallback: bool = True,
         connection_method_state: Optional[Dict[str, object]] = None,
         allow_empty_price: bool = False,
+        browser_session: Optional[BotasaurusBrowserSession] = None,
+        owns_browser_session: bool = True,
     ):
         self.run_id = run_id
         self.stop_signal = stop_signal
@@ -4100,6 +4177,8 @@ class ProductSiteCrawler:
             connection_method_state.setdefault("lock", threading.Lock())
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
+        self.browser_session = browser_session or BotasaurusBrowserSession(self.stop_signal)
+        self.owns_browser_session = owns_browser_session
         self.thread_local = threading.local()
         self.headers = {
             "User-Agent": (
@@ -4202,16 +4281,8 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
-        if method == "botasaurus-browser":
-            return fetch_with_botasaurus_browser(target_url, "google")
-        if method == "botasaurus-browser-direct":
-            return fetch_with_botasaurus_browser(target_url, "direct")
-        if method == "botasaurus-visible":
-            return fetch_with_botasaurus_visible_browser(target_url)
-        if method == "botasaurus-debug-visible":
-            return fetch_with_botasaurus_debug_visible_browser(target_url)
-        if method == "crawl4ai":
-            return fetch_with_crawl4ai(target_url)
+        if method in BROWSER_RENDER_METHODS:
+            return self.browser_session.fetch(target_url, method)
         if method == "firecrawl":
             if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
                 self.log("Метод firecrawl пропущен: не задан FIRECRAWL_API_KEY", "warning")
@@ -4221,10 +4292,6 @@ class ProductSiteCrawler:
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
             return fetch_with_crawlee(target_url)
-        if method == "playwright":
-            return fetch_with_playwright(target_url)
-        if method == "scrapegraphai":
-            return fetch_with_scrapegraphai(target_url)
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
@@ -4559,7 +4626,7 @@ class ProductSiteCrawler:
                 error=f"На странице каталога нет цен в HTML. Рендерю через Botasaurus: {url}",
             )
             self.log(f"Рендеринг каталога через Botasaurus: {url}", "warning")
-            rendered_html = fetch_with_botasaurus_browser(url)
+            rendered_html = self.browser_session.fetch(url, "botasaurus-browser")
             if rendered_html and not looks_blocked_or_empty(rendered_html):
                 html = rendered_html
                 listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
@@ -4733,6 +4800,8 @@ class ProductSiteCrawler:
                 pending_urls_to_requeue = list(pending.values())
                 self.requeue_pending(pending_urls_to_requeue)
             executor.shutdown(wait=False, cancel_futures=True)
+            if self.owns_browser_session:
+                self.browser_session.close()
 
         if self.stop_signal.is_set():
             self.elapsed_before_resume = self.elapsed_seconds()
@@ -6079,7 +6148,11 @@ def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
     return event
 
 
-def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: threading.Event) -> List[Dict[str, str]]:
+def collect_products_for_monitor(
+    monitor: Dict[str, object],
+    stop_signal: threading.Event,
+    browser_session: BotasaurusBrowserSession,
+) -> List[Dict[str, str]]:
     finish_signal = threading.Event()
     start_urls = normalize_start_urls(monitor.get("start_urls") or "", allow_empty=True)
     if not start_urls:
@@ -6132,6 +6205,8 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
         allow_empty_price=True,
+        browser_session=browser_session,
+        owns_browser_session=False,
         progress_callback=progress_callback,
     )
     crawler.run()
@@ -6153,6 +6228,8 @@ def collect_products_for_monitor(monitor: Dict[str, object], stop_signal: thread
 def enrich_news_product(
     product: Dict[str, str],
     monitor: Dict[str, object],
+    stop_signal: threading.Event,
+    browser_session: BotasaurusBrowserSession,
     connection_method_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     url = product.get("url", "")
@@ -6172,13 +6249,15 @@ def enrich_news_product(
     fetcher = CollectOnlyCrawler(
         [url],
         int(time.time()),
-        threading.Event(),
+        stop_signal,
         threading.Event(),
         1,
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
         connection_method_state=connection_method_state,
         allow_empty_price=True,
+        browser_session=browser_session,
+        owns_browser_session=False,
     )
     html = fetcher.fetch(url) if url else ""
     if not html:
@@ -6326,6 +6405,7 @@ def enrich_news_candidates(
     monitor: Dict[str, object],
     feed_code_sets: List[Dict[str, object]],
     stop_signal: threading.Event,
+    browser_session: BotasaurusBrowserSession,
     progress_callback,
 ) -> List[Dict[str, str]]:
     candidates: List[tuple[int, Dict[str, str]]] = []
@@ -6362,7 +6442,14 @@ def enrich_news_candidates(
         }
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {
-                executor.submit(enrich_news_product, product, monitor, connection_method_state): (index, product)
+                executor.submit(
+                    enrich_news_product,
+                    product,
+                    monitor,
+                    stop_signal,
+                    browser_session,
+                    connection_method_state,
+                ): (index, product)
                 for index, product in candidates
             }
             completed = len(products) - len(candidates)
@@ -6525,6 +6612,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
     availability_skipped = 0
+    browser_session = BotasaurusBrowserSession(stop_event)
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -6551,7 +6639,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             "info",
         )
         update_news_monitor_state(monitor, stage="Сканирование сайта-донора", percent=5)
-        products = collect_products_for_monitor(monitor, stop_event)
+        products = collect_products_for_monitor(monitor, stop_event, browser_session)
         check_stop_requested()
         add_news_log(monitor, "Сбор закончил", "info")
         add_news_log(monitor, f"Сканирование сайта завершено. Найдено товаров: {len(products)}", "info")
@@ -6586,7 +6674,14 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 currenturl=current_url,
             )
 
-        enriched_products = enrich_news_candidates(products, monitor, feed_code_sets, stop_event, update_compare_progress)
+        enriched_products = enrich_news_candidates(
+            products,
+            monitor,
+            feed_code_sets,
+            stop_event,
+            browser_session,
+            update_compare_progress,
+        )
         availability_exclusions = normalize_patterns((monitor.get("selector_settings") or {}).get("availability_exclusions", []))
         for details, product in zip(enriched_products, products):
             check_stop_requested()
@@ -6741,6 +6836,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             data={"error": str(exc)},
         )
     finally:
+        browser_session.close()
         with news_lock:
             news_stop_modes.pop(monitor_id, None)
             thread = news_scan_threads.get(monitor_id)
@@ -7637,6 +7733,12 @@ def api_project_delete_product_url_exclusion(project_id: str, index: int):
     return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
 
 
+def close_project_browser_session(project: Dict[str, object]) -> None:
+    crawler = project.get("crawler")
+    if isinstance(crawler, ProductSiteCrawler):
+        crawler.browser_session.close()
+
+
 def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str, object]:
     task_key = ("project", str(project["id"]))
     if scan_dispatcher.contains(task_key):
@@ -7660,6 +7762,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.run_id = int(project["run_id"])
         crawler.stop_signal = project["stop_event"]
         crawler.finish_signal = project["finish_event"]
+        crawler.browser_session.stop_signal = project["stop_event"]
         crawler.thread_count = min(parse_thread_count(project.get("thread_count", 4)), MAX_CRAWL_WORKERS_PER_SCAN)
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
@@ -7760,6 +7863,7 @@ def api_project_pause(project_id: str):
         stop_event.set()
     crawler = project.get("crawler")
     if crawler:
+        close_project_browser_session(project)
         crawler.finish_with_excel(partial=True)
     add_project_log(project, "Сбор приостановлен с формированием CSV", "warning")
     return jsonify(project["state"])
@@ -7776,6 +7880,7 @@ def api_project_soft_pause(project_id: str):
     project["stop_mode"] = "pause"
     if isinstance(stop_event, threading.Event):
         stop_event.set()
+    close_project_browser_session(project)
     update_project_state(project, error="Ставлю сбор на паузу...", currenturl="")
     add_project_log(project, "Запрошена обычная пауза", "warning")
     return jsonify(project["state"])
@@ -7805,6 +7910,7 @@ def api_project_stop(project_id: str):
     stop_event = project.get("stop_event")
     if isinstance(stop_event, threading.Event):
         stop_event.set()
+    close_project_browser_session(project)
     with projects_lock:
         project["stop_mode"] = "stop"
         project["run_id"] = int(project.get("run_id", 0)) + 1
@@ -7837,6 +7943,7 @@ def api_project_restart(project_id: str):
     stop_event = project.get("stop_event")
     if isinstance(stop_event, threading.Event):
         stop_event.set()
+    close_project_browser_session(project)
     worker = project.get("worker_thread")
     if isinstance(worker, threading.Thread) and worker.is_alive():
         with projects_lock:
