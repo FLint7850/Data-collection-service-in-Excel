@@ -5218,12 +5218,18 @@ def tail_after_brand(name: str, brand: str) -> str:
     pattern = brand_match_pattern(brand)
     match = re.search(pattern, text, flags=re.IGNORECASE) if pattern else None
     if match:
+        before_brand = clean_text(text[:match.start()])
+        if before_brand and any(model_signal_token(token) for token in before_brand.split()):
+            return before_brand
         return clean_text(text[match.end():])
     visual_text = text.translate(VISUAL_MODEL_TRANSLATION)
     visual_brand = brand.translate(VISUAL_MODEL_TRANSLATION)
     visual_pattern = brand_match_pattern(visual_brand)
     visual_match = re.search(visual_pattern, visual_text, flags=re.IGNORECASE) if visual_pattern else None
     if visual_match:
+        before_brand = clean_text(text[:visual_match.start()])
+        if before_brand and any(model_signal_token(token) for token in before_brand.split()):
+            return before_brand
         return clean_text(text[visual_match.end():])
     return text
 
