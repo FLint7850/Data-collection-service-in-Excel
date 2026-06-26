@@ -4984,6 +4984,15 @@ def remove_file_import_export(row: FileImport) -> None:
                 path.unlink()
             except OSError:
                 pass
+    original_filename = str(file_meta.get("original_filename") or file_meta.get("filename") or "").strip()
+    if original_filename:
+        prefix = f"Новинки_{safe_filename(Path(original_filename).stem or 'file')}_"
+        for path in EXPORT_DIR.glob(f"{prefix}*.csv"):
+            if path.is_file():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
 
 
 def public_file_import_state() -> Dict[str, object]:
@@ -5231,6 +5240,11 @@ def model_signal_token(token: str) -> bool:
     return has_latin or (has_digit and has_cyrillic) or bool(re.search(r"[A-Za-zА-Яа-яЁё]\d|\d[A-Za-zА-Яа-яЁё]", value))
 
 
+def visual_model_suffix_token(token: str) -> bool:
+    value = clean_text(token)
+    return bool(value and re.fullmatch(r"[A-Za-zА-Яа-яЁё]{1,3}", value) and value.translate(VISUAL_MODEL_TRANSLATION) != value)
+
+
 def candidate_until_russian_description(value: str) -> str:
     tokens = value.split()
     kept: List[str] = []
@@ -5241,6 +5255,9 @@ def candidate_until_russian_description(value: str) -> str:
         if model_signal_token(token):
             kept.append(token)
             seen_signal = True
+            continue
+        if seen_signal and visual_model_suffix_token(token):
+            kept.append(token)
             continue
         if seen_signal and re.fullmatch(r"[А-Яа-яЁё][А-Яа-яЁё/\-]*", token):
             break
@@ -5269,8 +5286,11 @@ def normalize_candidate_display(value: str) -> str:
     text = technical_clean_model_text(value)
     text = re.sub(r"\s+", " ", text).strip(" .,/\\_-+")
     tokens = text.split()
+    has_digit = any(char.isdigit() for char in text)
     normalized_tokens = [
-        token.translate(VISUAL_MODEL_TRANSLATION).upper() if any(char.isdigit() for char in token) else token
+        token.translate(VISUAL_MODEL_TRANSLATION).upper()
+        if any(char.isdigit() for char in token) or (has_digit and re.fullmatch(r"[A-Za-zА-Яа-яЁё]{1,3}", token))
+        else token
         for token in tokens
     ]
     return " ".join(normalized_tokens)
@@ -5325,9 +5345,13 @@ def generate_model_candidates(name: str, brand: str = "") -> List[str]:
     base = before_russian_description or main_part or strong_block
     tokens = base.split()
     for start in range(1, min(4, len(tokens))):
-        add_model_candidate(candidates, " ".join(tokens[start:]))
+        value = " ".join(tokens[start:])
+        if any(char.isdigit() for char in value):
+            add_model_candidate(candidates, value)
     for size in range(min(4, len(tokens)), 0, -1):
-        add_model_candidate(candidates, " ".join(tokens[:size]))
+        value = " ".join(tokens[:size])
+        if any(char.isdigit() for char in value):
+            add_model_candidate(candidates, value)
     return candidates[:8]
 
 
