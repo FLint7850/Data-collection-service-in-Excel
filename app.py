@@ -4833,6 +4833,18 @@ class ProductSiteCrawler:
         if self.stop_signal.is_set():
             self.elapsed_before_resume = self.elapsed_seconds()
             self.started_at = 0.0
+            if self.fatal_error:
+                self.update_state(
+                    status="error",
+                    currenturl="",
+                    active_urls=[],
+                    active_tasks=0,
+                    queue_size=self.queue.qsize(),
+                    elapsed_seconds=int(self.elapsed_before_resume),
+                    eta_seconds=None,
+                    error=self.fatal_error,
+                )
+                return
             stop_mode = str((self.project or {}).get("stop_mode") or "")
             if self.finish_signal.is_set():
                 self.finish_with_excel(partial=True)
@@ -5959,6 +5971,10 @@ def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
 def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, **kwargs: object) -> None:
     with news_lock:
         state = dict(monitor.get("state", make_news_state()))
+        current_status = str(state.get("status") or "")
+        terminal_statuses = {"completed", "error", "partial", "idle", "stopped"}
+        if state.get("finished_at") and current_status in terminal_statuses and kwargs.get("status") != current_status:
+            return
         state.update(kwargs)
         state = repair_mojibake(state)
         if state.get("started_at") and state.get("status") in {"running", "queued"}:
@@ -6190,6 +6206,8 @@ def collect_products_for_monitor(
         log_level = str(payload.get("log_level") or "info").strip() or "info"
         if log_message:
             add_news_log(monitor, log_message, log_level)
+            if stop_signal.is_set():
+                return
             event_state = {"last_event": log_message}
             if log_level == "warning":
                 event_state["last_warning"] = log_message
