@@ -1,6 +1,5 @@
 # Install only when these connection methods are really needed.
 crawl4ai
-firecrawl-py
 scrapy
 crawlee[all]
 scrapegraphai
