@@ -106,32 +106,62 @@ def seed_connection_methods(connection) -> None:
             "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
             "code VARCHAR(64) NOT NULL UNIQUE, "
             "name VARCHAR(255) NOT NULL, "
+            "is_browser_render BOOLEAN NOT NULL DEFAULT 0, "
+            "is_debug_visible BOOLEAN NOT NULL DEFAULT 0, "
             "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
             ")"
         )
     )
+    columns = table_columns(connection, "connection_methods")
+    added_is_browser_render = bool(columns and "is_browser_render" not in columns)
+    added_is_debug_visible = bool(columns and "is_debug_visible" not in columns)
+    if added_is_browser_render:
+        connection.execute(text("ALTER TABLE connection_methods ADD COLUMN is_browser_render BOOLEAN NOT NULL DEFAULT 0"))
+    if added_is_debug_visible:
+        connection.execute(text("ALTER TABLE connection_methods ADD COLUMN is_debug_visible BOOLEAN NOT NULL DEFAULT 0"))
     methods = [
-        ("requests", "Requests"),
-        ("botasaurus-request", "Botasaurus Request"),
-        ("botasaurus-browser", "Botasaurus Browser"),
-        ("botasaurus-browser-direct", "Botasaurus Browser Direct"),
-        ("botasaurus-visible", "Botasaurus Headless Browser"),
-        ("crawl4ai", "Crawl4AI"),
-        ("firecrawl", "Firecrawl"),
-        ("scrapy", "Scrapy"),
-        ("crawlee", "Crawlee"),
-        ("playwright", "Playwright"),
-        ("scrapegraphai", "ScrapeGraphAI"),
-        ("botasaurus-debug-visible", "Botasaurus Debug Visible"),
+        ("requests", "Requests", False, False),
+        ("botasaurus-request", "Botasaurus Request", False, False),
+        ("botasaurus-browser", "Botasaurus Browser", True, False),
+        ("botasaurus-browser-direct", "Botasaurus Browser Direct", True, False),
+        ("botasaurus-visible", "Botasaurus Headless Browser", True, False),
+        ("crawl4ai", "Crawl4AI", True, False),
+        ("firecrawl", "Firecrawl", False, False),
+        ("scrapy", "Scrapy", False, False),
+        ("crawlee", "Crawlee", False, False),
+        ("playwright", "Playwright", True, False),
+        ("scrapegraphai", "ScrapeGraphAI", True, False),
+        ("botasaurus-debug-visible", "Botasaurus Debug Visible", True, True),
     ]
-    for code, name in methods:
+    for code, name, is_browser_render, is_debug_visible in methods:
         connection.execute(
             text(
-                "INSERT INTO connection_methods (code, name, created_at) VALUES (:code, :name, CURRENT_TIMESTAMP) "
-                "ON CONFLICT(code) DO UPDATE SET name = excluded.name"
+                "INSERT INTO connection_methods "
+                "(code, name, is_browser_render, is_debug_visible, created_at) "
+                "VALUES (:code, :name, :is_browser_render, :is_debug_visible, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(code) DO NOTHING"
             ),
-            {"code": code, "name": name},
+            {
+                "code": code,
+                "name": name,
+                "is_browser_render": int(is_browser_render),
+                "is_debug_visible": int(is_debug_visible),
+            },
         )
+    if added_is_browser_render:
+        browser_codes = [code for code, _name, is_browser_render, _is_debug_visible in methods if is_browser_render]
+        for code in browser_codes:
+            connection.execute(
+                text("UPDATE connection_methods SET is_browser_render = 1 WHERE code = :code"),
+                {"code": code},
+            )
+    if added_is_debug_visible:
+        debug_codes = [code for code, _name, _is_browser_render, is_debug_visible in methods if is_debug_visible]
+        for code in debug_codes:
+            connection.execute(
+                text("UPDATE connection_methods SET is_debug_visible = 1 WHERE code = :code"),
+                {"code": code},
+            )
 
 
 def migrate_schema(connection) -> None:

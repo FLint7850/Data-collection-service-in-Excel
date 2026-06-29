@@ -258,7 +258,7 @@ FEED_STORAGE_LOCK = threading.RLock()
 feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
 UNIFIED_LOG_LOCK = threading.Lock()
 connection_method_cache_lock = threading.Lock()
-connection_method_cache: Dict[str, object] = {"loaded_at": 0.0, "codes": []}
+connection_method_cache: Dict[str, object] = {"loaded_at": 0.0, "methods": []}
 news_stop_events: Dict[str, threading.Event] = {}
 news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
@@ -340,16 +340,6 @@ class ScanDispatcher:
 
 
 scan_dispatcher = ScanDispatcher(MAX_CONCURRENT_SCANS)
-BROWSER_RENDER_METHODS = {
-    "botasaurus-browser",
-    "botasaurus-browser-direct",
-    "botasaurus-visible",
-    "botasaurus-debug-visible",
-    "crawl4ai",
-    "playwright",
-    "scrapegraphai",
-}
-DEBUG_VISIBLE_METHODS = {"botasaurus-debug-visible"}
 BLOCKED_BROWSER_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
 BLOCKED_BROWSER_URL_PARTS = (
     "google-analytics",
@@ -1801,23 +1791,32 @@ def parse_thread_count(value: object) -> int:
         return 4
 
 
-def get_connection_method_codes(force_refresh: bool = False) -> List[str]:
-    """Возвращает коды способов подключения из БД в порядке их id."""
+def load_connection_methods(force_refresh: bool = False) -> List[Dict[str, object]]:
+    """Возвращает способы подключения из БД в порядке их id."""
     now = time.time()
     with connection_method_cache_lock:
-        cached_codes = list(connection_method_cache.get("codes") or [])
+        cached_methods = list(connection_method_cache.get("methods") or [])
         loaded_at = float(connection_method_cache.get("loaded_at") or 0.0)
-        if cached_codes and not force_refresh and now - loaded_at < CONNECTION_METHOD_CACHE_SECONDS:
-            return cached_codes
+        if cached_methods and not force_refresh and now - loaded_at < CONNECTION_METHOD_CACHE_SECONDS:
+            return cached_methods
 
-    codes: List[str] = []
+    methods: List[Dict[str, object]] = []
     try:
         with session_scope() as session:
-            rows = session.execute(select(ConnectionMethod.code).order_by(ConnectionMethod.id)).scalars().all()
-        for code in rows:
-            code_text = str(code or "").strip()
-            if code_text and code_text not in codes:
-                codes.append(code_text)
+            rows = session.execute(select(ConnectionMethod).order_by(ConnectionMethod.id)).scalars().all()
+        seen_codes: Set[str] = set()
+        for row in rows:
+            code = str(row.code or "").strip()
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            methods.append({
+                "id": int(row.id),
+                "code": code,
+                "name": str(row.name or row.code or "").strip(),
+                "is_browser_render": bool(row.is_browser_render),
+                "is_debug_visible": bool(row.is_debug_visible),
+            })
     except Exception as error:
         append_unified_log({
             "project_id": "system",
@@ -1826,41 +1825,49 @@ def get_connection_method_codes(force_refresh: bool = False) -> List[str]:
             "message": f"Не удалось прочитать способы подключения из БД: {error}",
         })
 
-    if not codes:
-        codes = ["requests"]
+    if not methods:
+        methods = [{
+            "id": 0,
+            "code": "requests",
+            "name": "Requests",
+            "is_browser_render": False,
+            "is_debug_visible": False,
+        }]
 
     with connection_method_cache_lock:
-        connection_method_cache["codes"] = list(codes)
+        connection_method_cache["methods"] = list(methods)
         connection_method_cache["loaded_at"] = now
-    return codes
+    return methods
+
+
+def get_connection_method_codes(force_refresh: bool = False) -> List[str]:
+    return [str(method["code"]) for method in load_connection_methods(force_refresh)]
 
 
 def public_connection_methods() -> List[Dict[str, object]]:
-    try:
-        with session_scope() as session:
-            rows = session.execute(
-                select(ConnectionMethod).order_by(ConnectionMethod.id)
-            ).scalars().all()
-        methods = [
-            {
-                "id": int(row.id),
-                "code": str(row.code or "").strip(),
-                "name": str(row.name or row.code or "").strip(),
-            }
-            for row in rows
-            if str(row.code or "").strip()
-        ]
-    except Exception as error:
-        append_unified_log({
-            "project_id": "system",
-            "project_name": "system",
-            "level": "warning",
-            "message": f"Не удалось прочитать способы подключения из БД: {error}",
-        })
-        methods = []
-    if methods:
-        return methods
-    return [{"id": 0, "code": "requests", "name": "Requests"}]
+    return [
+        {
+            "id": method["id"],
+            "code": method["code"],
+            "name": method["name"],
+        }
+        for method in load_connection_methods()
+    ]
+
+
+def connection_method_has_flag(method: str, flag_name: str) -> bool:
+    for row in load_connection_methods():
+        if row["code"] == method:
+            return bool(row.get(flag_name))
+    return False
+
+
+def is_browser_render_method(method: str) -> bool:
+    return connection_method_has_flag(method, "is_browser_render")
+
+
+def is_debug_visible_method(method: str) -> bool:
+    return connection_method_has_flag(method, "is_debug_visible")
 
 
 def ordered_db_connection_methods(
@@ -4308,7 +4315,7 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
-        if method in BROWSER_RENDER_METHODS:
+        if is_browser_render_method(method):
             return self.browser_session.fetch(target_url, method)
         if method == "firecrawl":
             if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
@@ -4322,7 +4329,7 @@ class ProductSiteCrawler:
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
-        if method in BROWSER_RENDER_METHODS:
+        if is_browser_render_method(method):
             try:
                 return self.fetch_by_method(url, method)
             except Exception as error:
@@ -4357,7 +4364,7 @@ class ProductSiteCrawler:
         return [
             method
             for method in ordered_db_connection_methods()
-            if method not in DEBUG_VISIBLE_METHODS or method == self.connection_method
+            if not is_debug_visible_method(method) or method == self.connection_method
         ]
 
     def current_connection_method(self) -> str:
@@ -4421,7 +4428,7 @@ class ProductSiteCrawler:
                 # Browser renderers are scarce shared resources. A successful
                 # browser fallback helps this URL, but must not force every
                 # following URL of the scan into the browser queue.
-                if method != current_method and method not in BROWSER_RENDER_METHODS:
+                if method != current_method and not is_browser_render_method(method):
                     self.set_active_connection_method(method)
                     self.log(f"Автопереключение подключения: {method} для {url}", "warning")
                 return html
