@@ -1,4 +1,6 @@
+import os
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
@@ -11,6 +13,19 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+
+def database_url() -> str:
+    configured = os.environ.get("DATABASE_URL")
+    if configured:
+        return configured
+    db_path = Path(os.environ.get("DATABASE_PATH", "data/app.db"))
+    if not db_path.is_absolute():
+        db_path = Path(__file__).resolve().parent.parent / db_path
+    return f"sqlite:///{db_path.as_posix()}"
+
+
+config.set_main_option("sqlalchemy.url", database_url())
 
 
 def run_migrations_offline() -> None:

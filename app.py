@@ -32,6 +32,8 @@ import xml.etree.ElementTree as ET
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, g, jsonify as flask_jsonify, redirect, render_template, request, send_file, session, url_for
+from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 from sqlalchemy import delete, select
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -89,6 +91,15 @@ def env_float(name: str, default: float, minimum: Optional[float] = None, maximu
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw_value = str(os.environ.get(name, "")).strip().lower()
+    if raw_value in {"1", "true", "yes", "on", "y", "да"}:
+        return True
+    if raw_value in {"0", "false", "no", "off", "n", "нет"}:
+        return False
+    return bool(default)
 
 
 def env_list(name: str, default: Iterable[str]) -> List[str]:
@@ -157,6 +168,11 @@ NEWS_ENRICH_WORKER_COUNT = env_int("NEWS_ENRICH_WORKER_COUNT", 8, minimum=1, max
 NEWS_SCAN_STALL_TIMEOUT = env_int("NEWS_SCAN_STALL_TIMEOUT", 180, minimum=1)
 SCHEDULE_DUE_GRACE_SECONDS = env_int("SCHEDULE_DUE_GRACE_SECONDS", 90, minimum=0)
 CONNECTION_METHOD_CACHE_SECONDS = env_int("CONNECTION_METHOD_CACHE_SECONDS", 30, minimum=1)
+APP_ENV = env_str("APP_ENV", "development").lower()
+IS_PRODUCTION = APP_ENV in {"prod", "production"}
+MAX_UPLOAD_MB = env_int("MAX_UPLOAD_MB", 64, minimum=1, maximum=1024)
+LOGIN_RATE_LIMIT_MAX = env_int("LOGIN_RATE_LIMIT_MAX", 8, minimum=1, maximum=100)
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = env_int("LOGIN_RATE_LIMIT_WINDOW_SECONDS", 900, minimum=60, maximum=86400)
 PRICE_RE = re.compile(r"\d[\d\s\u2009\xa0]{1,}(?:\u20bd|\u0440\u0443\u0431\.?)", re.IGNORECASE)
 BLOCKED_PAGE_MARKERS = tuple(
     env_list(
@@ -178,14 +194,57 @@ BLOCKED_PAGE_MARKERS = tuple(
 
 app = Flask(__name__)
 app.secret_key = env_str("FLASK_SECRET_KEY", "change-this-secret-key")
+if IS_PRODUCTION and app.secret_key == "change-this-secret-key":
+    raise RuntimeError("В production обязательно задайте уникальный FLASK_SECRET_KEY в .env")
+
 app.config.update(
+    MAX_CONTENT_LENGTH=MAX_UPLOAD_MB * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SAMESITE=env_str("SESSION_COOKIE_SAMESITE", "Lax") or "Lax",
+    SESSION_COOKIE_SECURE=env_bool("SESSION_COOKIE_SECURE", IS_PRODUCTION),
+    PREFERRED_URL_SCHEME="https" if env_bool("SESSION_COOKIE_SECURE", IS_PRODUCTION) else "http",
 )
+
+if env_bool("TRUST_PROXY_HEADERS", IS_PRODUCTION):
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+login_attempts: Dict[str, Deque[float]] = {}
+login_attempts_lock = threading.Lock()
+
+
+def request_fingerprint(username: str = "") -> str:
+    forwarded_for = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    remote_ip = forwarded_for or request.remote_addr or "unknown"
+    return f"{remote_ip}:{username.strip().lower()}"
+
+
+def login_is_rate_limited(username: str) -> bool:
+    now = time.time()
+    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    key = request_fingerprint(username)
+    with login_attempts_lock:
+        attempts = login_attempts.setdefault(key, deque())
+        while attempts and attempts[0] < cutoff:
+            attempts.popleft()
+        return len(attempts) >= LOGIN_RATE_LIMIT_MAX
+
+
+def record_login_failure(username: str) -> None:
+    key = request_fingerprint(username)
+    with login_attempts_lock:
+        login_attempts.setdefault(key, deque()).append(time.time())
+
+
+def clear_login_failures(username: str) -> None:
+    key = request_fingerprint(username)
+    with login_attempts_lock:
+        login_attempts.pop(key, None)
 
 
 @app.errorhandler(Exception)
 def log_unhandled_exception(error: Exception):
+    if isinstance(error, HTTPException):
+        return error
     LOG_DIR.mkdir(exist_ok=True)
     with (LOG_DIR / "flask-error.log").open("a", encoding="utf-8") as error_file:
         error_file.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {request.method} {request.path}\n")
@@ -205,6 +264,8 @@ def ensure_default_user() -> None:
             return
         username = env_str("AUTH_DEFAULT_USERNAME", "admin")
         password = env_str("AUTH_DEFAULT_PASSWORD", "admin")
+        if IS_PRODUCTION and password == "admin":
+            raise RuntimeError("В production нельзя оставлять AUTH_DEFAULT_PASSWORD=admin")
         db_session.add(
             User(
                 username=username,
@@ -571,7 +632,7 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
 def public_project(project: Dict[str, object]) -> Dict[str, object]:
     state = repair_mojibake(dict(project["state"]))
     filename = str(state.get("filename") or "")
-    if filename and (EXPORT_DIR / filename).exists():
+    if filename and resolve_export_file(filename):
         state["download_ready"] = True
     return {
         "id": project["id"],
@@ -6150,6 +6211,10 @@ def news_monitor_thread_alive(monitor_id: object) -> bool:
     return isinstance(thread, threading.Thread) and thread.is_alive()
 
 
+def news_task_key(monitor_id: object) -> tuple[str, str]:
+    return ("news", str(monitor_id))
+
+
 def enqueue_news_scan(monitor_id: str, manual: bool) -> bool:
     monitor_id = str(monitor_id)
 
@@ -6169,8 +6234,32 @@ def enqueue_news_scan(monitor_id: str, manual: bool) -> bool:
                 news_scan_threads.pop(monitor_id, None)
 
     return scan_dispatcher.enqueue(
-        ("news", monitor_id), run, on_start=on_start, on_finish=on_finish
+        news_task_key(monitor_id), run, on_start=on_start, on_finish=on_finish
     )
+
+
+def cancel_queued_news_scan(monitor: Dict[str, object], *, status: str, stage: str) -> bool:
+    monitor_id = str(monitor.get("id") or "")
+    if not monitor_id or not scan_dispatcher.cancel(news_task_key(monitor_id)):
+        return False
+    finished_at = datetime.now(MSK_TZ).isoformat(timespec="seconds")
+    with news_lock:
+        monitor["state"] = {
+            **monitor.get("state", {}),
+            "status": status,
+            "stage": stage,
+            "error": "",
+            "currenturl": "",
+            "queue_size": 0,
+            "active_tasks": 0,
+            "active_urls": [],
+            "finished_at": finished_at,
+            "stop_requested_at": "",
+        }
+        monitor["brand_state"] = dict(monitor["state"])
+        save_news_settings()
+    persist_news_monitor_state(monitor, force=True)
+    return True
 
 
 def transition_requested_at(monitor: Dict[str, object]) -> Optional[datetime]:
@@ -6771,9 +6860,12 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     refresh_monitor_schedule_from_brand(monitor)
     started = time.time()
     stop_event = get_news_stop_event(monitor_id)
-    stop_event.clear()
     with news_lock:
-        news_stop_modes.pop(monitor_id, None)
+        stop_already_requested = stop_event.is_set()
+        if not stop_already_requested:
+            news_stop_modes.pop(monitor_id, None)
+    if not stop_already_requested:
+        stop_event.clear()
     new_items: List[Dict[str, str]] = []
     products: List[Dict[str, str]] = []
     local_feeds: List[Dict[str, object]] = []
@@ -6942,8 +7034,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         with news_lock:
             monitor["state"] = {
                 **monitor.get("state", {}),
-                "status": "partial" if stop_mode == "pause" else "idle",
-                "stage": "Приостановлено" if stop_mode == "pause" else "Ожидание",
+                "status": "partial" if stop_mode == "pause" else "stopped",
+                "stage": "Приостановлено" if stop_mode == "pause" else "Остановлено",
                 "error": "",
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
@@ -6969,7 +7061,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         update_brand_scan_state(
             "donor",
             monitor_id,
-            "partial" if stop_mode == "pause" else "idle",
+            "partial" if stop_mode == "pause" else "stopped",
             started,
             found_products=len(products),
             new_count=len(new_items),
@@ -7233,13 +7325,18 @@ def login() -> str | Response:
     if request.method == "POST":
         username = str(request.form.get("username") or "").strip()
         password = str(request.form.get("password") or "")
-        user = g.db.scalar(select(User).where(User.username == username, User.is_active.is_(True)))
-        if user and check_password_hash(user.password_hash, password):
-            session.clear()
-            session["user_id"] = int(user.id)
-            session["username"] = user.username
-            return redirect(url_for("index"))
-        error = "Неверный логин или пароль"
+        if login_is_rate_limited(username):
+            error = "Слишком много попыток входа. Попробуйте позже."
+        else:
+            user = g.db.scalar(select(User).where(User.username == username, User.is_active.is_(True)))
+            if user and check_password_hash(user.password_hash, password):
+                clear_login_failures(username)
+                session.clear()
+                session["user_id"] = int(user.id)
+                session["username"] = user.username
+                return redirect(url_for("index"))
+            record_login_failure(username)
+            error = "Неверный логин или пароль"
     return render_template("login.html", error=error)
 
 
@@ -7442,18 +7539,25 @@ def api_scan_news_monitor(monitor_id: str):
         return jsonify({"error": "У выбранного донора не указаны стартовые URL. Заполните поле \"Стартовые URL\" и сохраните настройки."}), 400
     if monitor.get("state", {}).get("status") in {"running", "queued"}:
         return jsonify({"error": "Сканирование уже выполняется"}), 409
+    previous_state = dict(monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {})
     with news_lock:
         monitor["state"] = {
             **make_news_state("queued"),
             "stage": "В очереди запуска",
             "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
-            "last_csv": str(monitor.get("state", {}).get("last_csv") or ""),
+            "last_csv": str(previous_state.get("last_csv") or ""),
         }
         monitor["brand_state"] = dict(monitor["state"])
         sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
     if not enqueue_news_scan(monitor_id, manual=True):
+        with news_lock:
+            monitor["state"] = previous_state or make_news_state("idle")
+            monitor["brand_state"] = dict(monitor["state"])
+            sync_brand_runtime_fields(monitor)
+            save_news_settings()
+        persist_news_monitor_state(monitor, force=True)
         return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     return jsonify({"monitor": response_monitor})
 
@@ -7463,6 +7567,12 @@ def api_stop_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
+    status = str((monitor.get("state") or {}).get("status") or "idle")
+    if status == "queued" and cancel_queued_news_scan(monitor, status="stopped", stage="Остановлено"):
+        add_news_log(monitor, "Сканирование новинок удалено из очереди и остановлено", "warning")
+        return jsonify({"monitor": dict(monitor)})
+    if status not in {"running", "queued", "pausing", "stopping"}:
+        return jsonify({"error": "Сканирование не выполняется"}), 409
     request_news_stop(monitor_id, "stop")
     with news_lock:
         response_monitor = dict(monitor)
@@ -7479,6 +7589,12 @@ def api_pause_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
+    status = str((monitor.get("state") or {}).get("status") or "idle")
+    if status == "queued" and cancel_queued_news_scan(monitor, status="partial", stage="Приостановлено до запуска"):
+        add_news_log(monitor, "Сканирование новинок удалено из очереди и приостановлено до запуска", "warning")
+        return jsonify({"monitor": dict(monitor)})
+    if status not in {"running", "queued"}:
+        return jsonify({"error": "Сканирование не выполняется"}), 409
     request_news_stop(monitor_id, "pause")
     with news_lock:
         response_monitor = dict(monitor)
@@ -7497,12 +7613,18 @@ def api_resume_news_monitor(monitor_id: str):
         return jsonify({"error": "Монитор не найден"}), 404
     if monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}:
         return jsonify({"error": "Сканирование уже выполняется"}), 409
+    previous_state = dict(monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {})
     with news_lock:
-        monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "Продолжение"}
+        monitor["state"] = {**previous_state, "status": "queued", "stage": "Продолжение"}
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = dict(monitor)
     if not enqueue_news_scan(monitor_id, manual=True):
+        with news_lock:
+            monitor["state"] = previous_state or make_news_state("partial")
+            monitor["brand_state"] = dict(monitor["state"])
+            save_news_settings()
+        persist_news_monitor_state(monitor, force=True)
         return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
     return jsonify({"monitor": response_monitor})
@@ -8325,10 +8447,10 @@ def progress_stream():
 def download_excel():
     current_state = snapshot_state()
     filename = str(current_state.get("filename") or "")
-    path = EXPORT_DIR / filename
-    if not filename or not path.exists():
+    path = resolve_export_file(filename)
+    if not path:
         return jsonify({"error": "Файл еще не готов"}), 404
-    return send_file(path, as_attachment=True, download_name=output_text(filename))
+    return send_file(path, as_attachment=True, download_name=output_text(path.name))
 
 
 @app.get("/api/projects/<project_id>/download")
@@ -8338,10 +8460,10 @@ def download_project_csv(project_id: str):
         return jsonify({"error": "Проект не найден"}), 404
     current_state = project.get("state", {})
     filename = str(current_state.get("filename") or "")
-    path = EXPORT_DIR / filename
-    if not filename or not path.exists():
+    path = resolve_export_file(filename)
+    if not path:
         return jsonify({"error": "Файл еще не готов"}), 404
-    return send_file(path, as_attachment=True, download_name=output_text(filename))
+    return send_file(path, as_attachment=True, download_name=output_text(path.name))
 
 
 if __name__ == "__main__":

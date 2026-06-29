@@ -269,6 +269,7 @@ const statusLabels = {
   stopping: "останавливается",
   pausing: "приостанавливается",
   partial: "приостановлено",
+  stopped: "остановлено",
 };
 
 function activeProject() {
@@ -898,7 +899,7 @@ function createdTimestamp(value) {
 function newsStatusClass(status) {
   if (status === "running" || status === "queued") return "status-running";
   if (status === "completed") return "status-completed";
-  if (status === "stopping" || status === "pausing" || status === "partial") return "status-paused";
+  if (status === "stopping" || status === "pausing" || status === "partial" || status === "stopped") return "status-paused";
   if (status === "error") return "status-error";
   return "status-idle";
 }
@@ -913,6 +914,7 @@ function newsStatusText(status) {
   if (status === "stopping") return "останавливается";
   if (status === "pausing") return "приостанавливается";
   if (status === "partial") return "приостановлено";
+  if (status === "stopped") return "остановлено";
   if (status === "error") return "ошибка";
   return "ожидание";
 }

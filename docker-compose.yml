@@ -1,0 +1,20 @@
+services:
+  parser:
+    build:
+      context: .
+    container_name: excel-parser
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:${HOST_PORT:-5000}:5000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+      - ./feeds:/app/feeds
+      - ./storage:/app/storage
+    shm_size: "1gb"
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
