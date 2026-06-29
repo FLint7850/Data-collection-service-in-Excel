@@ -3598,6 +3598,8 @@ class BotasaurusBrowserSession:
         self._browser = None
         self._context = None
         self._page_semaphore = None
+        self._pages = set()
+        self._closed = False
 
     def _ensure_loop(self) -> bool:
         with self._lock:
@@ -3615,7 +3617,10 @@ class BotasaurusBrowserSession:
                 loop_holder["loop"] = loop
                 asyncio.set_event_loop(loop)
                 ready.set()
-                loop.run_forever()
+                try:
+                    loop.run_forever()
+                finally:
+                    loop.close()
 
             self._thread = threading.Thread(target=run_loop, name="scan-browser-runtime", daemon=True)
             self._thread.start()
@@ -3673,6 +3678,7 @@ class BotasaurusBrowserSession:
             if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
                 return None
             page = await self._context.new_page()
+            self._pages.add(page)
             try:
                 await page.route(
                     "**/*",
@@ -3695,6 +3701,7 @@ class BotasaurusBrowserSession:
                 html = await page.content()
                 return html if isinstance(html, str) and html.strip() else None
             finally:
+                self._pages.discard(page)
                 try:
                     await page.close()
                 except Exception:
@@ -3702,6 +3709,8 @@ class BotasaurusBrowserSession:
 
     def fetch(self, url: str, method: str) -> Optional[str]:
         if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+            return None
+        if self._closed:
             return None
         if not self._ensure_loop():
             return None
@@ -3721,6 +3730,13 @@ class BotasaurusBrowserSession:
         self._browser = None
         self._playwright = None
         self._page_semaphore = None
+        pages = list(self._pages)
+        self._pages.clear()
+        for page in pages:
+            try:
+                await page.close()
+            except Exception:
+                pass
         if context is not None:
             try:
                 await context.close()
@@ -3737,16 +3753,26 @@ class BotasaurusBrowserSession:
             except Exception:
                 pass
 
-    def close(self) -> None:
+    def close(self, final: bool = True) -> None:
         loop = self._loop
+        thread = self._thread
+        self._closed = bool(final)
         if loop is None:
             return
         import asyncio
         future = asyncio.run_coroutine_threadsafe(self._close_async(), loop)
         try:
-            future.result(timeout=5)
+            future.result(timeout=15)
         except Exception:
             pass
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        self._loop = None
+        self._thread = None
 
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
@@ -4412,7 +4438,7 @@ class ProductSiteCrawler:
                 "warning",
             )
             if browser_render:
-                self.browser_session.close()
+                self.browser_session.close(final=False)
             return None
         if status == "error":
             self.log(f"Метод подключения {method} завершился ошибкой для {url}: {value}", "warning")
@@ -7949,12 +7975,20 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             crawler.run(resume=resume)
         except Exception as exc:  # noqa: BLE001
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
+            try:
+                crawler.browser_session.close()
+            except Exception:
+                pass
             add_project_log(project, f"Критическая ошибка: {exc}", "error")
 
     def on_start(thread: threading.Thread) -> None:
         project["worker_thread"] = thread
 
     def on_finish(thread: threading.Thread) -> None:
+        try:
+            crawler.browser_session.close()
+        except Exception:
+            pass
         if project.get("worker_thread") is thread:
             project["worker_thread"] = None
 
@@ -8207,6 +8241,10 @@ def start_scan():
             crawler.run()
         except Exception as exc:  # noqa: BLE001 - показываем ошибку пользователю в интерфейсе.
             update_state(run_id, status="error", error=str(exc), currenturl="", download_ready=False)
+            try:
+                crawler.browser_session.close()
+            except Exception:
+                pass
 
     worker_thread = threading.Thread(target=target, daemon=True)
     worker_thread.start()
