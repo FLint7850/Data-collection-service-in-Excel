@@ -1,9 +1,14 @@
 Flask==3.0.3
-SQLAlchemy>=2.0.41,<3
+SQLAlchemy>=2.0.41
 alembic==1.13.1
 requests>=2.31,<3
 chardet>=5.2.0,<6
 beautifulsoup4>=4.14.3
 openpyxl==3.1.5
 botasaurus
-playwright>=1.45,<2
+crawl4ai
+firecrawl-py
+scrapy
+crawlee[all]
+playwright
+scrapegraphai

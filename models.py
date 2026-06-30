@@ -100,10 +100,7 @@ class Donor(Base):
     brand: Mapped[Brand] = relationship("Brand", back_populates="donors", foreign_keys=[brand_id])
     connection_method_row: Mapped["ConnectionMethod | None"] = relationship("ConnectionMethod")
 
-    __table_args__ = (
-        Index("ix_donors_brand_id", "brand_id"),
-        Index("ix_donors_connection_id", "connection_id"),
-    )
+    __table_args__ = (Index("ix_donors_brand_id", "brand_id"),)
 
 
 class ConnectionMethod(Base):

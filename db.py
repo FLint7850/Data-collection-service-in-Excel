@@ -1,5 +1,4 @@
 import json
-import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -11,11 +10,8 @@ from models import Base
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-DB_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "app.db"))
-if not DB_PATH.is_absolute():
-    DB_PATH = BASE_DIR / DB_PATH
-DATABASE_URL = os.environ.get("DATABASE_URL") or f"sqlite:///{DB_PATH.as_posix()}"
-IS_SQLITE = DATABASE_URL.startswith("sqlite")
+DB_PATH = DATA_DIR / "app.db"
+DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
 DEFAULT_BRAND_STATE = {
     "status": "idle",
     "stage": "",
@@ -49,16 +45,13 @@ DEFAULT_BRAND_STATE_JSON = json.dumps(DEFAULT_BRAND_STATE, ensure_ascii=False, s
 engine = create_engine(
     DATABASE_URL,
     future=True,
-    connect_args={"check_same_thread": False} if IS_SQLITE else {},
-    pool_pre_ping=True,
+    connect_args={"check_same_thread": False},
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
 
 
 @event.listens_for(engine, "connect")
 def configure_sqlite(dbapi_connection, _connection_record) -> None:
-    if not IS_SQLITE:
-        return
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=5000")
@@ -68,26 +61,21 @@ def configure_sqlite(dbapi_connection, _connection_record) -> None:
 
 def init_db() -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    if IS_SQLITE and ":memory:" not in DATABASE_URL:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     migrate_app_settings_table()
     Base.metadata.create_all(bind=engine)
     with engine.connect() as connection:
-        if IS_SQLITE:
-            connection.execute(text("PRAGMA foreign_keys=OFF"))
-            connection.commit()
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.commit()
         with connection.begin():
-            if IS_SQLITE:
-                connection.execute(text("PRAGMA journal_mode=WAL"))
-                connection.execute(text("PRAGMA busy_timeout=5000"))
+            connection.execute(text("PRAGMA journal_mode=WAL"))
+            connection.execute(text("PRAGMA busy_timeout=5000"))
             migrate_schema(connection)
             connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
             current_revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()
             if not current_revision:
                 connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('20260608_0001')"))
-        if IS_SQLITE:
-            connection.execute(text("PRAGMA foreign_keys=ON"))
-            connection.commit()
+        connection.execute(text("PRAGMA foreign_keys=ON"))
+        connection.commit()
 
 
 def table_columns(connection, table_name: str) -> dict[str, str]:
@@ -193,14 +181,6 @@ def migrate_schema(connection) -> None:
     migrate_donors_table(connection)
     migrate_projects_table(connection)
     migrate_file_import_table(connection)
-    create_runtime_indexes(connection)
-
-
-
-def create_runtime_indexes(connection) -> None:
-    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_enabled_next_run ON brands (enabled, next_run_at)"))
-    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_connection_id ON donors (connection_id)"))
-    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_updated_at ON projects (updated_at)"))
 
 
 def reset_brand_states(connection) -> None:

@@ -15,12 +15,10 @@ ENV/
 .env
 .env.*
 !.env.example
-!.env.production.example
 instance/
 .webassets-cache
 
 # Runtime project data
-backups/
 exports/
 feeds/
 output/
