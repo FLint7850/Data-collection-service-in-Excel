@@ -342,102 +342,198 @@ def migrate_news_tables(connection) -> None:
     if not brand_columns and not donor_columns:
         return
 
-    if brand_columns:
-        brand_defaults = [
-            ("group_name", "VARCHAR(255) NOT NULL DEFAULT ''"),
-            ("state", f"JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'"),
-            ("enabled", "BOOLEAN NOT NULL DEFAULT 1"),
-            ("schedule_type", "VARCHAR(32) NOT NULL DEFAULT 'daily'"),
-            ("scan_time", "VARCHAR(8) NOT NULL DEFAULT '01:00'"),
-            ("weekday", "INTEGER NOT NULL DEFAULT 0"),
-            ("next_run_at", "DATETIME"),
-            ("primary_donor_id", "INTEGER"),
-        ]
-        for column_name, definition in brand_defaults:
-            if column_name not in brand_columns:
-                connection.execute(text(f"ALTER TABLE brands ADD COLUMN {column_name} {definition}"))
-                brand_columns = table_columns(connection, "brands")
-        if "group_type" in brand_columns:
-            connection.execute(
-                text(
-                    "UPDATE brands SET group_name = COALESCE(NULLIF(group_name, ''), NULLIF(group_type, ''), group_name) "
-                    "WHERE group_name IS NULL OR trim(group_name) = ''"
-                )
-            )
-        connection.execute(
-            text("UPDATE brands SET group_name = :group_name WHERE group_name IS NULL OR trim(group_name) = ''"),
-            {"group_name": "\u041c\u0430\u0440\u0436\u0430"},
+    brand_needs_rebuild = bool(
+        brand_columns
+        and (
+            "primary_donor_id" not in brand_columns
+            or "enabled" not in brand_columns
+            or "schedule_type" not in brand_columns
+            or "scan_time" not in brand_columns
+            or "weekday" not in brand_columns
+            or "next_run_at" not in brand_columns
+            or "exclusions" in brand_columns
+            or "collapsed" in brand_columns
+            or "group_type" in brand_columns
         )
+    )
+    donor_needs_rebuild = bool(
+        donor_columns
+        and (
+            "connection_id" not in donor_columns
+            or "enabled" in donor_columns
+            or "schedule_type" in donor_columns
+            or "scan_time" in donor_columns
+            or "weekday" in donor_columns
+            or "next_run_at" in donor_columns
+            or "state" in donor_columns
+            or "connection_method" in donor_columns
+            or "connection_method_id" in donor_columns
+        )
+    )
+    if not brand_needs_rebuild and not donor_needs_rebuild:
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
+        return
 
+    brand_rows = []
+    donor_rows = []
+    if brand_columns:
+        brand_rows = [dict(row) for row in connection.execute(text("SELECT * FROM brands")).mappings().all()]
     if donor_columns:
-        donor_defaults = [
-            ("legacy_id", "VARCHAR(32) NOT NULL DEFAULT ''"),
-            ("site_url", "TEXT NOT NULL DEFAULT ''"),
-            ("start_urls", "JSON NOT NULL DEFAULT '[]'"),
-            ("thread_count", "INTEGER NOT NULL DEFAULT 4"),
-            ("connection_id", "INTEGER"),
-            ("auto_connection_fallback", "BOOLEAN NOT NULL DEFAULT 1"),
-            ("exclusions", "JSON NOT NULL DEFAULT '[]'"),
-            ("product_url_filters", "JSON NOT NULL DEFAULT '[]'"),
-            ("product_url_exclusions", "JSON NOT NULL DEFAULT '[]'"),
-            ("extraction_rules", "JSON NOT NULL DEFAULT '{}'"),
-            ("selector_settings", "JSON NOT NULL DEFAULT '{}'"),
-            ("seen_models", "JSON NOT NULL DEFAULT '[]'"),
-            ("known_new_products", "JSON NOT NULL DEFAULT '{}'"),
-        ]
-        for column_name, definition in donor_defaults:
-            if column_name not in donor_columns:
-                connection.execute(text(f"ALTER TABLE donors ADD COLUMN {column_name} {definition}"))
-                donor_columns = table_columns(connection, "donors")
+        donor_rows = [dict(row) for row in connection.execute(text("SELECT * FROM donors")).mappings().all()]
+
+    connection.execute(text("DROP TABLE IF EXISTS donors_migration_tmp"))
+    connection.execute(text("DROP TABLE IF EXISTS brands_migration_tmp"))
+    connection.execute(text("DROP TABLE IF EXISTS donors"))
+    connection.execute(text("DROP TABLE IF EXISTS brands"))
+
+    connection.exec_driver_sql(
+        "CREATE TABLE brands ("
+        "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+        "name VARCHAR(255) NOT NULL, "
+        "group_name VARCHAR(255) NOT NULL DEFAULT '', "
+        f"state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}', "
+        "enabled BOOLEAN NOT NULL DEFAULT 1, "
+        "schedule_type VARCHAR(32) NOT NULL DEFAULT 'daily', "
+        "scan_time VARCHAR(8) NOT NULL DEFAULT '01:00', "
+        "weekday INTEGER NOT NULL DEFAULT 0, "
+        "next_run_at DATETIME, "
+        "primary_donor_id INTEGER, "
+        "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "CONSTRAINT uq_brands_name_group_name UNIQUE (name, group_name), "
+        "FOREIGN KEY(primary_donor_id) REFERENCES donors(id) ON DELETE SET NULL"
+        ")"
+    )
+    connection.execute(
+        text(
+            "CREATE TABLE donors ("
+            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+            "legacy_id VARCHAR(32) NOT NULL DEFAULT '', "
+            "brand_id INTEGER NOT NULL, "
+            "site_url TEXT NOT NULL DEFAULT '', "
+            "start_urls JSON NOT NULL DEFAULT '[]', "
+            "thread_count INTEGER NOT NULL DEFAULT 4, "
+            "connection_id INTEGER, "
+            "auto_connection_fallback BOOLEAN NOT NULL DEFAULT 1, "
+            "exclusions JSON NOT NULL DEFAULT '[]', "
+            "product_url_filters JSON NOT NULL DEFAULT '[]', "
+            "product_url_exclusions JSON NOT NULL DEFAULT '[]', "
+            "extraction_rules JSON NOT NULL DEFAULT '{}', "
+            "selector_settings JSON NOT NULL DEFAULT '{}', "
+            "seen_models JSON NOT NULL DEFAULT '[]', "
+            "known_new_products JSON NOT NULL DEFAULT '{}', "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "FOREIGN KEY(brand_id) REFERENCES brands(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(connection_id) REFERENCES connection_methods(id)"
+            ")"
+        )
+    )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
+
+    inserted_brand_ids = set()
+    for row in brand_rows:
+        brand_id = row.get("id")
+        if brand_id in inserted_brand_ids:
+            continue
+        inserted_brand_ids.add(brand_id)
         connection.execute(
             text(
-                "UPDATE donors SET start_urls = json_array(site_url) "
-                "WHERE (start_urls IS NULL OR start_urls = '' OR start_urls = '[]') "
-                "AND site_url IS NOT NULL AND trim(site_url) != ''"
-            )
+                "INSERT OR IGNORE INTO brands "
+                "(id, name, group_name, state, enabled, schedule_type, scan_time, weekday, next_run_at, created_at, updated_at) "
+                "VALUES (:id, :name, :group_name, json(:state), :enabled, :schedule_type, :scan_time, :weekday, :next_run_at, :created_at, :updated_at)"
+            ),
+            {
+                "id": brand_id,
+                "name": row.get("name") or "Донор",
+                "group_name": row.get("group_name") or row.get("group_type") or "Маржа",
+                "state": json.dumps(_json_or_default(row.get("state"), DEFAULT_BRAND_STATE), ensure_ascii=False),
+                "enabled": _bool_value(row.get("enabled"), True),
+                "schedule_type": row.get("schedule_type") or "daily",
+                "scan_time": str(row.get("scan_time") or "01:00")[:5],
+                "weekday": int(row.get("weekday") or 0),
+                "next_run_at": _datetime_value(row.get("next_run_at")),
+                "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
+                "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
+            },
         )
 
-        if brand_columns:
-            for brand_column in ("enabled", "schedule_type", "scan_time", "weekday", "next_run_at"):
-                if brand_column in donor_columns and brand_column in brand_columns:
-                    connection.execute(
-                        text(
-                            f"UPDATE brands SET {brand_column} = ("
-                            f"SELECT donors.{brand_column} FROM donors "
-                            "WHERE donors.brand_id = brands.id "
-                            f"AND donors.{brand_column} IS NOT NULL "
-                            "ORDER BY donors.id LIMIT 1"
-                            f") WHERE EXISTS (SELECT 1 FROM donors WHERE donors.brand_id = brands.id AND donors.{brand_column} IS NOT NULL)"
-                        )
-                    )
-            if "state" in donor_columns and "state" in brand_columns:
-                connection.execute(
-                    text(
-                        "UPDATE brands SET state = ("
-                        "SELECT donors.state FROM donors "
-                        "WHERE donors.brand_id = brands.id "
-                        "AND donors.state IS NOT NULL AND trim(CAST(donors.state AS TEXT)) != '' "
-                        "ORDER BY donors.id LIMIT 1"
-                        ") WHERE EXISTS ("
-                        "SELECT 1 FROM donors WHERE donors.brand_id = brands.id "
-                        "AND donors.state IS NOT NULL AND trim(CAST(donors.state AS TEXT)) != ''"
-                        ")"
-                    )
-                )
-            if "primary_donor_id" in brand_columns:
-                connection.execute(
-                    text(
-                        "UPDATE brands SET primary_donor_id = ("
-                        "SELECT donors.id FROM donors WHERE donors.brand_id = brands.id ORDER BY donors.id LIMIT 1"
-                        ") WHERE primary_donor_id IS NULL "
-                        "AND EXISTS (SELECT 1 FROM donors WHERE donors.brand_id = brands.id)"
-                    )
-                )
+    default_connection_id = connection.execute(
+        text("SELECT id FROM connection_methods WHERE code = 'requests' LIMIT 1")
+    ).scalar()
+    first_donor_by_brand = {}
+    for row in donor_rows:
+        brand_id = row.get("brand_id")
+        if brand_id not in inserted_brand_ids:
+            continue
+        donor_id = row.get("id")
+        legacy_id = row.get("legacy_id") or (str(donor_id) if isinstance(donor_id, str) and not str(donor_id).isdigit() else "")
+        site_url = row.get("site_url") or ""
+        start_urls = _json_or_default(row.get("start_urls"), [])
+        if not isinstance(start_urls, list):
+            start_urls = []
+        if not site_url:
+            if start_urls:
+                site_url = str(start_urls[0] or "")
+        if site_url and not start_urls:
+            start_urls = [site_url]
+        connection_id = row.get("connection_id") or row.get("connection_method_id")
+        if not connection_id:
+            method = row.get("connection_method") or "requests"
+            connection_id = connection.execute(
+                text("SELECT id FROM connection_methods WHERE code = :code LIMIT 1"),
+                {"code": method},
+            ).scalar() or default_connection_id
+        donor_state = _json_or_default(row.get("state"), None)
+        if donor_state and brand_id:
+            connection.execute(
+                text("UPDATE brands SET state = json(:state) WHERE id = :brand_id"),
+                {"state": json.dumps(donor_state, ensure_ascii=False), "brand_id": brand_id},
+            )
+        connection.execute(
+            text(
+                "INSERT INTO donors "
+                "(id, legacy_id, brand_id, site_url, start_urls, thread_count, connection_id, auto_connection_fallback, exclusions, "
+                "product_url_filters, product_url_exclusions, extraction_rules, selector_settings, seen_models, known_new_products, created_at, updated_at) "
+                "VALUES (:id, :legacy_id, :brand_id, :site_url, json(:start_urls), :thread_count, :connection_id, :auto_connection_fallback, json(:exclusions), "
+                "json(:product_url_filters), json(:product_url_exclusions), json(:extraction_rules), json(:selector_settings), json(:seen_models), json(:known_new_products), :created_at, :updated_at)"
+            ),
+            {
+                "id": donor_id if isinstance(donor_id, int) or str(donor_id).isdigit() else None,
+                "legacy_id": legacy_id,
+                "brand_id": brand_id,
+                "site_url": site_url,
+                "start_urls": json.dumps(start_urls, ensure_ascii=False),
+                "thread_count": int(row.get("thread_count") or 4),
+                "connection_id": connection_id,
+                "auto_connection_fallback": _bool_value(row.get("auto_connection_fallback"), True),
+                "exclusions": json.dumps(_json_or_default(row.get("exclusions"), []), ensure_ascii=False),
+                "product_url_filters": json.dumps(_json_or_default(row.get("product_url_filters"), []), ensure_ascii=False),
+                "product_url_exclusions": json.dumps(_json_or_default(row.get("product_url_exclusions"), []), ensure_ascii=False),
+                "extraction_rules": json.dumps(_json_or_default(row.get("extraction_rules"), {}), ensure_ascii=False),
+                "selector_settings": json.dumps(_json_or_default(row.get("selector_settings"), {}), ensure_ascii=False),
+                "seen_models": json.dumps(_json_or_default(row.get("seen_models"), []), ensure_ascii=False),
+                "known_new_products": json.dumps(_json_or_default(row.get("known_new_products"), {}), ensure_ascii=False),
+                "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
+                "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
+            },
+        )
+        if brand_id not in first_donor_by_brand:
+            first_donor_by_brand[brand_id] = donor_id if isinstance(donor_id, int) or str(donor_id).isdigit() else connection.execute(text("SELECT last_insert_rowid()")).scalar()
 
-    if brand_columns:
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
-    if donor_columns:
-        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
+    for row in brand_rows:
+        brand_id = row.get("id")
+        primary_id = row.get("primary_donor_id") or first_donor_by_brand.get(brand_id)
+        if primary_id:
+            connection.execute(
+                text(
+                    "UPDATE brands SET primary_donor_id = :primary_id "
+                    "WHERE id = :brand_id AND EXISTS (SELECT 1 FROM donors WHERE id = :primary_id AND brand_id = :brand_id)"
+                ),
+                {"primary_id": primary_id, "brand_id": brand_id},
+            )
 
 def migrate_projects_table(connection) -> None:
     columns = table_columns(connection, "projects")

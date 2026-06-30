@@ -3586,193 +3586,110 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
 
 
 class BotasaurusBrowserSession:
-    """One browser process owned by one project/news scan, with bounded pages."""
+    """One reusable Botasaurus browser owned by one project/news scan."""
 
-    def __init__(self, stop_signal: Optional[threading.Event] = None, max_pages: int = 1) -> None:
+    def __init__(self, stop_signal: Optional[threading.Event] = None) -> None:
         self.stop_signal = stop_signal
-        self.max_pages = max(1, int(max_pages or 1))
         self._lock = threading.Lock()
-        self._loop = None
-        self._thread: Optional[threading.Thread] = None
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page_semaphore = None
-        self._pages = set()
+        self._state_lock = threading.Lock()
+        self._active_driver = None
         self._closed = False
+        self._renderer = self._create_renderer()
 
-    def _ensure_loop(self) -> bool:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive() and self._loop is not None:
-                return True
-            try:
-                import asyncio
-            except ImportError:
-                return False
-            ready = threading.Event()
-            loop_holder = {}
-
-            def run_loop() -> None:
-                loop = asyncio.new_event_loop()
-                loop_holder["loop"] = loop
-                asyncio.set_event_loop(loop)
-                ready.set()
-                try:
-                    loop.run_forever()
-                finally:
-                    loop.close()
-
-            self._thread = threading.Thread(target=run_loop, name="scan-browser-runtime", daemon=True)
-            self._thread.start()
-            if not ready.wait(timeout=5):
-                return False
-            self._loop = loop_holder.get("loop")
-            return self._loop is not None
-
-    async def _ensure_browser(self) -> bool:
-        if self._browser is not None and self._context is not None:
-            return True
+    def _create_renderer(self):
         try:
-            from playwright.async_api import async_playwright
+            from botasaurus.browser import Driver
+            from botasaurus.browser import browser
         except ImportError:
-            return False
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+            return None
+
+        chrome_executable_path = botasaurus_browser_executable()
+
+        @browser(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
+            chrome_executable_path=chrome_executable_path,
+            add_arguments=[
+                "--headless=new",
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
                 "--disable-background-networking",
                 "--disable-sync",
-                "--no-sandbox",
                 "--blink-settings=imagesEnabled=false",
             ],
+            window_size=[1280, 720],
+            block_images_and_css=True,
+            wait_for_complete_page_load=False,
+            reuse_driver=True,
+            max_retry=1,
+            output=None,
+            close_on_crash=True,
+            create_error_logs=False,
         )
-        self._context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            locale="ru-RU",
-            viewport={"width": 1366, "height": 900},
-        )
-        import asyncio
-        self._page_semaphore = asyncio.Semaphore(self.max_pages)
-        return True
-
-    @staticmethod
-    def _should_block_resource(request) -> bool:
-        resource_type = getattr(request, "resource_type", "")
-        if resource_type in BLOCKED_BROWSER_RESOURCE_TYPES:
-            return True
-        request_url = str(getattr(request, "url", "") or "").lower()
-        return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
-
-    async def _fetch_async(self, url: str) -> Optional[str]:
-        if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
-            return None
-        if not await self._ensure_browser():
-            return None
-        async with self._page_semaphore:
-            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
-                return None
-            page = await self._context.new_page()
-            self._pages.add(page)
+        def _render_html(driver: Driver, payload: Dict[str, str]):
+            with self._state_lock:
+                self._active_driver = driver
             try:
-                await page.route(
-                    "**/*",
-                    lambda route, request: route.abort()
-                    if self._should_block_resource(request)
-                    else route.continue_(),
-                )
-                timeout_ms = REQUEST_TIMEOUT * 1000
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
-                except Exception:
-                    pass
-                for _ in range(3):
+                target_url = str(payload.get("url") or "")
+                navigation = str(payload.get("navigation") or "direct")
+                if navigation == "google":
+                    driver.google_get(target_url)
+                else:
+                    driver.get(target_url)
+                driver.sleep(2)
+                for _ in range(4):
                     try:
-                        await page.mouse.wheel(0, 1600)
-                        await page.wait_for_timeout(350)
+                        driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
                     except Exception:
                         break
-                html = await page.content()
-                return html if isinstance(html, str) and html.strip() else None
+                    driver.sleep(0.8)
+                return driver.page_html
             finally:
-                self._pages.discard(page)
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                with self._state_lock:
+                    if self._active_driver is driver:
+                        self._active_driver = None
+
+        return _render_html
 
     def fetch(self, url: str, method: str) -> Optional[str]:
         if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
             return None
-        if self._closed:
+        if self._renderer is None:
             return None
-        if not self._ensure_loop():
-            return None
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(self._fetch_async(url), self._loop)
-        try:
-            return future.result(timeout=CONNECTION_METHOD_TIMEOUT_SECONDS)
-        except Exception:
-            future.cancel()
-            return None
+        with self._state_lock:
+            if self._closed:
+                return None
+        navigation = "google" if method == "botasaurus-browser" else "direct"
+        with self._lock:
+            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                return None
+            with self._state_lock:
+                if self._closed:
+                    return None
+            try:
+                result = self._renderer({"url": url, "navigation": navigation})
+            except Exception:
+                return None
+        if isinstance(result, list):
+            result = result[0] if result else None
+        return result if isinstance(result, str) and result.strip() else None
 
-    async def _close_async(self) -> None:
-        context = self._context
-        browser = self._browser
-        playwright = self._playwright
-        self._context = None
-        self._browser = None
-        self._playwright = None
-        self._page_semaphore = None
-        pages = list(self._pages)
-        self._pages.clear()
-        for page in pages:
+    def close(self) -> None:
+        with self._state_lock:
+            self._closed = True
+            active_driver = self._active_driver
+        if active_driver is not None:
             try:
-                await page.close()
+                active_driver.close()
             except Exception:
                 pass
-        if context is not None:
+        renderer = self._renderer
+        if renderer is not None and hasattr(renderer, "close"):
             try:
-                await context.close()
+                renderer.close()
             except Exception:
                 pass
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-        if playwright is not None:
-            try:
-                await playwright.stop()
-            except Exception:
-                pass
-
-    def close(self, final: bool = True) -> None:
-        loop = self._loop
-        thread = self._thread
-        self._closed = bool(final)
-        if loop is None:
-            return
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(self._close_async(), loop)
-        try:
-            future.result(timeout=15)
-        except Exception:
-            pass
-        try:
-            loop.call_soon_threadsafe(loop.stop)
-        except Exception:
-            pass
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=5)
-        self._loop = None
-        self._thread = None
+        with self._state_lock:
+            self._active_driver = None
 
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
@@ -4170,6 +4087,9 @@ class PlaywrightHeadlessRenderer:
                 browser.close()
 
 
+playwright_headless_renderer = PlaywrightHeadlessRenderer()
+
+
 def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine_name: str = "engine") -> Optional[str]:
     try:
         completed = subprocess.run(
@@ -4235,7 +4155,7 @@ def fetch_with_playwright(url: str) -> Optional[str]:
         import playwright  # noqa: F401
     except ImportError:
         return None
-    return None
+    return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
 
 
 def fetch_with_scrapegraphai(url: str) -> Optional[str]:
@@ -4291,9 +4211,8 @@ class ProductSiteCrawler:
             connection_method_state.setdefault("lock", threading.Lock())
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
-        self.browser_session = browser_session or BotasaurusBrowserSession(self.stop_signal, self.thread_count)
+        self.browser_session = browser_session or BotasaurusBrowserSession(self.stop_signal)
         self.owns_browser_session = owns_browser_session
-        self.browser_render_semaphore = threading.BoundedSemaphore(self.thread_count)
         self.thread_local = threading.local()
         self.headers = {
             "User-Agent": (
@@ -4396,6 +4315,8 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
+        if is_browser_render_method(method):
+            return self.browser_session.fetch(target_url, method)
         if method == "firecrawl":
             if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
                 self.log("Метод firecrawl пропущен: не задан FIRECRAWL_API_KEY", "warning")
@@ -4405,28 +4326,23 @@ class ProductSiteCrawler:
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
             return fetch_with_crawlee(target_url)
-        if is_browser_render_method(method):
-            return self.browser_session.fetch(target_url, method)
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
+        if is_browser_render_method(method):
+            try:
+                return self.fetch_by_method(url, method)
+            except Exception as error:
+                self.log(f"Метод подключения {method} завершился ошибкой для {url}: {error}", "warning")
+                return None
+
         result_queue: Queue = Queue(maxsize=1)
-        browser_render = is_browser_render_method(method)
-        if browser_render and not self.browser_render_semaphore.acquire(timeout=CONNECTION_METHOD_TIMEOUT_SECONDS):
-            self.log(
-                f"Метод подключения {method} не получил browser-слот за {CONNECTION_METHOD_TIMEOUT_SECONDS} сек. для {url}",
-                "warning",
-            )
-            return None
 
         def run_method() -> None:
             try:
                 result_queue.put(("ok", self.fetch_by_method(url, method)), block=False)
             except Exception as error:
                 result_queue.put(("error", error), block=False)
-            finally:
-                if browser_render:
-                    self.browser_render_semaphore.release()
 
         thread = threading.Thread(target=run_method, daemon=True)
         thread.start()
@@ -4437,8 +4353,6 @@ class ProductSiteCrawler:
                 f"Метод подключения {method} превысил таймаут {CONNECTION_METHOD_TIMEOUT_SECONDS} сек. для {url}",
                 "warning",
             )
-            if browser_render:
-                self.browser_session.close(final=False)
             return None
         if status == "error":
             self.log(f"Метод подключения {method} завершился ошибкой для {url}: {value}", "warning")
@@ -4746,7 +4660,7 @@ class ProductSiteCrawler:
                 error=f"На странице каталога нет цен в HTML. Рендерю через Botasaurus: {url}",
             )
             self.log(f"Рендеринг каталога через Botasaurus: {url}", "warning")
-            rendered_html = self.fetch_by_method_with_timeout(url, "botasaurus-browser")
+            rendered_html = self.browser_session.fetch(url, "botasaurus-browser")
             if rendered_html and not looks_blocked_or_empty(rendered_html):
                 html = rendered_html
                 listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
@@ -6780,7 +6694,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
     availability_skipped = 0
-    browser_session = BotasaurusBrowserSession(stop_event, parse_thread_count(monitor.get("thread_count", 4)))
+    browser_session = BotasaurusBrowserSession(stop_event)
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -7927,18 +7841,11 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
 
     crawler = project.get("crawler") if resume else None
     if crawler:
-        old_browser_session = getattr(crawler, "browser_session", None)
-        if old_browser_session is not None:
-            try:
-                old_browser_session.close()
-            except Exception:
-                pass
         crawler.run_id = int(project["run_id"])
         crawler.stop_signal = project["stop_event"]
         crawler.finish_signal = project["finish_event"]
+        crawler.browser_session = BotasaurusBrowserSession(project["stop_event"])
         crawler.thread_count = min(parse_thread_count(project.get("thread_count", 4)), MAX_CRAWL_WORKERS_PER_SCAN)
-        crawler.browser_session = BotasaurusBrowserSession(project["stop_event"], crawler.thread_count)
-        crawler.browser_render_semaphore = threading.BoundedSemaphore(crawler.thread_count)
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
         crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)
@@ -7975,20 +7882,12 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             crawler.run(resume=resume)
         except Exception as exc:  # noqa: BLE001
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
-            try:
-                crawler.browser_session.close()
-            except Exception:
-                pass
             add_project_log(project, f"Критическая ошибка: {exc}", "error")
 
     def on_start(thread: threading.Thread) -> None:
         project["worker_thread"] = thread
 
     def on_finish(thread: threading.Thread) -> None:
-        try:
-            crawler.browser_session.close()
-        except Exception:
-            pass
         if project.get("worker_thread") is thread:
             project["worker_thread"] = None
 
@@ -8241,10 +8140,6 @@ def start_scan():
             crawler.run()
         except Exception as exc:  # noqa: BLE001 - показываем ошибку пользователю в интерфейсе.
             update_state(run_id, status="error", error=str(exc), currenturl="", download_ready=False)
-            try:
-                crawler.browser_session.close()
-            except Exception:
-                pass
 
     worker_thread = threading.Thread(target=target, daemon=True)
     worker_thread.start()
