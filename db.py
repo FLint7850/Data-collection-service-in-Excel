@@ -138,6 +138,7 @@ def seed_connection_methods(connection) -> None:
         ("botasaurus-browser-direct", "Botasaurus Browser Direct", True, False),
         ("botasaurus-visible", "Botasaurus Headless Browser", True, False),
         ("crawl4ai", "Crawl4AI", True, False),
+        ("firecrawl", "Firecrawl", False, False),
         ("scrapy", "Scrapy", False, False),
         ("crawlee", "Crawlee", False, False),
         ("playwright", "Playwright", True, False),
@@ -173,6 +174,7 @@ def seed_connection_methods(connection) -> None:
                 text("UPDATE connection_methods SET is_debug_visible = 1 WHERE code = :code"),
                 {"code": code},
             )
+
 
 def migrate_schema(connection) -> None:
     seed_connection_methods(connection)

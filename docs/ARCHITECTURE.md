@@ -4,7 +4,7 @@
 
 - Backend: Flask 3, SQLAlchemy 2, SQLite, Alembic.
 - Frontend: обычные шаблоны Jinja + `static/js/app.js` + `static/css/styles.css`.
-- Сбор данных: `requests`, Botasaurus/Playwright, опционально `crawl4ai`, `scrapy`, `crawlee`, `scrapegraphai`.
+- Сбор данных: `requests`, Botasaurus/Playwright, опционально `crawl4ai`, `firecrawl`, `scrapy`, `crawlee`, `scrapegraphai`.
 - Runtime: фоновые потоки Python, in-memory состояние сканов, SQLite WAL.
 
 ## Почему один процесс

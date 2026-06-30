@@ -3894,6 +3894,43 @@ def fetch_with_crawl4ai(url: str) -> Optional[str]:
         return None
 
 
+def fetch_with_firecrawl(url: str) -> Optional[str]:
+    api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        from firecrawl import FirecrawlApp
+    except ImportError:
+        try:
+            from firecrawl import Firecrawl
+        except ImportError:
+            return None
+        try:
+            app_client = Firecrawl(api_key=api_key)
+            result = app_client.scrape(url, formats=["html"])
+        except Exception:
+            return None
+    else:
+        try:
+            app_client = FirecrawlApp(api_key=api_key)
+            result = app_client.scrape_url(url, formats=["html"])
+        except Exception:
+            return None
+
+    if isinstance(result, dict):
+        for key in ("html", "rawHtml", "content"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        data = result.get("data")
+        if isinstance(data, dict):
+            for key in ("html", "rawHtml", "content"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+    return None
+
+
 ENGINE_OUTPUT_MARKER = "__PARSER_ENGINE_HTML_BASE64__:"
 
 SCRAPY_FETCH_SCRIPT = r"""
@@ -4420,6 +4457,11 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
+        if method == "firecrawl":
+            if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
+                self.log("Метод firecrawl пропущен: не задан FIRECRAWL_API_KEY", "warning")
+                return None
+            return fetch_with_firecrawl(target_url)
         if method == "scrapy":
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
