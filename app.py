@@ -3062,6 +3062,33 @@ def prepare_rule_model(value: str, rules: Dict[str, str]) -> str:
     return clean_text(text)
 
 
+def has_explicit_model_rules(rules: Optional[Dict[str, str]]) -> bool:
+    if not rules:
+        return False
+    return any(
+        str(rules.get(key, "")).strip()
+        for key in ("model_selector", "model_start_marker", "model_end_marker", "model_replace_rules")
+    )
+
+
+def has_model_replace_rules(rules: Optional[Dict[str, str]]) -> bool:
+    return bool(rules and str(rules.get("model_replace_rules", "")).strip())
+
+
+def finalize_scraped_model(
+    value: str,
+    product_url: str,
+    rules: Optional[Dict[str, str]] = None,
+    preserve_configured_model: bool = False,
+) -> str:
+    prepared = prepare_rule_model(value, rules or {})
+    if not prepared:
+        return ""
+    if preserve_configured_model or has_model_replace_rules(rules):
+        return prepared
+    return normalize_model(prepared, product_url)
+
+
 def first_by_selector(root, selector: str) -> str:
     if not selector or not hasattr(root, "select"):
         return ""
@@ -3140,12 +3167,13 @@ def extract_listing_products_by_rules(
             continue
 
         model = extract_model_by_markers(str(card), rules)
+        model_from_config = bool(model)
         if not model:
             model = first_by_selector(card, rules.get("model_selector", ""))
+            model_from_config = bool(model)
         if not model:
             model = extract_model_from_card(card, "")
-        model = prepare_rule_model(model, rules)
-        model = normalize_model(model, product_url)
+        model = finalize_scraped_model(model, product_url, rules, model_from_config)
 
         price = extract_price_from_container(card, rules.get("price_selector", ""))
         if not model or not price:
@@ -3190,8 +3218,10 @@ def extract_listing_products_from_common_cards(
             continue
 
         model = extract_model_by_markers(str(card), rules)
+        model_from_config = bool(model)
         if not model:
             model = first_by_selector(card, rules.get("model_selector", ""))
+            model_from_config = bool(model)
         if not model:
             title_link = None
             for link in card.select("a[title][href]"):
@@ -3203,8 +3233,7 @@ def extract_listing_products_from_common_cards(
             model = title_link.get("title", "") if title_link else ""
         if not model:
             model = extract_model_from_card(card, price)
-        model = prepare_rule_model(model, rules)
-        model = normalize_model(model, product_url)
+        model = finalize_scraped_model(model, product_url, rules, model_from_config)
         if not model:
             continue
 
@@ -3260,7 +3289,7 @@ def extract_listing_products(
         product_url = extract_product_url_from_card(card, current_url, filters)
         if product_url == current_url and not is_product_url_for_filters(current_url, filters):
             continue
-        model = normalize_model(extract_model_from_card(card, price), product_url)
+        model = finalize_scraped_model(extract_model_from_card(card, price), product_url, rules)
 
         if not model or product_url in seen_urls:
             continue
@@ -3356,7 +3385,7 @@ def extract_product_data_by_rules(
     if not model:
         model = first_by_selector(soup, rules.get("model_selector", ""))
     price = first_by_selector(soup, rules.get("price_selector", ""))
-    model = prepare_rule_model(model, rules)
+    model = finalize_scraped_model(model, url, rules, True)
     prices = extract_prices(price)
     if prices:
         price = prices[-1]
@@ -3365,7 +3394,6 @@ def extract_product_data_by_rules(
     if not price and not allow_empty_price:
         prices = extract_prices(soup.get_text(" ", strip=True))
         price = prices[-1] if prices else ""
-    model = normalize_model(model, url)
     page_text = clean_text(soup.get_text(" ", strip=True))
     h1 = first_text(soup, ["h1"])
     if should_accept_extracted_product(
@@ -3438,9 +3466,7 @@ def extract_product_data(
     if not model and h1:
         model = h1
 
-    if rules:
-        model = prepare_rule_model(model, rules)
-    model = normalize_model(model, url)
+    model = finalize_scraped_model(model, url, rules)
 
     page_text = clean_text(soup.get_text(" ", strip=True))
     if should_accept_extracted_product(
@@ -4703,7 +4729,7 @@ class ProductSiteCrawler:
             product["url"] = product_url
             self.remember_listing_price(product_url, product.get("price", ""))
             self.enqueue(product_url, force=True)
-        if not self.product_url_filters:
+        if not self.product_url_filters and not has_explicit_model_rules(self.extraction_rules):
             self.add_products(listing_products)
 
         should_extract_current_product = (
@@ -6387,10 +6413,16 @@ def enrich_news_product(
         details["model"] = product_data.get("model", details["model"])
         details["price"] = product_data.get("price", details["price"])
     else:
-        model_candidate = extract_model_by_markers(html, extraction_rules) or details["model"] or name
-        prepared_model = prepare_rule_model(model_candidate, extraction_rules)
+        marker_model = extract_model_by_markers(html, extraction_rules)
+        model_candidate = marker_model or details["model"] or name
+        prepared_model = finalize_scraped_model(
+            model_candidate,
+            url,
+            extraction_rules,
+            preserve_configured_model=bool(marker_model),
+        )
         if prepared_model:
-            details["model"] = normalize_model(prepared_model, url)
+            details["model"] = prepared_model
     details["name"] = name or details["name"]
     details["availability"] = extract_availability(soup, str(selector_settings.get("availability_selector", "")))
     details["photo_url"] = extract_photo_url(soup, url, str(selector_settings.get("photo_selector", "")))
