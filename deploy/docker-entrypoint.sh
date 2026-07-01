@@ -5,6 +5,9 @@ mkdir -p "${LOG_DIR:-/app/logs}" \
     "${FEED_DIR:-/app/feeds}" \
     "${EXPORT_DIR:-/app/exports}" \
     "${FILE_IMPORT_DIR:-/app/storage/file-import}" \
+    "${TMPDIR:-/tmp/parser}" \
     /app/data
+
+chmod 1777 "${TMPDIR:-/tmp/parser}" 2>/dev/null || true
 
 exec "$@"

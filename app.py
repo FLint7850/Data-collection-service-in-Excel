@@ -163,13 +163,9 @@ REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 20, minimum=1)
 CONNECTION_METHOD_TIMEOUT_SECONDS = env_int("CONNECTION_METHOD_TIMEOUT_SECONDS", 60, minimum=1)
 REQUEST_DELAY_SECONDS = env_float("REQUEST_DELAY_SECONDS", 0.05, minimum=0.0)
 MAX_RETRIES = env_int("MAX_RETRIES", 3, minimum=1)
-BOTASAURUS_REQUEST_MAX_CONCURRENT = env_int("BOTASAURUS_REQUEST_MAX_CONCURRENT", 1, minimum=1, maximum=4)
-MAX_CRAWL_WORKERS_PER_SCAN = env_int("MAX_CRAWL_WORKERS_PER_SCAN", 6, minimum=1, maximum=16)
-MAX_CONCURRENT_SCANS = env_int("MAX_CONCURRENT_SCANS", 3, minimum=1, maximum=16)
 FEED_WORKER_COUNT = env_int("FEED_WORKER_COUNT", 6, minimum=1, maximum=12)
 FEED_SNAPSHOT_CACHE_SECONDS = env_int("FEED_SNAPSHOT_CACHE_SECONDS", 120, minimum=0, maximum=3600)
 FEED_SNAPSHOT_RETAIN = env_int("FEED_SNAPSHOT_RETAIN", 3, minimum=2, maximum=10)
-NEWS_ENRICH_WORKER_COUNT = env_int("NEWS_ENRICH_WORKER_COUNT", 8, minimum=1, maximum=16)
 NEWS_SCAN_STALL_TIMEOUT = env_int("NEWS_SCAN_STALL_TIMEOUT", 180, minimum=1)
 SCHEDULE_DUE_GRACE_SECONDS = env_int("SCHEDULE_DUE_GRACE_SECONDS", 90, minimum=0)
 CONNECTION_METHOD_CACHE_SECONDS = env_int("CONNECTION_METHOD_CACHE_SECONDS", 30, minimum=1)
@@ -269,7 +265,6 @@ news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
-BOTASAURUS_REQUEST_SEMAPHORE = threading.BoundedSemaphore(BOTASAURUS_REQUEST_MAX_CONCURRENT)
 FEED_STORAGE_LOCK = threading.RLock()
 feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
 UNIFIED_LOG_LOCK = threading.Lock()
@@ -291,10 +286,9 @@ class ScanTask:
 
 
 class ScanDispatcher:
-    """Bounded FIFO queue shared by full project and news scans."""
+    """FIFO launcher shared by full project and news scans."""
 
-    def __init__(self, max_concurrent: int) -> None:
-        self.max_concurrent = max(1, max_concurrent)
+    def __init__(self) -> None:
         self._queue: Deque[ScanTask] = deque()
         self._queued: Set[Hashable] = set()
         self._active: Set[Hashable] = set()
@@ -330,7 +324,7 @@ class ScanDispatcher:
     def _dispatch(self) -> None:
         while True:
             with self._lock:
-                if len(self._active) >= self.max_concurrent or not self._queue:
+                if not self._queue:
                     return
                 task = self._queue.popleft()
                 if task.key not in self._queued:
@@ -355,7 +349,7 @@ class ScanDispatcher:
             self._dispatch()
 
 
-scan_dispatcher = ScanDispatcher(MAX_CONCURRENT_SCANS)
+scan_dispatcher = ScanDispatcher()
 BLOCKED_BROWSER_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
 BLOCKED_BROWSER_URL_PARTS = (
     "google-analytics",
@@ -3502,14 +3496,10 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
             "text": response.text,
         }
 
-    # Botasaurus Request keeps mutable process-level state on Windows. Serializing
-    # this connector avoids intermittent OSError: [Errno 22] Invalid argument
-    # while regular HTTP crawling remains parallel.
-    with BOTASAURUS_REQUEST_SEMAPHORE:
-        try:
-            result = _fetch_html(url)
-        except Exception:
-            return None
+    try:
+        result = _fetch_html(url)
+    except Exception:
+        return None
 
     if isinstance(result, list):
         result = result[0] if result else None
@@ -3531,7 +3521,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
     except ImportError:
         return None
 
-    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
+    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=False)
 
     @browser(
         headless=True,
@@ -3628,110 +3618,181 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
 
 
 class BotasaurusBrowserSession:
-    """One reusable Botasaurus browser owned by one project/news scan."""
+    """One browser owned by one project/news scan; thread_count controls open pages."""
 
-    def __init__(self, stop_signal: Optional[threading.Event] = None) -> None:
+    def __init__(self, stop_signal: Optional[threading.Event] = None, max_pages: int = 1) -> None:
         self.stop_signal = stop_signal
-        self._lock = threading.Lock()
+        self.max_pages = max(1, parse_thread_count(max_pages))
         self._state_lock = threading.Lock()
-        self._active_driver = None
+        self._ready = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._loop = None
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._semaphore = None
         self._closed = False
-        self._renderer = self._create_renderer()
+        self._start_error: Optional[BaseException] = None
 
-    def _create_renderer(self):
+    def _ensure_started(self) -> bool:
+        with self._state_lock:
+            if self._closed:
+                return False
+            if self._thread is None or not self._thread.is_alive():
+                self._start_error = None
+                self._ready.clear()
+                self._thread = threading.Thread(target=self._run_loop, name="project-browser-session", daemon=True)
+                self._thread.start()
+        if not self._ready.wait(timeout=30):
+            return False
+        return self._start_error is None and self._loop is not None
+
+    def _run_loop(self) -> None:
+        import asyncio
+
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         try:
-            from botasaurus.browser import Driver
-            from botasaurus.browser import browser
-        except ImportError:
-            return None
+            self._loop.run_until_complete(self._start_browser())
+        except BaseException as error:  # noqa: BLE001
+            self._start_error = error
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.run_until_complete(self._close_browser())
+            self._loop.close()
 
-        chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
+    async def _start_browser(self) -> None:
+        import asyncio
+        from playwright.async_api import async_playwright
 
-        @browser(
-            headless=True,
-            chrome_executable_path=chrome_executable_path,
-            add_arguments=[
+        self._playwright = await async_playwright().start()
+        executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or self._playwright.chromium.executable_path
+        launch_options = {
+            "headless": True,
+            "args": [
                 "--headless=new",
+                "--disable-blink-features=AutomationControlled",
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
                 "--disable-background-networking",
                 "--disable-sync",
+                "--no-sandbox",
                 "--blink-settings=imagesEnabled=false",
             ],
-            window_size=[1280, 720],
-            block_images_and_css=True,
-            wait_for_complete_page_load=False,
-            reuse_driver=True,
-            max_retry=1,
-            output=None,
-            close_on_crash=True,
-            create_error_logs=False,
+        }
+        if executable_path:
+            launch_options["executable_path"] = executable_path
+        self._browser = await self._playwright.chromium.launch(**launch_options)
+        self._context = await self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            locale="ru-RU",
+            viewport={"width": 1366, "height": 900},
         )
-        def _render_html(driver: Driver, payload: Dict[str, str]):
-            with self._state_lock:
-                self._active_driver = driver
-            try:
-                target_url = str(payload.get("url") or "")
-                navigation = str(payload.get("navigation") or "direct")
-                if navigation == "google":
-                    driver.google_get(target_url)
-                else:
-                    driver.get(target_url)
-                driver.sleep(2)
-                for _ in range(4):
-                    try:
-                        driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
-                    except Exception:
-                        break
-                    driver.sleep(0.8)
-                return driver.page_html
-            finally:
-                with self._state_lock:
-                    if self._active_driver is driver:
-                        self._active_driver = None
+        self._semaphore = asyncio.Semaphore(self.max_pages)
 
-        return _render_html
+    async def _close_browser(self) -> None:
+        for obj in (self._context, self._browser):
+            if obj is not None:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+        self._context = None
+        self._browser = None
+        self._playwright = None
+        self._semaphore = None
+
+    async def _fetch_async(self, url: str) -> Optional[str]:
+        if self._context is None or self._semaphore is None:
+            return None
+
+        async with self._semaphore:
+            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                return None
+            page = await self._context.new_page()
+            try:
+                async def route_handler(route, request):
+                    if self._should_block_resource(request):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+
+                await page.route(
+                    "**/*",
+                    route_handler,
+                )
+                timeout_ms = REQUEST_TIMEOUT * 1000
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
+                except Exception:
+                    pass
+                for _ in range(4):
+                    if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                        return None
+                    await page.mouse.wheel(0, 1600)
+                    await page.wait_for_timeout(500)
+                html = await page.content()
+                return html if isinstance(html, str) and html.strip() else None
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _should_block_resource(request) -> bool:
+        resource_type = getattr(request, "resource_type", "")
+        if resource_type in BLOCKED_BROWSER_RESOURCE_TYPES:
+            return True
+        request_url = str(getattr(request, "url", "") or "").lower()
+        return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
 
     def fetch(self, url: str, method: str) -> Optional[str]:
         if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
             return None
-        if self._renderer is None:
-            return None
         with self._state_lock:
             if self._closed:
                 return None
-        navigation = "google" if method == "botasaurus-browser" else "direct"
-        with self._lock:
-            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
-                return None
-            with self._state_lock:
-                if self._closed:
-                    return None
-            try:
-                result = self._renderer({"url": url, "navigation": navigation})
-            except Exception:
-                return None
-        if isinstance(result, list):
-            result = result[0] if result else None
+        if not self._ensure_started():
+            return None
+        try:
+            import asyncio
+
+            future = asyncio.run_coroutine_threadsafe(self._fetch_async(url), self._loop)
+            result = future.result(timeout=REQUEST_TIMEOUT + 35)
+        except Exception:
+            return None
         return result if isinstance(result, str) and result.strip() else None
 
     def close(self) -> None:
+        thread = None
+        loop = None
         with self._state_lock:
+            if self._closed:
+                return
             self._closed = True
-            active_driver = self._active_driver
-        if active_driver is not None:
+            thread = self._thread
+            loop = self._loop
+        if loop is not None:
             try:
-                active_driver.close()
+                loop.call_soon_threadsafe(loop.stop)
             except Exception:
                 pass
-        renderer = self._renderer
-        if renderer is not None and hasattr(renderer, "close"):
-            try:
-                renderer.close()
-            except Exception:
-                pass
-        with self._state_lock:
-            self._active_driver = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=10)
 
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
@@ -4235,7 +4296,7 @@ class ProductSiteCrawler:
         self.run_id = run_id
         self.stop_signal = stop_signal
         self.finish_signal = finish_signal
-        self.thread_count = max(1, min(int(thread_count or 4), MAX_CRAWL_WORKERS_PER_SCAN))
+        self.thread_count = parse_thread_count(thread_count)
         self.start_urls = normalize_start_urls(start_urls)
         self.start_url = self.start_urls[0]
         self.root_netloc = urlparse(self.start_url).netloc
@@ -4257,8 +4318,10 @@ class ProductSiteCrawler:
             connection_method_state.setdefault("lock", threading.Lock())
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
-        self.browser_session = browser_session or BotasaurusBrowserSession(self.stop_signal)
+        self.browser_session = browser_session or BotasaurusBrowserSession(self.stop_signal, self.thread_count)
         self.owns_browser_session = owns_browser_session
+        self.browser_sessions_lock = threading.Lock()
+        self.browser_sessions: List[BotasaurusBrowserSession] = []
         self.thread_local = threading.local()
         self.headers = {
             "User-Agent": (
@@ -4317,6 +4380,22 @@ class ProductSiteCrawler:
             self.thread_local.session = session
         return session
 
+    def browser_session_for_worker(self) -> BotasaurusBrowserSession:
+        return self.browser_session
+
+    def close_browser_sessions(self) -> None:
+        sessions: List[BotasaurusBrowserSession] = []
+        with self.browser_sessions_lock:
+            for session in self.browser_sessions:
+                if session not in sessions:
+                    sessions.append(session)
+            self.browser_sessions.clear()
+        if self.owns_browser_session:
+            if self.browser_session not in sessions:
+                sessions.append(self.browser_session)
+        for session in sessions:
+            session.close()
+
     def fetch_with_requests(self, url: str) -> Optional[str]:
         last_error = ""
         candidate_urls = [url]
@@ -4361,10 +4440,10 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
-        if method in {"botasaurus-browser", "botasaurus-browser-direct", "botasaurus-visible"}:
-            return self.browser_session.fetch(target_url, method)
         if method == "botasaurus-debug-visible":
             return fetch_with_botasaurus_debug_visible_browser(target_url)
+        if is_browser_render_method(method):
+            return self.browser_session_for_worker().fetch(target_url, method)
         if method == "crawl4ai":
             return fetch_with_crawl4ai(target_url)
         if method == "playwright":
@@ -4380,8 +4459,6 @@ class ProductSiteCrawler:
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
             return fetch_with_crawlee(target_url)
-        if is_browser_render_method(method):
-            return self.browser_session.fetch(target_url, method)
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
@@ -4416,12 +4493,23 @@ class ProductSiteCrawler:
         return value if isinstance(value, str) else None
 
     def fallback_method_sequence(self) -> List[str]:
-        """Возвращает полный цикл fallback-методов из БД в порядке id."""
-        return [
-            method
-            for method in ordered_db_connection_methods()
-            if not is_debug_visible_method(method) or method == self.connection_method
-        ]
+        """Возвращает fallback-методы из БД, но не перебирает несколько browser-render движков подряд."""
+        ordered = ordered_db_connection_methods()
+        browser_fallback = self.connection_method if is_browser_render_method(self.connection_method) else ""
+        if not browser_fallback:
+            for method in ordered:
+                if is_browser_render_method(method) and not is_debug_visible_method(method):
+                    browser_fallback = method
+                    break
+
+        methods: List[str] = []
+        for method in ordered:
+            if is_debug_visible_method(method) and method != self.connection_method:
+                continue
+            if is_browser_render_method(method) and method != browser_fallback:
+                continue
+            methods.append(method)
+        return methods
 
     def current_connection_method(self) -> str:
         lock = self.connection_method_state["lock"]
@@ -4890,8 +4978,7 @@ class ProductSiteCrawler:
                 pending_urls_to_requeue = list(pending.values())
                 self.requeue_pending(pending_urls_to_requeue)
             executor.shutdown(wait=False, cancel_futures=True)
-            if self.owns_browser_session:
-                self.browser_session.close()
+            self.close_browser_sessions()
 
         if self.stop_signal.is_set():
             self.elapsed_before_resume = self.elapsed_seconds()
@@ -6579,7 +6666,7 @@ def enrich_news_candidates(
             candidates.append((index, product))
 
     if candidates and not stop_signal.is_set():
-        max_workers = min(NEWS_ENRICH_WORKER_COUNT, max(1, parse_thread_count(monitor.get("thread_count", 4))), len(candidates))
+        max_workers = min(parse_thread_count(monitor.get("thread_count", 4)), len(candidates))
         connection_method_state = {
             "active_method": normalize_connection_method(monitor.get("connection_method")),
             "lock": threading.Lock(),
@@ -6756,7 +6843,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
     availability_skipped = 0
-    browser_session = BotasaurusBrowserSession(stop_event)
+    browser_session = BotasaurusBrowserSession(stop_event, parse_thread_count(monitor.get("thread_count", 4)))
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -7880,7 +7967,7 @@ def api_project_delete_product_url_exclusion(project_id: str, index: int):
 def close_project_browser_session(project: Dict[str, object]) -> None:
     crawler = project.get("crawler")
     if isinstance(crawler, ProductSiteCrawler):
-        crawler.browser_session.close()
+        crawler.close_browser_sessions()
 
 
 def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str, object]:
@@ -7906,8 +7993,8 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.run_id = int(project["run_id"])
         crawler.stop_signal = project["stop_event"]
         crawler.finish_signal = project["finish_event"]
-        crawler.browser_session = BotasaurusBrowserSession(project["stop_event"])
-        crawler.thread_count = min(parse_thread_count(project.get("thread_count", 4)), MAX_CRAWL_WORKERS_PER_SCAN)
+        crawler.thread_count = parse_thread_count(project.get("thread_count", 4))
+        crawler.browser_session = BotasaurusBrowserSession(project["stop_event"], crawler.thread_count)
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
         crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)

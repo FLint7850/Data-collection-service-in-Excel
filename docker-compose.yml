@@ -14,6 +14,7 @@ services:
       UNIFIED_LOG_FILE: /app/logs/app.log
       EXPORT_DIR: /app/exports
       FILE_IMPORT_DIR: /app/storage/file-import
+      TMPDIR: /tmp/parser
       FORCE_BROWSER_SETUP: 0
     ports:
       - "5000:5000"
@@ -24,4 +25,6 @@ services:
       - ./feeds:/app/feeds
       - ./storage:/app/storage
     shm_size: "1gb"
+    mem_limit: "3g"
+    cpus: 2
     stop_grace_period: 30s
