@@ -1,0 +1,27 @@
+services:
+  parser:
+    build: .
+    container_name: maunfeld-parser
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: 5000
+      LOG_DIR: /app/logs
+      FEED_DIR: /app/feeds
+      LOGS_FILE: /app/logs/logs.json
+      UNIFIED_LOG_FILE: /app/logs/app.log
+      EXPORT_DIR: /app/exports
+      FILE_IMPORT_DIR: /app/storage/file-import
+      FORCE_BROWSER_SETUP: 0
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+      - ./feeds:/app/feeds
+      - ./storage:/app/storage
+    shm_size: "1gb"
+    stop_grace_period: 30s

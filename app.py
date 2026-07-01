@@ -104,9 +104,13 @@ def env_path(name: str, default: str) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
-@lru_cache(maxsize=1)
-def botasaurus_browser_executable() -> Optional[str]:
-    """Return the Chromium executable downloaded by Playwright, if available."""
+@lru_cache(maxsize=2)
+def botasaurus_browser_executable(prefer_headless_shell: bool = True) -> Optional[str]:
+    """Return a Playwright browser executable, preferring headless shell for headless work."""
+    env_executable = os.environ.get("PLAYWRIGHT_BROWSER_EXECUTABLE", "").strip()
+    if env_executable and Path(env_executable).is_file():
+        return env_executable
+
     try:
         from playwright.sync_api import sync_playwright
 
@@ -115,6 +119,18 @@ def botasaurus_browser_executable() -> Optional[str]:
             executable = Path(playwright.chromium.executable_path)
         finally:
             playwright.stop()
+        if prefer_headless_shell:
+            browser_root = executable
+            for parent in executable.parents:
+                if parent.name.startswith("chromium-"):
+                    browser_root = parent.parent
+                    break
+            shell_names = ("headless_shell.exe", "headless_shell")
+            for shell_dir in sorted(browser_root.glob("chromium_headless_shell-*"), reverse=True):
+                for shell_name in shell_names:
+                    matches = list(shell_dir.rglob(shell_name))
+                    if matches:
+                        return str(matches[0])
         return str(executable) if executable.is_file() else None
     except Exception:
         return None
@@ -3489,7 +3505,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
     except ImportError:
         return None
 
-    chrome_executable_path = botasaurus_browser_executable()
+    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
 
     @browser(
         headless=True,
@@ -3547,7 +3563,7 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
     except ImportError:
         return None
 
-    chrome_executable_path = botasaurus_browser_executable()
+    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=False)
 
     @browser(
         headless=False,
@@ -3603,7 +3619,7 @@ class BotasaurusBrowserSession:
         except ImportError:
             return None
 
-        chrome_executable_path = botasaurus_browser_executable()
+        chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
 
         @browser(
             headless=True,
@@ -4031,9 +4047,10 @@ class PlaywrightHeadlessRenderer:
             return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=[
+            executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
+            launch_options = {
+                "headless": True,
+                "args": [
                     "--disable-blink-features=AutomationControlled",
                     "--disable-gpu",
                     "--disable-dev-shm-usage",
@@ -4042,7 +4059,10 @@ class PlaywrightHeadlessRenderer:
                     "--no-sandbox",
                     "--blink-settings=imagesEnabled=false",
                 ],
-            )
+            }
+            if executable_path:
+                launch_options["executable_path"] = executable_path
+            browser = playwright.chromium.launch(**launch_options)
             context = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -4315,8 +4335,16 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
-        if is_browser_render_method(method):
+        if method in {"botasaurus-browser", "botasaurus-browser-direct", "botasaurus-visible"}:
             return self.browser_session.fetch(target_url, method)
+        if method == "botasaurus-debug-visible":
+            return fetch_with_botasaurus_debug_visible_browser(target_url)
+        if method == "crawl4ai":
+            return fetch_with_crawl4ai(target_url)
+        if method == "playwright":
+            return fetch_with_playwright(target_url)
+        if method == "scrapegraphai":
+            return fetch_with_scrapegraphai(target_url)
         if method == "firecrawl":
             if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
                 self.log("Метод firecrawl пропущен: не задан FIRECRAWL_API_KEY", "warning")
@@ -4326,6 +4354,8 @@ class ProductSiteCrawler:
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
             return fetch_with_crawlee(target_url)
+        if is_browser_render_method(method):
+            return self.browser_session.fetch(target_url, method)
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:

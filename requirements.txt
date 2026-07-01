@@ -1,4 +1,5 @@
 Flask==3.0.3
+gunicorn==22.0.0
 SQLAlchemy>=2.0.41
 alembic==1.13.1
 requests>=2.31,<3

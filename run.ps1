@@ -83,8 +83,8 @@ $env:STATIC_DEPS = "true"
 & $venvPython -m pip install -r requirements.txt
 
 if ($createdVenv -or $ForceBrowserSetup) {
-    Write-Host "Installing Playwright Chromium..." -ForegroundColor Cyan
-    & $venvPython -m playwright install chromium
+    Write-Host "Installing Playwright Chromium and headless shell..." -ForegroundColor Cyan
+    & $venvPython -m playwright install chromium chromium-headless-shell
 }
 else {
     Write-Host "Skipping browser setup for existing .venv. Set FORCE_BROWSER_SETUP=1 to reinstall." -ForegroundColor DarkGray

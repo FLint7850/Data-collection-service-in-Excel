@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+logs/*
+exports/*
+feeds/*
+storage/*
+data/*.db-wal
+data/*.db-shm
+node_modules
+.env
+.env.*
+!/.env.example

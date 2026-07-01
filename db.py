@@ -122,16 +122,16 @@ def seed_connection_methods(connection) -> None:
     methods = [
         ("requests", "Requests", False, False),
         ("botasaurus-request", "Botasaurus Request", False, False),
-        ("botasaurus-browser", "Botasaurus Browser", True, False),
-        ("botasaurus-browser-direct", "Botasaurus Browser Direct", True, False),
-        ("botasaurus-visible", "Botasaurus Headless Browser", True, False),
-        ("crawl4ai", "Crawl4AI", True, False),
+        ("botasaurus-browser", "Botasaurus / Chrome Headless Shell", True, False),
+        ("botasaurus-browser-direct", "Botasaurus Direct / Chrome Headless Shell", True, False),
+        ("botasaurus-visible", "Botasaurus Legacy / Chrome Headless Shell", True, False),
+        ("crawl4ai", "Crawl4AI / Chromium", True, False),
         ("firecrawl", "Firecrawl", False, False),
         ("scrapy", "Scrapy", False, False),
         ("crawlee", "Crawlee", False, False),
-        ("playwright", "Playwright", True, False),
-        ("scrapegraphai", "ScrapeGraphAI", True, False),
-        ("botasaurus-debug-visible", "Botasaurus Debug Visible", True, True),
+        ("playwright", "Playwright / Chrome Headless Shell", True, False),
+        ("scrapegraphai", "ScrapeGraphAI / Chromium", True, False),
+        ("botasaurus-debug-visible", "Debug Visible / Google Chrome for Testing", True, True),
     ]
     for code, name, is_browser_render, is_debug_visible in methods:
         connection.execute(
@@ -139,7 +139,10 @@ def seed_connection_methods(connection) -> None:
                 "INSERT INTO connection_methods "
                 "(code, name, is_browser_render, is_debug_visible, created_at) "
                 "VALUES (:code, :name, :is_browser_render, :is_debug_visible, CURRENT_TIMESTAMP) "
-                "ON CONFLICT(code) DO NOTHING"
+                "ON CONFLICT(code) DO UPDATE SET "
+                "name = excluded.name, "
+                "is_browser_render = excluded.is_browser_render, "
+                "is_debug_visible = excluded.is_debug_visible"
             ),
             {
                 "code": code,
@@ -341,6 +344,133 @@ def migrate_news_tables(connection) -> None:
     donor_columns = table_columns(connection, "donors")
     if not brand_columns and not donor_columns:
         return
+
+    # Additive migration only: never drop/recreate brands or donors in production data.
+    if brand_columns:
+        brand_additions = {
+            "group_name": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "enabled": "BOOLEAN NOT NULL DEFAULT 1",
+            "schedule_type": "VARCHAR(32) NOT NULL DEFAULT 'daily'",
+            "scan_time": "VARCHAR(8) NOT NULL DEFAULT '01:00'",
+            "weekday": "INTEGER NOT NULL DEFAULT 0",
+            "next_run_at": "DATETIME",
+            "primary_donor_id": "INTEGER",
+            "created_at": "DATETIME",
+            "updated_at": "DATETIME",
+        }
+        for column_name, definition in brand_additions.items():
+            if column_name not in brand_columns:
+                connection.execute(text(f"ALTER TABLE brands ADD COLUMN {column_name} {definition}"))
+                brand_columns[column_name] = definition
+        if "state" not in brand_columns:
+            connection.exec_driver_sql(f"ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'")
+            brand_columns["state"] = "JSON"
+        if "group_type" in brand_columns:
+            connection.execute(
+                text(
+                    "UPDATE brands SET group_name = group_type "
+                    "WHERE (group_name IS NULL OR trim(group_name) = '') "
+                    "AND group_type IS NOT NULL AND trim(group_type) != ''"
+                )
+            )
+        connection.execute(text("UPDATE brands SET group_name = 'Маржа' WHERE group_name IS NULL OR trim(group_name) = ''"))
+        connection.execute(text("UPDATE brands SET enabled = 1 WHERE enabled IS NULL"))
+        connection.execute(text("UPDATE brands SET schedule_type = 'daily' WHERE schedule_type IS NULL OR trim(schedule_type) = ''"))
+        connection.execute(text("UPDATE brands SET scan_time = '01:00' WHERE scan_time IS NULL OR trim(scan_time) = ''"))
+        connection.execute(text("UPDATE brands SET weekday = 0 WHERE weekday IS NULL"))
+        connection.execute(text("UPDATE brands SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+        connection.execute(text("UPDATE brands SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+
+    if donor_columns:
+        if "connections_method" in donor_columns and "connection_method" not in donor_columns:
+            connection.execute(text("ALTER TABLE donors RENAME COLUMN connections_method TO connection_method"))
+            donor_columns = table_columns(connection, "donors")
+
+        donor_additions = {
+            "legacy_id": "VARCHAR(32) NOT NULL DEFAULT ''",
+            "site_url": "TEXT NOT NULL DEFAULT ''",
+            "start_urls": "JSON NOT NULL DEFAULT '[]'",
+            "thread_count": "INTEGER NOT NULL DEFAULT 4",
+            "auto_connection_fallback": "BOOLEAN NOT NULL DEFAULT 1",
+            "exclusions": "JSON NOT NULL DEFAULT '[]'",
+            "product_url_filters": "JSON NOT NULL DEFAULT '[]'",
+            "product_url_exclusions": "JSON NOT NULL DEFAULT '[]'",
+            "extraction_rules": "JSON NOT NULL DEFAULT '{}'",
+            "selector_settings": "JSON NOT NULL DEFAULT '{}'",
+            "seen_models": "JSON NOT NULL DEFAULT '[]'",
+            "known_new_products": "JSON NOT NULL DEFAULT '{}'",
+            "created_at": "DATETIME",
+            "updated_at": "DATETIME",
+        }
+        for column_name, definition in donor_additions.items():
+            if column_name not in donor_columns:
+                connection.execute(text(f"ALTER TABLE donors ADD COLUMN {column_name} {definition}"))
+                donor_columns[column_name] = definition
+
+        if "connection_id" not in donor_columns:
+            if "connection_method_id" in donor_columns:
+                connection.execute(text("ALTER TABLE donors RENAME COLUMN connection_method_id TO connection_id"))
+            else:
+                connection.execute(text("ALTER TABLE donors ADD COLUMN connection_id INTEGER"))
+            donor_columns = table_columns(connection, "donors")
+
+        connection.execute(text("UPDATE donors SET thread_count = 4 WHERE thread_count IS NULL OR thread_count < 1"))
+        connection.execute(text("UPDATE donors SET auto_connection_fallback = 1 WHERE auto_connection_fallback IS NULL"))
+        connection.execute(text("UPDATE donors SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+        connection.execute(text("UPDATE donors SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
+        connection.execute(
+            text(
+                "UPDATE donors SET start_urls = json_array(site_url) "
+                "WHERE (start_urls IS NULL OR start_urls = '' OR start_urls = '[]') "
+                "AND site_url IS NOT NULL AND trim(site_url) != ''"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE donors SET site_url = json_extract(start_urls, '$[0]') "
+                "WHERE (site_url IS NULL OR trim(site_url) = '') "
+                "AND json_valid(start_urls) AND json_array_length(start_urls) > 0"
+            )
+        )
+        if "connection_method" in donor_columns:
+            connection.execute(
+                text(
+                    "UPDATE donors SET connection_id = "
+                    "(SELECT id FROM connection_methods WHERE code = COALESCE(NULLIF(donors.connection_method, ''), 'requests') LIMIT 1) "
+                    "WHERE connection_id IS NULL"
+                )
+            )
+        connection.execute(
+            text(
+                "UPDATE donors SET connection_id = "
+                "(SELECT id FROM connection_methods WHERE code = 'requests' LIMIT 1) "
+                "WHERE connection_id IS NULL"
+            )
+        )
+        if brand_columns and "state" in donor_columns:
+            connection.execute(
+                text(
+                    "UPDATE brands SET state = ("
+                    "SELECT donors.state FROM donors "
+                    "WHERE donors.brand_id = brands.id AND donors.state IS NOT NULL "
+                    "ORDER BY donors.id LIMIT 1"
+                    ") WHERE EXISTS ("
+                    "SELECT 1 FROM donors WHERE donors.brand_id = brands.id AND donors.state IS NOT NULL"
+                    ")"
+                )
+            )
+        if brand_columns and "primary_donor_id" in brand_columns:
+            connection.execute(
+                text(
+                    "UPDATE brands SET primary_donor_id = ("
+                    "SELECT donors.id FROM donors WHERE donors.brand_id = brands.id ORDER BY donors.id LIMIT 1"
+                    ") WHERE primary_donor_id IS NULL "
+                    "AND EXISTS (SELECT 1 FROM donors WHERE donors.brand_id = brands.id)"
+                )
+            )
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
+    return
 
     brand_needs_rebuild = bool(
         brand_columns
