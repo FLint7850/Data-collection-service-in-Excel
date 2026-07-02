@@ -34,6 +34,7 @@ const startUrls = document.querySelector("#startUrls");
 const threadCount = document.querySelector("#threadCount");
 const connectionMethod = document.querySelector("#connectionMethod");
 const autoConnectionFallback = document.querySelector("#autoConnectionFallback");
+const persistProfile = document.querySelector("#persistProfile");
 const exclusionForm = document.querySelector("#exclusionForm");
 const exclusionInput = document.querySelector("#exclusionInput");
 const exclusionList = document.querySelector("#exclusionList");
@@ -358,6 +359,7 @@ function setControls(status) {
   threadCount.disabled = isRunning;
   connectionMethod.disabled = isRunning;
   autoConnectionFallback.disabled = isRunning;
+  persistProfile.disabled = isRunning;
   productCardSelector.disabled = isRunning;
   productUrlSelector.disabled = isRunning;
   modelSelector.disabled = isRunning;
@@ -553,6 +555,7 @@ function renderProjectForm(project) {
   threadCount.value = project.thread_count || project.state?.thread_count || 4;
   hydrateConnectionSelect(connectionMethod, project.connection_method);
   autoConnectionFallback.checked = project.auto_connection_fallback !== false;
+  persistProfile.checked = Boolean(project.persist_profile);
   const rules = project.extraction_rules || {};
   productCardSelector.value = rules.product_card_selector || "";
   productUrlSelector.value = rules.product_url_selector || "";
@@ -1957,6 +1960,7 @@ async function saveActiveProject() {
     thread_count: Number(threadCount.value || 4),
     connection_method: connectionMethod.value,
     auto_connection_fallback: autoConnectionFallback.checked,
+    persist_profile: persistProfile.checked,
   };
   const data = await requestJson(`/api/projects/${project.id}`, {
     method: "PATCH",
@@ -2132,6 +2136,7 @@ threadCount.addEventListener("input", scheduleSaveActiveProject);
 threadCount.addEventListener("change", saveActiveProject);
 connectionMethod.addEventListener("change", saveActiveProject);
 autoConnectionFallback.addEventListener("change", saveActiveProject);
+persistProfile.addEventListener("change", saveActiveProject);
 [
   productCardSelector,
   productUrlSelector,
@@ -2624,6 +2629,7 @@ startButton.addEventListener("click", async () => {
         thread_count: Number(threadCount.value || 4),
         connection_method: connectionMethod.value,
         auto_connection_fallback: autoConnectionFallback.checked,
+        persist_profile: persistProfile.checked,
       }),
     });
     renderState(project);

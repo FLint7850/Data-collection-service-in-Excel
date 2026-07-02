@@ -131,6 +131,7 @@ def upgrade() -> None:
         sa.Column("auto_cleanup", sa.Boolean(), nullable=False),
         sa.Column("connection_method", sa.String(length=64), nullable=False),
         sa.Column("auto_connection_fallback", sa.Boolean(), nullable=False),
+        sa.Column("persist_profile", sa.Boolean(), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),

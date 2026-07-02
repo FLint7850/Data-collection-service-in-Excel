@@ -677,6 +677,9 @@ def migrate_projects_table(connection) -> None:
         columns = table_columns(connection, "projects")
     if "legacy_id" not in columns:
         connection.execute(text("ALTER TABLE projects ADD COLUMN legacy_id VARCHAR(32) NOT NULL DEFAULT ''"))
+        columns = table_columns(connection, "projects")
+    if "persist_profile" not in columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN persist_profile BOOLEAN NOT NULL DEFAULT 0"))
 
 
 def migrate_donor_start_urls(connection) -> None:

@@ -25,6 +25,7 @@ class Project(Base):
     auto_cleanup: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     connection_method: Mapped[str] = mapped_column(String(64), default="requests", nullable=False)
     auto_connection_fallback: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    persist_profile: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

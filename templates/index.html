@@ -68,7 +68,14 @@
           <input id="autoConnectionFallback" type="checkbox" checked>
           <span>Автопереключение</span>
         </label>
-        <p class="connection-note">Автопереключение оставляет все методы, но браузерные методы работают в скрытом внутреннем браузере. Видимый браузер используется только для ручной диагностики.</p>
+        <label class="toggle-field profile-field">
+          <input id="persistProfile" type="checkbox">
+          <span class="profile-field-text">
+            <span>Хранить профиль</span>
+            <small>Работает в Browser Render методах и Debug Visible. При включении запуск идет в 1 поток</small>
+          </span>
+        </label>
+        <p class="connection-note">Автопереключение оставляет все методы. Профиль не используется в Requests, Botasaurus Request, Firecrawl, Scrapy и Crawlee.</p>
         <div class="button-row">
           <button class="button primary" id="startButton" type="button">Запустить сбор</button>
           <button class="button secondary" id="softPauseButton" type="button">Пауза</button>

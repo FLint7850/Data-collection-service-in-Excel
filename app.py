@@ -142,6 +142,7 @@ LOGS_FILE = env_path("LOGS_FILE", str(LOG_DIR / "logs.json"))
 UNIFIED_LOG_FILE = env_path("UNIFIED_LOG_FILE", str(LOG_DIR / "app.log"))
 EXPORT_DIR = env_path("EXPORT_DIR", "exports")
 FILE_IMPORT_DIR = env_path("FILE_IMPORT_DIR", "storage/file-import")
+PROJECT_PROFILE_DIR = BASE_DIR / "profiles" / "projects"
 DEFAULT_START_URL = env_str("DEFAULT_START_URL", "")
 DEFAULT_FEED_URL = env_str("DEFAULT_FEED_URL", "https://mega-kuhnya.ru/price/last_modified.xml")
 DEFAULT_FEED_GENERATE_URL = env_str(
@@ -422,6 +423,7 @@ def ensure_storage() -> None:
         LOG_DIR.mkdir(exist_ok=True)
         FEED_DIR.mkdir(exist_ok=True)
         FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+        PROJECT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         init_db()
         ensure_default_user()
         load_projects()
@@ -570,6 +572,7 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
         "auto_cleanup": False,
         "connection_method": normalize_connection_method(None),
         "auto_connection_fallback": True,
+        "persist_profile": False,
         "worker_thread": None,
         "stop_event": threading.Event(),
         "finish_event": threading.Event(),
@@ -596,6 +599,7 @@ def public_project(project: Dict[str, object]) -> Dict[str, object]:
         "auto_cleanup": project.get("auto_cleanup", False),
         "connection_method": project.get("connection_method", "requests"),
         "auto_connection_fallback": project.get("auto_connection_fallback", True),
+        "persist_profile": bool(project.get("persist_profile", False)),
     }
 
 
@@ -615,6 +619,7 @@ def project_model_to_dict(row: Project) -> Dict[str, object]:
         "auto_cleanup": bool(row.auto_cleanup),
         "connection_method": normalize_connection_method(row.connection_method),
         "auto_connection_fallback": bool(row.auto_connection_fallback),
+        "persist_profile": bool(getattr(row, "persist_profile", False)),
         "worker_thread": None,
         "stop_event": threading.Event(),
         "finish_event": threading.Event(),
@@ -644,6 +649,7 @@ def upsert_project_model(session, project: Dict[str, object]) -> int:
     row.auto_cleanup = bool(project.get("auto_cleanup", False))
     row.connection_method = normalize_connection_method(project.get("connection_method"))
     row.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
+    row.persist_profile = bool(project.get("persist_profile", False))
     session.flush()
     return int(row.id)
 
@@ -1799,6 +1805,13 @@ def parse_thread_count(value: object) -> int:
         return max(1, min(int(value or 4), 16))
     except (TypeError, ValueError):
         return 4
+
+
+def project_runtime_thread_count(project: Dict[str, object]) -> int:
+    method = normalize_connection_method(project.get("connection_method"))
+    if bool(project.get("persist_profile", False)) or is_debug_visible_method(method):
+        return 1
+    return parse_thread_count(project.get("thread_count", 4))
 
 
 def load_connection_methods(force_refresh: bool = False) -> List[Dict[str, object]]:
@@ -3620,9 +3633,15 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
 class BotasaurusBrowserSession:
     """One browser owned by one project/news scan; thread_count controls open pages."""
 
-    def __init__(self, stop_signal: Optional[threading.Event] = None, max_pages: int = 1) -> None:
+    def __init__(
+        self,
+        stop_signal: Optional[threading.Event] = None,
+        max_pages: int = 1,
+        profile_dir: Optional[Path] = None,
+    ) -> None:
         self.stop_signal = stop_signal
         self.max_pages = max(1, parse_thread_count(max_pages))
+        self.profile_dir = profile_dir
         self._state_lock = threading.Lock()
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -3674,7 +3693,6 @@ class BotasaurusBrowserSession:
         launch_options = {
             "headless": True,
             "args": [
-                "--headless=new",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
@@ -3686,8 +3704,7 @@ class BotasaurusBrowserSession:
         }
         if executable_path:
             launch_options["executable_path"] = executable_path
-        self._browser = await self._playwright.chromium.launch(**launch_options)
-        self._context = await self._browser.new_context(
+        context_options = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -3695,15 +3712,30 @@ class BotasaurusBrowserSession:
             locale="ru-RU",
             viewport={"width": 1366, "height": 900},
         )
+        if self.profile_dir is not None:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                str(self.profile_dir),
+                **launch_options,
+                **context_options,
+            )
+            self._browser = self._context.browser
+        else:
+            self._browser = await self._playwright.chromium.launch(**launch_options)
+            self._context = await self._browser.new_context(**context_options)
         self._semaphore = asyncio.Semaphore(self.max_pages)
 
     async def _close_browser(self) -> None:
-        for obj in (self._context, self._browser):
-            if obj is not None:
-                try:
-                    await obj.close()
-                except Exception:
-                    pass
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+        if self.profile_dir is None and self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -3793,6 +3825,79 @@ class BotasaurusBrowserSession:
                 pass
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=10)
+
+
+class BotasaurusDebugVisibleSession:
+    """One visible Botasaurus browser with a persistent project profile."""
+
+    def __init__(self, stop_signal: Optional[threading.Event] = None, profile: str = "protected_sites_debug_visible") -> None:
+        self.stop_signal = stop_signal
+        self.profile = profile or "protected_sites_debug_visible"
+        self._lock = threading.Lock()
+        self._closed = False
+        self._renderer = self._create_renderer()
+
+    def _create_renderer(self):
+        try:
+            from botasaurus.browser import Driver
+            from botasaurus.browser import browser
+        except ImportError:
+            return None
+
+        chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=False)
+
+        @browser(
+            headless=False,
+            chrome_executable_path=chrome_executable_path,
+            profile=self.profile,
+            window_size=[1280, 720],
+            add_arguments=["--window-position=40,40"],
+            block_images_and_css=False,
+            wait_for_complete_page_load=True,
+            reuse_driver=True,
+            output=None,
+            close_on_crash=True,
+            create_error_logs=False,
+            max_retry=1,
+        )
+        def _render_html(driver: Driver, target_url: str):
+            driver.get(target_url)
+            driver.sleep(8)
+            for _ in range(3):
+                try:
+                    driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    break
+                driver.sleep(0.8)
+            return driver.page_html
+
+        return _render_html
+
+    def fetch(self, url: str, method: str) -> Optional[str]:
+        if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+            return None
+        if self._renderer is None:
+            return None
+        with self._lock:
+            if self._closed:
+                return None
+            try:
+                result = self._renderer(url)
+            except Exception:
+                return None
+        if isinstance(result, list):
+            result = result[0] if result else None
+        return result if isinstance(result, str) and result.strip() else None
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            renderer = self._renderer
+            if renderer is not None and hasattr(renderer, "close"):
+                try:
+                    renderer.close()
+                except Exception:
+                    pass
 
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
@@ -4292,6 +4397,7 @@ class ProductSiteCrawler:
         allow_empty_price: bool = False,
         browser_session: Optional[BotasaurusBrowserSession] = None,
         owns_browser_session: bool = True,
+        profile_dir: Optional[Path] = None,
     ):
         self.run_id = run_id
         self.stop_signal = stop_signal
@@ -4308,6 +4414,7 @@ class ProductSiteCrawler:
         self.connection_method = normalize_connection_method(connection_method)
         self.auto_connection_fallback = bool(auto_connection_fallback)
         self.allow_empty_price = bool(allow_empty_price)
+        self.profile_dir = profile_dir
         if connection_method_state is None:
             connection_method_state = {
                 "active_method": self.connection_method,
@@ -4318,10 +4425,16 @@ class ProductSiteCrawler:
             connection_method_state.setdefault("lock", threading.Lock())
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
-        self.browser_session = browser_session or BotasaurusBrowserSession(self.stop_signal, self.thread_count)
+        debug_profile = str(profile_dir) if profile_dir is not None else "protected_sites_debug_visible"
+        self.browser_session = browser_session or BotasaurusBrowserSession(
+            self.stop_signal,
+            self.thread_count,
+            profile_dir=self.profile_dir,
+        )
+        self.debug_visible_session = BotasaurusDebugVisibleSession(self.stop_signal, debug_profile)
         self.owns_browser_session = owns_browser_session
         self.browser_sessions_lock = threading.Lock()
-        self.browser_sessions: List[BotasaurusBrowserSession] = []
+        self.browser_sessions: List[object] = []
         self.thread_local = threading.local()
         self.headers = {
             "User-Agent": (
@@ -4383,8 +4496,11 @@ class ProductSiteCrawler:
     def browser_session_for_worker(self) -> BotasaurusBrowserSession:
         return self.browser_session
 
+    def debug_visible_session_for_worker(self) -> BotasaurusDebugVisibleSession:
+        return self.debug_visible_session
+
     def close_browser_sessions(self) -> None:
-        sessions: List[BotasaurusBrowserSession] = []
+        sessions: List[object] = []
         with self.browser_sessions_lock:
             for session in self.browser_sessions:
                 if session not in sessions:
@@ -4393,6 +4509,8 @@ class ProductSiteCrawler:
         if self.owns_browser_session:
             if self.browser_session not in sessions:
                 sessions.append(self.browser_session)
+            if self.debug_visible_session not in sessions:
+                sessions.append(self.debug_visible_session)
         for session in sessions:
             session.close()
 
@@ -4441,7 +4559,7 @@ class ProductSiteCrawler:
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
         if method == "botasaurus-debug-visible":
-            return fetch_with_botasaurus_debug_visible_browser(target_url)
+            return self.debug_visible_session_for_worker().fetch(target_url, method)
         if is_browser_render_method(method):
             return self.browser_session_for_worker().fetch(target_url, method)
         if method == "crawl4ai":
@@ -6843,7 +6961,10 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
     availability_skipped = 0
-    browser_session = BotasaurusBrowserSession(stop_event, parse_thread_count(monitor.get("thread_count", 4)))
+    browser_session = BotasaurusBrowserSession(
+        stop_event,
+        parse_thread_count(monitor.get("thread_count", 4)),
+    )
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -7824,6 +7945,8 @@ def api_update_project(project_id: str):
             project["connection_method"] = normalize_connection_method(payload.get("connection_method"))
         if "auto_connection_fallback" in payload:
             project["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
+        if "persist_profile" in payload:
+            project["persist_profile"] = bool(payload.get("persist_profile"))
         if "auto_cleanup" in payload:
             project["auto_cleanup"] = bool(payload.get("auto_cleanup"))
         reset_project_state_after_form_save(project)
@@ -7970,6 +8093,31 @@ def close_project_browser_session(project: Dict[str, object]) -> None:
         crawler.close_browser_sessions()
 
 
+def project_profile_storage_dir(project: Dict[str, object]) -> Path:
+    project_id = safe_filename(str(project.get("id") or "project"))
+    return PROJECT_PROFILE_DIR / project_id
+
+
+def project_browser_profile_dir(project: Dict[str, object]) -> Optional[Path]:
+    if not bool(project.get("persist_profile", False)):
+        return None
+    return project_profile_storage_dir(project)
+
+
+def cleanup_project_profile_if_disabled(project: Dict[str, object]) -> None:
+    if bool(project.get("persist_profile", False)):
+        return
+    profile_dir = project_profile_storage_dir(project)
+    try:
+        root = PROJECT_PROFILE_DIR.resolve()
+        target = profile_dir.resolve()
+        if target == root or root not in target.parents or not target.exists():
+            return
+        shutil.rmtree(target, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str, object]:
     task_key = ("project", str(project["id"]))
     if scan_dispatcher.contains(task_key):
@@ -7989,29 +8137,43 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
     project["run_id"] = int(project.get("run_id", 0)) + 1
 
     crawler = project.get("crawler") if resume else None
+    profile_dir = project_browser_profile_dir(project)
+    runtime_thread_count = project_runtime_thread_count(project)
     if crawler:
+        crawler.close_browser_sessions()
+        cleanup_project_profile_if_disabled(project)
         crawler.run_id = int(project["run_id"])
         crawler.stop_signal = project["stop_event"]
         crawler.finish_signal = project["finish_event"]
-        crawler.thread_count = parse_thread_count(project.get("thread_count", 4))
-        crawler.browser_session = BotasaurusBrowserSession(project["stop_event"], crawler.thread_count)
+        crawler.thread_count = runtime_thread_count
         crawler.exclusions = list(project.get("exclusions", DEFAULT_EXCLUSIONS))
         crawler.extraction_rules = normalize_extraction_rules(project.get("extraction_rules", {}))
         crawler.product_url_filters = product_url_filter_patterns(project.get("product_url_filters", []), crawler.extraction_rules)
         crawler.product_url_exclusions = normalize_patterns(project.get("product_url_exclusions", []))
         crawler.connection_method = normalize_connection_method(project.get("connection_method"))
         crawler.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
+        crawler.profile_dir = profile_dir
+        crawler.browser_session = BotasaurusBrowserSession(
+            project["stop_event"],
+            crawler.thread_count,
+            profile_dir=crawler.profile_dir,
+        )
+        crawler.debug_visible_session = BotasaurusDebugVisibleSession(
+            project["stop_event"],
+            str(crawler.profile_dir) if crawler.profile_dir is not None else "protected_sites_debug_visible",
+        )
         crawler.active_connection_method = crawler.connection_method
         crawler.connection_method_state["active_method"] = crawler.connection_method
         crawler.excel_finalized = False
     else:
+        cleanup_project_profile_if_disabled(project)
         reset_project_state(project, "queued")
         crawler = ProductSiteCrawler(
             list(project.get("start_urls", [DEFAULT_START_URL])),
             int(project["run_id"]),
             project["stop_event"],
             project["finish_event"],
-            parse_thread_count(project.get("thread_count", 4)),
+            runtime_thread_count,
             project=project,
             exclusions=list(project.get("exclusions", DEFAULT_EXCLUSIONS)),
             product_url_filters=list(project.get("product_url_filters", [])),
@@ -8019,6 +8181,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             extraction_rules=normalize_extraction_rules(project.get("extraction_rules", {})),
             connection_method=project.get("connection_method", "requests"),
             auto_connection_fallback=bool(project.get("auto_connection_fallback", True)),
+            profile_dir=profile_dir,
         )
         project["crawler"] = crawler
 
@@ -8068,6 +8231,8 @@ def api_project_start(project_id: str):
             project["connection_method"] = normalize_connection_method(payload.get("connection_method"))
         if "auto_connection_fallback" in payload:
             project["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
+        if "persist_profile" in payload:
+            project["persist_profile"] = bool(payload.get("persist_profile"))
         save_projects()
 
     try:

@@ -408,7 +408,8 @@ select:focus {
 
 .project-control-panel .thread-field,
 .project-control-panel .connection-field,
-.project-control-panel .fallback-field {
+.project-control-panel .fallback-field,
+.project-control-panel .profile-field {
   grid-column: span 2;
 }
 
@@ -416,10 +417,30 @@ select:focus {
   text-align: center;
 }
 
-.project-control-panel .fallback-field {
+.project-control-panel .fallback-field,
+.project-control-panel .profile-field {
   min-height: 44px;
   align-self: end;
+}
+
+.project-control-panel .fallback-field {
   white-space: nowrap;
+}
+
+.project-control-panel .profile-field {
+  align-items: flex-start;
+}
+
+.profile-field-text {
+  display: grid;
+  gap: 3px;
+  line-height: 1.25;
+}
+
+.profile-field-text small {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
 }
 
 .project-control-panel .connection-note {
@@ -428,6 +449,10 @@ select:focus {
   color: var(--muted);
   font-size: 0.86rem;
   line-height: 1.45;
+}
+
+.project-control-panel .profile-field {
+  grid-column: 1 / -1;
 }
 
 .project-control-panel .button-row {
@@ -1762,6 +1787,7 @@ select:focus {
   .project-control-panel .thread-field,
   .project-control-panel .connection-field,
   .project-control-panel .fallback-field,
+  .project-control-panel .profile-field,
   .project-control-panel .button-row {
     grid-column: 1 / -1;
   }
