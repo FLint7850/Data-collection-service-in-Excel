@@ -5420,7 +5420,7 @@ def safe_filename(value: str) -> str:
     return cleaned or "project"
 
 
-FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx"}
+FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx", ".xls"}
 
 
 def clear_file_import_storage() -> None:
