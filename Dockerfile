@@ -18,7 +18,8 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt \
-    && mkdir -p /tmp/parser /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin/temp \
+    && rm -rf /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin/temp \
+    && mkdir -p /tmp/parser /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
     && chmod -R 1777 /tmp/parser \
     && chmod -R a+rwX /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
     && python -m playwright install --with-deps chromium chromium-headless-shell

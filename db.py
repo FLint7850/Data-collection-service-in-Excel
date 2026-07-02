@@ -50,10 +50,22 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
 
 
+def try_enable_wal(cursor_or_connection) -> None:
+    try:
+        cursor_or_connection.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        # Windows Docker bind mounts can reject SQLite WAL locks. The app can
+        # safely continue with the default journal mode in that environment.
+        try:
+            cursor_or_connection.execute("PRAGMA journal_mode=DELETE")
+        except Exception:
+            pass
+
+
 @event.listens_for(engine, "connect")
 def configure_sqlite(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
+    try_enable_wal(cursor)
     cursor.execute("PRAGMA busy_timeout=5000")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
@@ -67,7 +79,10 @@ def init_db() -> None:
         connection.execute(text("PRAGMA foreign_keys=OFF"))
         connection.commit()
         with connection.begin():
-            connection.execute(text("PRAGMA journal_mode=WAL"))
+            try:
+                connection.execute(text("PRAGMA journal_mode=WAL"))
+            except Exception:
+                connection.execute(text("PRAGMA journal_mode=DELETE"))
             connection.execute(text("PRAGMA busy_timeout=5000"))
             migrate_schema(connection)
             connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
@@ -126,7 +141,6 @@ def seed_connection_methods(connection) -> None:
         ("botasaurus-browser-direct", "Botasaurus Direct / Chrome Headless Shell", True, False),
         ("botasaurus-visible", "Botasaurus Legacy / Chrome Headless Shell", True, False),
         ("crawl4ai", "Crawl4AI / Chromium", True, False),
-        ("firecrawl", "Firecrawl", False, False),
         ("scrapy", "Scrapy", False, False),
         ("crawlee", "Crawlee", False, False),
         ("playwright", "Playwright / Chrome Headless Shell", True, False),

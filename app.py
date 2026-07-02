@@ -368,6 +368,21 @@ BLOCKED_BROWSER_URL_PARTS = (
     "top-fwz1.mail.ru",
     "mail.ru/counter",
 )
+SESSION_BROWSER_METHODS = {
+    "botasaurus-browser",
+    "botasaurus-browser-direct",
+    "botasaurus-visible",
+}
+DEBUG_VISIBLE_METHODS = {"botasaurus-debug-visible"}
+STATIC_BROWSER_RENDER_METHODS = {
+    *SESSION_BROWSER_METHODS,
+    *DEBUG_VISIBLE_METHODS,
+    "crawl4ai",
+    "playwright",
+    "scrapegraphai",
+}
+FETCH_DEBUG_HTML = env_str("FETCH_DEBUG_HTML", "0").lower() in {"1", "true", "yes", "on"}
+FETCH_DEBUG_HTML_DIR = LOG_DIR / "debug-html"
 
 scan_state: Dict[str, object] = {
     "status": "idle",
@@ -690,6 +705,63 @@ def append_unified_log(item: Dict[str, object]) -> None:
             UNIFIED_LOG_FILE.open("a", encoding="utf-8").write(line)
     except OSError:
         print(line, end="", flush=True)
+
+
+def fetch_debug_log(message: str, level: str = "info") -> None:
+    append_unified_log(
+        {
+            "project_id": "fetch-debug",
+            "project_name": "fetch-debug",
+            "level": level,
+            "message": message,
+        }
+    )
+
+
+def html_title_for_debug(html: str) -> str:
+    if not html:
+        return ""
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return clean_text(re.sub(r"<[^>]+>", " ", html_lib.unescape(match.group(1))))[:180]
+
+
+def debug_html_filename(url: str, method: str) -> str:
+    parsed = urlparse(url)
+    host = re.sub(r"[^A-Za-z0-9_-]+", "_", (parsed.hostname or "unknown").lower()).strip("_") or "unknown"
+    method_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(method or "method")).strip("_") or "method"
+    digest = hashlib.sha1(url.encode("utf-8", "ignore")).hexdigest()[:10]
+    return f"{host}_{method_name}_{digest}.html"
+
+
+def save_fetch_debug_html(url: str, method: str, html: str) -> None:
+    if not FETCH_DEBUG_HTML or not html:
+        return
+    try:
+        FETCH_DEBUG_HTML_DIR.mkdir(parents=True, exist_ok=True)
+        path = FETCH_DEBUG_HTML_DIR / debug_html_filename(url, method)
+        path.write_text(html, encoding="utf-8", errors="replace")
+    except OSError as error:
+        fetch_debug_log(f"Не удалось сохранить debug HTML для {method} {url}: {error}", "warning")
+
+
+def log_fetch_result(method: str, url: str, html: Optional[str], elapsed: float = 0.0, extra: str = "") -> None:
+    html_text = html or ""
+    title = html_title_for_debug(html_text)
+    blocked = looks_blocked_or_empty(html_text) if html_text else True
+    suffix = f"; {extra}" if extra else ""
+    fetch_debug_log(
+        f"method={method}; url={url}; html_len={len(html_text)}; blocked={blocked}; "
+        f"elapsed={elapsed:.2f}s; title={title}{suffix}",
+        "info" if html_text and not blocked else "warning",
+    )
+    if html_text:
+        save_fetch_debug_html(url, method, html_text)
+
+
+def log_fetch_exception(method: str, url: str, error: BaseException) -> None:
+    fetch_debug_log(f"method={method}; url={url}; error={type(error).__name__}: {error}", "warning")
 
 
 def read_logs_file() -> List[Dict[str, object]]:
@@ -1886,11 +1958,13 @@ def connection_method_has_flag(method: str, flag_name: str) -> bool:
 
 
 def is_browser_render_method(method: str) -> bool:
-    return connection_method_has_flag(method, "is_browser_render")
+    method = str(method or "").strip()
+    return method in STATIC_BROWSER_RENDER_METHODS or connection_method_has_flag(method, "is_browser_render")
 
 
 def is_debug_visible_method(method: str) -> bool:
-    return connection_method_has_flag(method, "is_debug_visible")
+    method = str(method or "").strip()
+    return method in DEBUG_VISIBLE_METHODS or connection_method_has_flag(method, "is_debug_visible")
 
 
 def ordered_db_connection_methods(
@@ -3511,7 +3585,8 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
 
     try:
         result = _fetch_html(url)
-    except Exception:
+    except Exception as error:
+        log_fetch_exception("botasaurus-request", url, error)
         return None
 
     if isinstance(result, list):
@@ -3570,8 +3645,10 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
         return driver.page_html
 
     try:
+        started = time.time()
         result = _render_html(url)
-    except Exception:
+    except Exception as error:
+        log_fetch_exception(f"botasaurus-browser:{navigation}", url, error)
         return None
 
     if isinstance(result, list):
@@ -3631,7 +3708,11 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
 
 
 class BotasaurusBrowserSession:
-    """One browser owned by one project/news scan; thread_count controls open pages."""
+    """One hidden full Chromium session owned by one project/news scan.
+
+    thread_count still controls parallel open pages, but every page now uses a
+    selector-driven fast path and closes as soon as the needed DOM appears.
+    """
 
     def __init__(
         self,
@@ -3675,6 +3756,7 @@ class BotasaurusBrowserSession:
             self._loop.run_until_complete(self._start_browser())
         except BaseException as error:  # noqa: BLE001
             self._start_error = error
+            fetch_debug_log(f"browser-session start failed: {type(error).__name__}: {error}", "warning")
             self._ready.set()
             return
         self._ready.set()
@@ -3689,7 +3771,10 @@ class BotasaurusBrowserSession:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
-        executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or self._playwright.chromium.executable_path
+        # Для совместимости с DNS/Технопарк используем полноценный Chromium/Chrome,
+        # а не headless_shell. Нагрузка снижается не урезанием движка, а ранней
+        # остановкой страницы после появления нужных селекторов.
+        executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(prefer_headless_shell=False)
         launch_options = {
             "headless": True,
             "args": [
@@ -3700,6 +3785,8 @@ class BotasaurusBrowserSession:
                 "--disable-sync",
                 "--no-sandbox",
                 "--blink-settings=imagesEnabled=false",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
             ],
         }
         if executable_path:
@@ -3707,10 +3794,13 @@ class BotasaurusBrowserSession:
         context_options = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             locale="ru-RU",
             viewport={"width": 1366, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            },
         )
         if self.profile_dir is not None:
             self.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -3746,53 +3836,227 @@ class BotasaurusBrowserSession:
         self._playwright = None
         self._semaphore = None
 
-    async def _fetch_async(self, url: str) -> Optional[str]:
+    @staticmethod
+    def _profiles_for_method(method: str) -> List[Dict[str, object]]:
+        method = str(method or "")
+        if method == "botasaurus-browser-direct":
+            referer = ""
+        elif method == "botasaurus-browser":
+            referer = "https://www.google.com/"
+        else:
+            referer = ""
+        return [
+            {"name": "fast_full_browser", "block_stylesheet": True, "selector_timeout": 2500, "referer": referer},
+            {"name": "compatible_full_browser", "block_stylesheet": False, "selector_timeout": 5500, "referer": referer},
+        ]
+
+    @staticmethod
+    def _selector_list(rules: Optional[Dict[str, str]], allow_empty_price: bool = False) -> List[str]:
+        rules = rules or {}
+        selectors: List[str] = []
+        for key in ("product_card_selector", "product_url_selector", "model_selector"):
+            value = str(rules.get(key) or "").strip()
+            if value and value not in selectors:
+                selectors.append(value)
+        price_selector = str(rules.get("price_selector") or "").strip()
+        if price_selector and (not allow_empty_price or not selectors):
+            selectors.append(price_selector)
+        return selectors
+
+    @staticmethod
+    async def _count_locator(page, selector: str) -> int:
+        try:
+            return await page.locator(selector).count()
+        except Exception:
+            return 0
+
+    async def _count_ready_nodes(self, page, rules: Optional[Dict[str, str]], allow_empty_price: bool = False) -> int:
+        total = 0
+        for selector in self._selector_list(rules, allow_empty_price):
+            total += await self._count_locator(page, selector)
+        for selector in (
+            "[itemtype*='Product']",
+            "[itemprop='price']",
+            "[itemprop='sku']",
+            "[itemprop='model']",
+            "a[href*='/product']",
+            "a[href*='/products']",
+            "[class*='product']",
+            "[class*='catalog']",
+        ):
+            total += await self._count_locator(page, selector)
+        return total
+
+    async def _wait_for_ready_selectors(self, page, rules: Optional[Dict[str, str]], allow_empty_price: bool, timeout_ms: int) -> bool:
+        for selector in self._selector_list(rules, allow_empty_price):
+            try:
+                await page.wait_for_selector(selector, state="attached", timeout=timeout_ms)
+                return True
+            except Exception:
+                continue
+        for selector in (
+            "[itemtype*='Product']",
+            "[itemprop='price']",
+            "[itemprop='sku']",
+            "[itemprop='model']",
+            "a[href*='/product']",
+            "a[href*='/products']",
+            "[class*='product']",
+        ):
+            try:
+                await page.wait_for_selector(selector, state="attached", timeout=max(800, timeout_ms // 2))
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _html_usable_for_parsing(
+        self,
+        url: str,
+        html: str,
+        rules: Optional[Dict[str, str]],
+        product_url_filters: Optional[Iterable[str]],
+        allow_empty_price: bool,
+    ) -> bool:
+        if not html or looks_blocked_or_empty(html):
+            return False
+        try:
+            if extract_listing_products(url, html, rules or {}, product_url_filters or []):
+                return True
+        except Exception:
+            pass
+        try:
+            product = extract_product_data(
+                url,
+                html,
+                "",
+                rules or {},
+                assume_product=is_probable_product_url(url),
+                allow_empty_price=allow_empty_price,
+            )
+            if product:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _fetch_once(
+        self,
+        url: str,
+        method: str,
+        profile: Dict[str, object],
+        rules: Optional[Dict[str, str]],
+        product_url_filters: Optional[Iterable[str]],
+        allow_empty_price: bool,
+    ) -> Optional[str]:
+        if self._context is None:
+            return None
+        page = await self._context.new_page()
+        profile_name = str(profile.get("name") or "browser")
+        block_stylesheet = bool(profile.get("block_stylesheet"))
+        selector_timeout = int(profile.get("selector_timeout") or 2500)
+        started = time.time()
+        scroll_count = 0
+        try:
+            referer = str(profile.get("referer") or "")
+            if referer:
+                await page.set_extra_http_headers({"Referer": referer})
+
+            async def route_handler(route, request):
+                if self._should_block_resource(request, block_stylesheet=block_stylesheet):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await page.route("**/*", route_handler)
+            timeout_ms = REQUEST_TIMEOUT * 1000
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            selector_found = await self._wait_for_ready_selectors(page, rules, allow_empty_price, selector_timeout)
+
+            last_count = await self._count_ready_nodes(page, rules, allow_empty_price)
+            stable_rounds = 0
+            # Скроллим только до стабилизации DOM, а не фиксированное количество раз.
+            for _ in range(5):
+                if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                    return None
+                await page.mouse.wheel(0, 1400)
+                scroll_count += 1
+                await page.wait_for_timeout(350)
+                current_count = await self._count_ready_nodes(page, rules, allow_empty_price)
+                if current_count <= last_count:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                    last_count = current_count
+                if selector_found and stable_rounds >= 1:
+                    break
+                if stable_rounds >= 2:
+                    break
+
+            try:
+                await page.evaluate("window.stop()")
+            except Exception:
+                pass
+            html = await page.content()
+            usable = self._html_usable_for_parsing(url, html, rules, product_url_filters, allow_empty_price)
+            log_fetch_result(
+                f"{method}:{profile_name}",
+                url,
+                html,
+                time.time() - started,
+                extra=f"selector_found={selector_found}; scroll_count={scroll_count}; usable={usable}",
+            )
+            return html if isinstance(html, str) and html.strip() else None
+        except Exception as error:
+            log_fetch_exception(f"{method}:{profile_name}", url, error)
+            return None
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def _fetch_async(
+        self,
+        url: str,
+        method: str,
+        rules: Optional[Dict[str, str]] = None,
+        product_url_filters: Optional[Iterable[str]] = None,
+        allow_empty_price: bool = False,
+    ) -> Optional[str]:
         if self._context is None or self._semaphore is None:
             return None
 
         async with self._semaphore:
             if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
                 return None
-            page = await self._context.new_page()
-            try:
-                async def route_handler(route, request):
-                    if self._should_block_resource(request):
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                await page.route(
-                    "**/*",
-                    route_handler,
-                )
-                timeout_ms = REQUEST_TIMEOUT * 1000
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
-                except Exception:
-                    pass
-                for _ in range(4):
-                    if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
-                        return None
-                    await page.mouse.wheel(0, 1600)
-                    await page.wait_for_timeout(500)
-                html = await page.content()
-                return html if isinstance(html, str) and html.strip() else None
-            finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+            best_html = ""
+            for profile in self._profiles_for_method(method):
+                html = await self._fetch_once(url, method, profile, rules, product_url_filters, allow_empty_price)
+                if html and not best_html:
+                    best_html = html
+                if html and self._html_usable_for_parsing(url, html, rules, product_url_filters, allow_empty_price):
+                    return html
+            return best_html or None
 
     @staticmethod
-    def _should_block_resource(request) -> bool:
+    def _should_block_resource(request, block_stylesheet: bool = True) -> bool:
         resource_type = getattr(request, "resource_type", "")
-        if resource_type in BLOCKED_BROWSER_RESOURCE_TYPES:
+        if resource_type in {"image", "media", "font"}:
+            return True
+        if block_stylesheet and resource_type == "stylesheet":
             return True
         request_url = str(getattr(request, "url", "") or "").lower()
         return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
 
-    def fetch(self, url: str, method: str) -> Optional[str]:
+    def fetch(
+        self,
+        url: str,
+        method: str,
+        rules: Optional[Dict[str, str]] = None,
+        product_url_filters: Optional[Iterable[str]] = None,
+        allow_empty_price: bool = False,
+    ) -> Optional[str]:
         if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
             return None
         with self._state_lock:
@@ -3803,9 +4067,13 @@ class BotasaurusBrowserSession:
         try:
             import asyncio
 
-            future = asyncio.run_coroutine_threadsafe(self._fetch_async(url), self._loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self._fetch_async(url, method, rules, product_url_filters, allow_empty_price),
+                self._loop,
+            )
             result = future.result(timeout=REQUEST_TIMEOUT + 35)
-        except Exception:
+        except Exception as error:
+            log_fetch_exception(method, url, error)
             return None
         return result if isinstance(result, str) and result.strip() else None
 
@@ -3956,43 +4224,6 @@ def fetch_with_crawl4ai(url: str) -> Optional[str]:
         return asyncio.run(_fetch())
     except Exception:
         return None
-
-
-def fetch_with_firecrawl(url: str) -> Optional[str]:
-    api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
-    if not api_key:
-        return None
-    try:
-        from firecrawl import FirecrawlApp
-    except ImportError:
-        try:
-            from firecrawl import Firecrawl
-        except ImportError:
-            return None
-        try:
-            app_client = Firecrawl(api_key=api_key)
-            result = app_client.scrape(url, formats=["html"])
-        except Exception:
-            return None
-    else:
-        try:
-            app_client = FirecrawlApp(api_key=api_key)
-            result = app_client.scrape_url(url, formats=["html"])
-        except Exception:
-            return None
-
-    if isinstance(result, dict):
-        for key in ("html", "rawHtml", "content"):
-            value = result.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
-        data = result.get("data")
-        if isinstance(data, dict):
-            for key in ("html", "rawHtml", "content"):
-                value = data.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-    return None
 
 
 ENGINE_OUTPUT_MARKER = "__PARSER_ENGINE_HTML_BASE64__:"
@@ -4560,19 +4791,20 @@ class ProductSiteCrawler:
             return fetch_with_botasaurus_request(target_url)
         if method == "botasaurus-debug-visible":
             return self.debug_visible_session_for_worker().fetch(target_url, method)
-        if is_browser_render_method(method):
-            return self.browser_session_for_worker().fetch(target_url, method)
+        if method in SESSION_BROWSER_METHODS:
+            return self.browser_session_for_worker().fetch(
+                target_url,
+                method,
+                self.extraction_rules,
+                self.product_url_filters,
+                self.allow_empty_price,
+            )
         if method == "crawl4ai":
             return fetch_with_crawl4ai(target_url)
         if method == "playwright":
             return fetch_with_playwright(target_url)
         if method == "scrapegraphai":
             return fetch_with_scrapegraphai(target_url)
-        if method == "firecrawl":
-            if not os.environ.get("FIRECRAWL_API_KEY", "").strip():
-                self.log("Метод firecrawl пропущен: не задан FIRECRAWL_API_KEY", "warning")
-                return None
-            return fetch_with_firecrawl(target_url)
         if method == "scrapy":
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
@@ -4580,7 +4812,7 @@ class ProductSiteCrawler:
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
-        if is_browser_render_method(method):
+        if method in SESSION_BROWSER_METHODS or is_debug_visible_method(method):
             try:
                 return self.fetch_by_method(url, method)
             except Exception as error:
@@ -4611,22 +4843,14 @@ class ProductSiteCrawler:
         return value if isinstance(value, str) else None
 
     def fallback_method_sequence(self) -> List[str]:
-        """Возвращает fallback-методы из БД, но не перебирает несколько browser-render движков подряд."""
-        ordered = ordered_db_connection_methods()
-        browser_fallback = self.connection_method if is_browser_render_method(self.connection_method) else ""
-        if not browser_fallback:
-            for method in ordered:
-                if is_browser_render_method(method) and not is_debug_visible_method(method):
-                    browser_fallback = method
-                    break
-
+        """Возвращает fallback-методы из БД без схлопывания разных браузерных движков."""
         methods: List[str] = []
-        for method in ordered:
+        for method in ordered_db_connection_methods():
+            # Видимый debug-браузер не запускаем автоматически, только если выбран явно.
             if is_debug_visible_method(method) and method != self.connection_method:
                 continue
-            if is_browser_render_method(method) and method != browser_fallback:
-                continue
-            methods.append(method)
+            if method not in methods:
+                methods.append(method)
         return methods
 
     def current_connection_method(self) -> str:
@@ -4647,8 +4871,11 @@ class ProductSiteCrawler:
     def fetch_with_connection_method(self, url: str, method: str) -> Optional[str]:
         self.last_progress_at = time.time()
         self.log(f"Пробую метод подключения {method} для {url}", "info")
+        started = time.time()
         html = self.fetch_by_method_with_timeout(url, method)
         self.last_progress_at = time.time()
+        if html:
+            log_fetch_result(method, url, html, time.time() - started)
         if html and not looks_blocked_or_empty(html):
             return html
         self.log(f"Метод подключения {method} не сработал для {url}", "warning")
@@ -4917,12 +5144,18 @@ class ProductSiteCrawler:
 
         listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
 
-        if not current_is_product and not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)) and not PRICE_RE.search(html):
+        if not current_is_product and not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)):
             self.update_state(
-                error=f"На странице каталога нет цен в HTML. Рендерю через Botasaurus: {url}",
+                error=f"На странице каталога не извлечены товары. Рендерю через браузер: {url}",
             )
-            self.log(f"Рендеринг каталога через Botasaurus: {url}", "warning")
-            rendered_html = self.browser_session.fetch(url, "botasaurus-browser")
+            self.log(f"Рендеринг каталога через браузер: {url}", "warning")
+            rendered_html = self.browser_session.fetch(
+                url,
+                "botasaurus-browser",
+                self.extraction_rules,
+                self.product_url_filters,
+                self.allow_empty_price,
+            )
             if rendered_html and not looks_blocked_or_empty(rendered_html):
                 html = rendered_html
                 listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
