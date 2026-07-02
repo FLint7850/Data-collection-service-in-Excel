@@ -266,6 +266,7 @@ news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
+HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
 FEED_STORAGE_LOCK = threading.RLock()
 feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
 UNIFIED_LOG_LOCK = threading.Lock()
@@ -369,6 +370,9 @@ BLOCKED_BROWSER_URL_PARTS = (
     "mail.ru/counter",
 )
 SESSION_BROWSER_METHODS = {
+    "protected-site",
+}
+BOTASAURUS_HEADLESS_METHODS = {
     "botasaurus-browser",
     "botasaurus-browser-direct",
     "botasaurus-visible",
@@ -376,6 +380,7 @@ SESSION_BROWSER_METHODS = {
 DEBUG_VISIBLE_METHODS = {"botasaurus-debug-visible"}
 STATIC_BROWSER_RENDER_METHODS = {
     *SESSION_BROWSER_METHODS,
+    *BOTASAURUS_HEADLESS_METHODS,
     *DEBUG_VISIBLE_METHODS,
     "crawl4ai",
     "playwright",
@@ -2129,10 +2134,6 @@ def is_domain_url(url: str, domain: str) -> bool:
     return urlparse(url).netloc.lower().removeprefix("www.").endswith(domain.lower().removeprefix("www."))
 
 
-def is_technopark_url(url: str) -> bool:
-    return urlparse(url).netloc.lower().endswith("technopark.ru")
-
-
 def has_static_extension(url: str) -> bool:
     return bool(
         re.search(
@@ -3571,7 +3572,8 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
     try:
         from botasaurus.request import Request
         from botasaurus.request import request as botasaurus_request
-    except ImportError:
+    except ImportError as error:
+        log_fetch_exception(f"botasaurus-browser:{navigation}:import", url, error)
         return None
 
     @botasaurus_request(max_retry=MAX_RETRIES, output=None, create_error_logs=False)
@@ -3646,13 +3648,16 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
 
     try:
         started = time.time()
-        result = _render_html(url)
+        with HEADLESS_BROWSER_SEMAPHORE:
+            result = _render_html(url)
     except Exception as error:
         log_fetch_exception(f"botasaurus-browser:{navigation}", url, error)
         return None
 
     if isinstance(result, list):
         result = result[0] if result else None
+    if result:
+        log_fetch_result(f"botasaurus-browser:{navigation}", url, result, time.time() - started)
     return result if isinstance(result, str) and result.strip() else None
 
 
@@ -3666,7 +3671,8 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
     try:
         from botasaurus.browser import Driver
         from botasaurus.browser import browser
-    except ImportError:
+    except ImportError as error:
+        log_fetch_exception("botasaurus-debug-visible:import", url, error)
         return None
 
     chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=False)
@@ -3699,7 +3705,8 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
     try:
         with VISIBLE_BROWSER_LOCK:
             result = _render_html(url)
-    except Exception:
+    except Exception as error:
+        log_fetch_exception("botasaurus-debug-visible", url, error)
         return None
 
     if isinstance(result, list):
@@ -3771,9 +3778,8 @@ class BotasaurusBrowserSession:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
-        # Для совместимости с DNS/Технопарк используем полноценный Chromium/Chrome,
-        # а не headless_shell. Нагрузка снижается не урезанием движка, а ранней
-        # остановкой страницы после появления нужных селекторов.
+        # Используем полноценный Chromium, а нагрузку снижаем ранней остановкой
+        # страницы после появления нужных селекторов.
         executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(prefer_headless_shell=False)
         launch_options = {
             "headless": True,
@@ -3813,6 +3819,17 @@ class BotasaurusBrowserSession:
         else:
             self._browser = await self._playwright.chromium.launch(**launch_options)
             self._context = await self._browser.new_context(**context_options)
+        try:
+            await self._context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = window.chrome || { runtime: {} };
+                """
+            )
+        except Exception:
+            pass
         self._semaphore = asyncio.Semaphore(self.max_pages)
 
     async def _close_browser(self) -> None:
@@ -3839,6 +3856,11 @@ class BotasaurusBrowserSession:
     @staticmethod
     def _profiles_for_method(method: str) -> List[Dict[str, object]]:
         method = str(method or "")
+        if method == "protected-site":
+            return [
+                {"name": "protected_direct", "block_stylesheet": False, "selector_timeout": 9000, "referer": ""},
+                {"name": "protected_google_referrer", "block_stylesheet": False, "selector_timeout": 9000, "referer": "https://www.google.com/"},
+            ]
         if method == "botasaurus-browser-direct":
             referer = ""
         elif method == "botasaurus-browser":
@@ -4067,11 +4089,12 @@ class BotasaurusBrowserSession:
         try:
             import asyncio
 
-            future = asyncio.run_coroutine_threadsafe(
-                self._fetch_async(url, method, rules, product_url_filters, allow_empty_price),
-                self._loop,
-            )
-            result = future.result(timeout=REQUEST_TIMEOUT + 35)
+            with HEADLESS_BROWSER_SEMAPHORE:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._fetch_async(url, method, rules, product_url_filters, allow_empty_price),
+                    self._loop,
+                )
+                result = future.result(timeout=REQUEST_TIMEOUT + 35)
         except Exception as error:
             log_fetch_exception(method, url, error)
             return None
@@ -4221,7 +4244,8 @@ def fetch_with_crawl4ai(url: str) -> Optional[str]:
             return html if isinstance(html, str) else None
 
     try:
-        return asyncio.run(_fetch())
+        with HEADLESS_BROWSER_SEMAPHORE:
+            return asyncio.run(_fetch())
     except Exception:
         return None
 
@@ -4387,6 +4411,15 @@ SCRAPEGRAPHAI_FETCH_SCRIPT = r"""
 import base64
 import sys
 
+try:
+    import langchain_community.chat_models as community_chat_models
+    from langchain_ollama import ChatOllama
+
+    if not hasattr(community_chat_models, "ChatOllama"):
+        community_chat_models.ChatOllama = ChatOllama
+except Exception:
+    pass
+
 from scrapegraphai.nodes.fetch_node import FetchNode
 
 url = sys.argv[1]
@@ -4413,15 +4446,13 @@ node = FetchNode(
         },
     },
 )
-state = node.execute({"url": url})
-documents = state.get("doc") or []
+state = node.execute({"url": url}) or {}
+documents = state.get("doc") or state.get("document") or []
 html = ""
-if documents:
-    html = getattr(documents[0], "page_content", "") or ""
-if not html:
-    compressed = state.get("doc") or state.get("document") or []
-    if compressed:
-        html = getattr(compressed[0], "page_content", "") or ""
+if isinstance(documents, list) and documents:
+    html = getattr(documents[0], "page_content", "") or str(documents[0] or "")
+elif isinstance(documents, str):
+    html = documents
 print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("ascii"))
 """
 
@@ -4598,7 +4629,8 @@ def fetch_with_playwright(url: str) -> Optional[str]:
         import playwright  # noqa: F401
     except ImportError:
         return None
-    return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
+    with HEADLESS_BROWSER_SEMAPHORE:
+        return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
 
 
 def fetch_with_scrapegraphai(url: str) -> Optional[str]:
@@ -4606,7 +4638,8 @@ def fetch_with_scrapegraphai(url: str) -> Optional[str]:
         import scrapegraphai  # noqa: F401
     except ImportError:
         return None
-    return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
+    with HEADLESS_BROWSER_SEMAPHORE:
+        return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
 
 
 class ProductSiteCrawler:
@@ -4789,6 +4822,12 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
+        if method == "botasaurus-browser":
+            return fetch_with_botasaurus_browser(target_url, "google")
+        if method == "botasaurus-browser-direct":
+            return fetch_with_botasaurus_browser(target_url, "direct")
+        if method == "botasaurus-visible":
+            return fetch_with_botasaurus_visible_browser(target_url)
         if method == "botasaurus-debug-visible":
             return self.debug_visible_session_for_worker().fetch(target_url, method)
         if method in SESSION_BROWSER_METHODS:
@@ -4812,7 +4851,7 @@ class ProductSiteCrawler:
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
-        if method in SESSION_BROWSER_METHODS or is_debug_visible_method(method):
+        if is_browser_render_method(method) or is_debug_visible_method(method):
             try:
                 return self.fetch_by_method(url, method)
             except Exception as error:
@@ -5136,8 +5175,6 @@ class ProductSiteCrawler:
             )
             if product:
                 self.add_products([product])
-                if is_technopark_url(url):
-                    self.log(f"Страница обработана: {url}. Найдено товаров на странице: 1", "info")
                 return
 
             current_is_product = False
@@ -5151,7 +5188,7 @@ class ProductSiteCrawler:
             self.log(f"Рендеринг каталога через браузер: {url}", "warning")
             rendered_html = self.browser_session.fetch(
                 url,
-                "botasaurus-browser",
+                "protected-site",
                 self.extraction_rules,
                 self.product_url_filters,
                 self.allow_empty_price,
@@ -5185,9 +5222,6 @@ class ProductSiteCrawler:
         )
         if product:
             self.add_products([product])
-
-        if is_technopark_url(url):
-            self.log(f"Страница обработана: {url}. Найдено товаров на странице: {len(listing_products)}", "info")
 
         if not current_is_product:
             self.extract_links(html, url)
@@ -6982,6 +7016,16 @@ def feed_missing_labels(keys: Set[str], feed_code_sets: List[Dict[str, object]])
     return missing_feeds
 
 
+def news_monitor_profile_storage_dir(monitor: Dict[str, object]) -> Path:
+    monitor_id = safe_filename(str(monitor.get("id") or monitor.get("brand") or "monitor"))
+    return PROJECT_PROFILE_DIR / "news" / monitor_id
+
+
+def news_monitor_should_keep_browser_profile(monitor: Dict[str, object]) -> bool:
+    method = normalize_connection_method(monitor.get("connection_method"))
+    return method == "protected-site" or bool(monitor.get("auto_connection_fallback", True))
+
+
 def enrich_news_candidates(
     products: List[Dict[str, str]],
     monitor: Dict[str, object],
@@ -7194,9 +7238,11 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     feed_code_sets: List[Dict[str, object]] = []
     missing_summary: List[Dict[str, object]] = []
     availability_skipped = 0
+    profile_dir = news_monitor_profile_storage_dir(monitor) if news_monitor_should_keep_browser_profile(monitor) else None
     browser_session = BotasaurusBrowserSession(
         stop_event,
         parse_thread_count(monitor.get("thread_count", 4)),
+        profile_dir=profile_dir,
     )
 
     def check_stop_requested() -> None:
@@ -8331,14 +8377,21 @@ def project_profile_storage_dir(project: Dict[str, object]) -> Path:
     return PROJECT_PROFILE_DIR / project_id
 
 
+def project_should_keep_browser_profile(project: Dict[str, object]) -> bool:
+    if bool(project.get("persist_profile", False)):
+        return True
+    method = normalize_connection_method(project.get("connection_method"))
+    return method == "protected-site" or bool(project.get("auto_connection_fallback", True))
+
+
 def project_browser_profile_dir(project: Dict[str, object]) -> Optional[Path]:
-    if not bool(project.get("persist_profile", False)):
+    if not project_should_keep_browser_profile(project):
         return None
     return project_profile_storage_dir(project)
 
 
 def cleanup_project_profile_if_disabled(project: Dict[str, object]) -> None:
-    if bool(project.get("persist_profile", False)):
+    if project_should_keep_browser_profile(project):
         return
     profile_dir = project_profile_storage_dir(project)
     try:

@@ -1,9 +1,11 @@
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from models import Base
 
@@ -12,6 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+SQLITE_JOURNAL_MODE = os.environ.get("SQLITE_JOURNAL_MODE", "DELETE").strip().upper() or "DELETE"
 DEFAULT_BRAND_STATE = {
     "status": "idle",
     "stage": "",
@@ -45,12 +48,19 @@ DEFAULT_BRAND_STATE_JSON = json.dumps(DEFAULT_BRAND_STATE, ensure_ascii=False, s
 engine = create_engine(
     DATABASE_URL,
     future=True,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
+    poolclass=NullPool,
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
 
 
 def try_enable_wal(cursor_or_connection) -> None:
+    if SQLITE_JOURNAL_MODE != "WAL":
+        try:
+            cursor_or_connection.execute("PRAGMA journal_mode=DELETE")
+        except Exception:
+            pass
+        return
     try:
         cursor_or_connection.execute("PRAGMA journal_mode=WAL")
     except Exception:
@@ -79,10 +89,7 @@ def init_db() -> None:
         connection.execute(text("PRAGMA foreign_keys=OFF"))
         connection.commit()
         with connection.begin():
-            try:
-                connection.execute(text("PRAGMA journal_mode=WAL"))
-            except Exception:
-                connection.execute(text("PRAGMA journal_mode=DELETE"))
+            try_enable_wal(connection)
             connection.execute(text("PRAGMA busy_timeout=5000"))
             migrate_schema(connection)
             connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
@@ -145,6 +152,7 @@ def seed_connection_methods(connection) -> None:
         ("crawlee", "Crawlee", False, False),
         ("playwright", "Playwright / Chrome Headless Shell", True, False),
         ("scrapegraphai", "ScrapeGraphAI / Chromium", True, False),
+        ("protected-site", "Protected Site / Persistent Chromium", True, False),
         ("botasaurus-debug-visible", "Debug Visible / Google Chrome for Testing", True, True),
     ]
     for code, name, is_browser_render, is_debug_visible in methods:

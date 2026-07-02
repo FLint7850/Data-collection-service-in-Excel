@@ -12,3 +12,4 @@ scrapy
 crawlee[all]
 playwright
 scrapegraphai
+langchain-ollama
