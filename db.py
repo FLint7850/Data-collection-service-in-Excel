@@ -146,14 +146,14 @@ def seed_connection_methods(connection) -> None:
         ("botasaurus-request", "Botasaurus Request", False, False),
         ("botasaurus-browser", "Botasaurus / Chrome Headless Shell", True, False),
         ("botasaurus-browser-direct", "Botasaurus Direct / Chrome Headless Shell", True, False),
-        ("botasaurus-visible", "Botasaurus Legacy / Chrome Headless Shell", True, False),
+        # ("botasaurus-visible", "Botasaurus Legacy / Chrome Headless Shell", True, False),
         ("crawl4ai", "Crawl4AI / Chromium", True, False),
         ("scrapy", "Scrapy", False, False),
         ("crawlee", "Crawlee", False, False),
         ("playwright", "Playwright / Chrome Headless Shell", True, False),
         ("scrapegraphai", "ScrapeGraphAI / Chromium", True, False),
         ("protected-site", "Protected Site / Persistent Chromium", True, False),
-        ("botasaurus-debug-visible", "Debug Visible / Google Chrome for Testing", True, True),
+        # ("botasaurus-debug-visible", "Debug Visible / Google Chrome for Testing", True, True),
     ]
     for code, name, is_browser_render, is_debug_visible in methods:
         connection.execute(
