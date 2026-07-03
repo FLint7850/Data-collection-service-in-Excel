@@ -602,8 +602,87 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
     }
 
 
+PROJECT_PROGRESS_FIELDS = (
+    "totalprocessed",
+    "processed_products",
+    "found_products",
+    "in_memory_products",
+    "queue_size",
+    "active_tasks",
+    "skipped",
+    "failed_pages",
+)
+
+
+def is_active_status(status: object) -> bool:
+    return str(status or "") in {"running", "queued", "pausing", "stopping"}
+
+
+def progress_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def has_positive_progress_value(state: Dict[str, object], fields: Iterable[str]) -> bool:
+    return any(progress_int(state.get(field, 0)) > 0 for field in fields)
+
+
+def same_progress_run(current: Dict[str, object], previous: Dict[str, object]) -> bool:
+    current_started = str(current.get("started_at") or "")
+    previous_started = str(previous.get("started_at") or "")
+    return not current_started or not previous_started or current_started == previous_started
+
+
+def is_empty_active_progress_state(state: Dict[str, object], fields: Iterable[str]) -> bool:
+    return (
+        is_active_status(state.get("status"))
+        and not has_positive_progress_value(state, fields)
+        and not str(state.get("currenturl") or "").strip()
+    )
+
+
+def merge_stable_progress_state(
+    state: Dict[str, object],
+    previous: Optional[Dict[str, object]],
+    fields: Iterable[str],
+) -> Dict[str, object]:
+    if not previous or not same_progress_run(state, previous) or not is_empty_active_progress_state(state, fields):
+        return state
+    merged = dict(state)
+    for field in fields:
+        if progress_int(merged.get(field, 0)) == 0 and progress_int(previous.get(field, 0)) > 0:
+            merged[field] = previous[field]
+    for field in (
+        "percent",
+        "currenturl",
+        "active_urls",
+        "last_event",
+        "last_warning",
+        "elapsed_seconds",
+        "eta_seconds",
+        "stall_seconds",
+    ):
+        value = merged.get(field)
+        if value in ("", None, 0, []) and previous.get(field):
+            merged[field] = previous[field]
+    return merged
+
+
+def stable_project_state(project: Dict[str, object], state: Dict[str, object]) -> Dict[str, object]:
+    if not is_active_status(state.get("status")):
+        return state
+    previous = project.get("_last_progress_state")
+    return merge_stable_progress_state(
+        state,
+        previous if isinstance(previous, dict) else None,
+        PROJECT_PROGRESS_FIELDS,
+    )
+
+
 def public_project(project: Dict[str, object]) -> Dict[str, object]:
-    state = repair_mojibake(dict(project["state"]))
+    state = repair_mojibake(stable_project_state(project, dict(project["state"])))
     filename = str(state.get("filename") or "")
     if filename and (EXPORT_DIR / filename).exists():
         state["download_ready"] = True
@@ -1068,6 +1147,17 @@ def update_project_state(project: Dict[str, object], **kwargs: object) -> None:
     with projects_lock:
         state = dict(project.get("state", make_state(parse_thread_count(project.get("thread_count", 4)))))
         state.update(kwargs)
+        if is_active_status(state.get("status")):
+            previous = project.get("_last_progress_state")
+            state = merge_stable_progress_state(
+                state,
+                previous if isinstance(previous, dict) else None,
+                PROJECT_PROGRESS_FIELDS,
+            )
+            if has_positive_progress_value(state, PROJECT_PROGRESS_FIELDS) or str(state.get("currenturl") or "").strip():
+                project["_last_progress_state"] = dict(state)
+        else:
+            project.pop("_last_progress_state", None)
         project["state"] = state
 
 
@@ -1076,6 +1166,7 @@ def reset_project_state(project: Dict[str, object], status: str = "idle") -> Non
     state = make_state(thread_count)
     state["status"] = status
     project["state"] = state
+    project.pop("_last_progress_state", None)
 
 
 def project_worker_alive(project: Dict[str, object]) -> bool:
@@ -3685,13 +3776,13 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
             driver.get(target_url)
         else:
             driver.google_get(target_url)
-        driver.sleep(2)
+        time.sleep(2)
         for _ in range(4):
             try:
                 driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
             except Exception:
                 break
-            driver.sleep(0.8)
+            time.sleep(0.8)
         return driver.page_html
 
     try:
@@ -3741,13 +3832,13 @@ def fetch_with_botasaurus_debug_visible_browser(url: str) -> Optional[str]:
     )
     def _render_html(driver: Driver, target_url: str):
         driver.get(target_url)
-        driver.sleep(8)
+        time.sleep(8)
         for _ in range(3):
             try:
                 driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
             except Exception:
                 break
-            driver.sleep(0.8)
+            time.sleep(0.8)
         return driver.page_html
 
     try:
@@ -4201,13 +4292,13 @@ class BotasaurusDebugVisibleSession:
         )
         def _render_html(driver: Driver, target_url: str):
             driver.get(target_url)
-            driver.sleep(8)
+            time.sleep(8)
             for _ in range(3):
                 try:
                     driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
                 except Exception:
                     break
-                driver.sleep(0.8)
+                time.sleep(0.8)
             return driver.page_html
 
         return _render_html

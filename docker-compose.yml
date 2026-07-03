@@ -17,6 +17,7 @@ services:
       TMPDIR: /tmp/parser
       FORCE_BROWSER_SETUP: 0
       SQLITE_JOURNAL_MODE: DELETE
+      GUNICORN_ACCESS_LOG: 0
     ports:
       - "5000:5000"
     volumes:
@@ -25,7 +26,13 @@ services:
       - ./exports:/app/exports
       - ./feeds:/app/feeds
       - ./storage:/app/storage
-    shm_size: "1gb"
-    mem_limit: "3g"
+    shm_size: "768m"
+    mem_limit: "4g"
+    memswap_limit: "5g"
     cpus: 2
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     stop_grace_period: 30s

@@ -263,6 +263,9 @@ let connectionMethods = [];
 let progressEvents = null;
 let progressIncludesNews = null;
 let newsLoadPromise = null;
+const stableProjectStates = new Map();
+const stableNewsMonitorStates = new Map();
+const stableNewsBrandStates = new Map();
 
 const statusLabels = {
   idle: "ожидание",
@@ -307,9 +310,110 @@ function stampNewsStates(data) {
   return data;
 }
 
+function isScanningStatus(status) {
+  return ["running", "queued", "pausing", "stopping"].includes(status);
+}
+
+function sameProgressRun(current, previous) {
+  const currentStarted = String(current?.started_at || "");
+  const previousStarted = String(previous?.started_at || "");
+  return !currentStarted || !previousStarted || currentStarted === previousStarted;
+}
+
+function hasPositiveProgressValue(state, fields) {
+  return fields.some((field) => Number(state?.[field] || 0) > 0);
+}
+
+function isEmptyProgressSnapshot(state, fields) {
+  return isScanningStatus(state?.status) && !hasPositiveProgressValue(state, fields) && !String(state?.currenturl || "").trim();
+}
+
+function mergeStableProgressState(state, previous, fields) {
+  if (!previous || !sameProgressRun(state, previous) || !isEmptyProgressSnapshot(state, fields)) {
+    return state;
+  }
+  const merged = { ...state };
+  fields.forEach((field) => {
+    if (Number(merged[field] || 0) === 0 && Number(previous[field] || 0) > 0) {
+      merged[field] = previous[field];
+    }
+  });
+  [
+    "percent",
+    "currenturl",
+    "active_urls",
+    "missing_by_feed",
+    "last_event",
+    "last_warning",
+    "elapsed_seconds",
+    "stall_seconds",
+  ].forEach((field) => {
+    const value = merged[field];
+    const isEmptyArray = Array.isArray(value) && value.length === 0;
+    if ((value === "" || value === null || value === undefined || isEmptyArray || Number(value || 0) === 0) && previous[field]) {
+      merged[field] = previous[field];
+    }
+  });
+  return merged;
+}
+
+function rememberStableProgressState(cache, key, state, fields) {
+  if (!key || !state) return state || {};
+  if (!isScanningStatus(state.status)) {
+    cache.delete(key);
+    return state;
+  }
+  const previous = cache.get(key);
+  const merged = mergeStableProgressState(state, previous, fields);
+  if (!isEmptyProgressSnapshot(merged, fields) || hasPositiveProgressValue(merged, fields)) {
+    cache.set(key, { ...merged });
+  }
+  return merged;
+}
+
+function applyProjectPayload(items) {
+  const projectFields = ["totalprocessed", "found_products", "skipped"];
+  projects = (items || []).map((project) => ({
+    ...project,
+    state: rememberStableProgressState(
+      stableProjectStates,
+      project.id,
+      project.state || {},
+      projectFields
+    ),
+  }));
+  return projects;
+}
+
 function applyNewsPayload(data) {
   setConnectionMethods(data?.connection_methods);
-  newsData = stampNewsStates(data);
+  const stamped = stampNewsStates(data);
+  const newsFields = [
+    "processed",
+    "found_products",
+    "candidate_products",
+    "compared_products",
+    "in_memory_products",
+    "queue_size",
+    "active_tasks",
+    "failed_pages",
+    "availability_skipped",
+  ];
+  (stamped?.monitors || []).forEach((monitor) => {
+    monitor.state = rememberStableProgressState(
+      stableNewsMonitorStates,
+      monitor.id,
+      monitor.state || {},
+      newsFields
+    );
+    monitor.brand_state = rememberStableProgressState(
+      stableNewsBrandStates,
+      monitor.brand_id || `${monitor.group || ""}::${monitor.brand || ""}`,
+      monitor.brand_state || {},
+      newsFields
+    );
+  });
+  newsData = stamped;
   return newsData;
 }
 
@@ -910,7 +1014,7 @@ function newsStatusClass(status) {
 }
 
 function isNewsScanningStatus(status) {
-  return ["running", "queued", "pausing", "stopping"].includes(status);
+  return isScanningStatus(status);
 }
 
 function newsStatusText(status) {
@@ -1941,7 +2045,7 @@ function renderAll() {
 async function loadProjects() {
   const data = await requestJson("/api/projects");
   setConnectionMethods(data.connection_methods);
-  projects = data.projects || [];
+  projects = applyProjectPayload(data.projects || []);
   if (!activeProjectId && projects.length) {
     activeProjectId = projects[0].id;
   }
@@ -2793,7 +2897,7 @@ function handleProgressEvent(event) {
     setConnectionMethods(data.connection_methods);
   }
   if (Array.isArray(data.projects)) {
-    projects = data.projects;
+    projects = applyProjectPayload(data.projects);
     if (!activeProjectId && projects.length) activeProjectId = projects[0].id;
     if (activeView === "projects") {
       renderTabs();

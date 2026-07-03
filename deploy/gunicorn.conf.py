@@ -9,7 +9,7 @@ timeout = int(os.environ.get("WEB_TIMEOUT", "180"))
 graceful_timeout = int(os.environ.get("WEB_GRACEFUL_TIMEOUT", "30"))
 keepalive = int(os.environ.get("WEB_KEEPALIVE", "5"))
 worker_class = "gthread"
-accesslog = "-"
+accesslog = "-" if os.environ.get("GUNICORN_ACCESS_LOG", "0").lower() in {"1", "true", "yes", "on"} else None
 errorlog = "-"
 loglevel = os.environ.get("LOG_LEVEL", "info")
 
