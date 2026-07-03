@@ -3171,6 +3171,15 @@ def has_explicit_model_rules(rules: Optional[Dict[str, str]]) -> bool:
     )
 
 
+def has_configured_model_source(rules: Optional[Dict[str, str]]) -> bool:
+    if not rules:
+        return False
+    return any(
+        str(rules.get(key, "")).strip()
+        for key in ("model_selector", "model_start_marker", "model_end_marker")
+    )
+
+
 def has_model_replace_rules(rules: Optional[Dict[str, str]]) -> bool:
     return bool(rules and str(rules.get("model_replace_rules", "")).strip())
 
@@ -3271,6 +3280,8 @@ def extract_listing_products_by_rules(
         if not model:
             model = first_by_selector(card, rules.get("model_selector", ""))
             model_from_config = bool(model)
+        if has_configured_model_source(rules) and not model_from_config:
+            continue
         if not model:
             model = extract_model_from_card(card, "")
         model = finalize_scraped_model(model, product_url, rules, model_from_config)
@@ -3333,6 +3344,8 @@ def extract_listing_products_from_common_cards(
             model = title_link.get("title", "") if title_link else ""
         if not model:
             model = extract_model_from_card(card, price)
+        if has_configured_model_source(rules) and not model_from_config:
+            continue
         model = finalize_scraped_model(model, product_url, rules, model_from_config)
         if not model:
             continue
@@ -3351,14 +3364,29 @@ def extract_listing_products(
 ) -> List[Dict[str, str]]:
     """Собирает товары прямо со страницы категории/каталога."""
     soup = BeautifulSoup(html, "html.parser")
-    products: List[Dict[str, str]] = extract_schema_listing_products(soup, current_url)
+    products: List[Dict[str, str]] = []
     price_sources = []
-    seen_urls: Set[str] = {product["url"] for product in products}
+    seen_urls: Set[str] = set()
     seen_source_ids: Set[int] = set()
     rules = normalize_extraction_rules(rules or {})
     filters = product_url_filter_patterns(product_url_filters or [], rules)
+    configured_model_source = has_configured_model_source(rules)
+
+    if configured_model_source:
+        products.extend(extract_listing_products_by_rules(soup, current_url, rules, seen_urls, filters))
+        seen_urls.update(product["url"] for product in products if product.get("url"))
 
     products.extend(extract_listing_products_from_common_cards(soup, current_url, rules, seen_urls, filters))
+    seen_urls.update(product["url"] for product in products if product.get("url"))
+
+    if configured_model_source:
+        return products
+
+    for product in extract_schema_listing_products(soup, current_url):
+        product_url = product.get("url", "")
+        if product_url and product_url not in seen_urls:
+            seen_urls.add(product_url)
+            products.append(product)
 
     for price_node in soup.find_all(string=PRICE_RE):
         price_sources.append(price_node)
@@ -3399,7 +3427,7 @@ def extract_listing_products(
 
     products.extend(extract_listing_products_from_links(soup, current_url, seen_urls, filters))
     products.extend(extract_listing_products_from_scripts(soup, current_url, seen_urls, filters))
-    if rules:
+    if rules and not configured_model_source:
         products.extend(extract_listing_products_by_rules(soup, current_url, rules, seen_urls, filters))
     return products
 
@@ -3533,6 +3561,8 @@ def extract_product_data(
     )
     if ruled_product:
         return ruled_product
+    if has_configured_model_source(rules):
+        return None
 
     h1 = first_text(soup, ["h1"])
     price = fallback_price or extract_price(soup, allow_page_fallback=not allow_empty_price)
