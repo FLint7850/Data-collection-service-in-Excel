@@ -613,6 +613,18 @@ PROJECT_PROGRESS_FIELDS = (
     "failed_pages",
 )
 
+NEWS_PROGRESS_FIELDS = (
+    "processed",
+    "found_products",
+    "candidate_products",
+    "compared_products",
+    "in_memory_products",
+    "queue_size",
+    "active_tasks",
+    "failed_pages",
+    "availability_skipped",
+)
+
 
 def is_active_status(status: object) -> bool:
     return str(status or "") in {"running", "queued", "pausing", "stopping"}
@@ -648,12 +660,14 @@ def merge_stable_progress_state(
     previous: Optional[Dict[str, object]],
     fields: Iterable[str],
 ) -> Dict[str, object]:
-    if not previous or not same_progress_run(state, previous) or not is_empty_active_progress_state(state, fields):
+    if not previous or not same_progress_run(state, previous) or not is_active_status(state.get("status")):
         return state
     merged = dict(state)
     for field in fields:
         if progress_int(merged.get(field, 0)) == 0 and progress_int(previous.get(field, 0)) > 0:
             merged[field] = previous[field]
+    if not is_empty_active_progress_state(state, fields):
+        return merged
     for field in (
         "percent",
         "currenturl",
@@ -6674,12 +6688,19 @@ def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
 
 def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, **kwargs: object) -> None:
     with news_lock:
-        state = dict(monitor.get("state", make_news_state()))
+        previous_state = dict(monitor.get("state", make_news_state()))
+        state = dict(previous_state)
         current_status = str(state.get("status") or "")
         terminal_statuses = {"completed", "error", "partial", "idle", "stopped"}
         if state.get("finished_at") and current_status in terminal_statuses and kwargs.get("status") != current_status:
             return
         state.update(kwargs)
+        previous_progress = monitor.get("_last_progress_state")
+        state = merge_stable_progress_state(
+            state,
+            previous_progress if isinstance(previous_progress, dict) else previous_state,
+            NEWS_PROGRESS_FIELDS,
+        )
         state = repair_mojibake(state)
         if state.get("started_at") and state.get("status") in {"running", "queued"}:
             try:
@@ -6691,6 +6712,11 @@ def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, 
                 pass
         monitor["state"] = state
         monitor["brand_state"] = dict(state)
+        if is_active_status(state.get("status")):
+            if has_positive_progress_value(state, NEWS_PROGRESS_FIELDS) or str(state.get("currenturl") or "").strip():
+                monitor["_last_progress_state"] = dict(state)
+        else:
+            monitor.pop("_last_progress_state", None)
         group = clean_text(str(monitor.get("group") or ""))
         brand = clean_text(str(monitor.get("brand") or ""))
         for item in news_settings.get("monitors", []):

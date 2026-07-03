@@ -329,7 +329,7 @@ function isEmptyProgressSnapshot(state, fields) {
 }
 
 function mergeStableProgressState(state, previous, fields) {
-  if (!previous || !sameProgressRun(state, previous) || !isEmptyProgressSnapshot(state, fields)) {
+  if (!previous || !sameProgressRun(state, previous) || !isScanningStatus(state?.status)) {
     return state;
   }
   const merged = { ...state };
@@ -338,6 +338,9 @@ function mergeStableProgressState(state, previous, fields) {
       merged[field] = previous[field];
     }
   });
+  if (!isEmptyProgressSnapshot(state, fields)) {
+    return merged;
+  }
   [
     "percent",
     "currenturl",
