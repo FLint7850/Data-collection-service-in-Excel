@@ -260,6 +260,9 @@ let logsSignature = null;
 let newsListRenderQueued = false;
 let newsModalProgressQueued = false;
 let connectionMethods = [];
+let progressEvents = null;
+let progressIncludesNews = null;
+let newsLoadPromise = null;
 
 const statusLabels = {
   idle: "ожидание",
@@ -1880,7 +1883,17 @@ async function persistPendingNewsBrandTitle() {
 }
 
 async function loadNews() {
-  newsData = applyNewsPayload(await requestJson("/api/news"));
+  if (!newsLoadPromise) {
+    newsLoadPromise = requestJson("/api/news")
+      .then((data) => {
+        newsData = applyNewsPayload(data);
+        return newsData;
+      })
+      .finally(() => {
+        newsLoadPromise = null;
+      });
+  }
+  await newsLoadPromise;
   renderNews();
 }
 
@@ -2023,32 +2036,31 @@ addProjectButton.addEventListener("click", async () => {
 
 projectsTabButton.addEventListener("click", () => {
   setActiveView("projects");
+  configureProgressStream();
   renderAll();
 });
 
 logsTabButton.addEventListener("click", () => {
   setActiveView("logs");
+  configureProgressStream();
   renderAll();
 });
 
 newItemsTabButton.addEventListener("click", () => {
   setActiveView("news");
-  loadNews().catch((error) => {
-    errorText.textContent = error.message;
-  });
+  configureProgressStream();
   renderAll();
 });
 
 importTabButton.addEventListener("click", () => {
   setActiveView("import");
+  configureProgressStream();
   renderAll();
 });
 
 settingsTabButton.addEventListener("click", () => {
   setActiveView("settings");
-  loadNews().catch((error) => {
-    errorText.textContent = error.message;
-  });
+  configureProgressStream();
   renderAll();
 });
 
@@ -2771,8 +2783,11 @@ autoCleanup.addEventListener("change", async () => {
 
 window.setInterval(tickNewsModalTimers, 1000);
 
-const events = new EventSource("/progress");
-events.addEventListener("progress", (event) => {
+function wantsNewsProgress() {
+  return activeView === "news" || activeView === "settings";
+}
+
+function handleProgressEvent(event) {
   const data = JSON.parse(event.data);
   if (Array.isArray(data.connection_methods)) {
     setConnectionMethods(data.connection_methods);
@@ -2784,9 +2799,9 @@ events.addEventListener("progress", (event) => {
       renderTabs();
       renderState(activeProject());
     }
-    if (activeView === "logs" && data.logs_signature && data.logs_signature !== logsSignature) {
-      loadLogs();
-    }
+  }
+  if (activeView === "logs" && data.logs_signature && data.logs_signature !== logsSignature) {
+    loadLogs();
   }
   if (data.news) {
     newsData = applyNewsPayload(data.news);
@@ -2799,9 +2814,21 @@ events.addEventListener("progress", (event) => {
       renderFeedStorage();
     }
   }
-});
+}
+
+function configureProgressStream() {
+  const includeNews = wantsNewsProgress();
+  if (progressEvents && progressIncludesNews === includeNews) return;
+  if (progressEvents) {
+    progressEvents.close();
+    progressEvents = null;
+  }
+  progressIncludesNews = includeNews;
+  progressEvents = new EventSource(`/progress?news=${includeNews ? "1" : "0"}`);
+  progressEvents.addEventListener("progress", handleProgressEvent);
+}
 
 loadProjects().catch((error) => {
   errorText.textContent = error.message;
 });
-loadNews().catch(() => {});
+configureProgressStream();

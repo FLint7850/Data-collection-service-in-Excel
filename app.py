@@ -277,6 +277,7 @@ news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
 NEWS_TRANSITION_TIMEOUT_SECONDS = 180
+PROGRESS_STREAM_INTERVAL_SECONDS = env_float("PROGRESS_STREAM_INTERVAL_SECONDS", 2.0, minimum=0.5, maximum=30.0)
 
 
 @dataclass(frozen=True)
@@ -621,6 +622,21 @@ def public_project(project: Dict[str, object]) -> Dict[str, object]:
         "auto_connection_fallback": project.get("auto_connection_fallback", True),
         "persist_profile": bool(project.get("persist_profile", False)),
     }
+
+
+def payload_signature(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def projects_progress_payload() -> List[Dict[str, object]]:
+    with projects_lock:
+        return [public_project(project) for project in projects.values()]
+
+
+def news_progress_payload() -> Dict[str, object]:
+    return public_news_settings(include_connection_methods=False)
 
 
 def project_model_to_dict(row: Project) -> Dict[str, object]:
@@ -1820,7 +1836,7 @@ def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
     return public_monitor
 
 
-def public_news_settings() -> Dict[str, object]:
+def public_news_settings(include_connection_methods: bool = True) -> Dict[str, object]:
     cleanup_stale_news_transitions()
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
@@ -1829,7 +1845,7 @@ def public_news_settings() -> Dict[str, object]:
         own_sites = own_sites_from_settings(news_settings)
         feed_urls = [site["feed_url"] for site in own_sites]
         feed_generate_urls = [site["feed_generate_url"] for site in own_sites]
-        return {
+        payload = {
             "feed_url": feed_urls[0] if feed_urls else DEFAULT_FEED_URL,
             "feed_generate_url": feed_generate_urls[0] if feed_generate_urls else DEFAULT_FEED_GENERATE_URL,
             "feed_urls": feed_urls,
@@ -1838,9 +1854,11 @@ def public_news_settings() -> Dict[str, object]:
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
-            "connection_methods": public_connection_methods(),
             "monitors": [public_news_monitor(monitor) for monitor in news_settings.get("monitors", [])],
         }
+        if include_connection_methods:
+            payload["connection_methods"] = public_connection_methods()
+        return payload
 
 def reset_state(status: str = "idle", run_id: Optional[int] = None, thread_count: Optional[int] = None) -> None:
     with state_lock:
@@ -8797,21 +8815,47 @@ def restart_scan():
 
 @app.get("/progress")
 def progress_stream():
+    include_news = request.args.get("news") == "1"
+
     def stream():
+        last_projects_signature = ""
+        last_news_signature = ""
+        last_logs_signature = ""
+        last_connection_methods_signature = ""
         while True:
             ensure_storage()
-            with projects_lock:
-                data = json.dumps(
-                    {
-                        "projects": [public_project(project) for project in projects.values()],
-                        "news": public_news_settings(),
-                        "connection_methods": public_connection_methods(),
-                        "logs_signature": logs_signature(),
-                    },
-                    ensure_ascii=False,
-                )
-            yield f"event: progress\ndata: {data}\n\n"
-            time.sleep(0.5)
+            payload: Dict[str, object] = {}
+
+            projects_payload = projects_progress_payload()
+            projects_signature = payload_signature(projects_payload)
+            if projects_signature != last_projects_signature:
+                payload["projects"] = projects_payload
+                last_projects_signature = projects_signature
+
+            if include_news:
+                news_payload = news_progress_payload()
+                news_signature = payload_signature(news_payload)
+                if news_signature != last_news_signature:
+                    payload["news"] = news_payload
+                    last_news_signature = news_signature
+
+            connection_methods = public_connection_methods()
+            connection_methods_signature = payload_signature(connection_methods)
+            if connection_methods_signature != last_connection_methods_signature:
+                payload["connection_methods"] = connection_methods
+                last_connection_methods_signature = connection_methods_signature
+
+            current_logs_signature = logs_signature()
+            if current_logs_signature != last_logs_signature:
+                payload["logs_signature"] = current_logs_signature
+                last_logs_signature = current_logs_signature
+
+            if payload:
+                data = json.dumps(payload, ensure_ascii=False)
+                yield f"event: progress\ndata: {data}\n\n"
+            else:
+                yield ": keep-alive\n\n"
+            time.sleep(PROGRESS_STREAM_INTERVAL_SECONDS)
 
     return Response(stream(), mimetype="text/event-stream")
 
