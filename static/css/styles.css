@@ -727,7 +727,7 @@ select:focus {
 }
 
 .hidden {
-  display: none;
+  display: none!important;
 }
 
 .logs-panel {

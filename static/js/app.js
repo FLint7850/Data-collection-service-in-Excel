@@ -1395,7 +1395,7 @@ function closeNewsModal() {
   newsMonitorModal.classList.add("hidden");
   newsMonitorModal.setAttribute("aria-hidden", "true");
   activeNewsBrandKey = null;
-  activeNewsSelectorsOpen = false;
+  activeNewsSelectorsOpen = true;
   activeNewsReplaceRulesOpen = false;
   activeNewsBrandNameEditing = false;
 }
@@ -1610,7 +1610,7 @@ function renderNewsModal() {
         <h3>Настройки выбранного донора</h3>
       </div>
       <div class="modal-form-grid">
-      <label class="field">
+      <label class="field modal-wide-field">
         <span>Основной сайт</span>
         <input data-field="site_url" type="text" value="${escapeHtml(monitor.site_url || "")}">
       </label>
@@ -1676,13 +1676,13 @@ function renderNewsModal() {
         <span>Селектор наличия</span>
         <input data-selector="availability_selector" type="text" value="${escapeHtml(monitor.selector_settings?.availability_selector || "")}">
       </label>
-      <label class="field modal-wide-field">
-        <span>Исключение товаров по статусу</span>
-        <textarea data-selector="availability_exclusions" rows="3" placeholder="Снят с производства&#10;Нет в наличии">${escapeHtml((monitor.selector_settings?.availability_exclusions || []).join("\n"))}</textarea>
-      </label>
       <label class="field">
         <span>Селектор фото</span>
         <input data-selector="photo_selector" type="text" value="${escapeHtml(monitor.selector_settings?.photo_selector || "")}">
+      </label>
+      <label class="field modal-wide-field">
+        <span>Исключение товаров по статусу</span>
+        <textarea data-selector="availability_exclusions" rows="3" placeholder="Снят с производства&#10;Нет в наличии">${escapeHtml((monitor.selector_settings?.availability_exclusions || []).join("\n"))}</textarea>
       </label>
       </div>
     </div>
