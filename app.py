@@ -33,6 +33,7 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, g, jsonify as flask_jsonify, redirect, render_template, request, send_file, session, url_for
 from sqlalchemy import delete, select
+from sqlalchemy.exc import OperationalError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from db import SessionLocal, init_db, session_scope
@@ -266,7 +267,7 @@ news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
 VISIBLE_BROWSER_LOCK = threading.Lock()
-HEADLESS_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
+STANDALONE_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
 FEED_STORAGE_LOCK = threading.RLock()
 feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
 UNIFIED_LOG_LOCK = threading.Lock()
@@ -3801,7 +3802,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
 
     try:
         started = time.time()
-        with HEADLESS_BROWSER_SEMAPHORE:
+        with STANDALONE_BROWSER_SEMAPHORE:
             result = _render_html(url)
     except Exception as error:
         log_fetch_exception(f"botasaurus-browser:{navigation}", url, error)
@@ -3923,8 +3924,9 @@ class BotasaurusBrowserSession:
         try:
             self._loop.run_forever()
         finally:
-            self._loop.run_until_complete(self._close_browser())
-            self._loop.close()
+            if not self._loop.is_closed():
+                self._loop.run_until_complete(self._shutdown_async())
+                self._loop.close()
 
     async def _start_browser(self) -> None:
         import asyncio
@@ -4005,6 +4007,21 @@ class BotasaurusBrowserSession:
         self._browser = None
         self._playwright = None
         self._semaphore = None
+
+    async def _shutdown_async(self) -> None:
+        import asyncio
+
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not current_task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._close_browser()
 
     @staticmethod
     def _profiles_for_method(method: str) -> List[Dict[str, object]]:
@@ -4239,21 +4256,29 @@ class BotasaurusBrowserSession:
                 return None
         if not self._ensure_started():
             return None
+        future = None
         try:
             import asyncio
 
-            with HEADLESS_BROWSER_SEMAPHORE:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._fetch_async(url, method, rules, product_url_filters, allow_empty_price),
-                    self._loop,
-                )
-                result = future.result(timeout=REQUEST_TIMEOUT + 35)
+            future = asyncio.run_coroutine_threadsafe(
+                self._fetch_async(url, method, rules, product_url_filters, allow_empty_price),
+                self._loop,
+            )
+            result = future.result(timeout=REQUEST_TIMEOUT + 35)
         except Exception as error:
+            if future is not None:
+                future.cancel()
+                try:
+                    future.result(timeout=2)
+                except Exception:
+                    pass
             log_fetch_exception(method, url, error)
             return None
         return result if isinstance(result, str) and result.strip() else None
 
     def close(self) -> None:
+        import asyncio
+
         thread = None
         loop = None
         with self._state_lock:
@@ -4263,6 +4288,11 @@ class BotasaurusBrowserSession:
             thread = self._thread
             loop = self._loop
         if loop is not None:
+            try:
+                shutdown = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
+                shutdown.result(timeout=10)
+            except Exception:
+                pass
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except Exception:
@@ -4397,7 +4427,7 @@ def fetch_with_crawl4ai(url: str) -> Optional[str]:
             return html if isinstance(html, str) else None
 
     try:
-        with HEADLESS_BROWSER_SEMAPHORE:
+        with STANDALONE_BROWSER_SEMAPHORE:
             return asyncio.run(_fetch())
     except Exception:
         return None
@@ -4782,7 +4812,7 @@ def fetch_with_playwright(url: str) -> Optional[str]:
         import playwright  # noqa: F401
     except ImportError:
         return None
-    with HEADLESS_BROWSER_SEMAPHORE:
+    with STANDALONE_BROWSER_SEMAPHORE:
         return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
 
 
@@ -4791,7 +4821,7 @@ def fetch_with_scrapegraphai(url: str) -> Optional[str]:
         import scrapegraphai  # noqa: F401
     except ImportError:
         return None
-    with HEADLESS_BROWSER_SEMAPHORE:
+    with STANDALONE_BROWSER_SEMAPHORE:
         return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")
 
 
@@ -4975,12 +5005,14 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
-        if method == "botasaurus-browser":
-            return fetch_with_botasaurus_browser(target_url, "google")
-        if method == "botasaurus-browser-direct":
-            return fetch_with_botasaurus_browser(target_url, "direct")
-        if method == "botasaurus-visible":
-            return fetch_with_botasaurus_visible_browser(target_url)
+        if method in {"botasaurus-browser", "botasaurus-browser-direct", "botasaurus-visible", "playwright"}:
+            return self.browser_session_for_worker().fetch(
+                target_url,
+                method,
+                self.extraction_rules,
+                self.product_url_filters,
+                self.allow_empty_price,
+            )
         if method == "botasaurus-debug-visible":
             return self.debug_visible_session_for_worker().fetch(target_url, method)
         if method in SESSION_BROWSER_METHODS:
@@ -4993,8 +5025,6 @@ class ProductSiteCrawler:
             )
         if method == "crawl4ai":
             return fetch_with_crawl4ai(target_url)
-        if method == "playwright":
-            return fetch_with_playwright(target_url)
         if method == "scrapegraphai":
             return fetch_with_scrapegraphai(target_url)
         if method == "scrapy":
@@ -5054,11 +5084,23 @@ class ProductSiteCrawler:
             return current
 
     def set_active_connection_method(self, method: str) -> None:
+        previous = self.active_connection_method
         lock = self.connection_method_state["lock"]
         with lock:
             current = normalize_connection_method(method)
             self.connection_method_state["active_method"] = current
             self.active_connection_method = current
+        if current != previous and self.owns_browser_session:
+            self.close_browser_sessions()
+            self.browser_session = BotasaurusBrowserSession(
+                self.stop_signal,
+                self.thread_count,
+                profile_dir=self.profile_dir,
+            )
+            self.debug_visible_session = BotasaurusDebugVisibleSession(
+                self.stop_signal,
+                str(self.profile_dir) if self.profile_dir is not None else "protected_sites_debug_visible",
+            )
 
     def fetch_with_connection_method(self, url: str, method: str) -> Optional[str]:
         self.last_progress_at = time.time()
@@ -5106,10 +5148,7 @@ class ProductSiteCrawler:
             last_method = method
             html = self.fetch_with_connection_method(url, method)
             if html:
-                # Browser renderers are scarce shared resources. A successful
-                # browser fallback helps this URL, but must not force every
-                # following URL of the scan into the browser queue.
-                if method != current_method and not is_browser_render_method(method):
+                if method != current_method:
                     self.set_active_connection_method(method)
                     self.log(f"Автопереключение подключения: {method} для {url}", "warning")
                 return html
@@ -6740,16 +6779,24 @@ def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) 
         return
     news_state_persisted_at[monitor_id] = now
     state = repair_mojibake({**make_news_state(), **(monitor.get("state") or {})})
-    try:
-        with session_scope() as session:
-            donor = get_donor_row(session, monitor_id)
-            if donor is None:
+    for attempt in range(4):
+        try:
+            with session_scope() as session:
+                donor = get_donor_row(session, monitor_id)
+                if donor is None:
+                    return
+                donor.updated_at = datetime.utcnow()
+                if donor.brand:
+                    donor.brand.state = state
+            return
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt == 3:
+                print(f"Failed to persist news monitor state {monitor_id}: {exc}", flush=True)
                 return
-            donor.updated_at = datetime.utcnow()
-            if donor.brand:
-                donor.brand.state = state
-    except Exception as exc:
-        print(f"Failed to persist news monitor state {monitor_id}: {exc}", flush=True)
+            time.sleep(0.25 * (attempt + 1))
+        except Exception as exc:
+            print(f"Failed to persist news monitor state {monitor_id}: {exc}", flush=True)
+            return
 
 
 def news_monitor_thread_alive(monitor_id: object) -> bool:

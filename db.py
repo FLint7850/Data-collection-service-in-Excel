@@ -14,7 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
-SQLITE_JOURNAL_MODE = os.environ.get("SQLITE_JOURNAL_MODE", "DELETE").strip().upper() or "DELETE"
+SQLITE_JOURNAL_MODE = os.environ.get("SQLITE_JOURNAL_MODE", "WAL").strip().upper() or "WAL"
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "30000") or "30000")
 DEFAULT_BRAND_STATE = {
     "status": "idle",
     "stage": "",
@@ -76,7 +77,7 @@ def try_enable_wal(cursor_or_connection) -> None:
 def configure_sqlite(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()
     try_enable_wal(cursor)
-    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
@@ -90,7 +91,7 @@ def init_db() -> None:
         connection.commit()
         with connection.begin():
             try_enable_wal(connection)
-            connection.execute(text("PRAGMA busy_timeout=5000"))
+            connection.execute(text(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}"))
             migrate_schema(connection)
             connection.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
             current_revision = connection.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar()

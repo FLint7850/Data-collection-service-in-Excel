@@ -16,7 +16,9 @@ services:
       FILE_IMPORT_DIR: /app/storage/file-import
       TMPDIR: /tmp/parser
       FORCE_BROWSER_SETUP: 0
-      SQLITE_JOURNAL_MODE: DELETE
+      SQLITE_JOURNAL_MODE: WAL
+      SQLITE_BUSY_TIMEOUT_MS: 30000
+      WEB_GRACEFUL_TIMEOUT: 90
       GUNICORN_ACCESS_LOG: 0
     ports:
       - "5000:5000"
@@ -35,4 +37,4 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
-    stop_grace_period: 30s
+    stop_grace_period: 90s
