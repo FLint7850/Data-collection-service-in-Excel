@@ -5373,7 +5373,12 @@ class ProductSiteCrawler:
 
         listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
 
-        if not current_is_product and not listing_products and (is_catalog_url(url) or not is_probable_product_url(url)):
+        if (
+            self.current_connection_method() != "requests"
+            and not current_is_product
+            and not listing_products
+            and (is_catalog_url(url) or not is_probable_product_url(url))
+        ):
             self.update_state(
                 error=f"На странице каталога не извлечены товары. Рендерю через браузер: {url}",
             )
