@@ -29,8 +29,8 @@ services:
       - ./feeds:/app/feeds
       - ./storage:/app/storage
     shm_size: "768m"
-    mem_limit: "4g"
-    memswap_limit: "5g"
+    mem_limit: "5g"
+    memswap_limit: "6g"
     cpus: 2
     logging:
       driver: "json-file"
