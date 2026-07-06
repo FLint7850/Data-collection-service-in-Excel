@@ -3727,7 +3727,7 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
         from botasaurus.request import Request
         from botasaurus.request import request as botasaurus_request
     except ImportError as error:
-        log_fetch_exception(f"botasaurus-browser:{navigation}:import", url, error)
+        log_fetch_exception("botasaurus-request:import", url, error)
         return None
 
     @botasaurus_request(max_retry=MAX_RETRIES, output=None, create_error_logs=False)
