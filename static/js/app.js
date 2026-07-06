@@ -1,4 +1,4 @@
-const projectTabs = document.querySelector("#projectTabs");
+﻿const projectTabs = document.querySelector("#projectTabs");
 const addProjectButton = document.querySelector("#addProjectButton");
 const projectsTabButton = document.querySelector("#projectsTabButton");
 const newItemsTabButton = document.querySelector("#newItemsTabButton");
@@ -215,11 +215,31 @@ let newsData = null;
 let fileImportData = null;
 let fileImportLoaded = false;
 let fileImportUploading = false;
-let activeProjectId = null;
 const activeViewStorageKey = "excelServiceActiveView";
 const allowedActiveViews = new Set(["projects", "news", "import", "settings", "logs"]);
+const appConfig = window.__APP_CONFIG__ || {};
+let activeProjectId = appConfig.activeProjectId || idFromEditPath("projects") || null;
+let pendingNewsMonitorId = appConfig.activeNewsId || idFromEditPath("news") || "";
+
+function viewFromPath(pathname = window.location.pathname) {
+  if (pathname.startsWith("/news")) return "news";
+  if (pathname.startsWith("/file-import")) return "import";
+  if (pathname.startsWith("/settings")) return "settings";
+  if (pathname.startsWith("/logs")) return "logs";
+  return "projects";
+}
+
+function idFromEditPath(prefix, pathname = window.location.pathname) {
+  const marker = `/${prefix}/edit/`;
+  if (!pathname.startsWith(marker)) return "";
+  return decodeURIComponent(pathname.slice(marker.length).split("/")[0] || "");
+}
 
 function readStoredActiveView() {
+  const configured = appConfig.activeView;
+  if (allowedActiveViews.has(configured)) return configured;
+  const routed = viewFromPath();
+  if (allowedActiveViews.has(routed)) return routed;
   try {
     const storedView = window.localStorage.getItem(activeViewStorageKey);
     if (storedView === "project") return "projects";
@@ -229,11 +249,36 @@ function readStoredActiveView() {
   }
 }
 
-function setActiveView(view) {
+function routeForView(view, options = {}) {
+  if (view === "projects") {
+    const projectId = options.projectId || activeProjectId || "";
+    return projectId ? `/projects/edit/${encodeURIComponent(projectId)}` : "/projects";
+  }
+  if (view === "news") {
+    const monitorId = options.newsId || "";
+    return monitorId ? `/news/edit/${encodeURIComponent(monitorId)}` : "/news";
+  }
+  if (view === "import") return "/file-import";
+  if (view === "settings") return "/settings";
+  if (view === "logs") return "/logs";
+  return "/projects";
+}
+
+function pushAppRoute(view, options = {}, replace = false) {
+  const nextPath = routeForView(view, options);
+  if (window.location.pathname === nextPath) return;
+  const method = replace ? "replaceState" : "pushState";
+  window.history[method]({ view, ...options }, "", nextPath);
+}
+
+function setActiveView(view, options = {}) {
   activeView = allowedActiveViews.has(view) ? view : "projects";
   try {
     window.localStorage.setItem(activeViewStorageKey, activeView);
   } catch {
+  }
+  if (options.updateRoute !== false) {
+    pushAppRoute(activeView, options, Boolean(options.replace));
   }
 }
 
@@ -374,23 +419,48 @@ function rememberStableProgressState(cache, key, state, fields) {
   return merged;
 }
 
+function mergeProjectPayloadItem(project) {
+  const previous = projects.find((item) => item.id === project.id) || null;
+  const hasDetails = Object.prototype.hasOwnProperty.call(project, "start_urls");
+  return {
+    ...(previous || {}),
+    ...project,
+    __detail_loaded: hasDetails || Boolean(previous?.__detail_loaded),
+  };
+}
+
 function applyProjectPayload(items) {
   const projectFields = ["totalprocessed", "found_products", "skipped"];
-  projects = (items || []).map((project) => ({
-    ...project,
-    state: rememberStableProgressState(
-      stableProjectStates,
-      project.id,
-      project.state || {},
-      projectFields
-    ),
-  }));
+  projects = (items || []).map((item) => {
+    const project = mergeProjectPayloadItem(item);
+    return {
+      ...project,
+      state: rememberStableProgressState(
+        stableProjectStates,
+        project.id,
+        project.state || {},
+        projectFields
+      ),
+    };
+  });
   return projects;
+}
+
+function mergeNewsMonitorPayloadItem(monitor) {
+  const previous = (newsData?.monitors || []).find((item) => item.id === monitor.id) || null;
+  const hasDetails = Object.prototype.hasOwnProperty.call(monitor, "extraction_rules")
+    || Object.prototype.hasOwnProperty.call(monitor, "selector_settings")
+    || Object.prototype.hasOwnProperty.call(monitor, "exclusions");
+  return {
+    ...(previous || {}),
+    ...monitor,
+    __detail_loaded: hasDetails || Boolean(previous?.__detail_loaded),
+  };
 }
 
 function applyNewsPayload(data) {
   setConnectionMethods(data?.connection_methods);
-  const stamped = stampNewsStates(data);
+  const stamped = stampNewsStates(data || {});
   const newsFields = [
     "processed",
     "found_products",
@@ -402,7 +472,8 @@ function applyNewsPayload(data) {
     "failed_pages",
     "availability_skipped",
   ];
-  (stamped?.monitors || []).forEach((monitor) => {
+  const mergedMonitors = (stamped?.monitors || []).map((item) => {
+    const monitor = mergeNewsMonitorPayloadItem(item);
     monitor.state = rememberStableProgressState(
       stableNewsMonitorStates,
       monitor.id,
@@ -415,8 +486,13 @@ function applyNewsPayload(data) {
       monitor.brand_state || {},
       newsFields
     );
+    return monitor;
   });
-  newsData = stamped;
+  newsData = {
+    ...(newsData || {}),
+    ...(stamped || {}),
+    monitors: mergedMonitors,
+  };
   return newsData;
 }
 
@@ -503,9 +579,12 @@ function renderTabs() {
     button.className = "project-tab-button";
     button.textContent = project.name;
     button.addEventListener("click", () => {
-      setActiveView("projects");
       activeProjectId = project.id;
+      setActiveView("projects", { projectId: project.id });
       renderAll();
+      loadProjectDetail(project.id).then(renderAll).catch((error) => {
+        errorText.textContent = error.message;
+      });
     });
 
     const closeButton = document.createElement("button");
@@ -657,6 +736,9 @@ async function deletePendingNewsMonitor() {
 
 function renderProjectForm(project) {
   if (!project) {
+    return;
+  }
+  if (!project.__detail_loaded) {
     return;
   }
   isHydratingForm = true;
@@ -1479,26 +1561,39 @@ function activeNewsMonitor() {
   const primaryId = String(monitors[0]?.primary_donor_id || "");
   const selectedId = selectedNewsSites.get(activeNewsBrandKey);
   const monitor =
-    monitors.find((item) => item.id === primaryId) ||
     monitors.find((item) => item.id === selectedId) ||
+    monitors.find((item) => item.id === primaryId) ||
     monitors[0];
   selectedNewsSites.set(activeNewsBrandKey, monitor.id);
   return monitor;
 }
 
-function openNewsModal(brandKey) {
+async function openNewsModal(brandKey, options = {}) {
   activeNewsBrandKey = brandKey;
   const monitors = monitorsForBrandKey(brandKey);
   const primaryId = String(monitors[0]?.primary_donor_id || "");
-  if (primaryId) {
+  if (primaryId && !selectedNewsSites.has(brandKey)) {
     selectedNewsSites.set(brandKey, primaryId);
   }
   activeNewsSelectorsOpen = false;
   activeNewsReplaceRulesOpen = false;
   activeNewsBrandNameEditing = false;
-  renderNewsModal();
   newsMonitorModal.classList.remove("hidden");
   newsMonitorModal.setAttribute("aria-hidden", "false");
+  const selected = activeNewsMonitor();
+  if (selected?.id) {
+    pushAppRoute("news", { newsId: selected.id }, Boolean(options.replace));
+    if (!selected.__detail_loaded) {
+      newsModalContent.dataset.monitorId = selected.id;
+      newsModalContent.innerHTML = `<div class="modal-summary-row">Загружаю настройки донора...</div>`;
+      try {
+        await loadNewsMonitorDetail(selected.id);
+      } catch (error) {
+        errorText.textContent = error.message;
+      }
+    }
+  }
+  renderNewsModal();
 }
 
 function closeNewsModal() {
@@ -1508,6 +1603,7 @@ function closeNewsModal() {
   activeNewsSelectorsOpen = true;
   activeNewsReplaceRulesOpen = false;
   activeNewsBrandNameEditing = false;
+  if (activeView === "news") pushAppRoute("news");
 }
 
 function updateNewsModalProgress() {
@@ -1989,11 +2085,49 @@ async function persistPendingNewsBrandTitle() {
   return updated;
 }
 
+async function mergeNewsMonitorDetails(monitors) {
+  if (!newsData) newsData = { monitors: [] };
+  const byId = new Map((newsData.monitors || []).map((monitor) => [monitor.id, monitor]));
+  (monitors || []).forEach((monitor) => {
+    byId.set(monitor.id, mergeNewsMonitorPayloadItem({ ...monitor, __detail_loaded: true }));
+  });
+  newsData.monitors = Array.from(byId.values());
+}
+
+async function loadNewsMonitorDetail(monitorId) {
+  if (!monitorId) return null;
+  const data = await requestJson(`/api/news/monitors/${monitorId}`);
+  const monitors = data.brand_monitors || (data.monitor ? [data.monitor] : []);
+  await mergeNewsMonitorDetails(monitors);
+  return data.monitor || null;
+}
+
+async function loadNewsSettingsOnly() {
+  const data = await requestJson("/api/news?summary=1&monitors=0");
+  setConnectionMethods(data.connection_methods);
+  newsData = {
+    ...(newsData || {}),
+    ...data,
+    monitors: newsData?.monitors || [],
+  };
+  renderNewsSettings();
+  renderFeedStorage();
+  return newsData;
+}
+
 async function loadNews() {
   if (!newsLoadPromise) {
-    newsLoadPromise = requestJson("/api/news")
-      .then((data) => {
+    newsLoadPromise = requestJson("/api/news?summary=1")
+      .then(async (data) => {
         newsData = applyNewsPayload(data);
+        if (pendingNewsMonitorId) {
+          const monitor = (newsData.monitors || []).find((item) => item.id === pendingNewsMonitorId);
+          if (monitor) {
+            activeNewsBrandKey = `${monitor.group || "Маржа"}::${monitor.brand || ""}`;
+            selectedNewsSites.set(activeNewsBrandKey, monitor.id);
+            await loadNewsMonitorDetail(monitor.id);
+          }
+        }
         return newsData;
       })
       .finally(() => {
@@ -2002,6 +2136,13 @@ async function loadNews() {
   }
   await newsLoadPromise;
   renderNews();
+  if (pendingNewsMonitorId) {
+    const monitor = (newsData?.monitors || []).find((item) => item.id === pendingNewsMonitorId);
+    pendingNewsMonitorId = "";
+    if (monitor) {
+      openNewsModal(`${monitor.group || "Маржа"}::${monitor.brand || ""}`, { replace: true });
+    }
+  }
 }
 
 function renderAll() {
@@ -2013,6 +2154,13 @@ function renderAll() {
   settingsView.classList.toggle("hidden", activeView !== "settings");
   logsView.classList.toggle("hidden", activeView !== "logs");
   if (activeView === "projects") {
+    if (project && !project.__detail_loaded) {
+      renderState(project);
+      loadProjectDetail(project.id).then(renderAll).catch((error) => {
+        errorText.textContent = error.message;
+      });
+      return;
+    }
     renderProjectForm(project);
     renderState(project);
   } else if (activeView === "news") {
@@ -2024,11 +2172,11 @@ function renderAll() {
       });
     }
   } else if (activeView === "settings") {
-    if (newsData) {
+    if (newsData?.own_sites) {
       renderNewsSettings();
       renderFeedStorage();
     } else {
-      loadNews().catch((error) => {
+      loadNewsSettingsOnly().catch((error) => {
         errorText.textContent = error.message;
       });
     }
@@ -2045,8 +2193,22 @@ function renderAll() {
   }
 }
 
+async function loadProjectDetail(projectId) {
+  if (!projectId) return null;
+  const data = await requestJson(`/api/projects/${projectId}`);
+  const detail = { ...(data.project || {}), __detail_loaded: true };
+  const index = projects.findIndex((project) => project.id === detail.id);
+  if (index >= 0) {
+    projects[index] = mergeProjectPayloadItem(detail);
+  } else {
+    projects.push(detail);
+  }
+  activeProjectId = detail.id;
+  return detail;
+}
+
 async function loadProjects() {
-  const data = await requestJson("/api/projects");
+  const data = await requestJson("/api/projects?summary=1");
   setConnectionMethods(data.connection_methods);
   projects = applyProjectPayload(data.projects || []);
   if (!activeProjectId && projects.length) {
@@ -2054,6 +2216,10 @@ async function loadProjects() {
   }
   if (!projects.some((project) => project.id === activeProjectId) && projects.length) {
     activeProjectId = projects[0].id;
+  }
+  if (activeProjectId) {
+    await loadProjectDetail(activeProjectId);
+    pushAppRoute("projects", { projectId: activeProjectId }, true);
   }
   renderAll();
 }
@@ -2103,7 +2269,7 @@ function scheduleSaveActiveProject() {
 }
 
 async function loadLogs(force = false) {
-  const data = await requestJson("/api/logs");
+  const data = await requestJson("/api/logs?limit=200&page=1");
   autoCleanup.checked = Boolean(data.auto_cleanup);
   const nextSignature = data.logs_signature || "";
   if (!force && logsSignature && nextSignature && nextSignature === logsSignature) {
@@ -2142,9 +2308,13 @@ addProjectButton.addEventListener("click", async () => {
 });
 
 projectsTabButton.addEventListener("click", () => {
-  setActiveView("projects");
+  setActiveView("projects", { projectId: activeProjectId || "" });
   configureProgressStream();
-  renderAll();
+  if (!projects.length) {
+    loadProjects().catch((error) => { errorText.textContent = error.message; });
+  } else {
+    renderAll();
+  }
 });
 
 logsTabButton.addEventListener("click", () => {
@@ -2891,7 +3061,7 @@ autoCleanup.addEventListener("change", async () => {
 window.setInterval(tickNewsModalTimers, 1000);
 
 function wantsNewsProgress() {
-  return activeView === "news" || activeView === "settings";
+  return activeView === "news";
 }
 
 function handleProgressEvent(event) {
@@ -2931,11 +3101,34 @@ function configureProgressStream() {
     progressEvents = null;
   }
   progressIncludesNews = includeNews;
-  progressEvents = new EventSource(`/progress?news=${includeNews ? "1" : "0"}`);
+  const includeProjects = activeView === "projects";
+  progressEvents = new EventSource(`/progress?projects=${includeProjects ? "1" : "0"}&news=${includeNews ? "1" : "0"}`);
   progressEvents.addEventListener("progress", handleProgressEvent);
 }
 
-loadProjects().catch((error) => {
+async function bootstrapActiveRoute() {
+  if (activeView === "projects") {
+    await loadProjects();
+  } else {
+    renderAll();
+  }
+  configureProgressStream();
+}
+
+window.addEventListener("popstate", () => {
+  activeView = viewFromPath();
+  activeProjectId = idFromEditPath("projects") || activeProjectId;
+  pendingNewsMonitorId = idFromEditPath("news") || "";
+  configureProgressStream();
+  if (activeView === "projects" && !projects.length) {
+    loadProjects().catch((error) => { errorText.textContent = error.message; });
+  } else {
+    renderAll();
+  }
+});
+
+bootstrapActiveRoute().catch((error) => {
   errorText.textContent = error.message;
 });
-configureProgressStream();
+
+

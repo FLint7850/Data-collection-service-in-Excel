@@ -442,6 +442,13 @@
     </section>
   </main>
 
+  <script>
+    window.__APP_CONFIG__ = {
+      activeView: {{ (active_view or "projects")|tojson }},
+      activeProjectId: {{ (active_project_id or "")|tojson }},
+      activeNewsId: {{ (active_news_id or "")|tojson }}
+    };
+  </script>
   <script src="{{ url_for('static', filename='js/app.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

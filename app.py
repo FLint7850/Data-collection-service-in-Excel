@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import csv
 import hashlib
@@ -696,26 +696,33 @@ def stable_project_state(project: Dict[str, object], state: Dict[str, object]) -
     )
 
 
-def public_project(project: Dict[str, object]) -> Dict[str, object]:
+def public_project(project: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
     state = repair_mojibake(stable_project_state(project, dict(project["state"])))
     filename = str(state.get("filename") or "")
     if filename and (EXPORT_DIR / filename).exists():
         state["download_ready"] = True
-    return {
+    payload = {
         "id": project["id"],
         "name": repair_mojibake_text(project["name"]),
-        "start_urls": project["start_urls"],
         "thread_count": project["thread_count"],
-        "exclusions": project["exclusions"],
-        "product_url_filters": project.get("product_url_filters", []),
-        "product_url_exclusions": project.get("product_url_exclusions", []),
-        "extraction_rules": project.get("extraction_rules", {}),
         "state": state,
-        "auto_cleanup": project.get("auto_cleanup", False),
         "connection_method": project.get("connection_method", "requests"),
-        "auto_connection_fallback": project.get("auto_connection_fallback", True),
-        "persist_profile": bool(project.get("persist_profile", False)),
     }
+    if not include_details:
+        return payload
+    payload.update(
+        {
+            "start_urls": project["start_urls"],
+            "exclusions": project["exclusions"],
+            "product_url_filters": project.get("product_url_filters", []),
+            "product_url_exclusions": project.get("product_url_exclusions", []),
+            "extraction_rules": project.get("extraction_rules", {}),
+            "auto_cleanup": project.get("auto_cleanup", False),
+            "auto_connection_fallback": project.get("auto_connection_fallback", True),
+            "persist_profile": bool(project.get("persist_profile", False)),
+        }
+    )
+    return payload
 
 
 def payload_signature(value: object) -> str:
@@ -726,11 +733,11 @@ def payload_signature(value: object) -> str:
 
 def projects_progress_payload() -> List[Dict[str, object]]:
     with projects_lock:
-        return [public_project(project) for project in projects.values()]
+        return [public_project(project, include_details=False) for project in projects.values()]
 
 
 def news_progress_payload() -> Dict[str, object]:
-    return public_news_settings(include_connection_methods=False)
+    return public_news_settings(include_connection_methods=False, include_monitor_details=False)
 
 
 def project_model_to_dict(row: Project) -> Dict[str, object]:
@@ -1910,7 +1917,7 @@ def delete_project_csv_for_project(project: Dict[str, object], keep_filename: st
                 pass
 
 
-def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
+def public_news_monitor(monitor: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
     public_monitor = repair_mojibake(dict(monitor))
     state = dict(public_monitor.get("state") or make_news_state())
     original_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
@@ -1939,10 +1946,26 @@ def public_news_monitor(monitor: Dict[str, object]) -> Dict[str, object]:
         if brand_state.get("last_csv"):
             brand_state["last_csv"] = str(repair_mojibake_text(brand_state["last_csv"]) or brand_state["last_csv"])
         public_monitor["brand_state"] = brand_state
+    if not include_details:
+        summary_keys = {
+            "id",
+            "brand_id",
+            "primary_donor_id",
+            "group",
+            "brand",
+            "site_url",
+            "start_urls",
+            "enabled",
+            "state",
+            "brand_state",
+            "created_at",
+            "brand_created_at",
+        }
+        public_monitor = {key: value for key, value in public_monitor.items() if key in summary_keys}
     return public_monitor
 
 
-def public_news_settings(include_connection_methods: bool = True) -> Dict[str, object]:
+def public_news_settings(include_connection_methods: bool = True, include_monitor_details: bool = True, include_monitors: bool = True) -> Dict[str, object]:
     cleanup_stale_news_transitions()
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
@@ -1960,7 +1983,7 @@ def public_news_settings(include_connection_methods: bool = True) -> Dict[str, o
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,
             "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
-            "monitors": [public_news_monitor(monitor) for monitor in news_settings.get("monitors", [])],
+            "monitors": [public_news_monitor(monitor, include_details=include_monitor_details) for monitor in news_settings.get("monitors", [])] if include_monitors else [],
         }
         if include_connection_methods:
             payload["connection_methods"] = public_connection_methods()
@@ -7935,12 +7958,58 @@ def logout() -> Response:
     return redirect(url_for("login"))
 
 
-@app.route("/")
-def index() -> str:
+def render_app_page(active_view: str = "projects", active_project_id: str = "", active_news_id: str = "") -> str:
     ensure_storage()
     static_files = [BASE_DIR / "static" / "js" / "app.js", BASE_DIR / "static" / "css" / "styles.css"]
     static_version = max((int(path.stat().st_mtime) for path in static_files if path.exists()), default=0)
-    return render_template("index.html", default_start_url=DEFAULT_START_URL, static_version=static_version)
+    return render_template(
+        "index.html",
+        default_start_url=DEFAULT_START_URL,
+        static_version=static_version,
+        active_view=active_view,
+        active_project_id=active_project_id,
+        active_news_id=active_news_id,
+    )
+
+
+@app.route("/")
+def index() -> Response:
+    return redirect(url_for("projects_page"))
+
+
+@app.get("/projects")
+def projects_page() -> str:
+    return render_app_page("projects")
+
+
+@app.get("/projects/edit/<project_id>")
+def project_edit_page(project_id: str) -> str:
+    return render_app_page("projects", active_project_id=project_id)
+
+
+@app.get("/news")
+def news_page() -> str:
+    return render_app_page("news")
+
+
+@app.get("/news/edit/<monitor_id>")
+def news_edit_page(monitor_id: str) -> str:
+    return render_app_page("news", active_news_id=monitor_id)
+
+
+@app.get("/file-import")
+def file_import_page() -> str:
+    return render_app_page("import")
+
+
+@app.get("/logs")
+def logs_page() -> str:
+    return render_app_page("logs")
+
+
+@app.get("/settings")
+def settings_page() -> str:
+    return render_app_page("settings")
 
 
 @app.get("/api/state")
@@ -7957,7 +8026,9 @@ def api_connection_methods():
 @app.get("/api/news")
 def api_news():
     ensure_storage()
-    return jsonify(public_news_settings())
+    summary = request.args.get("summary") == "1"
+    include_monitors = request.args.get("monitors", "1") != "0"
+    return jsonify(public_news_settings(include_monitor_details=not summary, include_monitors=include_monitors))
 
 
 @app.patch("/api/news/settings")
@@ -8038,6 +8109,24 @@ def api_test_news_email():
     if not send_news_email(None, 0, test=True, error_holder=errors):
         return jsonify({"error": errors[-1] if errors else "Email не отправлен. Проверьте SMTP-настройки и логи мониторинга."}), 500
     return jsonify({"ok": True})
+
+
+@app.get("/api/news/monitors/<monitor_id>")
+def api_get_news_monitor(monitor_id: str):
+    monitor = get_news_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Монитор не найден"}), 404
+    group = clean_text(str(monitor.get("group") or ""))
+    brand = clean_text(str(monitor.get("brand") or ""))
+    with news_lock:
+        brand_monitors = [
+            public_news_monitor(item)
+            for item in news_settings.get("monitors", [])
+            if isinstance(item, dict)
+            and clean_text(str(item.get("group") or "")) == group
+            and clean_text(str(item.get("brand") or "")) == brand
+        ]
+    return jsonify({"monitor": public_news_monitor(monitor), "brand_monitors": brand_monitors})
 
 
 @app.patch("/api/news/monitors/<monitor_id>")
@@ -8390,13 +8479,22 @@ def api_download_file_import_result():
 @app.get("/api/projects")
 def api_projects():
     ensure_storage()
+    summary = request.args.get("summary") == "1"
     with projects_lock:
         return jsonify(
             {
-                "projects": [public_project(project) for project in projects.values()],
+                "projects": [public_project(project, include_details=not summary) for project in projects.values()],
                 "connection_methods": public_connection_methods(),
             }
         )
+
+
+@app.get("/api/projects/<project_id>")
+def api_get_project(project_id: str):
+    project = get_project(project_id)
+    if not project:
+        return jsonify({"error": "Проект не найден"}), 404
+    return jsonify({"project": public_project(project)})
 
 
 @app.post("/api/projects")
@@ -8896,9 +8994,24 @@ def api_logs():
 
     all_logs = combined_log_entries()
     all_logs.sort(key=lambda item: item.get("time", ""))
+    try:
+        limit = max(1, min(int(request.args.get("limit") or 200), 1000))
+    except (TypeError, ValueError):
+        limit = 200
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    total = len(all_logs)
+    end = max(0, total - (page - 1) * limit)
+    start = max(0, end - limit)
+    page_logs = all_logs[start:end]
     return jsonify(
         {
-            "logs": all_logs,
+            "logs": page_logs,
+            "logs_total": total,
+            "logs_page": page,
+            "logs_limit": limit,
             "auto_cleanup": auto_cleanup,
             "logs_signature": logs_signature(),
         }
@@ -9014,6 +9127,7 @@ def restart_scan():
 
 @app.get("/progress")
 def progress_stream():
+    include_projects = request.args.get("projects", "1") == "1"
     include_news = request.args.get("news") == "1"
 
     def stream():
@@ -9025,11 +9139,12 @@ def progress_stream():
             ensure_storage()
             payload: Dict[str, object] = {}
 
-            projects_payload = projects_progress_payload()
-            projects_signature = payload_signature(projects_payload)
-            if projects_signature != last_projects_signature:
-                payload["projects"] = projects_payload
-                last_projects_signature = projects_signature
+            if include_projects:
+                projects_payload = projects_progress_payload()
+                projects_signature = payload_signature(projects_payload)
+                if projects_signature != last_projects_signature:
+                    payload["projects"] = projects_payload
+                    last_projects_signature = projects_signature
 
             if include_news:
                 news_payload = news_progress_payload()
@@ -9096,3 +9211,4 @@ if __name__ == "__main__":
     with make_server("127.0.0.1", port, app, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
         print(f"Serving on http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
+
