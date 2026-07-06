@@ -1,4 +1,6 @@
-# Сервис сбора данных в Excel
+# Data-collection-service-in-Excel
+
+Сервис сбора данных в Excel: https://github.com/FLint7850/Data-collection-service-in-Excel
 
 Локальный Flask-сервис для обхода каталогов, сбора моделей и цен, управления исключениями и выгрузки CSV.
 

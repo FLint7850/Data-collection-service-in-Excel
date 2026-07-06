@@ -1,7 +1,7 @@
 services:
   parser:
     build: .
-    container_name: maunfeld-parser
+    container_name: data-collection-service-in-excel
     restart: unless-stopped
     env_file:
       - path: .env

@@ -46,7 +46,7 @@ WEB_CONCURRENCY=1
 WEB_THREADS=2
 ```
 
-If Docker logs show OOM kills or `docker stats maunfeld-parser` stays near 4 GB during normal runs, increase `mem_limit` only together with reducing workers or adding server RAM. Avoid assigning all 8 GB to the container; Chromium, SQLite, Docker, and the OS still need headroom.
+If Docker logs show OOM kills or `docker stats data-collection-service-in-excel` stays near 4 GB during normal runs, increase `mem_limit` only together with reducing workers or adding server RAM. Avoid assigning all 8 GB to the container; Chromium, SQLite, Docker, and the OS still need headroom.
 
 ## Browser runtime
 

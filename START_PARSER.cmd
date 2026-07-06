@@ -3,10 +3,10 @@ setlocal
 
 cd /d "%~dp0"
 
-title Data Parser Service
+title Data-collection-service-in-Excel
 echo.
 echo ===============================================
-echo  Data Parser Service
+echo  Data-collection-service-in-Excel
 echo ===============================================
 echo.
 echo Project folder:
