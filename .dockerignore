@@ -1,4 +1,4 @@
-.git
+﻿.git
 .venv
 __pycache__
 *.pyc
@@ -9,6 +9,7 @@ logs/*
 exports/*
 feeds/*
 storage/*
+profiles/
 data/*.db-wal
 data/*.db-shm
 node_modules
