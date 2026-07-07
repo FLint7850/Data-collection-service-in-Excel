@@ -1414,7 +1414,11 @@ function newsBrandTileHtml(group, brand, brandMonitors) {
   const stallSeconds = Number(activeState.stall_seconds || 0);
   const missingSummary = aggregateMissingByFeed([activeState]);
   const lastScan = states.map((state) => state.last_scan_at || "").filter(Boolean).sort().pop() || "—";
+  const resetDisabled = ["running", "queued", "pausing", "stopping"].includes(status);
   return `
+    <span class="news-tile-reset-wrap">
+      <button class="news-visual-reset" data-action="reset-news-visual" data-monitor-id="${monitor.id}" data-brand-key="${escapeHtml(brandKey)}" type="button" title="Сбросить отображение последнего сканирования" aria-label="Сбросить отображение последнего сканирования" ${resetDisabled ? "disabled" : ""}>↻</button>
+    </span>
     <span class="news-tile-remove-wrap">
       <button class="news-tile-remove" data-action="delete-news-monitor-card" data-monitor-id="${monitor.id}" data-brand-key="${escapeHtml(brandKey)}" type="button" aria-label="Удалить">×</button>
     </span>
@@ -1672,6 +1676,8 @@ function updateNewsModalProgress() {
   if (stopButton) stopButton.disabled = !["running", "queued", "pausing", "stopping"].includes(state.status);
   const resumeButton = newsModalTitleActions.querySelector("[data-action='resume-news']");
   if (resumeButton) resumeButton.disabled = state.status !== "partial";
+  const resetButton = newsModalTitleActions.querySelector("[data-action='reset-news-visual']");
+  if (resetButton) resetButton.disabled = ["running", "queued", "pausing", "stopping"].includes(state.status);
   const downloadLink = newsModalContent.querySelector("[data-role='modal-csv-download']");
   if (downloadLink) {
     const ready = Boolean(state.csv_ready || state.last_csv);
@@ -1690,6 +1696,7 @@ function renderNewsModal() {
 
   const state = monitor.state || {};
   const disabled = ["running", "queued", "stopping"].includes(state.status);
+  const resetDisabled = ["running", "queued", "pausing", "stopping"].includes(state.status);
   const percent = getCompareProgress(state);
   const brand = monitor.brand || "Донор";
   const site = monitor.site_url || (monitor.start_urls || [])[0] || "";
@@ -1709,6 +1716,7 @@ function renderNewsModal() {
   newsModalSubtitle.textContent = site;
   newsModalTitleActions.innerHTML = `
   ${newsStatusHtml(state.status)}
+    <button class="news-visual-reset news-visual-reset--modal" data-action="reset-news-visual" type="button" title="Сбросить отображение последнего сканирования" aria-label="Сбросить отображение последнего сканирования" ${resetDisabled ? "disabled" : ""}>↻</button>
     <label class="toggle-field modal-title-toggle">
     <input
       class="toggle-field__input"
@@ -2575,11 +2583,27 @@ async function addNewsMonitorToGroup(group) {
   }
 }
 
+function applyNewsMonitorResponse(data) {
+  const monitors = Array.isArray(data?.brand_monitors) && data.brand_monitors.length
+    ? data.brand_monitors
+    : (data?.monitor ? [data.monitor] : []);
+  monitors.forEach((nextMonitor) => {
+    const index = (newsData?.monitors || []).findIndex((monitor) => monitor.id === nextMonitor.id);
+    if (index >= 0) {
+      newsData.monitors[index] = nextMonitor;
+    }
+  });
+  return data?.monitor || monitors[0] || null;
+}
+
 async function runNewsAction(monitorId, endpoint) {
   const data = await requestJson(`/api/news/monitors/${monitorId}/${endpoint}`, { method: "POST" });
-  const index = (newsData?.monitors || []).findIndex((monitor) => monitor.id === monitorId);
-  if (index >= 0) newsData.monitors[index] = data.monitor;
-  return data.monitor;
+  return applyNewsMonitorResponse(data);
+}
+
+async function resetNewsVisualStatus(monitorId) {
+  const data = await requestJson(`/api/news/monitors/${monitorId}/reset-visual`, { method: "POST" });
+  return applyNewsMonitorResponse(data);
 }
 
 function selectedMonitorIdForBrandKey(brandKey, action = "") {
@@ -2598,6 +2622,26 @@ function selectedMonitorIdForBrandKey(brandKey, action = "") {
 }
 
 newsGroups.addEventListener("click", (event) => {
+  const resetButton = event.target.closest("[data-action='reset-news-visual']");
+  if (resetButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (resetButton.disabled) return;
+    const tile = resetButton.closest("[data-action='open-news-brand']");
+    const monitorId = resetButton.dataset.monitorId || selectedMonitorIdForBrandKey(tile?.dataset.brandKey || "");
+    if (!monitorId) return;
+    resetNewsVisualStatus(monitorId)
+      .then(() => {
+        renderNewsMonitors();
+        if (activeNewsBrandKey === tile?.dataset.brandKey && !newsMonitorModal.classList.contains("hidden")) {
+          renderNewsModal();
+        }
+      })
+      .catch((error) => {
+        errorText.textContent = error.message;
+      });
+    return;
+  }
   const actionButton = event.target.closest("[data-action='pause-news'], [data-action='stop-news'], [data-action='resume-news']");
   if (actionButton) {
     event.preventDefault();
@@ -2732,6 +2776,21 @@ newsModalContent.addEventListener("change", async (event) => {
 });
 
 newsModalTitleActions.addEventListener("click", async (event) => {
+  const resetButton = event.target.closest("[data-action='reset-news-visual']");
+  if (resetButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (resetButton.disabled) return;
+    try {
+      const monitorId = newsModalContent.dataset.monitorId;
+      await resetNewsVisualStatus(monitorId);
+      renderNewsMonitors();
+      renderNewsModal();
+    } catch (error) {
+      errorText.textContent = error.message;
+    }
+    return;
+  }
   const actionButton = event.target.closest("[data-action='pause-news'], [data-action='stop-news'], [data-action='resume-news']");
   if (!actionButton) return;
   const action = actionButton.dataset.action;

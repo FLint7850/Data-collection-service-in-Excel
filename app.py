@@ -8276,6 +8276,37 @@ def api_resume_news_monitor(monitor_id: str):
     add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
     return jsonify({"monitor": response_monitor})
 
+@app.post("/api/news/monitors/<monitor_id>/reset-visual")
+def api_reset_news_monitor_visual(monitor_id: str):
+    monitor = get_news_monitor(monitor_id)
+    if not monitor:
+        return jsonify({"error": "Монитор не найден"}), 404
+    group = clean_text(str(monitor.get("group") or ""))
+    brand = clean_text(str(monitor.get("brand") or ""))
+    active_statuses = {"running", "queued", "pausing", "stopping"}
+    with news_lock:
+        brand_monitors = [
+            item
+            for item in news_settings.get("monitors", [])
+            if isinstance(item, dict)
+            and clean_text(str(item.get("group") or "")) == group
+            and clean_text(str(item.get("brand") or "")) == brand
+        ]
+        if any(str((item.get("state") or {}).get("status") or "") in active_statuses for item in brand_monitors):
+            return jsonify({"error": "Нельзя сбрасывать статус, пока сканирование выполняется."}), 409
+        for item in brand_monitors:
+            previous_state = item.get("state", {}) if isinstance(item.get("state"), dict) else {}
+            reset_state = make_news_state("idle")
+            last_csv = str(previous_state.get("last_csv") or "")
+            if last_csv:
+                reset_state["last_csv"] = last_csv
+            item["state"] = reset_state
+            item["brand_state"] = dict(reset_state)
+            item.pop("_last_progress_state", None)
+        save_news_settings()
+        response_monitors = [public_news_monitor(item) for item in brand_monitors]
+        response_monitor = next((item for item in response_monitors if str(item.get("id")) == str(monitor_id)), response_monitors[0] if response_monitors else public_news_monitor(monitor))
+    return jsonify({"monitor": response_monitor, "brand_monitors": response_monitors})
 
 @app.post("/api/news/monitors")
 def api_create_news_monitor():
