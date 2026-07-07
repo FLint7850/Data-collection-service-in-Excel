@@ -1534,6 +1534,7 @@ function renderNewsMonitors() {
       tile.type = "button";
       tile.dataset.action = "open-news-brand";
       tile.dataset.brandKey = brandKey;
+      tile.dataset.brandId = String(brandMonitors[0]?.brand_id || "");
       tile.innerHTML = newsBrandTileHtml(group, brand, brandMonitors);
       tile.dataset.newsStatus = aggregateNewsStatus(brandMonitors.map((item) => stateWithBrandState(item)));
       list.append(tile);
@@ -1559,6 +1560,14 @@ function monitorsForBrandKey(brandKey) {
   return groupNewsMonitors()[group]?.[brand] || [];
 }
 
+function brandIdForBrandKey(brandKey) {
+  const monitors = monitorsForBrandKey(brandKey);
+  return String(monitors[0]?.brand_id || "");
+}
+
+function brandKeyForMonitor(monitor) {
+  return `${monitor?.group || "Маржа"}::${monitor?.brand || ""}`;
+}
 function activeNewsMonitor() {
   const monitors = monitorsForBrandKey(activeNewsBrandKey);
   if (!monitors.length) return null;
@@ -1584,14 +1593,16 @@ async function openNewsModal(brandKey, options = {}) {
   activeNewsBrandNameEditing = false;
   newsMonitorModal.classList.remove("hidden");
   newsMonitorModal.setAttribute("aria-hidden", "false");
-  const selected = activeNewsMonitor();
-  if (selected?.id) {
-    pushAppRoute("news", { newsId: selected.id }, Boolean(options.replace));
-    if (!selected.__detail_loaded) {
-      newsModalContent.dataset.monitorId = selected.id;
-      newsModalContent.innerHTML = `<div class="modal-summary-row">Загружаю настройки донора...</div>`;
+  let selected = activeNewsMonitor();
+  const brandId = brandIdForBrandKey(brandKey);
+  if (brandId) {
+    pushAppRoute("news", { newsId: brandId }, Boolean(options.replace));
+    if (!selected?.__detail_loaded) {
+      newsModalContent.dataset.monitorId = selected?.id || "";
+      newsModalContent.innerHTML = `<div class="modal-summary-row">Загружаю настройки бренда...</div>`;
       try {
-        await loadNewsMonitorDetail(selected.id);
+        await loadNewsBrandDetail(brandId);
+        selected = activeNewsMonitor();
       } catch (error) {
         errorText.textContent = error.message;
       }
@@ -1599,7 +1610,6 @@ async function openNewsModal(brandKey, options = {}) {
   }
   renderNewsModal();
 }
-
 function closeNewsModal() {
   newsMonitorModal.classList.add("hidden");
   newsMonitorModal.setAttribute("aria-hidden", "true");
@@ -1749,7 +1759,7 @@ function renderNewsModal() {
           ${monitors
             .map((item) => {
               const itemSite = item.site_url || (item.start_urls || [])[0] || "";
-              return `<option value="${item.id}" ${item.id === String(monitor.primary_donor_id || monitor.id) ? "selected" : ""}>${escapeHtml(itemSite)}</option>`;
+              return `<option value="${item.id}" ${item.id === monitor.id ? "selected" : ""}>${escapeHtml(itemSite)}</option>`;
             })
             .join("")}
         </select>
@@ -1890,10 +1900,7 @@ function renderNewsModal() {
         <span>Селектор наличия</span>
         <input data-selector="availability_selector" type="text" value="${escapeHtml(monitor.selector_settings?.availability_selector || "")}">
       </label>
-      <label class="field">
-        <span>Селектор фото</span>
-        <input data-selector="photo_selector" type="text" value="${escapeHtml(monitor.selector_settings?.photo_selector || "")}">
-      </label>
+
       <label class="field modal-wide-field">
         <span>Исключение товаров по статусу</span>
         <textarea data-selector="availability_exclusions" rows="3" placeholder="Снят с производства&#10;Нет в наличии">${escapeHtml((monitor.selector_settings?.availability_exclusions || []).join("\n"))}</textarea>
@@ -2102,14 +2109,59 @@ async function mergeNewsMonitorDetails(monitors) {
   newsData.monitors = Array.from(byId.values());
 }
 
+function monitorsFromNewsBrand(brand) {
+  const brandId = brand?.brand_id || brand?.id || "";
+  const brandName = brand?.brand || brand?.name || "";
+  const groupName = brand?.group || brand?.group_name || "Маржа";
+  return (brand?.donors || []).map((donor) => ({
+    ...donor,
+    brand_id: donor.brand_id || brandId,
+    brand: donor.brand || brandName,
+    group: donor.group || groupName,
+    brand_state: donor.brand_state || brand.brand_state || brand.state || {},
+    primary_donor_id: donor.primary_donor_id || brand.primary_donor_id || "",
+    enabled: donor.enabled ?? brand.enabled,
+    schedule_type: donor.schedule_type || brand.schedule_type,
+    scan_time: donor.scan_time || brand.scan_time,
+    weekday: donor.weekday ?? brand.weekday,
+    next_run_at: donor.next_run_at || brand.next_run_at || "",
+    brand_created_at: donor.brand_created_at || brand.created_at || "",
+  }));
+}
+
+async function mergeNewsBrandDetail(brand) {
+  const monitors = monitorsFromNewsBrand(brand);
+  await mergeNewsMonitorDetails(monitors);
+  if (monitors.length) {
+    const brandKey = brandKeyForMonitor(monitors[0]);
+    const primaryId = String(brand.primary_donor_id || monitors[0].primary_donor_id || monitors[0].id || "");
+    if (primaryId) selectedNewsSites.set(brandKey, primaryId);
+  }
+  return brand;
+}
+
+async function loadNewsBrandDetail(brandId) {
+  if (!brandId) return null;
+  const data = await requestJson(`/api/news/brands/${brandId}`);
+  if (data.brand) {
+    await mergeNewsBrandDetail(data.brand);
+    return data.brand;
+  }
+  return null;
+}
+
 async function loadNewsMonitorDetail(monitorId) {
   if (!monitorId) return null;
+  const existing = (newsData?.monitors || []).find((item) => item.id === monitorId);
+  if (existing?.brand_id) {
+    await loadNewsBrandDetail(existing.brand_id);
+    return activeNewsMonitor();
+  }
   const data = await requestJson(`/api/news/monitors/${monitorId}`);
   const monitors = data.brand_monitors || (data.monitor ? [data.monitor] : []);
   await mergeNewsMonitorDetails(monitors);
   return data.monitor || null;
 }
-
 async function loadNewsSettingsOnly() {
   const data = await requestJson("/api/news?summary=1&monitors=0");
   setConnectionMethods(data.connection_methods);
@@ -2129,11 +2181,13 @@ async function loadNews() {
       .then(async (data) => {
         newsData = applyNewsPayload(data);
         if (pendingNewsMonitorId) {
-          const monitor = (newsData.monitors || []).find((item) => item.id === pendingNewsMonitorId);
+          const brandId = pendingNewsMonitorId;
+          const monitor = (newsData.monitors || []).find((item) => String(item.brand_id || "") === String(brandId));
           if (monitor) {
-            activeNewsBrandKey = `${monitor.group || "Маржа"}::${monitor.brand || ""}`;
-            selectedNewsSites.set(activeNewsBrandKey, monitor.id);
-            await loadNewsMonitorDetail(monitor.id);
+            activeNewsBrandKey = brandKeyForMonitor(monitor);
+            const primaryId = String(monitor.primary_donor_id || monitor.id || "");
+            if (primaryId) selectedNewsSites.set(activeNewsBrandKey, primaryId);
+            await loadNewsBrandDetail(brandId);
           }
         }
         return newsData;
@@ -2145,14 +2199,14 @@ async function loadNews() {
   await newsLoadPromise;
   renderNews();
   if (pendingNewsMonitorId) {
-    const monitor = (newsData?.monitors || []).find((item) => item.id === pendingNewsMonitorId);
+    const brandId = pendingNewsMonitorId;
+    const monitor = (newsData?.monitors || []).find((item) => String(item.brand_id || "") === String(brandId));
     pendingNewsMonitorId = "";
     if (monitor) {
-      openNewsModal(`${monitor.group || "Маржа"}::${monitor.brand || ""}`, { replace: true });
+      openNewsModal(brandKeyForMonitor(monitor), { replace: true });
     }
   }
 }
-
 function renderAll() {
   renderTabs();
   const project = activeProject();
@@ -3205,5 +3259,7 @@ window.addEventListener("popstate", () => {
 bootstrapActiveRoute().catch((error) => {
   errorText.textContent = error.message;
 });
+
+
 
 

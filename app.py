@@ -566,7 +566,7 @@ def normalize_emails(value: object) -> List[str]:
 def normalize_selector_settings(value: object) -> Dict[str, object]:
     if not isinstance(value, dict):
         value = {}
-    allowed = {"name_selector", "availability_selector", "photo_selector"}
+    allowed = {"name_selector", "availability_selector"}
     settings: Dict[str, object] = {}
     for key in allowed:
         text = clean_text(str(value.get(key, "")))
@@ -1917,6 +1917,96 @@ def delete_project_csv_for_project(project: Dict[str, object], keep_filename: st
                 pass
 
 
+
+def runtime_news_monitor_by_id(monitor_id: object) -> Optional[Dict[str, object]]:
+    monitor_id_text = str(monitor_id or "")
+    if not monitor_id_text:
+        return None
+    for monitor in news_settings.get("monitors", []):
+        if isinstance(monitor, dict) and str(monitor.get("id")) == monitor_id_text:
+            return monitor
+    return None
+
+
+def runtime_news_monitors_for_brand(brand_id: object) -> List[Dict[str, object]]:
+    brand_id_text = str(brand_id or "")
+    if not brand_id_text:
+        return []
+    return [
+        monitor
+        for monitor in news_settings.get("monitors", [])
+        if isinstance(monitor, dict) and str(monitor.get("brand_id")) == brand_id_text
+    ]
+
+
+def public_news_brand(brand: Brand) -> Dict[str, object]:
+    with news_lock:
+        runtime_monitors = runtime_news_monitors_for_brand(brand.id)
+        runtime_by_id = {str(monitor.get("id")): monitor for monitor in runtime_monitors}
+        runtime_brand_state = aggregate_brand_state(runtime_monitors) if runtime_monitors else None
+
+    brand_state = repair_mojibake({**make_news_state(), **(runtime_brand_state or brand.state or {})})
+    primary_donor_id = brand.primary_donor_id
+    if primary_donor_id and not any(donor.id == primary_donor_id for donor in brand.donors):
+        primary_donor_id = brand.donors[0].id if brand.donors else None
+
+    donors = []
+    for donor in sorted(brand.donors, key=lambda item: item.id):
+        runtime_monitor = runtime_by_id.get(str(donor.id)) or {}
+        donor_state = repair_mojibake({**brand_state, **(runtime_monitor.get("state") or {})})
+        site_url = str(donor.site_url or "").strip()
+        donors.append(
+            {
+                "id": str(donor.id),
+                "legacy_id": donor.legacy_id or "",
+                "brand_id": brand.id,
+                "site_url": site_url,
+                "start_urls": normalize_start_urls(donor.start_urls or [], allow_empty=True),
+                "thread_count": parse_thread_count(donor.thread_count),
+                "connection_id": donor.connection_id,
+                "connection_method": donor_connection_code(donor),
+                "auto_connection_fallback": bool(donor.auto_connection_fallback),
+                "exclusions": normalize_patterns(donor.exclusions or DEFAULT_EXCLUSIONS),
+                "product_url_filters": normalize_patterns(donor.product_url_filters or []),
+                "product_url_exclusions": normalize_patterns(getattr(donor, "product_url_exclusions", None) or []),
+                "extraction_rules": normalize_extraction_rules(donor.extraction_rules or {}),
+                "selector_settings": normalize_selector_settings(donor.selector_settings or {}),
+                "seen_models": [normalize_model_key(str(value)) for value in (donor.seen_models or []) if str(value).strip()],
+                "created_at": donor.created_at.isoformat(timespec="milliseconds") if donor.created_at else "",
+                "updated_at": donor.updated_at.isoformat(timespec="milliseconds") if donor.updated_at else "",
+                "state": donor_state,
+                "brand_state": brand_state,
+                "group": brand.group_name,
+                "brand": brand.name,
+                "brand_created_at": brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else "",
+                "primary_donor_id": primary_donor_id,
+                "enabled": bool(brand.enabled),
+                "schedule_type": brand.schedule_type or "daily",
+                "scan_time": brand.scan_time or "01:00",
+                "weekday": max(0, min(int(brand.weekday or 0), 6)),
+                "next_run_at": datetime_to_input_value(brand.next_run_at),
+            }
+        )
+
+    return {
+        "id": brand.id,
+        "brand_id": brand.id,
+        "name": brand.name,
+        "brand": brand.name,
+        "group_name": brand.group_name,
+        "group": brand.group_name,
+        "state": brand_state,
+        "brand_state": brand_state,
+        "enabled": bool(brand.enabled),
+        "schedule_type": brand.schedule_type or "daily",
+        "scan_time": brand.scan_time or "01:00",
+        "weekday": max(0, min(int(brand.weekday or 0), 6)),
+        "next_run_at": datetime_to_input_value(brand.next_run_at),
+        "primary_donor_id": primary_donor_id,
+        "created_at": brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else "",
+        "updated_at": brand.updated_at.isoformat(timespec="milliseconds") if brand.updated_at else "",
+        "donors": donors,
+    }
 def public_news_monitor(monitor: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
     public_monitor = repair_mojibake(dict(monitor))
     state = dict(public_monitor.get("state") or make_news_state())
@@ -6354,43 +6444,6 @@ def text_by_selector(soup: BeautifulSoup, selector: str) -> str:
         return ""
 
 
-def image_by_selector(soup: BeautifulSoup, selector: str, base_url: str) -> str:
-    if not selector:
-        return ""
-    try:
-        node = soup.select_one(selector)
-    except Exception:
-        return ""
-    if not node:
-        return ""
-    if node.name == "img":
-        value = node.get("src") or node.get("data-src") or node.get("data-original") or ""
-    else:
-        image = node.select_one("img")
-        value = image.get("src") or image.get("data-src") or image.get("data-original") if image else ""
-    return normalize_url(value, base_url) or "" if value else ""
-
-
-def extract_photo_url(soup: BeautifulSoup, base_url: str, selector: str = "") -> str:
-    selected = image_by_selector(soup, selector, base_url)
-    if selected:
-        return selected
-    meta = soup.select_one("meta[property='og:image'], meta[name='twitter:image'], link[itemprop='image']")
-    if meta:
-        value = meta.get("content") or meta.get("href") or ""
-        normalized = normalize_url(value, base_url)
-        if normalized:
-            return normalized
-    for image in soup.select("img[src], img[data-src], img[data-original]"):
-        value = image.get("src") or image.get("data-src") or image.get("data-original") or ""
-        normalized = normalize_url(value, base_url)
-        if normalized and not has_static_extension(normalized.replace(".jpg", "")):
-            return normalized
-        if normalized:
-            return normalized
-    return ""
-
-
 def extract_availability(soup: BeautifulSoup, selector: str = "") -> str:
     selected = text_by_selector(soup, selector)
     if selected:
@@ -6742,7 +6795,7 @@ def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
     for key in ("product_card_selector", "product_url_selector", "model_selector", "price_selector"):
         if rules.get(key):
             selector_fields.append((key, str(rules[key])))
-    for key in ("name_selector", "availability_selector", "photo_selector"):
+    for key in ("name_selector", "availability_selector"):
         if selectors.get(key):
             selector_fields.append((key, str(selectors[key])))
     soup = BeautifulSoup("", "html.parser")
@@ -7093,7 +7146,6 @@ def enrich_news_product(
         "model": product.get("model", ""),
         "price": product.get("price", ""),
         "availability": "",
-        "photo_url": "",
         "url": url,
     }
     fetcher = CollectOnlyCrawler(
@@ -7137,7 +7189,6 @@ def enrich_news_product(
             details["model"] = prepared_model
     details["name"] = name or details["name"]
     details["availability"] = extract_availability(soup, str(selector_settings.get("availability_selector", "")))
-    details["photo_url"] = extract_photo_url(soup, url, str(selector_settings.get("photo_selector", "")))
     return details
 
 
@@ -7292,8 +7343,7 @@ def enrich_news_candidates(
                 "model": product.get("model", ""),
                 "price": product.get("price", ""),
                 "availability": "",
-                "photo_url": "",
-                "url": product.get("url", ""),
+                        "url": product.get("url", ""),
             }
             resolved[index] = details
             progress_callback(index + 1, details.get("url", ""))
@@ -7992,9 +8042,9 @@ def news_page() -> str:
     return render_app_page("news")
 
 
-@app.get("/news/edit/<monitor_id>")
-def news_edit_page(monitor_id: str) -> str:
-    return render_app_page("news", active_news_id=monitor_id)
+@app.get("/news/edit/<brand_id>")
+def news_edit_page(brand_id: str) -> str:
+    return render_app_page("news", active_news_id=brand_id)
 
 
 @app.get("/file-import")
@@ -8110,6 +8160,19 @@ def api_test_news_email():
         return jsonify({"error": errors[-1] if errors else "Email не отправлен. Проверьте SMTP-настройки и логи мониторинга."}), 500
     return jsonify({"ok": True})
 
+
+@app.get("/api/news/brands/<brand_id>")
+def api_get_news_brand(brand_id: str):
+    ensure_storage()
+    brand_pk = parse_db_int(brand_id)
+    if not brand_pk:
+        return jsonify({"error": "Бренд не найден"}), 404
+    with session_scope() as session:
+        brand = session.get(Brand, brand_pk)
+        if not brand:
+            return jsonify({"error": "Бренд не найден"}), 404
+        payload = public_news_brand(brand)
+    return jsonify({"brand": payload})
 
 @app.get("/api/news/monitors/<monitor_id>")
 def api_get_news_monitor(monitor_id: str):
@@ -9267,4 +9330,7 @@ if __name__ == "__main__":
     with make_server("127.0.0.1", port, app, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
         print(f"Serving on http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
+
+
+
 
