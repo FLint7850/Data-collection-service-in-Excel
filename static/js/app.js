@@ -2583,17 +2583,33 @@ async function addNewsMonitorToGroup(group) {
   }
 }
 
+function mergeNewsMonitorPatch(currentMonitor, nextMonitor) {
+  if (!currentMonitor) return nextMonitor;
+  const merged = { ...currentMonitor, ...nextMonitor };
+  if (nextMonitor.state && currentMonitor.state) {
+    merged.state = { ...currentMonitor.state, ...nextMonitor.state };
+  }
+  if (nextMonitor.brand_state && currentMonitor.brand_state) {
+    merged.brand_state = { ...currentMonitor.brand_state, ...nextMonitor.brand_state };
+  }
+  return merged;
+}
+
 function applyNewsMonitorResponse(data) {
   const monitors = Array.isArray(data?.brand_monitors) && data.brand_monitors.length
     ? data.brand_monitors
     : (data?.monitor ? [data.monitor] : []);
+  let primaryMonitor = null;
   monitors.forEach((nextMonitor) => {
     const index = (newsData?.monitors || []).findIndex((monitor) => monitor.id === nextMonitor.id);
     if (index >= 0) {
-      newsData.monitors[index] = nextMonitor;
+      newsData.monitors[index] = mergeNewsMonitorPatch(newsData.monitors[index], nextMonitor);
+      if (data?.monitor?.id === nextMonitor.id || !primaryMonitor) {
+        primaryMonitor = newsData.monitors[index];
+      }
     }
   });
-  return data?.monitor || monitors[0] || null;
+  return primaryMonitor || data?.monitor || monitors[0] || null;
 }
 
 async function runNewsAction(monitorId, endpoint) {

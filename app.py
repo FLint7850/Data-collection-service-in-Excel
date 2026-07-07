@@ -8294,19 +8294,44 @@ def api_reset_news_monitor_visual(monitor_id: str):
         ]
         if any(str((item.get("state") or {}).get("status") or "") in active_statuses for item in brand_monitors):
             return jsonify({"error": "Нельзя сбрасывать статус, пока сканирование выполняется."}), 409
+        previous_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+        reset_state = make_news_state("idle")
+        last_csv = str(previous_state.get("last_csv") or "")
+        if last_csv:
+            reset_state["last_csv"] = last_csv
         for item in brand_monitors:
-            previous_state = item.get("state", {}) if isinstance(item.get("state"), dict) else {}
-            reset_state = make_news_state("idle")
-            last_csv = str(previous_state.get("last_csv") or "")
-            if last_csv:
-                reset_state["last_csv"] = last_csv
-            item["state"] = reset_state
+            item["state"] = dict(reset_state)
             item["brand_state"] = dict(reset_state)
             item.pop("_last_progress_state", None)
-        save_news_settings()
-        response_monitors = [public_news_monitor(item) for item in brand_monitors]
-        response_monitor = next((item for item in response_monitors if str(item.get("id")) == str(monitor_id)), response_monitors[0] if response_monitors else public_news_monitor(monitor))
-    return jsonify({"monitor": response_monitor, "brand_monitors": response_monitors})
+        persist_news_monitor_state(monitor, force=True)
+    state_patch = {
+        "status": "idle",
+        "stage": "",
+        "percent": 0,
+        "currenturl": "",
+        "processed": 0,
+        "found_products": 0,
+        "candidate_products": 0,
+        "compared_products": 0,
+        "queue_size": 0,
+        "active_tasks": 0,
+        "active_urls": [],
+        "in_memory_products": 0,
+        "availability_skipped": 0,
+        "failed_pages": 0,
+        "stall_seconds": 0,
+        "last_event": "",
+        "last_warning": "",
+        "new_count": 0,
+        "missing_by_feed": [],
+        "skipped": 0,
+        "last_scan_at": "",
+        "error": "",
+        "started_at": "",
+        "finished_at": "",
+        "elapsed_seconds": 0,
+    }
+    return jsonify({"monitor": {"id": str(monitor_id), "state": state_patch, "brand_state": dict(state_patch)}})
 
 @app.post("/api/news/monitors")
 def api_create_news_monitor():
