@@ -5075,8 +5075,17 @@ def read_file_import_rows(path: Path, model_field: str) -> List[Dict[str, object
         sheet = workbook.active
         rows = [list(row) for row in sheet.iter_rows(values_only=True)]
         workbook.close()
+    elif path.suffix.lower() == ".xls":
+        try:
+            import xlrd
+        except ImportError as exc:
+            raise ValueError("Для обработки XLS установите зависимость xlrd") from exc
+
+        workbook = xlrd.open_workbook(str(path))
+        sheet = workbook.sheet_by_index(0)
+        rows = [sheet.row_values(row_index) for row_index in range(sheet.nrows)]
     else:
-        raise ValueError("Можно обработать только CSV или XLSX")
+        raise ValueError("Можно обработать только CSV, XLS или XLSX")
 
     header_index = next((index for index, row in enumerate(rows) if any(clean_text(str(cell or "")) for cell in row)), None)
     if header_index is None:
@@ -5137,6 +5146,12 @@ def technical_clean_model_text(value: object, remove_brackets: bool = True) -> s
     text = re.sub(r"\s*([/_.+\-])\s*", r"\1", text)
     if remove_brackets:
         text = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", " ", text)
+    return clean_text(text)
+
+
+def strip_file_import_non_model_phrases(value: str) -> str:
+    text = clean_text(value)
+    text = re.sub(r"(?<![A-Za-z0-9])side\s*[- ]\s*by\s*[- ]\s*side(?![A-Za-z0-9])", " ", text, flags=re.IGNORECASE)
     return clean_text(text)
 
 
@@ -5331,7 +5346,7 @@ def code_model_tokens(value: str) -> List[str]:
 
 
 def generate_model_candidates(name: str, brand: str = "") -> List[str]:
-    cleaned = technical_clean_model_text(name)
+    cleaned = strip_file_import_non_model_phrases(technical_clean_model_text(name))
     detected_brand = find_brand_in_name(cleaned, brand)
     tail = tail_after_brand(cleaned, detected_brand)
     main_part = re.split(r"[,;|]", tail, maxsplit=1)[0]
