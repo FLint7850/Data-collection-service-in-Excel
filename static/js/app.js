@@ -310,7 +310,6 @@ let progressIncludesNews = null;
 let newsLoadPromise = null;
 const stableProjectStates = new Map();
 const stableNewsMonitorStates = new Map();
-const stableNewsBrandStates = new Map();
 
 const statusLabels = {
   idle: "ожидание",
@@ -350,7 +349,6 @@ function stampNewsStates(data) {
   const receivedAt = Date.now();
   (data?.monitors || []).forEach((monitor) => {
     if (monitor?.state) monitor.state._receivedAt = receivedAt;
-    if (monitor?.brand_state) monitor.brand_state._receivedAt = receivedAt;
   });
   return data;
 }
@@ -478,12 +476,6 @@ function applyNewsPayload(data) {
       stableNewsMonitorStates,
       monitor.id,
       monitor.state || {},
-      newsFields
-    );
-    monitor.brand_state = rememberStableProgressState(
-      stableNewsBrandStates,
-      monitor.brand_id || `${monitor.group || ""}::${monitor.brand || ""}`,
-      monitor.brand_state || {},
       newsFields
     );
     return monitor;
@@ -1174,12 +1166,7 @@ function aggregateNewsStatus(states) {
 }
 
 function stateWithBrandState(monitor) {
-  const state = { ...(monitor.state || {}) };
-  const brandState = monitor.brand_state || null;
-  if (brandState && (!state.status || state.status === "idle")) {
-    return { ...state, ...brandState };
-  }
-  return state;
+  return { ...(monitor.state || {}) };
 }
 
 function clampPercent(value) {
@@ -1602,7 +1589,7 @@ async function openNewsModal(brandKey, options = {}) {
       newsModalContent.innerHTML = `<div class="modal-summary-row">Загружаю настройки бренда...</div>`;
       try {
         await loadNewsBrandDetail(brandId);
-        selected = activeNewsMonitor();
+        activeNewsMonitor();
       } catch (error) {
         errorText.textContent = error.message;
       }
@@ -2118,7 +2105,6 @@ function monitorsFromNewsBrand(brand) {
     brand_id: donor.brand_id || brandId,
     brand: donor.brand || brandName,
     group: donor.group || groupName,
-    brand_state: donor.brand_state || brand.brand_state || brand.state || {},
     primary_donor_id: donor.primary_donor_id || brand.primary_donor_id || "",
     enabled: donor.enabled ?? brand.enabled,
     schedule_type: donor.schedule_type || brand.schedule_type,
@@ -2642,9 +2628,6 @@ function mergeNewsMonitorPatch(currentMonitor, nextMonitor) {
   const merged = { ...currentMonitor, ...nextMonitor };
   if (nextMonitor.state && currentMonitor.state) {
     merged.state = { ...currentMonitor.state, ...nextMonitor.state };
-  }
-  if (nextMonitor.brand_state && currentMonitor.brand_state) {
-    merged.brand_state = { ...currentMonitor.brand_state, ...nextMonitor.brand_state };
   }
   return merged;
 }

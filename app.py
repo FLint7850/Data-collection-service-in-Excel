@@ -1975,7 +1975,6 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
                 "created_at": donor.created_at.isoformat(timespec="milliseconds") if donor.created_at else "",
                 "updated_at": donor.updated_at.isoformat(timespec="milliseconds") if donor.updated_at else "",
                 "state": donor_state,
-                "brand_state": brand_state,
                 "group": brand.group_name,
                 "brand": brand.name,
                 "brand_created_at": brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else "",
@@ -1996,7 +1995,6 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
         "group_name": brand.group_name,
         "group": brand.group_name,
         "state": brand_state,
-        "brand_state": brand_state,
         "enabled": bool(brand.enabled),
         "schedule_type": brand.schedule_type or "daily",
         "scan_time": brand.scan_time or "01:00",
@@ -2009,6 +2007,8 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
     }
 def public_news_monitor(monitor: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
     public_monitor = repair_mojibake(dict(monitor))
+    public_monitor.pop("known_new_products", None)
+    public_monitor.pop("brand_state", None)
     state = dict(public_monitor.get("state") or make_news_state())
     original_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     original_data = original_state.get("data", {}) if isinstance(original_state.get("data"), dict) else {}
@@ -2026,16 +2026,6 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
     if state.get("last_csv"):
         state["last_csv"] = str(repair_mojibake_text(state["last_csv"]) or state["last_csv"])
     public_monitor["state"] = state
-    if isinstance(public_monitor.get("brand_state"), dict):
-        brand_state = dict(public_monitor["brand_state"])
-        brand_data = brand_state.get("data", {}) if isinstance(brand_state.get("data"), dict) else {}
-        brand_filename = str(brand_state.get("last_csv") or brand_data.get("csv") or filename)
-        if brand_filename and not brand_state.get("last_csv"):
-            brand_state["last_csv"] = str(repair_mojibake_text(brand_filename) or brand_filename)
-        brand_state["csv_ready"] = bool(resolve_export_file(brand_filename))
-        if brand_state.get("last_csv"):
-            brand_state["last_csv"] = str(repair_mojibake_text(brand_state["last_csv"]) or brand_state["last_csv"])
-        public_monitor["brand_state"] = brand_state
     if not include_details:
         summary_keys = {
             "id",
@@ -2047,7 +2037,6 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
             "start_urls",
             "enabled",
             "state",
-            "brand_state",
             "created_at",
             "brand_created_at",
         }
@@ -8259,7 +8248,7 @@ def api_update_news_monitor(monitor_id: str):
                         brand.primary_donor_id = primary_donor_pk
         sync_brand_runtime_fields(monitor)
         save_news_settings()
-    response_monitor = dict(monitor)
+    response_monitor = public_news_monitor(monitor)
     if "primary_donor_id" in payload:
         response_monitor["primary_donor_id"] = parse_db_int(payload.get("primary_donor_id"))
     return jsonify({"monitor": response_monitor})
@@ -8284,7 +8273,7 @@ def api_scan_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
-        response_monitor = dict(monitor)
+        response_monitor = public_news_monitor(monitor)
     if not enqueue_news_scan(monitor_id, manual=True):
         return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     return jsonify({"monitor": response_monitor})
@@ -8297,7 +8286,7 @@ def api_stop_news_monitor(monitor_id: str):
         return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "stop")
     with news_lock:
-        response_monitor = dict(monitor)
+        response_monitor = public_news_monitor(monitor)
     threading.Thread(
         target=add_news_log,
         args=(monitor, "Запрошена остановка сканирования новинок", "warning"),
@@ -8313,7 +8302,7 @@ def api_pause_news_monitor(monitor_id: str):
         return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "pause")
     with news_lock:
-        response_monitor = dict(monitor)
+        response_monitor = public_news_monitor(monitor)
     threading.Thread(
         target=add_news_log,
         args=(monitor, "Запрошена приостановка сканирования новинок с сохранением результата", "warning"),
@@ -8333,7 +8322,7 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "Продолжение"}
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
-        response_monitor = dict(monitor)
+        response_monitor = public_news_monitor(monitor)
     if not enqueue_news_scan(monitor_id, manual=True):
         return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
@@ -8394,7 +8383,7 @@ def api_reset_news_monitor_visual(monitor_id: str):
         "finished_at": "",
         "elapsed_seconds": 0,
     }
-    return jsonify({"monitor": {"id": str(monitor_id), "state": state_patch, "brand_state": dict(state_patch)}})
+    return jsonify({"monitor": {"id": str(monitor_id), "state": state_patch}})
 
 @app.post("/api/news/monitors")
 def api_create_news_monitor():
@@ -8417,7 +8406,7 @@ def api_create_news_monitor():
         news_settings.setdefault("monitors", []).append(monitor)
         save_news_settings()
     add_news_log(monitor, "Монитор новинок создан", "success")
-    return jsonify({"monitor": dict(monitor)})
+    return jsonify({"monitor": public_news_monitor(monitor)})
 
 
 @app.delete("/api/news/monitors/<monitor_id>")
@@ -8450,7 +8439,7 @@ def api_delete_news_monitor(monitor_id: str):
         news_stop_events.pop(monitor_id, None)
         save_news_settings()
     add_news_log(monitor, "Монитор новинок удален", "warning")
-    return jsonify({"ok": True, "monitors": [dict(item) for item in news_settings.get("monitors", []) if isinstance(item, dict)]})
+    return jsonify({"ok": True, "monitors": [public_news_monitor(item) for item in news_settings.get("monitors", []) if isinstance(item, dict)]})
 
 
 @app.get("/api/news/monitors/<monitor_id>/download")
