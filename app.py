@@ -4901,6 +4901,10 @@ FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx", ".xls"}
 FILE_IMPORT_ACTIVE_STATUSES = {"queued", "running", "stopping"}
 
 
+class FileImportStopped(Exception):
+    pass
+
+
 def make_file_import_state(status: str = "idle") -> Dict[str, object]:
     return {
         "status": status,
@@ -4966,6 +4970,11 @@ def update_file_import_state(db_session, **kwargs: object) -> Dict[str, object]:
     row.state = normalize_file_import_state(state)
     db_session.flush()
     return dict(row.state)
+
+
+def stop_file_import_if_requested(stop_event: Optional[threading.Event]) -> None:
+    if stop_event and stop_event.is_set():
+        raise FileImportStopped()
 
 
 def clear_file_import_storage() -> None:
@@ -5468,9 +5477,11 @@ def index_feed_value(index: Dict[str, Dict[str, object]], value: str, item: Dict
         feed_index_add(index, key, item)
 
 
-def build_feed_index_from_xml(content: bytes, feed: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+def build_feed_index_from_xml(content: bytes, feed: Dict[str, object], stop_event: Optional[threading.Event] = None) -> Dict[str, Dict[str, object]]:
     index: Dict[str, Dict[str, object]] = {}
-    for _event, node in ET.iterparse(io.BytesIO(content), events=("end",)):
+    for node_index, (_event, node) in enumerate(ET.iterparse(io.BytesIO(content), events=("end",)), start=1):
+        if node_index % 500 == 0:
+            stop_file_import_if_requested(stop_event)
         children = list(node)
         if not children:
             continue
@@ -5500,15 +5511,16 @@ def build_feed_index_from_xml(content: bytes, feed: Dict[str, object]) -> Dict[s
     return index
 
 
-def build_file_import_feed_indexes() -> List[Dict[str, object]]:
-    downloaded_feeds = download_feed_files()
+def build_file_import_feed_indexes(stop_event: Optional[threading.Event] = None) -> List[Dict[str, object]]:
+    downloaded_feeds = download_feed_files(stop_event=stop_event)
     feed_indexes: List[Dict[str, object]] = []
     for feed in downloaded_feeds:
+        stop_file_import_if_requested(stop_event)
         path = feed_snapshot_path(feed)
         try:
             if path is None:
                 raise FileNotFoundError("Не задан путь к snapshot фида")
-            index = build_feed_index_from_xml(path.read_bytes(), feed)
+            index = build_feed_index_from_xml(path.read_bytes(), feed, stop_event=stop_event)
             feed_indexes.append({**feed, "index": index, "codes_count": len(index)})
         except Exception as exc:
             feed_indexes.append({**feed, "index": {}, "codes_count": 0, "error": str(exc)})
@@ -5584,11 +5596,14 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
         result_filename="",
     )
     db.commit()
+    stop_file_import_if_requested(stop_event)
     source_rows = read_file_import_rows(path, model_field)
     total_rows = len(source_rows)
     update_file_import_state(db, stage="Загружаю фиды", percent=8, total_rows=total_rows)
     db.commit()
-    feed_indexes = build_file_import_feed_indexes()
+    stop_file_import_if_requested(stop_event)
+    feed_indexes = build_file_import_feed_indexes(stop_event=stop_event)
+    stop_file_import_if_requested(stop_event)
     update_file_import_state(db, stage="Сравниваю строки", percent=10, total_rows=total_rows)
     db.commit()
 
@@ -5684,6 +5699,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
     result_path = EXPORT_DIR / file_import_result_filename(original_filename)
     update_file_import_state(db, stage="Записываю CSV", percent=98)
     db.commit()
+    stop_file_import_if_requested(stop_event)
     with result_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         fieldnames = [
             "row",
@@ -5737,6 +5753,18 @@ def run_file_import_compare(stop_event: threading.Event) -> None:
     db = SessionLocal()
     try:
         compare_file_import_with_feeds(db, stop_event=stop_event)
+    except FileImportStopped:
+        db.rollback()
+        try:
+            update_file_import_state(
+                db,
+                status="stopped",
+                stage="Остановлено",
+                finished_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
     except Exception as exc:
         db.rollback()
         try:
@@ -6040,7 +6068,20 @@ def cleanup_feed_snapshots() -> None:
             continue
 
 
-def download_feed_files() -> List[Dict[str, object]]:
+def wait_feed_futures(futures, stop_event: Optional[threading.Event]) -> List[object]:
+    pending = set(futures)
+    results: List[object] = []
+    while pending:
+        stop_file_import_if_requested(stop_event)
+        completed, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+        if not completed:
+            continue
+        for future in completed:
+            results.append(future.result())
+    return results
+
+
+def download_feed_files(stop_event: Optional[threading.Event] = None) -> List[Dict[str, object]]:
     with news_lock:
         own_sites = own_sites_from_settings(news_settings)
         feed_urls = [site["feed_url"] for site in own_sites]
@@ -6058,24 +6099,40 @@ def download_feed_files() -> List[Dict[str, object]]:
         ):
             return [dict(feed) for feed in cache_feeds if isinstance(feed, dict)]
 
+        stop_file_import_if_requested(stop_event)
         if generate_urls:
-            with ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(generate_urls))) as executor:
-                list(executor.map(trigger_feed_generation, generate_urls))
+            executor = ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(generate_urls)))
+            try:
+                wait_feed_futures([executor.submit(trigger_feed_generation, url) for url in generate_urls], stop_event)
+            except FileImportStopped:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
 
         snapshot = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         snapshot_dir = feed_snapshots_dir() / snapshot
         snapshot_dir.mkdir(parents=True, exist_ok=False)
         downloaded: List[Dict[str, object]] = []
         if own_sites:
-            with ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(own_sites))) as executor:
+            executor = ThreadPoolExecutor(max_workers=min(FEED_WORKER_COUNT, len(own_sites)))
+            try:
                 futures = [
                     executor.submit(download_feed_site, index, site, snapshot_dir, snapshot)
                     for index, site in enumerate(own_sites, start=1)
                 ]
-                for future in futures:
-                    feed = future.result()
+                for feed in wait_feed_futures(futures, stop_event):
                     if feed:
                         downloaded.append(feed)
+            except FileImportStopped:
+                executor.shutdown(wait=False, cancel_futures=True)
+                try:
+                    shutil.rmtree(snapshot_dir)
+                except OSError:
+                    pass
+                raise
+            else:
+                executor.shutdown(wait=True)
         if not downloaded:
             try:
                 shutil.rmtree(snapshot_dir)
