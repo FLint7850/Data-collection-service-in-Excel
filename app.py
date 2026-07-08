@@ -5261,7 +5261,7 @@ def model_signal_token(token: str) -> bool:
     value = clean_text(token)
     if not value:
         return False
-    if re.fullmatch(r"\d+(?:[.,]\d+)?(?:ВТ|W|BT|В|V|B|Л|L|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM)(?:/\d+(?:[.,]\d+)?(?:ВТ|W|BT|В|V|B|Л|L|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM))*", value.upper()):
+    if re.fullmatch(r"\d+(?:[.,]\d+)?(?:ВТ|W|BT|В|V|B|Л|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM)(?:/\d+(?:[.,]\d+)?(?:ВТ|W|BT|В|V|B|Л|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM))*", value.upper()):
         return False
     has_digit = bool(re.search(r"\d", value))
     has_latin = bool(re.search(r"[A-Za-z]", value))
