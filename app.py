@@ -5201,11 +5201,19 @@ def read_file_import_rows(path: Path, model_field: str) -> List[Dict[str, object
     return result
 
 
+def strip_file_import_model_special_chars(value: str) -> str:
+    text = re.sub(r"[^0-9A-Za-zА-Яа-яЁё\s\-./\\|@+]+", " ", str(value or ""))
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*([\-./\\|])\s*", r"\1", text)
+    return clean_text(text)
+
+
 def prepare_file_import_model(value: str, replace_rules: str) -> str:
-    return prepare_rule_model(
+    prepared = prepare_rule_model(
         str(value or ""),
         {"model_replace_rules": normalize_file_import_rules_text(replace_rules)},
     )
+    return strip_file_import_model_special_chars(prepared)
 
 
 VISUAL_MODEL_TRANSLATION = str.maketrans(
@@ -5347,7 +5355,7 @@ def model_signal_token(token: str) -> bool:
     value = clean_text(token)
     if not value:
         return False
-    if re.fullmatch(r"\d+(?:[.,]\d+)?(?:ВТ|W|BT|В|V|B|Л|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM)(?:/\d+(?:[.,]\d+)?(?:ВТ|W|BT|В|V|B|Л|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM))*", value.upper()):
+    if re.fullmatch(r"\d+(?:[.,]\d+)?(?:ВТ|BT|В|V|B|Л|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM)(?:/\d+(?:[.,]\d+)?(?:ВТ|BT|В|V|B|Л|МЛ|ML|КГ|KG|Г|G|СМ|CM|ММ|MM))*", value.upper()):
         return False
     has_digit = bool(re.search(r"\d", value))
     has_latin = bool(re.search(r"[A-Za-z]", value))
