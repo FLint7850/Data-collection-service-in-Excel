@@ -950,6 +950,17 @@ select:focus {
   background: rgba(45, 168, 157, 0.1);
 }
 
+.file-dropzone.is-dragover {
+  border-color: var(--primary);
+  background: rgba(45, 168, 157, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(45, 168, 157, 0.28);
+}
+
+.file-dropzone.is-uploading {
+  cursor: wait;
+  opacity: 0.78;
+}
+
 .file-dropzone input {
   position: absolute;
   width: 1px;

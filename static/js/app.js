@@ -51,6 +51,7 @@ const priceSelector = document.querySelector("#priceSelector");
 const modelStartMarker = document.querySelector("#modelStartMarker");
 const modelEndMarker = document.querySelector("#modelEndMarker");
 const modelReplaceRules = document.querySelector("#modelReplaceRules");
+const fileDropzone = document.querySelector("#fileDropzone");
 const fileImportInput = document.querySelector("#fileImportInput");
 const fileImportExclusions = document.querySelector("#fileImportExclusions");
 const fileImportExclusionsDetails = document.querySelector(".file-import-exclusions");
@@ -70,6 +71,7 @@ const fileImportNotice = document.querySelector("#fileImportNotice");
 const fileImportActions = document.querySelector("#fileImportActions");
 const compareFileImportButton = document.querySelector("#compareFileImportButton");
 const downloadFileImportCsvButton = document.querySelector("#downloadFileImportCsvButton");
+const fileImportAllowedExtensions = new Set(["csv", "xls", "xlsx"]);
 
 function enableDetailsAnimation(details) {
   if (!details) return;
@@ -1236,6 +1238,10 @@ function renderFileImport() {
     downloadFileImportCsvButton.href = "#";
   }
   fileImportInput.disabled = fileImportUploading;
+  if (fileDropzone) {
+    fileDropzone.classList.toggle("is-uploading", fileImportUploading);
+    fileDropzone.setAttribute("aria-disabled", fileImportUploading ? "true" : "false");
+  }
   if (!fileImportUploading && !file) {
     fileImportProgress.classList.add("hidden");
     setFileImportProgress(0, "");
@@ -1293,6 +1299,45 @@ function uploadFileImport(file) {
     xhr.addEventListener("error", () => reject(new Error("Не удалось выгрузить файл")));
     xhr.send(formData);
   });
+}
+
+function fileImportExtension(file) {
+  return String(file?.name || "").split(".").pop().toLowerCase();
+}
+
+async function handleFileImportSelection(files) {
+  const selectedFiles = Array.from(files || []).filter(Boolean);
+  if (!selectedFiles.length) return;
+  if (fileImportUploading) {
+    fileImportNotice.textContent = "Дождитесь окончания загрузки файла";
+    return;
+  }
+  if (selectedFiles.length > 1) {
+    fileImportNotice.textContent = "Можно загрузить только один файл";
+    return;
+  }
+
+  const file = selectedFiles[0];
+  if (!fileImportAllowedExtensions.has(fileImportExtension(file))) {
+    fileImportNotice.textContent = "Можно загрузить только CSV, XLS или XLSX";
+    return;
+  }
+
+  fileImportUploading = true;
+  fileImportProgress.classList.remove("hidden");
+  setFileImportProgress(0, "Подготовка...");
+  renderFileImport();
+  try {
+    fileImportData = await uploadFileImport(file);
+    fileImportLoaded = true;
+    setFileImportProgress(100, "Файл выгружен");
+  } catch (error) {
+    if (fileImportInput) fileImportInput.value = "";
+    fileImportNotice.textContent = error.message;
+  } finally {
+    fileImportUploading = false;
+    renderFileImport();
+  }
 }
 
 async function deleteFileImport() {
@@ -2429,23 +2474,43 @@ if (saveFileImportButton && fileImportSaveNotice) {
 
 if (fileImportInput) {
   fileImportInput.addEventListener("change", async () => {
-    const file = fileImportInput.files?.[0] || null;
-    if (!file) return;
-    fileImportUploading = true;
-    fileImportProgress.classList.remove("hidden");
-    setFileImportProgress(0, "Подготовка...");
-    renderFileImport();
-    try {
-      fileImportData = await uploadFileImport(file);
-      fileImportLoaded = true;
-      setFileImportProgress(100, "Файл выгружен");
-    } catch (error) {
-      fileImportInput.value = "";
-      fileImportNotice.textContent = error.message;
-    } finally {
-      fileImportUploading = false;
-      renderFileImport();
-    }
+    await handleFileImportSelection(fileImportInput.files);
+  });
+}
+
+if (fileDropzone) {
+  let fileImportDragDepth = 0;
+
+  function resetFileImportDragState() {
+    fileImportDragDepth = 0;
+    fileDropzone.classList.remove("is-dragover");
+  }
+
+  ["dragenter", "dragover"].forEach((eventName) => {
+    fileDropzone.addEventListener(eventName, (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (eventName === "dragenter") fileImportDragDepth += 1;
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = fileImportUploading ? "none" : "copy";
+      }
+      if (!fileImportUploading) fileDropzone.classList.add("is-dragover");
+    });
+  });
+
+  fileDropzone.addEventListener("dragleave", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    fileImportDragDepth = Math.max(0, fileImportDragDepth - 1);
+    if (fileImportDragDepth === 0) fileDropzone.classList.remove("is-dragover");
+  });
+
+  fileDropzone.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const files = event.dataTransfer?.files || [];
+    resetFileImportDragState();
+    await handleFileImportSelection(files);
   });
 }
 
