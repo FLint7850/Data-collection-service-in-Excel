@@ -5522,6 +5522,8 @@ def build_file_import_feed_indexes(stop_event: Optional[threading.Event] = None)
                 raise FileNotFoundError("Не задан путь к snapshot фида")
             index = build_feed_index_from_xml(path.read_bytes(), feed, stop_event=stop_event)
             feed_indexes.append({**feed, "index": index, "codes_count": len(index)})
+        except FileImportStopped:
+            raise
         except Exception as exc:
             feed_indexes.append({**feed, "index": {}, "codes_count": 0, "error": str(exc)})
     with news_lock:
@@ -5534,11 +5536,17 @@ def build_file_import_feed_indexes(stop_event: Optional[threading.Event] = None)
     return feed_indexes
 
 
-def match_candidates_against_feed_indexes(candidates: List[str], feed_indexes: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+def match_candidates_against_feed_indexes(
+    candidates: List[str],
+    feed_indexes: List[Dict[str, object]],
+    stop_event: Optional[threading.Event] = None,
+) -> Optional[Dict[str, object]]:
     for candidate in candidates:
+        stop_file_import_if_requested(stop_event)
         keys = compare_keys_for_value(candidate)
         for reason, key in keys.items():
             for feed in feed_indexes:
+                stop_file_import_if_requested(stop_event)
                 index = feed.get("index", {})
                 if isinstance(index, dict) and key in index:
                     match = dict(index[key])
@@ -5554,12 +5562,18 @@ def match_candidates_against_feed_indexes(candidates: List[str], feed_indexes: L
     return None
 
 
-def missing_feed_labels(candidates: List[str], feed_indexes: List[Dict[str, object]]) -> List[str]:
+def missing_feed_labels(
+    candidates: List[str],
+    feed_indexes: List[Dict[str, object]],
+    stop_event: Optional[threading.Event] = None,
+) -> List[str]:
     labels: List[str] = []
     keys = set()
     for candidate in candidates:
+        stop_file_import_if_requested(stop_event)
         keys.update(compare_keys_for_value(candidate).values())
     for feed in feed_indexes:
+        stop_file_import_if_requested(stop_event)
         index = feed.get("index", {})
         if not isinstance(index, dict) or not (keys & set(index.keys())):
             labels.append(str(feed.get("source_label") or feed.get("url") or "Фид"))
@@ -5659,7 +5673,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                     }
                 )
             else:
-                match = match_candidates_against_feed_indexes(candidates, feed_indexes)
+                match = match_candidates_against_feed_indexes(candidates, feed_indexes, stop_event=stop_event)
                 if match:
                     found += 1
                 else:
@@ -5672,7 +5686,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                             "brand": brand,
                             "model_candidates": " | ".join(candidates),
                             "selected_model": selected_model,
-                            "missing_on": ", ".join(missing_feed_labels(candidates, feed_indexes)),
+                            "missing_on": ", ".join(missing_feed_labels(candidates, feed_indexes, stop_event=stop_event)),
                         }
                     )
         now = time.time()
@@ -8066,13 +8080,21 @@ def api_compare_file_import():
 def api_stop_file_import():
     ensure_storage()
     with file_import_lock:
-        active_thread = file_import_worker_thread and file_import_worker_thread.is_alive()
+        active_thread = bool(file_import_worker_thread and file_import_worker_thread.is_alive())
         if active_thread:
             file_import_stop_event.set()
     row = get_file_import_row()
     state = normalize_file_import_state(getattr(row, "state", {}) or {})
     if is_file_import_active_state(state):
-        row.state = {**state, "status": "stopping", "stage": "Останавливаю"}
+        if active_thread:
+            row.state = {**state, "status": "stopping", "stage": "Останавливаю"}
+        else:
+            row.state = {
+                **state,
+                "status": "stopped",
+                "stage": "Остановлено",
+                "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            }
     return jsonify(public_file_import_state())
 
 
