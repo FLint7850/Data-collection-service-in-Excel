@@ -305,8 +305,10 @@ let logsSignature = null;
 let newsListRenderQueued = false;
 let newsModalProgressQueued = false;
 let connectionMethods = [];
-let progressEvents = null;
+let progressPollTimer = null;
 let progressIncludesNews = null;
+let progressIncludesProjects = null;
+let progressPollInFlight = false;
 let newsLoadPromise = null;
 const stableProjectStates = new Map();
 const stableNewsMonitorStates = new Map();
@@ -449,11 +451,18 @@ function mergeNewsMonitorPayloadItem(monitor) {
   const hasDetails = Object.prototype.hasOwnProperty.call(monitor, "extraction_rules")
     || Object.prototype.hasOwnProperty.call(monitor, "selector_settings")
     || Object.prototype.hasOwnProperty.call(monitor, "exclusions");
-  return {
+  const merged = {
     ...(previous || {}),
     ...monitor,
     __detail_loaded: hasDetails || Boolean(previous?.__detail_loaded),
   };
+  ["created_at", "brand_created_at", "site_url"].forEach((field) => {
+    if (!merged[field] && previous?.[field]) merged[field] = previous[field];
+  });
+  if ((!Array.isArray(merged.start_urls) || !merged.start_urls.length) && Array.isArray(previous?.start_urls)) {
+    merged.start_urls = previous.start_urls;
+  }
+  return merged;
 }
 
 function applyNewsPayload(data) {
@@ -3207,15 +3216,36 @@ function handleProgressEvent(event) {
 
 function configureProgressStream() {
   const includeNews = wantsNewsProgress();
-  if (progressEvents && progressIncludesNews === includeNews) return;
-  if (progressEvents) {
-    progressEvents.close();
-    progressEvents = null;
+  const includeProjects = activeView === "projects";
+  if (
+    progressPollTimer
+    && progressIncludesNews === includeNews
+    && progressIncludesProjects === includeProjects
+  ) {
+    return;
+  }
+  if (progressPollTimer) {
+    window.clearInterval(progressPollTimer);
+    progressPollTimer = null;
   }
   progressIncludesNews = includeNews;
-  const includeProjects = activeView === "projects";
-  progressEvents = new EventSource(`/progress?projects=${includeProjects ? "1" : "0"}&news=${includeNews ? "1" : "0"}`);
-  progressEvents.addEventListener("progress", handleProgressEvent);
+  progressIncludesProjects = includeProjects;
+
+  async function pollProgress() {
+    if (progressPollInFlight) return;
+    progressPollInFlight = true;
+    try {
+      const data = await requestJson(`/progress?once=1&projects=${includeProjects ? "1" : "0"}&news=${includeNews ? "1" : "0"}`);
+      handleProgressEvent({ data: JSON.stringify(data) });
+    } catch (error) {
+      if (errorText) errorText.textContent = error.message;
+    } finally {
+      progressPollInFlight = false;
+    }
+  }
+
+  pollProgress();
+  progressPollTimer = window.setInterval(pollProgress, 3000);
 }
 
 async function bootstrapActiveRoute() {

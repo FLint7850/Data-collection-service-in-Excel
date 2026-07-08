@@ -740,6 +740,18 @@ def news_progress_payload() -> Dict[str, object]:
     return public_news_settings(include_connection_methods=False, include_monitor_details=False)
 
 
+def progress_payload(include_projects: bool, include_news: bool) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "connection_methods": public_connection_methods(),
+        "logs_signature": logs_signature(),
+    }
+    if include_projects:
+        payload["projects"] = projects_progress_payload()
+    if include_news:
+        payload["news"] = news_progress_payload()
+    return payload
+
+
 def project_model_to_dict(row: Project) -> Dict[str, object]:
     thread_count = parse_thread_count(row.thread_count)
     project = {
@@ -7706,7 +7718,7 @@ def api_upload_file_import():
     original_filename = output_text(upload.filename)
     suffix = Path(original_filename).suffix.lower()
     if suffix not in FILE_IMPORT_ALLOWED_SUFFIXES:
-        return jsonify({"error": "Можно загрузить только CSV или XLSX"}), 400
+        return jsonify({"error": "Можно загрузить только CSV, XLS или XLSX"}), 400
 
     row = get_file_import_row()
     remove_file_import_export(row)
@@ -8414,6 +8426,8 @@ def restart_scan():
 def progress_stream():
     include_projects = request.args.get("projects", "1") == "1"
     include_news = request.args.get("news") == "1"
+    if request.args.get("once") == "1":
+        return jsonify(progress_payload(include_projects, include_news))
 
     def stream():
         last_projects_signature = ""
@@ -8456,7 +8470,10 @@ def progress_stream():
                 yield ": keep-alive\n\n"
             time.sleep(PROGRESS_STREAM_INTERVAL_SECONDS)
 
-    return Response(stream(), mimetype="text/event-stream")
+    response = Response(stream(), mimetype="text/event-stream")
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
 
 
 @app.get("/download")

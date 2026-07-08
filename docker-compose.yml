@@ -19,9 +19,11 @@ services:
       SQLITE_JOURNAL_MODE: WAL
       SQLITE_BUSY_TIMEOUT_MS: 30000
       WEB_GRACEFUL_TIMEOUT: 90
+      WEB_CONCURRENCY: 1
+      WEB_THREADS: 12
       GUNICORN_ACCESS_LOG: 0
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -38,3 +40,19 @@ services:
         max-size: "10m"
         max-file: "5"
     stop_grace_period: 90s
+  nginx:
+    image: nginx:alpine
+    container_name: data-service-nginx
+    restart: unless-stopped
+    depends_on:
+      - parser
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./static:/app/static:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
