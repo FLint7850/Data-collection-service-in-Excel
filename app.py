@@ -5685,11 +5685,10 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                 )
             else:
                 match = match_candidates_against_feed_indexes(candidates, feed_indexes, stop_event=stop_event)
-                if match:
-                    found += 1
-                else:
+                missing_labels = missing_feed_labels(candidates, feed_indexes, stop_event=stop_event)
+                if missing_labels:
                     missing += 1
-                    selected_model = candidates[0]
+                    selected_model = str((match or {}).get("selected_model") or candidates[0])
                     result_rows.append(
                         {
                             "row": item.get("row_number"),
@@ -5697,9 +5696,11 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                             "brand": brand,
                             "model_candidates": " | ".join(candidates),
                             "selected_model": selected_model,
-                            "missing_on": ", ".join(missing_feed_labels(candidates, feed_indexes, stop_event=stop_event)),
+                            "missing_on": ", ".join(missing_labels),
                         }
                     )
+                else:
+                    found += 1
         now = time.time()
         if index == total_rows or index - last_progress_index >= 10 or now - last_progress_time >= 1.0:
             last_progress_time = now
@@ -8860,6 +8861,7 @@ if __name__ == "__main__":
     with make_server("127.0.0.1", port, app, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
         print(f"Serving on http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
+
 
 
 
