@@ -70,6 +70,7 @@ const fileImportProgressText = document.querySelector("#fileImportProgressText")
 const fileImportNotice = document.querySelector("#fileImportNotice");
 const fileImportActions = document.querySelector("#fileImportActions");
 const compareFileImportButton = document.querySelector("#compareFileImportButton");
+const stopFileImportButton = document.querySelector("#stopFileImportButton");
 const downloadFileImportCsvButton = document.querySelector("#downloadFileImportCsvButton");
 const fileImportAllowedExtensions = new Set(["csv", "xls", "xlsx"]);
 
@@ -217,9 +218,11 @@ let newsData = null;
 let fileImportData = null;
 let fileImportLoaded = false;
 let fileImportUploading = false;
+let fileImportPollTimer = null;
 const activeViewStorageKey = "excelServiceActiveView";
 const allowedActiveViews = new Set(["projects", "news", "import", "settings", "logs"]);
 const appConfig = window.__APP_CONFIG__ || {};
+const progressPollIntervalMs = Math.max(500, Math.min(Number(appConfig.progressIntervalMs || 2000), 30000));
 let activeProjectId = appConfig.activeProjectId || idFromEditPath("projects") || null;
 let pendingNewsMonitorId = appConfig.activeNewsId || idFromEditPath("news") || "";
 
@@ -1210,8 +1213,31 @@ function setFileImportProgress(percent, notice = "") {
   fileImportNotice.textContent = notice;
 }
 
+function isFileImportScanningStatus(status) {
+  return ["queued", "running", "stopping"].includes(status);
+}
+
+function fileImportStateNotice(state) {
+  const status = state?.status || "idle";
+  if (status === "queued") return state.stage || "В очереди";
+  if (status === "running") {
+    const current = Number(state.current_row || 0);
+    const total = Number(state.total_rows || 0);
+    const stage = state.stage || "Сравниваю";
+    const rows = total && current > 0 ? ` ${current}/${total}` : "";
+    return `${stage}${rows}`;
+  }
+  if (status === "stopping") return state.stage || "Останавливаю";
+  if (status === "stopped") return state.stage || "Остановлено";
+  if (status === "completed") return `Готово. Missing: ${Number(state.missing_rows || 0)}`;
+  if (status === "error") return state.error || "Ошибка сравнения";
+  return "";
+}
+
 function renderFileImport() {
   const file = fileImportData?.file || null;
+  const state = fileImportData?.state || {};
+  const scanning = isFileImportScanningStatus(state.status);
   if (fileImportExclusions && document.activeElement !== fileImportExclusions) {
     fileImportExclusions.value = fileImportData?.exclusions || "";
   }
@@ -1225,10 +1251,14 @@ function renderFileImport() {
   fileImportSize.textContent = file?.size ? formatFileSize(file.size) : "";
   fileImportSelected.classList.toggle("hidden", !file);
   fileImportActions.classList.toggle("hidden", !file);
-  if (saveFileImportButton) saveFileImportButton.disabled = fileImportUploading;
-  clearFileImportButton.disabled = fileImportUploading || !file;
-  compareFileImportButton.disabled = fileImportUploading || !file;
-  if (fileImportData?.result_ready) {
+  if (saveFileImportButton) saveFileImportButton.disabled = fileImportUploading || scanning;
+  clearFileImportButton.disabled = fileImportUploading || scanning || !file;
+  compareFileImportButton.disabled = fileImportUploading || scanning || !file;
+  if (stopFileImportButton) {
+    stopFileImportButton.classList.toggle("hidden", !scanning);
+    stopFileImportButton.disabled = state.status === "stopping";
+  }
+  if (fileImportData?.result_ready && !scanning) {
     downloadFileImportCsvButton.classList.remove("disabled");
     downloadFileImportCsvButton.setAttribute("aria-disabled", "false");
     downloadFileImportCsvButton.href = "/api/file-import/download";
@@ -1237,12 +1267,16 @@ function renderFileImport() {
     downloadFileImportCsvButton.setAttribute("aria-disabled", "true");
     downloadFileImportCsvButton.href = "#";
   }
-  fileImportInput.disabled = fileImportUploading;
-  if (fileDropzone) {
-    fileDropzone.classList.toggle("is-uploading", fileImportUploading);
-    fileDropzone.setAttribute("aria-disabled", fileImportUploading ? "true" : "false");
+  if (state.status && state.status !== "idle") {
+    fileImportProgress.classList.remove("hidden");
+    setFileImportProgress(state.percent || 0, fileImportStateNotice(state));
   }
-  if (!fileImportUploading && !file) {
+  fileImportInput.disabled = fileImportUploading || scanning;
+  if (fileDropzone) {
+    fileDropzone.classList.toggle("is-uploading", fileImportUploading || scanning);
+    fileDropzone.setAttribute("aria-disabled", fileImportUploading || scanning ? "true" : "false");
+  }
+  if (!fileImportUploading && !scanning && !file && (!state.status || state.status === "idle")) {
     fileImportProgress.classList.add("hidden");
     setFileImportProgress(0, "");
   }
@@ -1252,6 +1286,24 @@ async function loadFileImport() {
   fileImportData = await requestJson("/api/file-import");
   fileImportLoaded = true;
   renderFileImport();
+}
+
+function configureFileImportPolling() {
+  if (activeView !== "import") {
+    if (fileImportPollTimer) {
+      window.clearInterval(fileImportPollTimer);
+      fileImportPollTimer = null;
+    }
+    return;
+  }
+  if (fileImportPollTimer) return;
+  fileImportPollTimer = window.setInterval(async () => {
+    try {
+      await loadFileImport();
+    } catch (error) {
+      errorText.textContent = error.message;
+    }
+  }, progressPollIntervalMs);
 }
 
 async function saveFileImport() {
@@ -1308,8 +1360,8 @@ function fileImportExtension(file) {
 async function handleFileImportSelection(files) {
   const selectedFiles = Array.from(files || []).filter(Boolean);
   if (!selectedFiles.length) return;
-  if (fileImportUploading) {
-    fileImportNotice.textContent = "Дождитесь окончания загрузки файла";
+  if (fileImportUploading || isFileImportScanningStatus(fileImportData?.state?.status)) {
+    fileImportNotice.textContent = fileImportUploading ? "Дождитесь окончания загрузки файла" : "Дождитесь окончания сравнения файла";
     return;
   }
   if (selectedFiles.length > 1) {
@@ -1349,10 +1401,14 @@ async function deleteFileImport() {
 async function compareFileImport() {
   compareFileImportButton.disabled = true;
   fileImportProgress.classList.remove("hidden");
-  setFileImportProgress(20, "Сравниваю с фидами...");
+  setFileImportProgress(0, "Запускаю сравнение...");
   fileImportData = await requestJson("/api/file-import/compare", { method: "POST" });
-  const summary = fileImportData?.summary || {};
-  setFileImportProgress(100, `Готово. Missing: ${Number(summary.missing_rows || 0)}`);
+  renderFileImport();
+}
+
+async function stopFileImportScan() {
+  if (stopFileImportButton) stopFileImportButton.disabled = true;
+  fileImportData = await requestJson("/api/file-import/stop", { method: "POST" });
   renderFileImport();
 }
 
@@ -2249,6 +2305,7 @@ async function loadNews() {
 }
 function renderAll() {
   renderTabs();
+  configureFileImportPolling();
   const project = activeProject();
   projectView.classList.toggle("hidden", activeView !== "projects");
   newItemsView.classList.toggle("hidden", activeView !== "news");
@@ -2537,6 +2594,25 @@ if (compareFileImportButton) {
     } catch (error) {
       fileImportNotice.textContent = error.message;
       compareFileImportButton.disabled = false;
+    }
+  });
+}
+
+if (stopFileImportButton) {
+  stopFileImportButton.addEventListener("click", async () => {
+    try {
+      await stopFileImportScan();
+    } catch (error) {
+      fileImportNotice.textContent = error.message;
+      stopFileImportButton.disabled = false;
+    }
+  });
+}
+
+if (downloadFileImportCsvButton) {
+  downloadFileImportCsvButton.addEventListener("click", (event) => {
+    if (downloadFileImportCsvButton.classList.contains("disabled")) {
+      event.preventDefault();
     }
   });
 }
@@ -3282,6 +3358,7 @@ function handleProgressEvent(event) {
 function configureProgressStream() {
   const includeNews = wantsNewsProgress();
   const includeProjects = activeView === "projects";
+  const shouldPollProgress = includeProjects || includeNews;
   if (
     progressPollTimer
     && progressIncludesNews === includeNews
@@ -3295,6 +3372,9 @@ function configureProgressStream() {
   }
   progressIncludesNews = includeNews;
   progressIncludesProjects = includeProjects;
+  if (!shouldPollProgress) {
+    return;
+  }
 
   async function pollProgress() {
     if (progressPollInFlight) return;
@@ -3310,7 +3390,7 @@ function configureProgressStream() {
   }
 
   pollProgress();
-  progressPollTimer = window.setInterval(pollProgress, 3000);
+  progressPollTimer = window.setInterval(pollProgress, progressPollIntervalMs);
 }
 
 async function bootstrapActiveRoute() {

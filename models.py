@@ -146,5 +146,6 @@ class FileImport(Base):
     replace_rules: Mapped[str] = mapped_column(Text, default="", nullable=False)
     export_path: Mapped[str] = mapped_column(String(500), default="", nullable=False)
     file: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

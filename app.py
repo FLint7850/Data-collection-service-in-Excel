@@ -256,10 +256,13 @@ def close_request_db_session(error: Optional[BaseException] = None) -> None:
 state_lock = threading.RLock()
 projects_lock = threading.RLock()
 news_lock = threading.RLock()
+file_import_lock = threading.RLock()
 active_stop_event = threading.Event()
 active_finish_event = threading.Event()
+file_import_stop_event = threading.Event()
 active_run_id = 0
 worker_thread: Optional[threading.Thread] = None
+file_import_worker_thread: Optional[threading.Thread] = None
 active_crawler = None
 
 projects: Dict[str, Dict[str, object]] = {}
@@ -448,6 +451,7 @@ def ensure_storage() -> None:
         PROJECT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         init_db()
         ensure_default_user()
+        recover_interrupted_file_import_scan()
         load_projects()
         load_news_settings()
         start_news_scheduler()
@@ -4894,6 +4898,74 @@ def safe_filename(value: str) -> str:
 
 
 FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx", ".xls"}
+FILE_IMPORT_ACTIVE_STATUSES = {"queued", "running", "stopping"}
+
+
+def make_file_import_state(status: str = "idle") -> Dict[str, object]:
+    return {
+        "status": status,
+        "stage": "",
+        "percent": 0,
+        "current_row": 0,
+        "total_rows": 0,
+        "processed_rows": 0,
+        "excluded_rows": 0,
+        "found_rows": 0,
+        "missing_rows": 0,
+        "model_not_found_rows": 0,
+        "error": "",
+        "started_at": "",
+        "finished_at": "",
+        "elapsed_seconds": 0,
+        "result_filename": "",
+    }
+
+
+def normalize_file_import_state(value: object) -> Dict[str, object]:
+    state = {**make_file_import_state(), **(value if isinstance(value, dict) else {})}
+    state["status"] = str(state.get("status") or "idle")
+    for field in (
+        "percent",
+        "current_row",
+        "total_rows",
+        "processed_rows",
+        "excluded_rows",
+        "found_rows",
+        "missing_rows",
+        "model_not_found_rows",
+        "elapsed_seconds",
+    ):
+        try:
+            state[field] = int(float(state.get(field) or 0))
+        except (TypeError, ValueError):
+            state[field] = 0
+    state["percent"] = max(0, min(100, state["percent"]))
+    return state
+
+
+def is_file_import_active_state(state: object) -> bool:
+    return str((state if isinstance(state, dict) else {}).get("status") or "") in FILE_IMPORT_ACTIVE_STATUSES
+
+
+def file_import_path_for_row(row: FileImport) -> Optional[Path]:
+    file_meta = row.file if isinstance(row.file, dict) else {}
+    filename = str(file_meta.get("stored_filename") or "").strip()
+    if not filename:
+        return None
+    base_dir = FILE_IMPORT_DIR.resolve()
+    path = (FILE_IMPORT_DIR / filename).resolve()
+    if base_dir not in path.parents or not path.exists() or not path.is_file():
+        return None
+    return path
+
+
+def update_file_import_state(db_session, **kwargs: object) -> Dict[str, object]:
+    row = get_file_import_row(db_session)
+    state = normalize_file_import_state(getattr(row, "state", {}) or {})
+    state.update(kwargs)
+    row.state = normalize_file_import_state(state)
+    db_session.flush()
+    return dict(row.state)
 
 
 def clear_file_import_storage() -> None:
@@ -4929,10 +5001,15 @@ def get_file_import_row(db_session=None) -> FileImport:
             model_field="",
             replace_rules="",
             file={},
+            state=make_file_import_state(),
         )
         db.add(row)
         db.flush()
     else:
+        normalized_state = normalize_file_import_state(getattr(row, "state", {}) or {})
+        if row.state != normalized_state:
+            row.state = normalized_state
+            db.flush()
         normalized_exclusions = normalize_file_import_exclusions(row.exclusions)
         if row.exclusions != normalized_exclusions:
             row.exclusions = normalized_exclusions
@@ -4960,15 +5037,7 @@ def get_file_import_row(db_session=None) -> FileImport:
 
 def current_file_import_path() -> Optional[Path]:
     row = get_file_import_row()
-    file_meta = row.file if isinstance(row.file, dict) else {}
-    filename = str(file_meta.get("stored_filename") or "").strip()
-    if not filename:
-        return None
-    base_dir = FILE_IMPORT_DIR.resolve()
-    path = (FILE_IMPORT_DIR / filename).resolve()
-    if base_dir not in path.parents or not path.exists() or not path.is_file():
-        return None
-    return path
+    return file_import_path_for_row(row)
 
 
 def resolve_file_import_export_path(value: str) -> Optional[Path]:
@@ -5005,13 +5074,16 @@ def remove_file_import_export(row: FileImport) -> None:
 
 def public_file_import_state() -> Dict[str, object]:
     row = get_file_import_row()
-    path = current_file_import_path()
+    path = file_import_path_for_row(row)
     file_meta = row.file if isinstance(row.file, dict) else {}
     exclusions = normalize_file_import_exclusions(row.exclusions)
     exclusions_text = "\n".join(exclusions)
     model_field = clean_text(str(row.model_field or ""))
     replace_rules = normalize_file_import_rules_text(row.replace_rules)
-    result_filename = Path(str(row.export_path or file_meta.get("result_filename") or "")).name
+    state = normalize_file_import_state(getattr(row, "state", {}) or {})
+    active = is_file_import_active_state(state)
+    result_filename = Path(str(row.export_path or file_meta.get("result_filename") or state.get("result_filename") or "")).name
+    result_ready = bool(result_filename and not active and resolve_file_import_export_path(result_filename))
     if not path:
         return {
             "file": None,
@@ -5020,7 +5092,8 @@ def public_file_import_state() -> Dict[str, object]:
             "model_field": model_field,
             "replace_rules": replace_rules,
             "result_filename": result_filename,
-            "result_ready": bool(resolve_file_import_export_path(result_filename)),
+            "result_ready": result_ready,
+            "state": state,
         }
     stat = path.stat()
     return {
@@ -5029,7 +5102,8 @@ def public_file_import_state() -> Dict[str, object]:
         "model_field": model_field,
         "replace_rules": replace_rules,
         "result_filename": result_filename,
-        "result_ready": bool(resolve_file_import_export_path(result_filename)),
+        "result_ready": result_ready,
+        "state": state,
         "file": {
             "filename": output_text(str(file_meta.get("original_filename") or path.name)),
             "stored_filename": path.name,
@@ -5485,9 +5559,10 @@ def file_import_result_filename(original_filename: str) -> str:
     return f"Новинки_{stem}_{datetime.now(MSK_TZ).strftime('%d-%m-%Y_%H-%M-%S')}.csv"
 
 
-def compare_file_import_with_feeds() -> Dict[str, object]:
-    row = get_file_import_row()
-    path = current_file_import_path()
+def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threading.Event] = None) -> Dict[str, object]:
+    db = db_session or g.db
+    row = get_file_import_row(db)
+    path = file_import_path_for_row(row)
     if not path:
         raise ValueError("Файл не загружен")
     model_field = clean_text(str(row.model_field or ""))
@@ -5496,54 +5571,119 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
 
     exclusions = normalize_file_import_exclusions(row.exclusions)
     replace_rules = normalize_file_import_rules_text(row.replace_rules)
+    started_at = time.time()
+    update_file_import_state(
+        db,
+        status="running",
+        stage="Читаю файл",
+        percent=2,
+        error="",
+        started_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        finished_at="",
+        elapsed_seconds=0,
+        result_filename="",
+    )
+    db.commit()
     source_rows = read_file_import_rows(path, model_field)
+    total_rows = len(source_rows)
+    update_file_import_state(db, stage="Загружаю фиды", percent=8, total_rows=total_rows)
+    db.commit()
     feed_indexes = build_file_import_feed_indexes()
+    update_file_import_state(db, stage="Сравниваю строки", percent=10, total_rows=total_rows)
+    db.commit()
 
     result_rows: List[Dict[str, object]] = []
     processed = excluded = found = missing = empty_model = 0
-    for item in source_rows:
+    last_progress_time = 0.0
+    last_progress_index = 0
+    for index, item in enumerate(source_rows, start=1):
+        if stop_event and stop_event.is_set():
+            state = update_file_import_state(
+                db,
+                status="stopped",
+                stage="Остановлено",
+                percent=max(0, min(99, int((index - 1) / max(total_rows, 1) * 90) + 10)),
+                current_row=index - 1,
+                processed_rows=processed,
+                excluded_rows=excluded,
+                found_rows=found,
+                missing_rows=missing,
+                model_not_found_rows=empty_model,
+                finished_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+                elapsed_seconds=int(time.time() - started_at),
+            )
+            db.commit()
+            return {
+                "stopped": True,
+                "total_rows": total_rows,
+                "processed_rows": processed,
+                "excluded_rows": excluded,
+                "model_not_found_rows": empty_model,
+                "found_rows": found,
+                "missing_rows": missing,
+                "state": state,
+            }
         name = str(item.get("name") or "")
         brand = str(item.get("brand") or "")
         if file_import_exclusion_matches(name, brand, exclusions):
             excluded += 1
-            continue
-        processed += 1
-        prepared_model = prepare_file_import_model(name, replace_rules)
-        candidates = generate_model_candidates(prepared_model, brand)
-        if not candidates:
-            empty_model += 1
-            result_rows.append(
-                {
-                    "row": item.get("row_number"),
-                    "name": name,
-                    "brand": brand,
-                    "model_candidates": "",
-                    "selected_model": "",
-                    "missing_on": "",
-                }
+        else:
+            processed += 1
+            prepared_model = prepare_file_import_model(name, replace_rules)
+            candidates = generate_model_candidates(prepared_model, brand)
+            if not candidates:
+                empty_model += 1
+                result_rows.append(
+                    {
+                        "row": item.get("row_number"),
+                        "name": name,
+                        "brand": brand,
+                        "model_candidates": "",
+                        "selected_model": "",
+                        "missing_on": "",
+                    }
+                )
+            else:
+                match = match_candidates_against_feed_indexes(candidates, feed_indexes)
+                if match:
+                    found += 1
+                else:
+                    missing += 1
+                    selected_model = candidates[0]
+                    result_rows.append(
+                        {
+                            "row": item.get("row_number"),
+                            "name": name,
+                            "brand": brand,
+                            "model_candidates": " | ".join(candidates),
+                            "selected_model": selected_model,
+                            "missing_on": ", ".join(missing_feed_labels(candidates, feed_indexes)),
+                        }
+                    )
+        now = time.time()
+        if index == total_rows or index - last_progress_index >= 10 or now - last_progress_time >= 1.0:
+            last_progress_time = now
+            last_progress_index = index
+            update_file_import_state(
+                db,
+                stage="Сравниваю строки",
+                percent=10 + int(index / max(total_rows, 1) * 85),
+                current_row=index,
+                processed_rows=processed,
+                excluded_rows=excluded,
+                found_rows=found,
+                missing_rows=missing,
+                model_not_found_rows=empty_model,
+                elapsed_seconds=int(now - started_at),
             )
-            continue
-        match = match_candidates_against_feed_indexes(candidates, feed_indexes)
-        if match:
-            found += 1
-            continue
-        missing += 1
-        selected_model = candidates[0]
-        result_rows.append(
-            {
-                "row": item.get("row_number"),
-                "name": name,
-                "brand": brand,
-                "model_candidates": " | ".join(candidates),
-                "selected_model": selected_model,
-                "missing_on": ", ".join(missing_feed_labels(candidates, feed_indexes)),
-            }
-        )
+            db.commit()
 
     file_meta = dict(row.file) if isinstance(row.file, dict) else {}
     original_filename = str(file_meta.get("original_filename") or file_meta.get("filename") or path.name)
     remove_file_import_export(row)
     result_path = EXPORT_DIR / file_import_result_filename(original_filename)
+    update_file_import_state(db, stage="Записываю CSV", percent=98)
+    db.commit()
     with result_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         fieldnames = [
             "row",
@@ -5561,6 +5701,24 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
     file_meta["result_created_at"] = datetime.now(MSK_TZ).isoformat(timespec="seconds")
     row.export_path = result_path.name
     row.file = file_meta
+    state = update_file_import_state(
+        db,
+        status="completed",
+        stage="Готово",
+        percent=100,
+        current_row=total_rows,
+        total_rows=total_rows,
+        processed_rows=processed,
+        excluded_rows=excluded,
+        found_rows=found,
+        missing_rows=missing,
+        model_not_found_rows=empty_model,
+        finished_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        elapsed_seconds=int(time.time() - started_at),
+        result_filename=result_path.name,
+        error="",
+    )
+    db.commit()
     return {
         "total_rows": len(source_rows),
         "processed_rows": processed,
@@ -5569,8 +5727,88 @@ def compare_file_import_with_feeds() -> Dict[str, object]:
         "found_rows": found,
         "missing_rows": missing,
         "result_filename": result_path.name,
-        "result_url": url_for("api_download_file_import_result"),
+        "result_url": "/api/file-import/download",
+        "state": state,
     }
+
+
+def run_file_import_compare(stop_event: threading.Event) -> None:
+    global file_import_worker_thread
+    db = SessionLocal()
+    try:
+        compare_file_import_with_feeds(db, stop_event=stop_event)
+    except Exception as exc:
+        db.rollback()
+        try:
+            update_file_import_state(
+                db,
+                status="error",
+                stage="Ошибка",
+                error=str(exc),
+                finished_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+        with file_import_lock:
+            if threading.current_thread() is file_import_worker_thread:
+                file_import_worker_thread = None
+                file_import_stop_event.clear()
+
+
+def recover_interrupted_file_import_scan() -> None:
+    with session_scope() as db_session:
+        row = get_file_import_row(db_session)
+        state = normalize_file_import_state(getattr(row, "state", {}) or {})
+        if not is_file_import_active_state(state):
+            return
+        row.state = {
+            **state,
+            "status": "error",
+            "stage": "Прервано",
+            "error": "Сравнение файла было прервано перезапуском сервера. Запустите его снова.",
+            "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        }
+
+
+def start_file_import_compare() -> Dict[str, object]:
+    global file_import_worker_thread
+    with file_import_lock:
+        if file_import_worker_thread and file_import_worker_thread.is_alive():
+            return public_file_import_state()
+        row = get_file_import_row()
+        state = normalize_file_import_state(getattr(row, "state", {}) or {})
+        if is_file_import_active_state(state):
+            return public_file_import_state()
+        path = file_import_path_for_row(row)
+        if not path:
+            raise ValueError("Файл не загружен")
+        if not clean_text(str(row.model_field or "")):
+            raise ValueError("Укажите название столбца модели")
+
+        remove_file_import_export(row)
+        file_meta = dict(row.file) if isinstance(row.file, dict) else {}
+        file_meta.pop("result_filename", None)
+        file_meta.pop("result_created_at", None)
+        row.file = file_meta
+        row.export_path = ""
+        row.state = {
+            **make_file_import_state("queued"),
+            "stage": "В очереди",
+            "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        }
+        g.db.commit()
+
+        file_import_stop_event.clear()
+        file_import_worker_thread = threading.Thread(
+            target=run_file_import_compare,
+            args=(file_import_stop_event,),
+            daemon=True,
+        )
+        file_import_worker_thread.start()
+        return public_file_import_state()
 
 
 def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, object]] = None) -> Path:
@@ -7197,6 +7435,7 @@ def render_app_page(active_view: str = "projects", active_project_id: str = "", 
         active_view=active_view,
         active_project_id=active_project_id,
         active_news_id=active_news_id,
+        progress_interval_ms=int(PROGRESS_STREAM_INTERVAL_SECONDS * 1000),
     )
 
 
@@ -7709,6 +7948,8 @@ def api_update_file_import():
 @app.post("/api/file-import")
 def api_upload_file_import():
     ensure_storage()
+    if is_file_import_active_state(public_file_import_state().get("state")):
+        return jsonify({"error": "Дождитесь окончания сравнения файла"}), 409
     uploads = request.files.getlist("file")
     if len(uploads) > 1:
         return jsonify({"error": "Можно загрузить только один файл"}), 400
@@ -7734,17 +7975,21 @@ def api_upload_file_import():
         "uploaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
     }
     row.export_path = ""
+    row.state = make_file_import_state()
     return jsonify(public_file_import_state())
 
 
 @app.delete("/api/file-import")
 def api_delete_file_import():
     ensure_storage()
+    if is_file_import_active_state(public_file_import_state().get("state")):
+        return jsonify({"error": "Дождитесь окончания сравнения файла"}), 409
     row = get_file_import_row()
     remove_file_import_export(row)
     clear_file_import_storage()
     row.export_path = ""
     row.file = {}
+    row.state = make_file_import_state()
     return jsonify(public_file_import_state())
 
 
@@ -7752,19 +7997,34 @@ def api_delete_file_import():
 def api_compare_file_import():
     ensure_storage()
     try:
-        summary = compare_file_import_with_feeds()
+        state = start_file_import_compare()
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
-        return jsonify({"error": f"Ошибка сравнения: {exc}"}), 500
-    state = public_file_import_state()
-    return jsonify({"summary": summary, **state})
+        return jsonify({"error": f"Ошибка запуска сравнения: {exc}"}), 500
+    return jsonify(state)
+
+
+@app.post("/api/file-import/stop")
+def api_stop_file_import():
+    ensure_storage()
+    with file_import_lock:
+        active_thread = file_import_worker_thread and file_import_worker_thread.is_alive()
+        if active_thread:
+            file_import_stop_event.set()
+    row = get_file_import_row()
+    state = normalize_file_import_state(getattr(row, "state", {}) or {})
+    if is_file_import_active_state(state):
+        row.state = {**state, "status": "stopping", "stage": "Останавливаю"}
+    return jsonify(public_file_import_state())
 
 
 @app.get("/api/file-import/download")
 def api_download_file_import_result():
     ensure_storage()
     row = get_file_import_row()
+    if is_file_import_active_state(getattr(row, "state", {}) or {}):
+        return jsonify({"error": "CSV будет доступен после окончания сравнения"}), 409
     file_meta = row.file if isinstance(row.file, dict) else {}
     filename = str(row.export_path or file_meta.get("result_filename") or "")
     path = resolve_file_import_export_path(filename)

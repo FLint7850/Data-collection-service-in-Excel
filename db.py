@@ -291,6 +291,9 @@ def migrate_file_import_table(connection) -> None:
     if "export_path" not in columns:
         connection.execute(text("ALTER TABLE file_import ADD COLUMN export_path VARCHAR(500) NOT NULL DEFAULT ''"))
         columns = table_columns(connection, "file_import")
+    if "state" not in columns:
+        connection.execute(text("ALTER TABLE file_import ADD COLUMN state JSON NOT NULL DEFAULT '{}'"))
+        columns = table_columns(connection, "file_import")
 
     rows = [dict(row) for row in connection.execute(text("SELECT * FROM file_import")).mappings().all()]
     if columns.get("exclusions") == "JSON":
@@ -298,10 +301,11 @@ def migrate_file_import_table(connection) -> None:
             model_field = str(row.get("model_field") or "").strip()
             replace_rules = str(row.get("replace_rules") or row.get("model_replace_rules") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
             export_path = str(row.get("export_path") or "").strip()
+            state = _json_or_default(row.get("state"), {})
             connection.execute(
                 text(
                     "UPDATE file_import SET exclusions = json(:exclusions), model_field = :model_field, "
-                    "replace_rules = :replace_rules, export_path = :export_path WHERE id = :id"
+                    "replace_rules = :replace_rules, export_path = :export_path, state = json(:state) WHERE id = :id"
                 ),
                 {
                     "id": row.get("id"),
@@ -309,6 +313,7 @@ def migrate_file_import_table(connection) -> None:
                     "model_field": model_field,
                     "replace_rules": replace_rules,
                     "export_path": export_path,
+                    "state": json.dumps(state, ensure_ascii=False),
                 },
             )
         return
@@ -323,6 +328,7 @@ def migrate_file_import_table(connection) -> None:
             "replace_rules TEXT NOT NULL DEFAULT '', "
             "export_path VARCHAR(500) NOT NULL DEFAULT '', "
             "file JSON NOT NULL DEFAULT '{}', "
+            "state JSON NOT NULL DEFAULT '{}', "
             "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
             "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
             ")"
@@ -332,8 +338,8 @@ def migrate_file_import_table(connection) -> None:
         connection.execute(
             text(
                 "INSERT INTO file_import_migration_tmp "
-                "(id, exclusions, model_field, replace_rules, export_path, file, created_at, updated_at) "
-                "VALUES (:id, json(:exclusions), :model_field, :replace_rules, :export_path, json(:file), :created_at, :updated_at)"
+                "(id, exclusions, model_field, replace_rules, export_path, file, state, created_at, updated_at) "
+                "VALUES (:id, json(:exclusions), :model_field, :replace_rules, :export_path, json(:file), json(:state), :created_at, :updated_at)"
             ),
             {
                 "id": row.get("id"),
@@ -342,6 +348,7 @@ def migrate_file_import_table(connection) -> None:
                 "replace_rules": str(row.get("replace_rules") or row.get("model_replace_rules") or "").replace("\r\n", "\n").replace("\r", "\n").strip(),
                 "export_path": str(row.get("export_path") or "").strip(),
                 "file": json.dumps(_json_or_default(row.get("file"), {}), ensure_ascii=False),
+                "state": json.dumps(_json_or_default(row.get("state"), {}), ensure_ascii=False),
                 "created_at": row.get("created_at") or "CURRENT_TIMESTAMP",
                 "updated_at": row.get("updated_at") or "CURRENT_TIMESTAMP",
             },

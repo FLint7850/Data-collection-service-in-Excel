@@ -357,6 +357,7 @@
           </div>
           <div class="file-import-actions hidden" id="fileImportActions">
             <button class="button primary" id="compareFileImportButton" type="button">Сравнить</button>
+            <button class="button secondary hidden" id="stopFileImportButton" type="button">Остановить</button>
             <a class="button download disabled" id="downloadFileImportCsvButton" href="#" aria-disabled="true">Скачать CSV</a>
           </div>
         </div>
@@ -446,7 +447,8 @@
     window.__APP_CONFIG__ = {
       activeView: {{ (active_view or "projects")|tojson }},
       activeProjectId: {{ (active_project_id or "")|tojson }},
-      activeNewsId: {{ (active_news_id or "")|tojson }}
+      activeNewsId: {{ (active_news_id or "")|tojson }},
+      progressIntervalMs: {{ progress_interval_ms|tojson }}
     };
   </script>
   <script src="{{ url_for('static', filename='js/app.js') }}?v={{ static_version }}"></script>
