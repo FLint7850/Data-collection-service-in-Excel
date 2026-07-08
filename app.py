@@ -5076,12 +5076,13 @@ def remove_file_import_export(row: FileImport) -> None:
     original_filename = str(file_meta.get("original_filename") or file_meta.get("filename") or "").strip()
     if original_filename:
         prefix = f"Новинки_{safe_filename(Path(original_filename).stem or 'file')}_"
-        for path in EXPORT_DIR.glob(f"{prefix}*.csv"):
-            if path.is_file():
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+        for pattern in (f"{prefix}*.csv", f"{prefix}*.xlsx"):
+            for path in EXPORT_DIR.glob(pattern):
+                if path.is_file():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
 
 def public_file_import_state() -> Dict[str, object]:
@@ -5593,9 +5594,78 @@ def missing_feed_labels(
 
 def file_import_result_filename(original_filename: str) -> str:
     stem = safe_filename(Path(original_filename).stem or "file")
-    return f"Новинки_{stem}_{datetime.now(MSK_TZ).strftime('%d-%m-%Y_%H-%M-%S')}.csv"
+    return f"Новинки_{stem}_{datetime.now(MSK_TZ).strftime('%d-%m-%Y_%H-%M-%S')}.xlsx"
 
 
+
+FILE_IMPORT_RESULT_FIELDS = [
+    "row",
+    "name",
+    "brand",
+    "model_candidates",
+    "selected_model",
+    "missing_on",
+]
+
+
+def excel_sheet_title(raw_title: str, used_titles: Set[str]) -> str:
+    title = re.sub(r"[\[\]:*?/\\]", " ", clean_text(raw_title or "Результат"))
+    title = re.sub(r"\s+", " ", title).strip() or "Результат"
+    title = title[:31].rstrip() or "Результат"
+    base = title
+    counter = 2
+    while title in used_titles:
+        suffix = f" {counter}"
+        title = f"{base[:31 - len(suffix)].rstrip()}{suffix}"
+        counter += 1
+    used_titles.add(title)
+    return title
+
+
+def write_file_import_workbook(result_path: Path, rows: List[Dict[str, object]], feed_indexes: List[Dict[str, object]]) -> None:
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
+
+    feed_labels = [
+        str(feed.get("source_label") or feed.get("url") or "Фид").strip() or "Фид"
+        for feed in feed_indexes
+    ]
+    all_feed_labels = set(feed_labels)
+    grouped_rows: Dict[str, List[Dict[str, object]]] = {}
+    for row in rows:
+        missing_labels = []
+        for label in row.get("_missing_labels", []):
+            label_text = str(label).strip()
+            if label_text and label_text not in missing_labels:
+                missing_labels.append(label_text)
+        if not missing_labels:
+            continue
+        if all_feed_labels and set(missing_labels) == all_feed_labels:
+            title = f"Не найдено на {', '.join(feed_labels)}"
+            grouped_rows.setdefault(title, []).append(row)
+            continue
+        for label in missing_labels:
+            title = f"Не найдено на {label}"
+            grouped_rows.setdefault(title, []).append(row)
+
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+    used_titles: Set[str] = set()
+    groups = list(grouped_rows.items()) or [("Результат", [])]
+    for raw_title, group_rows in groups:
+        sheet = workbook.create_sheet(excel_sheet_title(raw_title, used_titles))
+        sheet.append(FILE_IMPORT_RESULT_FIELDS)
+        for row in group_rows:
+            sheet.append([row.get(field, "") for field in FILE_IMPORT_RESULT_FIELDS])
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column_index, field in enumerate(FILE_IMPORT_RESULT_FIELDS, start=1):
+            values = [str(field)]
+            values.extend(str(row.get(field, "")) for row in group_rows[:200])
+            width = min(max(len(value) for value in values) + 2, 60)
+            sheet.column_dimensions[get_column_letter(column_index)].width = width
+    workbook.save(result_path)
 def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threading.Event] = None) -> Dict[str, object]:
     db = db_session or g.db
     row = get_file_import_row(db)
@@ -5673,16 +5743,6 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
             candidates = generate_model_candidates(prepared_model, brand)
             if not candidates:
                 empty_model += 1
-                result_rows.append(
-                    {
-                        "row": item.get("row_number"),
-                        "name": name,
-                        "brand": brand,
-                        "model_candidates": "",
-                        "selected_model": "",
-                        "missing_on": "",
-                    }
-                )
             else:
                 match = match_candidates_against_feed_indexes(candidates, feed_indexes, stop_event=stop_event)
                 missing_labels = missing_feed_labels(candidates, feed_indexes, stop_event=stop_event)
@@ -5697,6 +5757,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                             "model_candidates": " | ".join(candidates),
                             "selected_model": selected_model,
                             "missing_on": ", ".join(missing_labels),
+                            "_missing_labels": missing_labels,
                         }
                     )
                 else:
@@ -5723,21 +5784,10 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
     original_filename = str(file_meta.get("original_filename") or file_meta.get("filename") or path.name)
     remove_file_import_export(row)
     result_path = EXPORT_DIR / file_import_result_filename(original_filename)
-    update_file_import_state(db, stage="Записываю CSV", percent=98)
+    update_file_import_state(db, stage="Записываю XLSX", percent=98)
     db.commit()
     stop_file_import_if_requested(stop_event)
-    with result_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
-        fieldnames = [
-            "row",
-            "name",
-            "brand",
-            "model_candidates",
-            "selected_model",
-            "missing_on",
-        ]
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames, delimiter=";")
-        writer.writeheader()
-        writer.writerows(result_rows)
+    write_file_import_workbook(result_path, result_rows, feed_indexes)
 
     file_meta["result_filename"] = result_path.name
     file_meta["result_created_at"] = datetime.now(MSK_TZ).isoformat(timespec="seconds")
@@ -7963,7 +8013,7 @@ def api_download_news_csv(monitor_id: str):
     filename = str(state.get("last_csv") or state_data.get("csv") or "")
     path = resolve_export_file(filename)
     if not path:
-        return jsonify({"error": "CSV еще не готов"}), 404
+        return jsonify({"error": "Файл еще не готов"}), 404
     download_name = output_text(path.name)
     return send_file(path, as_attachment=True, download_name=download_name)
 
@@ -8112,12 +8162,12 @@ def api_download_file_import_result():
     ensure_storage()
     row = get_file_import_row()
     if is_file_import_active_state(getattr(row, "state", {}) or {}):
-        return jsonify({"error": "CSV будет доступен после окончания сравнения"}), 409
+        return jsonify({"error": "Файл будет доступен после окончания сравнения"}), 409
     file_meta = row.file if isinstance(row.file, dict) else {}
     filename = str(row.export_path or file_meta.get("result_filename") or "")
     path = resolve_file_import_export_path(filename)
     if not path:
-        return jsonify({"error": "CSV еще не готов"}), 404
+        return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(path.name))
 
 
@@ -8861,6 +8911,9 @@ if __name__ == "__main__":
     with make_server("127.0.0.1", port, app, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
         print(f"Serving on http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
+
+
+
 
 
 
