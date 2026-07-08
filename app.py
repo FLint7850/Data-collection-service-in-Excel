@@ -4898,7 +4898,7 @@ def safe_filename(value: str) -> str:
 
 
 FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx", ".xls"}
-FILE_IMPORT_ACTIVE_STATUSES = {"queued", "running", "stopping"}
+FILE_IMPORT_ACTIVE_STATUSES = {"queued", "running"}
 
 
 class FileImportStopped(Exception):
@@ -4928,6 +4928,9 @@ def make_file_import_state(status: str = "idle") -> Dict[str, object]:
 def normalize_file_import_state(value: object) -> Dict[str, object]:
     state = {**make_file_import_state(), **(value if isinstance(value, dict) else {})}
     state["status"] = str(state.get("status") or "idle")
+    if state["status"] == "stopping":
+        state["status"] = "stopped"
+        state["stage"] = "Остановлено"
     for field in (
         "percent",
         "current_row",
@@ -8086,15 +8089,12 @@ def api_stop_file_import():
     row = get_file_import_row()
     state = normalize_file_import_state(getattr(row, "state", {}) or {})
     if is_file_import_active_state(state):
-        if active_thread:
-            row.state = {**state, "status": "stopping", "stage": "Останавливаю"}
-        else:
-            row.state = {
-                **state,
-                "status": "stopped",
-                "stage": "Остановлено",
-                "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
-            }
+        row.state = {
+            **state,
+            "status": "stopped",
+            "stage": "Остановлено",
+            "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+        }
     return jsonify(public_file_import_state())
 
 

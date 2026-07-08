@@ -1214,7 +1214,7 @@ function setFileImportProgress(percent, notice = "") {
 }
 
 function isFileImportScanningStatus(status) {
-  return ["queued", "running", "stopping"].includes(status);
+  return ["queued", "running"].includes(status);
 }
 
 function fileImportStateNotice(state) {
@@ -1227,7 +1227,6 @@ function fileImportStateNotice(state) {
     const rows = total && current > 0 ? ` ${current}/${total}` : "";
     return `${stage}${rows}`;
   }
-  if (status === "stopping") return state.stage || "Останавливаю";
   if (status === "stopped") return state.stage || "Остановлено";
   if (status === "completed") return `Готово. Missing: ${Number(state.missing_rows || 0)}`;
   if (status === "error") return state.error || "Ошибка сравнения";
@@ -1256,7 +1255,7 @@ function renderFileImport() {
   compareFileImportButton.disabled = fileImportUploading || scanning || !file;
   if (stopFileImportButton) {
     stopFileImportButton.classList.toggle("hidden", !scanning);
-    stopFileImportButton.disabled = state.status === "stopping";
+    stopFileImportButton.disabled = false;
   }
   if (fileImportData?.result_ready && !scanning) {
     downloadFileImportCsvButton.classList.remove("disabled");
