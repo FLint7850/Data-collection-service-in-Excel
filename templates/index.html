@@ -307,10 +307,16 @@
           <h2>Выгрузка из CSV/XLSX</h2>
         </div>
         <div class="file-upload-shell">
-          <label class="field">
-            <span>Название столбца с моделью</span>
-            <input id="fileImportModelField" type="text" placeholder="name">
-          </label>
+          <div class="selector-grid">
+            <label class="field">
+              <span>Название столбца с моделью</span>
+              <input id="fileImportModelField" type="text" placeholder="name">
+            </label>
+            <label class="field">
+              <span>Название столбца с ценой</span>
+              <input id="fileImportPriceField" type="text" placeholder="price">
+            </label>
+          </div>
           <details class="settings-details file-import-exclusions">
             <summary>Исключения</summary>
             <div class="settings-details__content">
@@ -454,4 +460,5 @@
   <script src="{{ url_for('static', filename='js/app.js') }}?v={{ static_version }}"></script>
 </body>
 </html>
+
 

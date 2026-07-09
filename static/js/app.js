@@ -57,6 +57,7 @@ const fileImportExclusions = document.querySelector("#fileImportExclusions");
 const fileImportExclusionsDetails = document.querySelector(".file-import-exclusions");
 const fileImportRulesDetails = document.querySelector(".file-import-rules");
 const fileImportModelField = document.querySelector("#fileImportModelField");
+const fileImportPriceField = document.querySelector("#fileImportPriceField");
 const fileImportModelReplaceRules = document.querySelector("#fileImportModelReplaceRules");
 const saveFileImportButton = document.querySelector("#saveFileImportButton");
 const fileImportSaveNotice = document.querySelector("#fileImportSaveNotice");
@@ -1243,6 +1244,9 @@ function renderFileImport() {
   if (fileImportModelField && document.activeElement !== fileImportModelField) {
     fileImportModelField.value = fileImportData?.model_field || "";
   }
+  if (fileImportPriceField && document.activeElement !== fileImportPriceField) {
+    fileImportPriceField.value = fileImportData?.price_field || "";
+  }
   if (fileImportModelReplaceRules && document.activeElement !== fileImportModelReplaceRules) {
     fileImportModelReplaceRules.value = fileImportData?.replace_rules || "";
   }
@@ -1314,6 +1318,7 @@ async function saveFileImport() {
     body: JSON.stringify({
       exclusions: fileImportExclusions?.value || "",
       model_field: fileImportModelField?.value || "",
+      price_field: fileImportPriceField?.value || "",
       replace_rules: fileImportModelReplaceRules?.value || "",
       file: fileImportData?.file || null,
     }),
@@ -2505,10 +2510,12 @@ if (fileImportExclusions && fileImportSaveNotice) {
   });
 }
 
-if (fileImportModelField && fileImportSaveNotice) {
-  fileImportModelField.addEventListener("input", () => {
-    fileImportSaveNotice.textContent = "";
-  });
+for (const field of [fileImportModelField, fileImportPriceField]) {
+  if (field && fileImportSaveNotice) {
+    field.addEventListener("input", () => {
+      fileImportSaveNotice.textContent = "";
+    });
+  }
 }
 
 for (const field of [fileImportModelReplaceRules]) {
@@ -3416,6 +3423,7 @@ window.addEventListener("popstate", () => {
 bootstrapActiveRoute().catch((error) => {
   errorText.textContent = error.message;
 });
+
 
 
 

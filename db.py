@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -285,6 +285,9 @@ def migrate_file_import_table(connection) -> None:
     if "model_field" not in columns:
         connection.execute(text("ALTER TABLE file_import ADD COLUMN model_field VARCHAR(255) NOT NULL DEFAULT ''"))
         columns = table_columns(connection, "file_import")
+    if "price_field" not in columns:
+        connection.execute(text("ALTER TABLE file_import ADD COLUMN price_field VARCHAR(255) NOT NULL DEFAULT ''"))
+        columns = table_columns(connection, "file_import")
     if "replace_rules" not in columns:
         connection.execute(text("ALTER TABLE file_import ADD COLUMN replace_rules TEXT NOT NULL DEFAULT ''"))
         columns = table_columns(connection, "file_import")
@@ -299,18 +302,21 @@ def migrate_file_import_table(connection) -> None:
     if columns.get("exclusions") == "JSON":
         for row in rows:
             model_field = str(row.get("model_field") or "").strip()
+            price_field = str(row.get("price_field") or "").strip()
             replace_rules = str(row.get("replace_rules") or row.get("model_replace_rules") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
             export_path = str(row.get("export_path") or "").strip()
             state = _json_or_default(row.get("state"), {})
             connection.execute(
                 text(
                     "UPDATE file_import SET exclusions = json(:exclusions), model_field = :model_field, "
-                    "replace_rules = :replace_rules, export_path = :export_path, state = json(:state) WHERE id = :id"
+                    "price_field = :price_field, replace_rules = :replace_rules, export_path = :export_path, "
+                    "state = json(:state) WHERE id = :id"
                 ),
                 {
                     "id": row.get("id"),
                     "exclusions": json.dumps(_string_array_from_lines(row.get("exclusions")), ensure_ascii=False),
                     "model_field": model_field,
+                    "price_field": price_field,
                     "replace_rules": replace_rules,
                     "export_path": export_path,
                     "state": json.dumps(state, ensure_ascii=False),
@@ -325,6 +331,7 @@ def migrate_file_import_table(connection) -> None:
             "id INTEGER NOT NULL PRIMARY KEY, "
             "exclusions JSON NOT NULL DEFAULT '[]', "
             "model_field VARCHAR(255) NOT NULL DEFAULT '', "
+            "price_field VARCHAR(255) NOT NULL DEFAULT '', "
             "replace_rules TEXT NOT NULL DEFAULT '', "
             "export_path VARCHAR(500) NOT NULL DEFAULT '', "
             "file JSON NOT NULL DEFAULT '{}', "
@@ -338,13 +345,14 @@ def migrate_file_import_table(connection) -> None:
         connection.execute(
             text(
                 "INSERT INTO file_import_migration_tmp "
-                "(id, exclusions, model_field, replace_rules, export_path, file, state, created_at, updated_at) "
-                "VALUES (:id, json(:exclusions), :model_field, :replace_rules, :export_path, json(:file), json(:state), :created_at, :updated_at)"
+                "(id, exclusions, model_field, price_field, replace_rules, export_path, file, state, created_at, updated_at) "
+                "VALUES (:id, json(:exclusions), :model_field, :price_field, :replace_rules, :export_path, json(:file), json(:state), :created_at, :updated_at)"
             ),
             {
                 "id": row.get("id"),
                 "exclusions": json.dumps(_string_array_from_lines(row.get("exclusions")), ensure_ascii=False),
                 "model_field": str(row.get("model_field") or "").strip(),
+                "price_field": str(row.get("price_field") or "").strip(),
                 "replace_rules": str(row.get("replace_rules") or row.get("model_replace_rules") or "").replace("\r\n", "\n").replace("\r", "\n").strip(),
                 "export_path": str(row.get("export_path") or "").strip(),
                 "file": json.dumps(_json_or_default(row.get("file"), {}), ensure_ascii=False),
@@ -812,3 +820,4 @@ def session_scope() -> Session:
         raise
     finally:
         session.close()
+

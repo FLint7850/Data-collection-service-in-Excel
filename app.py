@@ -5011,6 +5011,7 @@ def get_file_import_row(db_session=None) -> FileImport:
             id=1,
             exclusions=[],
             model_field="",
+            price_field="",
             replace_rules="",
             file={},
             state=make_file_import_state(),
@@ -5029,6 +5030,10 @@ def get_file_import_row(db_session=None) -> FileImport:
         normalized_model_field = clean_text(str(getattr(row, "model_field", "") or ""))
         if row.model_field != normalized_model_field:
             row.model_field = normalized_model_field
+            db.flush()
+        normalized_price_field = clean_text(str(getattr(row, "price_field", "") or ""))
+        if getattr(row, "price_field", "") != normalized_price_field:
+            row.price_field = normalized_price_field
             db.flush()
         normalized_replace_rules = normalize_file_import_rules_text(getattr(row, "replace_rules", ""))
         if row.replace_rules != normalized_replace_rules:
@@ -5092,6 +5097,7 @@ def public_file_import_state() -> Dict[str, object]:
     exclusions = normalize_file_import_exclusions(row.exclusions)
     exclusions_text = "\n".join(exclusions)
     model_field = clean_text(str(row.model_field or ""))
+    price_field = clean_text(str(getattr(row, "price_field", "") or ""))
     replace_rules = normalize_file_import_rules_text(row.replace_rules)
     state = normalize_file_import_state(getattr(row, "state", {}) or {})
     active = is_file_import_active_state(state)
@@ -5103,6 +5109,7 @@ def public_file_import_state() -> Dict[str, object]:
             "exclusions": exclusions_text,
             "exclusions_list": exclusions,
             "model_field": model_field,
+            "price_field": price_field,
             "replace_rules": replace_rules,
             "result_filename": result_filename,
             "result_ready": result_ready,
@@ -5113,6 +5120,7 @@ def public_file_import_state() -> Dict[str, object]:
         "exclusions": exclusions_text,
         "exclusions_list": exclusions,
         "model_field": model_field,
+        "price_field": price_field,
         "replace_rules": replace_rules,
         "result_filename": result_filename,
         "result_ready": result_ready,
@@ -5139,14 +5147,14 @@ def normalize_file_import_header(value: object) -> str:
     return clean_text(str(value or "")).casefold()
 
 
-def file_import_column_index(headers: List[object], column_name: str) -> int:
+def file_import_column_index(headers: List[object], column_name: str, column_label: str = "модели") -> int:
     expected = normalize_file_import_header(column_name)
     if not expected:
-        raise ValueError("Укажите название столбца модели")
+        raise ValueError(f"Укажите название столбца {column_label}")
     for index, header in enumerate(headers):
         if normalize_file_import_header(header) == expected:
             return index
-    raise ValueError(f"Столбец модели не найден: {column_name}")
+    raise ValueError(f"Столбец {column_label} не найден: {column_name}")
 
 
 def file_import_optional_brand_index(headers: List[object]) -> Optional[int]:
@@ -5157,7 +5165,7 @@ def file_import_optional_brand_index(headers: List[object]) -> Optional[int]:
     return None
 
 
-def read_file_import_rows(path: Path, model_field: str) -> List[Dict[str, object]]:
+def read_file_import_rows(path: Path, model_field: str, price_field: str = "") -> List[Dict[str, object]]:
     if path.suffix.lower() == ".csv":
         text = decode_file_import_csv(path.read_bytes())
         sample = text[:4096]
@@ -5190,15 +5198,17 @@ def read_file_import_rows(path: Path, model_field: str) -> List[Dict[str, object
     if header_index is None:
         return []
     headers = rows[header_index]
-    model_index = file_import_column_index(headers, model_field)
+    model_index = file_import_column_index(headers, model_field, "модели")
+    price_index = file_import_column_index(headers, price_field, "цены") if clean_text(str(price_field or "")) else None
     brand_index = file_import_optional_brand_index(headers)
     result: List[Dict[str, object]] = []
     for row_number, row in enumerate(rows[header_index + 1:], start=header_index + 2):
         source = clean_text(str(row[model_index] if model_index < len(row) else ""))
         if not source:
             continue
+        price = clean_text(str(row[price_index] if price_index is not None and price_index < len(row) else ""))
         brand = clean_text(str(row[brand_index] if brand_index is not None and brand_index < len(row) else ""))
-        result.append({"row_number": row_number, "name": source, "brand": brand})
+        result.append({"row_number": row_number, "name": source, "price": price, "brand": brand})
     return result
 
 
@@ -5601,6 +5611,7 @@ def file_import_result_filename(original_filename: str) -> str:
 FILE_IMPORT_RESULT_FIELDS = [
     "row",
     "name",
+    "price",
     "brand",
     "model_candidates",
     "selected_model",
@@ -5677,6 +5688,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
         raise ValueError("Укажите название столбца модели")
 
     exclusions = normalize_file_import_exclusions(row.exclusions)
+    price_field = clean_text(str(getattr(row, "price_field", "") or ""))
     replace_rules = normalize_file_import_rules_text(row.replace_rules)
     started_at = time.time()
     update_file_import_state(
@@ -5692,7 +5704,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
     )
     db.commit()
     stop_file_import_if_requested(stop_event)
-    source_rows = read_file_import_rows(path, model_field)
+    source_rows = read_file_import_rows(path, model_field, price_field)
     total_rows = len(source_rows)
     update_file_import_state(db, stage="Загружаю фиды", percent=8, total_rows=total_rows)
     db.commit()
@@ -5734,6 +5746,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                 "state": state,
             }
         name = str(item.get("name") or "")
+        price = str(item.get("price") or "")
         brand = str(item.get("brand") or "")
         if file_import_exclusion_matches(name, brand, exclusions):
             excluded += 1
@@ -5753,6 +5766,7 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                         {
                             "row": item.get("row_number"),
                             "name": name,
+                            "price": price,
                             "brand": brand,
                             "model_candidates": " | ".join(candidates),
                             "selected_model": selected_model,
@@ -8059,6 +8073,8 @@ def api_update_file_import():
         row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
     if "model_field" in payload:
         row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
+    if "price_field" in payload:
+        row.price_field = clean_text(str(payload.get("price_field") or ""))[:255]
     if "replace_rules" in payload:
         row.replace_rules = normalize_file_import_rules_text(payload.get("replace_rules"))
     if "file" in payload:
@@ -8911,6 +8927,9 @@ if __name__ == "__main__":
     with make_server("127.0.0.1", port, app, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
         print(f"Serving on http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
+
+
+
 
 
 
