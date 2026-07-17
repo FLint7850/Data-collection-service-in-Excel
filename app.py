@@ -5165,6 +5165,34 @@ def file_import_optional_brand_index(headers: List[object]) -> Optional[int]:
     return None
 
 
+def file_import_optional_name_index(headers: List[object]) -> Optional[int]:
+    name_headers = (
+        "наименование товара",
+        "название товара",
+        "наименование",
+        "название",
+        "product name",
+        "product_name",
+        "item name",
+        "item_name",
+        "name",
+    )
+    normalized_headers = [normalize_file_import_header(header) for header in headers]
+    for expected in name_headers:
+        try:
+            return normalized_headers.index(expected)
+        except ValueError:
+            continue
+    return None
+
+
+def file_import_cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = clean_text(str(value))
+    return "" if text.casefold() in {"none", "null", "nan"} else text
+
+
 def read_file_import_rows(path: Path, model_field: str, price_field: str = "") -> List[Dict[str, object]]:
     if path.suffix.lower() == ".csv":
         text = decode_file_import_csv(path.read_bytes())
@@ -5201,14 +5229,30 @@ def read_file_import_rows(path: Path, model_field: str, price_field: str = "") -
     model_index = file_import_column_index(headers, model_field, "модели")
     price_index = file_import_column_index(headers, price_field, "цены") if clean_text(str(price_field or "")) else None
     brand_index = file_import_optional_brand_index(headers)
+    name_index = file_import_optional_name_index(headers)
     result: List[Dict[str, object]] = []
     for row_number, row in enumerate(rows[header_index + 1:], start=header_index + 2):
-        source = clean_text(str(row[model_index] if model_index < len(row) else ""))
-        if not source:
+        source_model = file_import_cell_text(row[model_index] if model_index < len(row) else None)
+        if not source_model:
             continue
-        price = clean_text(str(row[price_index] if price_index is not None and price_index < len(row) else ""))
-        brand = clean_text(str(row[brand_index] if brand_index is not None and brand_index < len(row) else ""))
-        result.append({"row_number": row_number, "name": source, "price": price, "brand": brand})
+        source_name = file_import_cell_text(
+            row[name_index] if name_index is not None and name_index < len(row) else None
+        )
+        price = file_import_cell_text(
+            row[price_index] if price_index is not None and price_index < len(row) else None
+        )
+        brand = file_import_cell_text(
+            row[brand_index] if brand_index is not None and brand_index < len(row) else None
+        )
+        result.append(
+            {
+                "row_number": row_number,
+                "source_model": source_model,
+                "name": source_name or source_model,
+                "price": price,
+                "brand": brand,
+            }
+        )
     return result
 
 
@@ -5746,13 +5790,14 @@ def compare_file_import_with_feeds(db_session=None, stop_event: Optional[threadi
                 "state": state,
             }
         name = str(item.get("name") or "")
+        source_model = str(item.get("source_model") or name)
         price = str(item.get("price") or "")
         brand = str(item.get("brand") or "")
-        if file_import_exclusion_matches(name, brand, exclusions):
+        if file_import_exclusion_matches(f"{source_model} {name}", brand, exclusions):
             excluded += 1
         else:
             processed += 1
-            prepared_model = prepare_file_import_model(name, replace_rules)
+            prepared_model = prepare_file_import_model(source_model, replace_rules)
             candidates = generate_model_candidates(prepared_model, brand)
             if not candidates:
                 empty_model += 1
