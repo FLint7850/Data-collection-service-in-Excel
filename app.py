@@ -2353,14 +2353,25 @@ def normalize_url(raw_url: str, base_url: str) -> Optional[str]:
 # Для Bitrix/каталогов URL вида /catalog/category/ и /catalog/category
 # могут обрабатываться сайтом по-разному. Например ZUGEL требует слэш.
 
-    # Сохраняем только пагинацию. Остальные параметры обычно создают дубликаты:
-    # сортировки, UTM-метки, сравнение, фильтры с теми же товарами.
-    pagination_params = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+    # Сохраняем пагинацию и обязательные параметры товарных страниц OpenCart.
+    # Остальные параметры обычно создают дубликаты: сортировки, UTM-метки,
+    # сравнение и фильтры с теми же товарами.
+    query_params = parse_qsl(parsed.query, keep_blank_values=False)
+    route = next(
+        (value for key, value in query_params if key.lower() == "route"),
+        "",
+    ).strip("/").lower()
+    has_product_id = any(key.lower() == "product_id" and value for key, value in query_params)
+    is_opencart_product = route == "product/product" and has_product_id
+
+    preserved_params = []
+    for key, value in query_params:
         key_lower = key.lower()
         if key_lower == "page" or key_lower.startswith("pagen_"):
-            pagination_params.append((key, value))
-    query = urlencode(pagination_params)
+            preserved_params.append((key, value))
+        elif is_opencart_product and key_lower in {"route", "path", "product_id"}:
+            preserved_params.append((key, value))
+    query = urlencode(preserved_params, safe="/")
 
     result = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", query, ""))
     return result
