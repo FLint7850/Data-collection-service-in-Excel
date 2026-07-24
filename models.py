@@ -151,3 +151,28 @@ class FileImport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+
+class FeedComparison(Base):
+    __tablename__ = "feed_comparisons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    export_path: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class SupplierFeed(Base):
+    __tablename__ = "supplier_feeds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    feed_url: Mapped[str] = mapped_column(Text, nullable=False)
+    model_field: Mapped[str] = mapped_column(String(255), nullable=False)
+    exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    replace_rules: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (UniqueConstraint("feed_url", name="uq_supplier_feeds_feed_url"),)
+

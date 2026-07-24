@@ -33,6 +33,7 @@
       <button class="tab-button" id="projectsTabButton" type="button">Проекты</button>
       <button class="tab-button" id="newItemsTabButton" type="button">Новинки</button>
       <button class="tab-button" id="importTabButton" type="button">Выгрузка из файла</button>
+      <button class="tab-button" id="feedComparisonTabButton" type="button">Сравнения с фидами</button>
       <button class="tab-button" id="settingsTabButton" type="button">Настройки</button>
       <button class="tab-button" id="logsTabButton" type="button">Логи</button>
     </nav>
@@ -365,6 +366,70 @@
             <button class="button primary" id="compareFileImportButton" type="button">Сравнить</button>
             <button class="button secondary hidden" id="stopFileImportButton" type="button">Остановить</button>
             <a class="button download disabled" id="downloadFileImportCsvButton" href="#" aria-disabled="true">Скачать XLSX</a>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section class="feed-comparison-view hidden" id="feedComparisonView">
+      <section class="feed-comparison-grid">
+        <div class="panel feed-comparison-panel">
+          <div class="section-title-row">
+            <div>
+              <h2>Фиды моих сайтов</h2>
+              <p class="section-subtitle">Эти фиды также используются в мониторинге новинок и выгрузке из файла.</p>
+            </div>
+            <button class="button secondary compact-button" id="addComparisonOwnSiteButton" type="button">+ Фид</button>
+          </div>
+          <div class="feed-comparison-list" id="comparisonOwnSitesList"></div>
+        </div>
+
+        <div class="panel feed-comparison-panel">
+          <div class="section-title-row">
+            <div>
+              <h2>Фиды поставщиков</h2>
+              <p class="section-subtitle">Для каждого поставщика укажите точное имя XML-поля с моделью.</p>
+            </div>
+            <button class="button secondary compact-button" id="addSupplierFeedButton" type="button">+ Поставщик</button>
+          </div>
+          <div class="feed-comparison-list" id="supplierFeedsList"></div>
+        </div>
+      </section>
+
+      <section class="panel feed-comparison-progress-panel">
+        <div class="progress-header">
+          <div>
+            <h2>Сравнение</h2>
+            <p class="section-subtitle">В итоговом XLSX каждый поставщик будет на отдельном листе.</p>
+          </div>
+          <a class="button download disabled" id="downloadFeedComparisonButton" href="#" aria-disabled="true">Скачать XLSX</a>
+        </div>
+        <div class="main-block-wrapper feed-comparison-progress">
+          <div class="progress-track" aria-label="Прогресс сравнения фидов">
+            <div class="progress-fill" id="feedComparisonProgressFill"></div>
+          </div>
+          <div class="percent-row">
+            <span id="feedComparisonProgressText">0%</span>
+            <span id="feedComparisonNotice"></span>
+          </div>
+          <div class="stats-grid">
+            <div class="stat">
+              <span class="stat-value" id="feedComparisonSuppliersCount">0 / 0</span>
+              <span class="stat-label">Фиды поставщиков</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="feedComparisonRowsCount">0</span>
+              <span class="stat-label">Сравнено моделей</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="feedComparisonMissingCount">0</span>
+              <span class="stat-label">Не найдено</span>
+            </div>
+          </div>
+          <div class="file-import-actions">
+            <button class="button primary" id="startFeedComparisonButton" type="button">Запустить сравнение</button>
+            <button class="button secondary hidden" id="stopFeedComparisonButton" type="button">Остановить</button>
+            <span class="save-notice" id="feedComparisonSaveNotice"></span>
           </div>
         </div>
       </section>

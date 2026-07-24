@@ -207,6 +207,7 @@ def migrate_schema(connection) -> None:
     migrate_donors_table(connection)
     migrate_projects_table(connection)
     migrate_file_import_table(connection)
+    migrate_supplier_feeds_table(connection)
 
 
 def reset_brand_states(connection) -> None:
@@ -363,6 +364,16 @@ def migrate_file_import_table(connection) -> None:
         )
     connection.execute(text("DROP TABLE file_import"))
     connection.execute(text("ALTER TABLE file_import_migration_tmp RENAME TO file_import"))
+
+
+def migrate_supplier_feeds_table(connection) -> None:
+    columns = table_columns(connection, "supplier_feeds")
+    if not columns:
+        return
+    if "exclusions" not in columns:
+        connection.execute(text("ALTER TABLE supplier_feeds ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
+    if "replace_rules" not in columns:
+        connection.execute(text("ALTER TABLE supplier_feeds ADD COLUMN replace_rules TEXT NOT NULL DEFAULT ''"))
 
 
 def _bool_value(value, default=False) -> bool:

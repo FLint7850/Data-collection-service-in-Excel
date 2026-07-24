@@ -3,11 +3,13 @@ const addProjectButton = document.querySelector("#addProjectButton");
 const projectsTabButton = document.querySelector("#projectsTabButton");
 const newItemsTabButton = document.querySelector("#newItemsTabButton");
 const importTabButton = document.querySelector("#importTabButton");
+const feedComparisonTabButton = document.querySelector("#feedComparisonTabButton");
 const settingsTabButton = document.querySelector("#settingsTabButton");
 const logsTabButton = document.querySelector("#logsTabButton");
 const projectView = document.querySelector("#projectView");
 const newItemsView = document.querySelector("#newItemsView");
 const fileImportView = document.querySelector("#fileImportView");
+const feedComparisonView = document.querySelector("#feedComparisonView");
 const settingsView = document.querySelector("#settingsView");
 const logsView = document.querySelector("#logsView");
 
@@ -74,6 +76,20 @@ const compareFileImportButton = document.querySelector("#compareFileImportButton
 const stopFileImportButton = document.querySelector("#stopFileImportButton");
 const downloadFileImportCsvButton = document.querySelector("#downloadFileImportCsvButton");
 const fileImportAllowedExtensions = new Set(["csv", "xls", "xlsx"]);
+const comparisonOwnSitesList = document.querySelector("#comparisonOwnSitesList");
+const supplierFeedsList = document.querySelector("#supplierFeedsList");
+const addComparisonOwnSiteButton = document.querySelector("#addComparisonOwnSiteButton");
+const addSupplierFeedButton = document.querySelector("#addSupplierFeedButton");
+const feedComparisonProgressFill = document.querySelector("#feedComparisonProgressFill");
+const feedComparisonProgressText = document.querySelector("#feedComparisonProgressText");
+const feedComparisonNotice = document.querySelector("#feedComparisonNotice");
+const feedComparisonSuppliersCount = document.querySelector("#feedComparisonSuppliersCount");
+const feedComparisonRowsCount = document.querySelector("#feedComparisonRowsCount");
+const feedComparisonMissingCount = document.querySelector("#feedComparisonMissingCount");
+const startFeedComparisonButton = document.querySelector("#startFeedComparisonButton");
+const stopFeedComparisonButton = document.querySelector("#stopFeedComparisonButton");
+const downloadFeedComparisonButton = document.querySelector("#downloadFeedComparisonButton");
+const feedComparisonSaveNotice = document.querySelector("#feedComparisonSaveNotice");
 
 function enableDetailsAnimation(details) {
   if (!details) return;
@@ -220,8 +236,15 @@ let fileImportData = null;
 let fileImportLoaded = false;
 let fileImportUploading = false;
 let fileImportPollTimer = null;
+let feedComparisonData = null;
+let feedComparisonLoaded = false;
+let feedComparisonPollTimer = null;
+let pendingComparisonOwnSite = false;
+let pendingSupplierFeed = false;
+const openComparisonOwnSites = new Set();
+const openSupplierFeeds = new Set();
 const activeViewStorageKey = "excelServiceActiveView";
-const allowedActiveViews = new Set(["projects", "news", "import", "settings", "logs"]);
+const allowedActiveViews = new Set(["projects", "news", "import", "feed-comparison", "settings", "logs"]);
 const appConfig = window.__APP_CONFIG__ || {};
 const progressPollIntervalMs = Math.max(500, Math.min(Number(appConfig.progressIntervalMs || 2000), 30000));
 let activeProjectId = appConfig.activeProjectId || idFromEditPath("projects") || null;
@@ -230,6 +253,7 @@ let pendingNewsMonitorId = appConfig.activeNewsId || idFromEditPath("news") || "
 function viewFromPath(pathname = window.location.pathname) {
   if (pathname.startsWith("/news")) return "news";
   if (pathname.startsWith("/file-import")) return "import";
+  if (pathname.startsWith("/feed-comparison")) return "feed-comparison";
   if (pathname.startsWith("/settings")) return "settings";
   if (pathname.startsWith("/logs")) return "logs";
   return "projects";
@@ -265,6 +289,7 @@ function routeForView(view, options = {}) {
     return monitorId ? `/news/edit/${encodeURIComponent(monitorId)}` : "/news";
   }
   if (view === "import") return "/file-import";
+  if (view === "feed-comparison") return "/feed-comparison";
   if (view === "settings") return "/settings";
   if (view === "logs") return "/logs";
   return "/projects";
@@ -612,6 +637,7 @@ function renderTabs() {
   projectsTabButton.classList.toggle("active", activeView === "projects");
   newItemsTabButton.classList.toggle("active", activeView === "news");
   importTabButton.classList.toggle("active", activeView === "import");
+  feedComparisonTabButton.classList.toggle("active", activeView === "feed-comparison");
   settingsTabButton.classList.toggle("active", activeView === "settings");
   logsTabButton.classList.toggle("active", activeView === "logs");
 }
@@ -1414,6 +1440,232 @@ async function stopFileImportScan() {
   if (stopFileImportButton) stopFileImportButton.disabled = true;
   fileImportData = await requestJson("/api/file-import/stop", { method: "POST" });
   renderFileImport();
+}
+
+function isFeedComparisonActive(status) {
+  return ["queued", "running"].includes(status);
+}
+
+function feedComparisonStateNotice(state) {
+  const status = state?.status || "idle";
+  if (status === "queued") return state.stage || "В очереди";
+  if (status === "running") {
+    const supplier = state.current_supplier ? `: ${state.current_supplier}` : "";
+    return `${state.stage || "Сравниваю"}${supplier}`;
+  }
+  if (status === "completed") return `Готово. Не найдено: ${Number(state.missing_rows || 0)}`;
+  if (status === "stopped") return "Сравнение остановлено";
+  if (status === "error") return state.error || "Ошибка сравнения";
+  return state.stage || "";
+}
+
+function comparisonCardMarkup(kind, item, isNew, disabled) {
+  const ownSite = kind === "own";
+  const key = isNew ? "new" : String(item.id);
+  const openSet = ownSite ? openComparisonOwnSites : openSupplierFeeds;
+  const open = isNew || openSet.has(key);
+  const title = item.name || (ownSite ? "Новый фид сайта" : "Новый поставщик");
+  return `
+    <details class="settings-details feed-comparison-card" data-kind="${kind}" data-id="${escapeHtml(key)}" ${open ? "open" : ""}>
+      <summary>
+        <span>${escapeHtml(title)}</span>
+        <span class="feed-comparison-summary-meta">${isNew ? "не сохранено" : escapeHtml(item.feed_url || "")}</span>
+      </summary>
+      <div class="settings-details__content feed-comparison-card-content">
+        <div class="feed-comparison-fields">
+          <label class="field">
+            <span>${ownSite ? "Название фида" : "Поставщик"}</span>
+            <input data-field="name" type="text" value="${escapeHtml(item.name || "")}" ${disabled ? "disabled" : ""}>
+          </label>
+          <label class="field feed-comparison-url-field">
+            <span>Ссылка на фид</span>
+            <input data-field="feed_url" type="url" value="${escapeHtml(item.feed_url || "")}" placeholder="https://site.ru/feed.xml" ${disabled ? "disabled" : ""}>
+          </label>
+          ${ownSite ? `
+            <label class="field feed-comparison-url-field">
+              <span>Ссылка генерации фида</span>
+              <input data-field="feed_generate_url" type="url" value="${escapeHtml(item.feed_generate_url || "")}" placeholder="https://site.ru/generate" ${disabled ? "disabled" : ""}>
+            </label>
+          ` : `
+            <label class="field">
+              <span>XML-поле модели</span>
+              <input data-field="model_field" type="text" value="${escapeHtml(item.model_field || "")}" placeholder="vendorCode" ${disabled ? "disabled" : ""}>
+              <small>Точное имя поля, например vendorCode, model, @sku или param:Модель.</small>
+            </label>
+          `}
+        </div>
+        ${ownSite ? "" : `
+          <details class="settings-details feed-comparison-rules">
+            <summary>Исключения и поиск/замена</summary>
+            <div class="settings-details__content feed-comparison-rules-content">
+              <label class="field">
+                <span>Исключения по названию товара</span>
+                <textarea data-field="exclusions" rows="4" placeholder="Аксессуар&#10;Рекламная продукция" ${disabled ? "disabled" : ""}>${escapeHtml(item.exclusions || "")}</textarea>
+                <small>Каждое правило с новой строки. Совпадение проверяется по названию товара.</small>
+              </label>
+              <label class="field">
+                <span>Правила поиск/замены для названия и модели</span>
+                <textarea data-field="replace_rules" rows="5" placeholder="{reg[#\\s{2,}#]}| " ${disabled ? "disabled" : ""}>${escapeHtml(item.replace_rules || "")}</textarea>
+                <small>Формат такой же, как во вкладке «Выгрузка из файла».</small>
+              </label>
+            </div>
+          </details>
+        `}
+        <div class="feed-comparison-card-actions">
+          <button class="button primary compact-button" data-action="save-comparison-feed" type="button" ${disabled ? "disabled" : ""}>Сохранить</button>
+          <button class="button danger compact-button" data-action="delete-comparison-feed" type="button" ${disabled ? "disabled" : ""}>${isNew ? "Отменить" : "Удалить"}</button>
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function bindComparisonDetails(list, openSet) {
+  list?.querySelectorAll(".feed-comparison-card").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      const key = details.dataset.id || "";
+      if (details.open) openSet.add(key);
+      else openSet.delete(key);
+    });
+  });
+}
+
+function renderFeedComparisonLists(scanning) {
+  if (comparisonOwnSitesList) {
+    const sites = feedComparisonData?.own_sites || [];
+    comparisonOwnSitesList.innerHTML = [
+      ...sites.map((item) => comparisonCardMarkup("own", item, false, scanning)),
+      ...(pendingComparisonOwnSite ? [comparisonCardMarkup("own", {}, true, scanning)] : []),
+    ].join("") || '<p class="feed-comparison-empty">Добавьте фид вашего сайта.</p>';
+    bindComparisonDetails(comparisonOwnSitesList, openComparisonOwnSites);
+  }
+  if (supplierFeedsList) {
+    const suppliers = feedComparisonData?.suppliers || [];
+    supplierFeedsList.innerHTML = [
+      ...suppliers.map((item) => comparisonCardMarkup("supplier", item, false, scanning)),
+      ...(pendingSupplierFeed ? [comparisonCardMarkup("supplier", {}, true, scanning)] : []),
+    ].join("") || '<p class="feed-comparison-empty">Добавьте хотя бы один фид поставщика.</p>';
+    bindComparisonDetails(supplierFeedsList, openSupplierFeeds);
+  }
+}
+
+function renderFeedComparison() {
+  const state = feedComparisonData?.state || {};
+  const scanning = isFeedComparisonActive(state.status);
+  renderFeedComparisonLists(scanning);
+  const percent = clampPercent(state.percent || 0);
+  if (feedComparisonProgressFill) feedComparisonProgressFill.style.width = `${percent}%`;
+  if (feedComparisonProgressText) feedComparisonProgressText.textContent = `${percent}%`;
+  if (feedComparisonNotice) {
+    feedComparisonNotice.textContent = feedComparisonStateNotice(state);
+    feedComparisonNotice.classList.toggle("error-text", state.status === "error");
+  }
+  if (feedComparisonSuppliersCount) {
+    feedComparisonSuppliersCount.textContent = `${Number(state.suppliers_done || 0)} / ${Number(state.suppliers_total || (feedComparisonData?.suppliers || []).length)}`;
+  }
+  if (feedComparisonRowsCount) feedComparisonRowsCount.textContent = String(Number(state.processed_rows || 0));
+  if (feedComparisonMissingCount) feedComparisonMissingCount.textContent = String(Number(state.missing_rows || 0));
+  if (startFeedComparisonButton) startFeedComparisonButton.disabled = scanning;
+  if (stopFeedComparisonButton) {
+    stopFeedComparisonButton.classList.toggle("hidden", !scanning);
+    stopFeedComparisonButton.disabled = false;
+  }
+  if (addComparisonOwnSiteButton) addComparisonOwnSiteButton.disabled = scanning || pendingComparisonOwnSite;
+  if (addSupplierFeedButton) addSupplierFeedButton.disabled = scanning || pendingSupplierFeed;
+  if (downloadFeedComparisonButton) {
+    const ready = Boolean(feedComparisonData?.result_ready) && !scanning;
+    downloadFeedComparisonButton.classList.toggle("disabled", !ready);
+    downloadFeedComparisonButton.setAttribute("aria-disabled", ready ? "false" : "true");
+    downloadFeedComparisonButton.href = ready ? "/api/feed-comparison/download" : "#";
+  }
+}
+
+async function loadFeedComparison() {
+  feedComparisonData = await requestJson("/api/feed-comparison");
+  feedComparisonLoaded = true;
+  renderFeedComparison();
+  configureFeedComparisonPolling();
+}
+
+function configureFeedComparisonPolling() {
+  const scanning = isFeedComparisonActive(feedComparisonData?.state?.status);
+  if (activeView !== "feed-comparison" || !scanning) {
+    if (feedComparisonPollTimer) {
+      window.clearInterval(feedComparisonPollTimer);
+      feedComparisonPollTimer = null;
+    }
+    return;
+  }
+  if (feedComparisonPollTimer) return;
+  feedComparisonPollTimer = window.setInterval(async () => {
+    try {
+      await loadFeedComparison();
+    } catch (error) {
+      if (feedComparisonNotice) feedComparisonNotice.textContent = error.message;
+    }
+  }, progressPollIntervalMs);
+}
+
+function comparisonCardPayload(details) {
+  const payload = {};
+  details.querySelectorAll("[data-field]").forEach((field) => {
+    payload[field.dataset.field] = field.value || "";
+  });
+  return payload;
+}
+
+async function saveComparisonCard(details) {
+  const kind = details.dataset.kind;
+  const id = details.dataset.id;
+  const isNew = id === "new";
+  const base = kind === "own"
+    ? "/api/feed-comparison/own-sites"
+    : "/api/feed-comparison/suppliers";
+  if (feedComparisonSaveNotice) feedComparisonSaveNotice.textContent = "Сохраняю...";
+  feedComparisonData = await requestJson(isNew ? base : `${base}/${encodeURIComponent(id)}`, {
+    method: isNew ? "POST" : "PATCH",
+    body: JSON.stringify(comparisonCardPayload(details)),
+  });
+  if (kind === "own") pendingComparisonOwnSite = false;
+  else pendingSupplierFeed = false;
+  if (feedComparisonSaveNotice) {
+    feedComparisonSaveNotice.textContent = "Сохранено";
+    window.setTimeout(() => {
+      if (feedComparisonSaveNotice.textContent === "Сохранено") feedComparisonSaveNotice.textContent = "";
+    }, 1800);
+  }
+  renderFeedComparison();
+}
+
+async function deleteComparisonCard(details) {
+  const kind = details.dataset.kind;
+  const id = details.dataset.id;
+  if (id === "new") {
+    if (kind === "own") pendingComparisonOwnSite = false;
+    else pendingSupplierFeed = false;
+    renderFeedComparison();
+    return;
+  }
+  const base = kind === "own"
+    ? "/api/feed-comparison/own-sites"
+    : "/api/feed-comparison/suppliers";
+  feedComparisonData = await requestJson(`${base}/${encodeURIComponent(id)}`, { method: "DELETE" });
+  (kind === "own" ? openComparisonOwnSites : openSupplierFeeds).delete(id);
+  renderFeedComparison();
+}
+
+async function startFeedComparison() {
+  if (feedComparisonNotice) feedComparisonNotice.textContent = "Запускаю сравнение...";
+  feedComparisonData = await requestJson("/api/feed-comparison/start", { method: "POST" });
+  renderFeedComparison();
+  configureFeedComparisonPolling();
+}
+
+async function stopFeedComparison() {
+  if (stopFeedComparisonButton) stopFeedComparisonButton.disabled = true;
+  feedComparisonData = await requestJson("/api/feed-comparison/stop", { method: "POST" });
+  renderFeedComparison();
+  configureFeedComparisonPolling();
 }
 
 function renderFeedStorage() {
@@ -2310,10 +2562,12 @@ async function loadNews() {
 function renderAll() {
   renderTabs();
   configureFileImportPolling();
+  configureFeedComparisonPolling();
   const project = activeProject();
   projectView.classList.toggle("hidden", activeView !== "projects");
   newItemsView.classList.toggle("hidden", activeView !== "news");
   fileImportView.classList.toggle("hidden", activeView !== "import");
+  feedComparisonView.classList.toggle("hidden", activeView !== "feed-comparison");
   settingsView.classList.toggle("hidden", activeView !== "settings");
   logsView.classList.toggle("hidden", activeView !== "logs");
   if (activeView === "projects") {
@@ -2349,6 +2603,14 @@ function renderAll() {
     } else {
       loadFileImport().catch((error) => {
         errorText.textContent = error.message;
+      });
+    }
+  } else if (activeView === "feed-comparison") {
+    if (feedComparisonLoaded) {
+      renderFeedComparison();
+    } else {
+      loadFeedComparison().catch((error) => {
+        if (feedComparisonNotice) feedComparisonNotice.textContent = error.message;
       });
     }
   } else {
@@ -2498,6 +2760,12 @@ importTabButton.addEventListener("click", () => {
   renderAll();
 });
 
+feedComparisonTabButton.addEventListener("click", () => {
+  setActiveView("feed-comparison");
+  configureProgressStream();
+  renderAll();
+});
+
 settingsTabButton.addEventListener("click", () => {
   setActiveView("settings");
   configureProgressStream();
@@ -2620,6 +2888,65 @@ if (downloadFileImportCsvButton) {
     if (downloadFileImportCsvButton.classList.contains("disabled")) {
       event.preventDefault();
     }
+  });
+}
+
+if (addComparisonOwnSiteButton) {
+  addComparisonOwnSiteButton.addEventListener("click", () => {
+    pendingComparisonOwnSite = true;
+    openComparisonOwnSites.add("new");
+    renderFeedComparison();
+    comparisonOwnSitesList?.querySelector("[data-id='new'] input")?.focus();
+  });
+}
+
+if (addSupplierFeedButton) {
+  addSupplierFeedButton.addEventListener("click", () => {
+    pendingSupplierFeed = true;
+    openSupplierFeeds.add("new");
+    renderFeedComparison();
+    supplierFeedsList?.querySelector("[data-id='new'] input")?.focus();
+  });
+}
+
+for (const list of [comparisonOwnSitesList, supplierFeedsList]) {
+  list?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action]");
+    const details = button?.closest(".feed-comparison-card");
+    if (!button || !details) return;
+    button.disabled = true;
+    const action = button.dataset.action;
+    const operation = action === "save-comparison-feed"
+      ? saveComparisonCard(details)
+      : deleteComparisonCard(details);
+    operation.catch((error) => {
+      button.disabled = false;
+      if (feedComparisonSaveNotice) feedComparisonSaveNotice.textContent = error.message;
+    });
+  });
+}
+
+if (startFeedComparisonButton) {
+  startFeedComparisonButton.addEventListener("click", () => {
+    startFeedComparison().catch((error) => {
+      startFeedComparisonButton.disabled = false;
+      if (feedComparisonNotice) feedComparisonNotice.textContent = error.message;
+    });
+  });
+}
+
+if (stopFeedComparisonButton) {
+  stopFeedComparisonButton.addEventListener("click", () => {
+    stopFeedComparison().catch((error) => {
+      stopFeedComparisonButton.disabled = false;
+      if (feedComparisonNotice) feedComparisonNotice.textContent = error.message;
+    });
+  });
+}
+
+if (downloadFeedComparisonButton) {
+  downloadFeedComparisonButton.addEventListener("click", (event) => {
+    if (downloadFeedComparisonButton.classList.contains("disabled")) event.preventDefault();
   });
 }
 

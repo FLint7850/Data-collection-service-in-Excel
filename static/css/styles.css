@@ -897,13 +897,119 @@ select:focus {
 }
 
 .settings-view.hidden,
-.file-import-view.hidden {
+.file-import-view.hidden,
+.feed-comparison-view.hidden {
   display: none;
 }
 
 .file-import-view {
   display: grid;
   gap: 18px;
+}
+
+.feed-comparison-view {
+  display: grid;
+  gap: 18px;
+}
+
+.feed-comparison-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.section-subtitle {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.feed-comparison-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.feed-comparison-card {
+  margin: 0;
+}
+
+.feed-comparison-card summary {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.feed-comparison-card summary > span:first-child {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.feed-comparison-summary-meta {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed-comparison-card-content {
+  display: grid;
+  gap: 12px;
+  padding: 0 14px 14px;
+  overflow: hidden;
+}
+
+.feed-comparison-fields {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.65fr) minmax(220px, 1.35fr);
+  gap: 12px;
+}
+
+.feed-comparison-url-field {
+  grid-column: span 2;
+}
+
+.feed-comparison-fields small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.feed-comparison-rules {
+  margin: 0;
+}
+
+.feed-comparison-rules-content {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 0 14px 14px;
+  overflow: hidden;
+}
+
+.feed-comparison-card-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.feed-comparison-empty {
+  margin: 0;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  color: var(--muted);
+}
+
+.feed-comparison-progress {
+  display: grid;
+  gap: 14px;
+}
+
+.feed-comparison-progress-panel .progress-header {
+  align-items: flex-start;
 }
 
 .file-upload-shell {
@@ -1854,9 +1960,28 @@ select:focus {
   .modal-actions,
   .file-import-save-row,
   .file-import-selected,
-  .file-import-actions {
+  .file-import-actions,
+  .feed-comparison-card-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .feed-comparison-grid,
+  .feed-comparison-fields,
+  .feed-comparison-rules-content {
+    grid-template-columns: 1fr;
+  }
+
+  .feed-comparison-url-field {
+    grid-column: auto;
+  }
+
+  .feed-comparison-card summary {
+    grid-template-columns: 1fr;
+  }
+
+  .feed-comparison-summary-meta {
+    text-align: left;
   }
 
   .file-import-selected strong {
