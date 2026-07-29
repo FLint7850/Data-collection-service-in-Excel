@@ -1,13 +1,14 @@
 $ErrorActionPreference = "Stop"
-$Port = 5055
-$AppUrl = "http://127.0.0.1:$Port"
+
+$BackendPort = 5055
+$FrontendPort = 3000
+$FrontendDir = Join-Path $PSScriptRoot "frontend"
 
 function Load-LocalEnv {
     $envPath = Join-Path $PSScriptRoot ".env"
     if (-not (Test-Path $envPath)) {
         return
     }
-
     foreach ($rawLine in Get-Content -Encoding UTF8 -LiteralPath $envPath) {
         $line = $rawLine.Trim()
         if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) {
@@ -22,52 +23,56 @@ function Load-LocalEnv {
     }
 }
 
-Load-LocalEnv
-
 function Find-Python {
-    $candidates = @(
-        @{ Command = "python"; Args = @("--version") },
-        @{ Command = "py"; Args = @("-3", "--version") },
-        @{ Command = "python3"; Args = @("--version") }
-    )
-
-    foreach ($candidate in $candidates) {
-        $command = Get-Command $candidate.Command -ErrorAction SilentlyContinue
-        if (-not $command) {
-            continue
-        }
-
-        try {
-            & $candidate.Command @($candidate.Args) *> $null
-            return $candidate.Command
-        }
-        catch {
-            continue
+    foreach ($candidate in @("python", "py", "python3")) {
+        if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+            return $candidate
         }
     }
-
     return $null
 }
 
-function Test-AppReady {
-    try {
-        $response = Invoke-WebRequest -Uri "$AppUrl/api/health" -UseBasicParsing -TimeoutSec 2
-        if ($response.StatusCode -ne 200) {
-            return $false
+function Find-XTunnel {
+    foreach ($candidate in @(
+        (Join-Path $PSScriptRoot "tools\xtunnel\xtunnel.exe"),
+        (Join-Path $PSScriptRoot "xtunnel.exe")
+    )) {
+        if (Test-Path $candidate) {
+            return $candidate
         }
-        $data = $response.Content | ConvertFrom-Json
-        return $data.ok -eq $true
+    }
+    $command = Get-Command xtunnel -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    return $null
+}
+
+function Test-PortBusy {
+    param([int]$PortToCheck)
+    try {
+        return $null -ne (Get-NetTCPConnection -LocalPort $PortToCheck -ErrorAction SilentlyContinue | Select-Object -First 1)
     }
     catch {
         return $false
     }
 }
 
-function Test-PortBusy {
-    param([int]$PortToCheck)
+function Find-FreePort {
+    param([int]$Preferred, [int]$Last)
+    for ($candidate = $Preferred; $candidate -le $Last; $candidate++) {
+        if (-not (Test-PortBusy -PortToCheck $candidate)) {
+            return $candidate
+        }
+    }
+    throw "No free port found in range $Preferred-$Last."
+}
+
+function Test-JsonHealth {
+    param([string]$Url)
     try {
-        $connection = Get-NetTCPConnection -LocalPort $PortToCheck -ErrorAction SilentlyContinue | Select-Object -First 1
-        return $null -ne $connection
+        $response = Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -eq 200 -and ($response.Content | ConvertFrom-Json).ok -eq $true
     }
     catch {
         return $false
@@ -81,64 +86,31 @@ function Stop-StartedProcess {
     }
 }
 
-function Find-XTunnel {
-    $localCandidates = @(
-        (Join-Path $PSScriptRoot "tools\xtunnel\xtunnel.exe"),
-        (Join-Path $PSScriptRoot "xtunnel.exe")
-    )
-
-    foreach ($candidate in $localCandidates) {
-        if (Test-Path $candidate) {
-            return $candidate
-        }
-    }
-
-    $command = Get-Command xtunnel -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
-    }
-
-    return $null
-}
+Load-LocalEnv
 
 $xtunnelPath = Find-XTunnel
 if (-not $xtunnelPath) {
     Write-Host "xTunnel is not installed or is not available in PATH." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Run INSTALL_XTUNNEL.cmd once, or download Windows x64 manually from:" -ForegroundColor Yellow
-    Write-Host "https://xtunnel.ru/docs/install/windows/zip"
-    Write-Host ""
-    Write-Host "Then activate xTunnel once:"
-    Write-Host "   .\tools\xtunnel\xtunnel.exe register YOUR_KEY"
-    Write-Host ""
-    Write-Host "After that run START_PUBLIC_PARSER.cmd again." -ForegroundColor Yellow
-    Write-Host ""
+    Write-Host "Run INSTALL_XTUNNEL.cmd, activate xTunnel, then try again." -ForegroundColor Yellow
     Write-Host "Press Enter to close this window."
     Read-Host
     exit 1
 }
-
-Write-Host "Using xTunnel: $xtunnelPath" -ForegroundColor Cyan
 
 $python = Find-Python
-if (-not $python) {
-    Write-Host "Python was not found in PATH." -ForegroundColor Red
-    Write-Host "Install Python 3.10+ from https://www.python.org/downloads/ and enable 'Add python.exe to PATH'." -ForegroundColor Yellow
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+$npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $python -or -not $nodeCommand -or -not $npmCommand) {
+    Write-Host "Python 3.10+ and Node.js 20+ are required." -ForegroundColor Red
     Write-Host "Press Enter to close this window."
     Read-Host
     exit 1
 }
 
-if ($python -eq "py") {
-    $pythonArgs = @("-3")
-}
-else {
-    $pythonArgs = @()
-}
-
+$pythonArgs = if ($python -eq "py") { @("-3") } else { @() }
 $createdVenv = $false
 if (-not (Test-Path ".venv")) {
-    Write-Host "Creating virtual environment..." -ForegroundColor Cyan
+    Write-Host "Creating Python environment..." -ForegroundColor Cyan
     & $python @pythonArgs -m venv .venv
     $createdVenv = $true
 }
@@ -151,98 +123,93 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install -r requirements.txt
 
 if ($createdVenv -or $ForceBrowserSetup) {
-    Write-Host "Installing Playwright Chromium and headless shell..." -ForegroundColor Cyan
     & $venvPython -m playwright install chromium chromium-headless-shell
-}
-else {
-    Write-Host "Skipping browser setup for existing .venv. Set FORCE_BROWSER_SETUP=1 to reinstall." -ForegroundColor DarkGray
-}
-
-if ($createdVenv -or $ForceBrowserSetup) {
-    Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
     $crawl4aiSetup = Join-Path ".venv" "Scripts\crawl4ai-setup.exe"
-    if (-not (Test-Path $crawl4aiSetup)) {
-        Write-Host "crawl4ai-setup.exe was not found. Updating Crawl4AI..." -ForegroundColor Yellow
-        & $venvPython -m pip install -U crawl4ai
-    }
     if (Test-Path $crawl4aiSetup) {
         & $crawl4aiSetup
     }
-    else {
-        Write-Host "crawl4ai-setup.exe is still missing after install. Skipping Crawl4AI browser preparation." -ForegroundColor Yellow
+}
+
+if (-not (Test-Path (Join-Path $FrontendDir "node_modules\.bin\nuxt.cmd"))) {
+    Push-Location $FrontendDir
+    try {
+        & $($npmCommand.Source) ci
+    }
+    finally {
+        Pop-Location
     }
 }
 
-if (Test-AppReady) {
-    Write-Host "The app is already running at $AppUrl" -ForegroundColor Green
-}
-else {
-    if (Test-PortBusy -PortToCheck $Port) {
-        for ($candidate = 5056; $candidate -le 5065; $candidate++) {
-            if (-not (Test-PortBusy -PortToCheck $candidate)) {
-                $Port = $candidate
-                $AppUrl = "http://127.0.0.1:$Port"
-                Write-Host "Default parser port is busy. Using $AppUrl instead." -ForegroundColor Yellow
-                break
-            }
-        }
-    }
+$BackendPort = Find-FreePort -Preferred $BackendPort -Last 5065
+$FrontendPort = Find-FreePort -Preferred $FrontendPort -Last 3010
+$BackendUrl = "http://127.0.0.1:$BackendPort"
+$AppUrl = "http://127.0.0.1:$FrontendPort"
 
-    $LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $LogDir = Join-Path $PSScriptRoot "logs"
-    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-    $AppLog = Join-Path $LogDir "app.log"
-    Add-Content -Path $AppLog -Encoding UTF8 -Value ""
-    Add-Content -Path $AppLog -Encoding UTF8 -Value "[$(Get-Date -Format o)] Starting public server on port $Port"
+$LogDir = Join-Path $PSScriptRoot "logs"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$BackendLog = Join-Path $LogDir "backend.log"
+$FrontendLog = Join-Path $LogDir "frontend.log"
+$backendProcess = $null
+$frontendProcess = $null
 
-    Write-Host "Starting Flask app..." -ForegroundColor Green
-    $env:PORT = "$Port"
-    $LaunchCommand = "set PORT=$Port&& set PYTHONIOENCODING=utf-8&& `"$venvPython`" `"app.py`" >> `"$AppLog`" 2>>&1"
-    $appProcess = Start-Process `
+try {
+    Write-Host "Starting API at $BackendUrl ..." -ForegroundColor Green
+    $backendCommand = "set PORT=$BackendPort&& set PYTHONIOENCODING=utf-8&& `"$venvPython`" `"app.py`" >> `"$BackendLog`" 2>>&1"
+    $backendProcess = Start-Process `
         -FilePath "cmd.exe" `
-        -ArgumentList "/d", "/c", $LaunchCommand `
+        -ArgumentList "/d", "/c", $backendCommand `
         -WorkingDirectory $PSScriptRoot `
         -PassThru `
         -WindowStyle Hidden
 
-    Write-Host "Waiting for $AppUrl ..." -ForegroundColor Cyan
-    $ready = $false
-    for ($i = 0; $i -lt 40; $i++) {
-        if ($appProcess.HasExited) {
+    $backendReady = $false
+    for ($i = 0; $i -lt 60; $i++) {
+        if (Test-JsonHealth -Url $BackendUrl) {
+            $backendReady = $true
             break
         }
-        if (Test-AppReady) {
-            $ready = $true
+        if ($backendProcess.HasExited) {
             break
         }
         Start-Sleep -Milliseconds 500
     }
-
-    if (-not $ready) {
-        Write-Host "The app did not start correctly." -ForegroundColor Red
-        if (Test-Path $AppLog) {
-            Write-Host ""
-            Write-Host "${AppLog}:" -ForegroundColor Yellow
-            Get-Content $AppLog -Tail 120
-        }
-        Stop-StartedProcess $appProcess
-        Write-Host "Press Enter to close this window."
-        Read-Host
-        exit 1
+    if (-not $backendReady) {
+        throw "The API did not start. Check $BackendLog."
     }
-}
 
-Write-Host ""
-Write-Host "Local app is ready: $AppUrl" -ForegroundColor Green
-Start-Process $AppUrl
-Write-Host ""
-Write-Host "Starting xTunnel. Copy the public HTTPS URL from the output below and send it to other users." -ForegroundColor Yellow
-Write-Host "Keep this window open while the public link is needed." -ForegroundColor Yellow
-Write-Host ""
+    Write-Host "Starting Nuxt at $AppUrl ..." -ForegroundColor Green
+    $frontendCommand = "set PORT=$FrontendPort&& set NUXT_BACKEND_URL=$BackendUrl&& `"$($npmCommand.Source)`" run dev -- --host 127.0.0.1 --port $FrontendPort >> `"$FrontendLog`" 2>>&1"
+    $frontendProcess = Start-Process `
+        -FilePath "cmd.exe" `
+        -ArgumentList "/d", "/c", $frontendCommand `
+        -WorkingDirectory $FrontendDir `
+        -PassThru `
+        -WindowStyle Hidden
 
-try {
-    & $xtunnelPath http $Port --tunnel-host tunnel4.com
+    $frontendReady = $false
+    for ($i = 0; $i -lt 80; $i++) {
+        if (Test-JsonHealth -Url $AppUrl) {
+            $frontendReady = $true
+            break
+        }
+        if ($frontendProcess.HasExited) {
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $frontendReady) {
+        throw "Nuxt did not start. Check $FrontendLog."
+    }
+
+    Write-Host "Local application is ready: $AppUrl" -ForegroundColor Green
+    Start-Process $AppUrl
+    Write-Host ""
+    Write-Host "Starting xTunnel for the Nuxt interface." -ForegroundColor Yellow
+    Write-Host "Copy the public HTTPS URL and keep this window open." -ForegroundColor Yellow
+    Write-Host ""
+    & $xtunnelPath http $FrontendPort --tunnel-host tunnel4.com
 }
 finally {
-    Stop-StartedProcess $appProcess
+    Stop-StartedProcess $frontendProcess
+    Stop-StartedProcess $backendProcess
 }

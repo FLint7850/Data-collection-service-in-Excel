@@ -1,0 +1,357 @@
+<script setup lang="ts">
+import { newsService } from "~/services/news.service";
+import type { NewsMonitor, ProgressPayload, ScanState } from "~/types/api";
+import { errorMessage } from "~/utils/format";
+
+const props = withDefaults(defineProps<{ brandId?: string }>(), { brandId: "" });
+const toast = useToast();
+const { data, loading, load, merge, upsertMonitor } = useNews();
+const modalOpen = ref(false);
+const selectedMonitorId = ref("");
+const createOpen = ref(false);
+const createGroup = ref("Маржа");
+const createBrand = ref("");
+const creating = ref(false);
+const collapsedGroups = ref<Set<string>>(new Set());
+const deletingKey = ref("");
+const deleteOpen = ref(false);
+const pageError = ref("");
+
+interface BrandGroup {
+  key: string;
+  group: string;
+  brand: string;
+  brandId?: number;
+  monitors: NewsMonitor[];
+  state: ScanState;
+}
+
+function aggregateState(monitors: NewsMonitor[]): ScanState {
+  const active =
+    monitors.find((item) =>
+      ["running", "queued", "pausing", "stopping"].includes(item.state?.status),
+    ) ||
+    monitors.find((item) => item.state?.status === "partial") ||
+    monitors[0];
+  if (!active) {
+    return {
+      status: "idle",
+      percent: 0,
+      currenturl: "",
+      totalprocessed: 0,
+      processed_products: 0,
+      found_products: 0,
+      skipped: 0,
+      error: "",
+      elapsed_seconds: 0,
+    };
+  }
+  return {
+    ...active.state,
+    new_count: Math.max(...monitors.map((item) => Number(item.state?.new_count || 0))),
+    found_products: Math.max(...monitors.map((item) => Number(item.state?.found_products || 0))),
+    failed_pages: monitors.reduce(
+      (total, item) => total + Number(item.state?.failed_pages || 0),
+      0,
+    ),
+  };
+}
+
+const brands = computed<BrandGroup[]>(() => {
+  const map = new Map<string, NewsMonitor[]>();
+  for (const monitor of data.value?.monitors || []) {
+    const key = `${monitor.group || "Без группы"}::${monitor.brand || "Без бренда"}`;
+    const list = map.get(key) || [];
+    list.push(monitor);
+    map.set(key, list);
+  }
+  return [...map.entries()]
+    .map(([key, monitors]) => ({
+      key,
+      group: monitors[0]?.group || "Без группы",
+      brand: monitors[0]?.brand || "Без бренда",
+      brandId: monitors[0]?.brand_id,
+      monitors,
+      state: aggregateState(monitors),
+    }))
+    .sort((left, right) =>
+      `${left.group}-${left.brand}`.localeCompare(`${right.group}-${right.brand}`, "ru"),
+    );
+});
+
+const groupedBrands = computed(() => {
+  const map = new Map<string, BrandGroup[]>();
+  for (const brand of brands.value) {
+    const list = map.get(brand.group) || [];
+    list.push(brand);
+    map.set(brand.group, list);
+  }
+  return [...map.entries()].map(([group, items]) => ({ group, items }));
+});
+
+const totals = computed(() => ({
+  brands: brands.value.length,
+  donors: data.value?.monitors.length || 0,
+  active: brands.value.filter((brand) =>
+    ["running", "queued", "pausing", "stopping"].includes(brand.state.status),
+  ).length,
+  news: brands.value.reduce((total, brand) => total + Number(brand.state.new_count || 0), 0),
+}));
+
+function toggleGroup(group: string) {
+  const next = new Set(collapsedGroups.value);
+  if (next.has(group)) next.delete(group);
+  else next.add(group);
+  collapsedGroups.value = next;
+}
+
+async function openBrand(brand: BrandGroup) {
+  const selected =
+    brand.monitors.find((item) => String(item.id) === String(item.primary_donor_id)) ||
+    brand.monitors[0];
+  if (!selected) return;
+  selectedMonitorId.value = selected.id;
+  modalOpen.value = true;
+  if (brand.brandId && useRoute().path !== `/news/edit/${brand.brandId}`) {
+    await navigateTo(`/news/edit/${brand.brandId}`, { replace: true });
+  }
+}
+
+async function openRequestedBrand(brandId: string) {
+  const response = await newsService.getBrand(brandId);
+  for (const donor of response.brand.donors) upsertMonitor(donor);
+  const selected =
+    response.brand.donors.find(
+      (item) => String(item.id) === String(response.brand.primary_donor_id || ""),
+    ) || response.brand.donors[0];
+  if (!selected) {
+    pageError.value = "У этого бренда нет ни одного сайта-донора";
+    return;
+  }
+  selectedMonitorId.value = selected.id;
+  modalOpen.value = true;
+}
+
+function closeModal() {
+  modalOpen.value = false;
+  selectedMonitorId.value = "";
+  if (useRoute().path.startsWith("/news/edit/")) void navigateTo("/news", { replace: true });
+}
+
+async function createMonitor() {
+  creating.value = true;
+  try {
+    const result = await newsService.createMonitor({
+      group: createGroup.value.trim() || "Маржа",
+      brand: createBrand.value.trim() || "Новый бренд",
+      create_new_brand: true,
+    });
+    upsertMonitor(result.monitor);
+    createOpen.value = false;
+    createBrand.value = "";
+    await load(true);
+    const created = brands.value.find((item) =>
+      item.monitors.some((monitor) => monitor.id === result.monitor.id),
+    );
+    if (created) await openBrand(created);
+  } catch (caught) {
+    toast.add({ title: errorMessage(caught), color: "error" });
+  } finally {
+    creating.value = false;
+  }
+}
+
+async function runBrandAction(brand: BrandGroup, action: "pause" | "resume" | "stop" | "reset-visual") {
+  const monitor =
+    brand.monitors.find((item) =>
+      action === "resume"
+        ? item.state.status === "partial"
+        : ["running", "queued", "pausing", "stopping"].includes(item.state.status),
+    ) || brand.monitors[0];
+  if (!monitor) return;
+  try {
+    const result = await newsService.action(monitor.id, action);
+    upsertMonitor(result.monitor);
+  } catch (caught) {
+    pageError.value = errorMessage(caught);
+  }
+}
+
+function requestDelete(brand: BrandGroup) {
+  deletingKey.value = brand.key;
+  deleteOpen.value = true;
+}
+
+async function deleteBrand() {
+  const brand = brands.value.find((item) => item.key === deletingKey.value);
+  const monitor = brand?.monitors[0];
+  if (!monitor) return;
+  try {
+    const result = await newsService.removeMonitor(monitor.id, "brand");
+    if (data.value) data.value.monitors = result.monitors;
+    deleteOpen.value = false;
+    toast.add({ title: "Бренд удалён", color: "success" });
+  } catch (caught) {
+    toast.add({ title: errorMessage(caught), color: "error" });
+  }
+}
+
+async function pollProgress() {
+  const payload = await $fetch<ProgressPayload>("/progress", {
+    query: { once: 1, projects: 0, news: 1 },
+  });
+  if (payload.news) merge(payload.news);
+}
+
+useProgressPolling(pollProgress);
+
+onMounted(async () => {
+  try {
+    await load(true);
+    if (props.brandId) {
+      await openRequestedBrand(props.brandId);
+    }
+  } catch (caught) {
+    pageError.value = errorMessage(caught, "Не удалось загрузить мониторинг");
+  }
+});
+</script>
+
+<template>
+  <div>
+    <SectionHeader
+      eyebrow="МОНИТОРИНГ НОВИНОК"
+      title="Бренды и доноры"
+      description="Сверяйте каталоги поставщиков с собственными фидами и выгружайте только новые модели."
+    >
+      <template #actions>
+        <UButton color="primary" icon="i-lucide-plus" @click="createOpen = true">
+          Добавить бренд
+        </UButton>
+      </template>
+    </SectionHeader>
+
+    <div class="metrics-grid">
+      <MetricCard label="Брендов" :value="totals.brands" icon="i-lucide-tags" tone="mint" />
+      <MetricCard label="Доноров" :value="totals.donors" icon="i-lucide-globe-2" tone="blue" />
+      <MetricCard label="Активных проверок" :value="totals.active" icon="i-lucide-radar" tone="amber" />
+      <MetricCard label="Новых моделей" :value="totals.news" icon="i-lucide-sparkles" tone="purple" />
+    </div>
+
+    <UAlert
+      v-if="pageError"
+      color="error"
+      variant="subtle"
+      icon="i-lucide-triangle-alert"
+      :description="pageError"
+      close
+      class="page-error"
+      @update:open="pageError = ''"
+    />
+
+    <div v-if="loading && !data" class="loading-state">
+      <span class="loading-logo"><UIcon name="i-lucide-sparkles" /></span>
+      <p>Загружаем бренды…</p>
+    </div>
+
+    <EmptyState
+      v-else-if="!brands.length"
+      icon="i-lucide-radar"
+      title="Мониторинг ещё не настроен"
+      description="Добавьте бренд, укажите сайт-донора и стартовые URL."
+    >
+      <UButton color="primary" icon="i-lucide-plus" @click="createOpen = true">
+        Добавить бренд
+      </UButton>
+    </EmptyState>
+
+    <div v-else class="news-groups">
+      <UCard
+        v-for="section in groupedBrands"
+        :key="section.group"
+        as="section"
+        variant="outline"
+        class="news-group-panel"
+        :ui="{ body: 'p-3' }"
+      >
+        <button
+          type="button"
+          class="news-group-header"
+          :aria-expanded="!collapsedGroups.has(section.group)"
+          @click="toggleGroup(section.group)"
+        >
+          <span class="news-group-icon"><UIcon name="i-lucide-layers-3" /></span>
+          <span>
+            <strong>{{ section.group }}</strong>
+            <small>{{ section.items.length }} брендов</small>
+          </span>
+          <UIcon
+            :name="collapsedGroups.has(section.group) ? 'i-lucide-chevron-right' : 'i-lucide-chevron-down'"
+          />
+        </button>
+
+        <div v-if="!collapsedGroups.has(section.group)" class="news-brand-grid">
+          <NewsBrandCard
+            v-for="brand in section.items"
+            :key="brand.key"
+            :brand="brand.brand"
+            :group="brand.group"
+            :monitors="brand.monitors"
+            :state="brand.state"
+            @open="openBrand(brand)"
+            @action="runBrandAction(brand, $event)"
+            @remove="requestDelete(brand)"
+          />
+        </div>
+      </UCard>
+    </div>
+
+    <NewsMonitorModal
+      v-if="modalOpen && selectedMonitorId"
+      :monitor-id="selectedMonitorId"
+      :connection-methods="data?.connection_methods || []"
+      @close="closeModal"
+      @changed="load(true)"
+    />
+
+    <UModal
+      v-model:open="createOpen"
+      title="Новый бренд"
+      description="Создайте мониторинг бренда и затем добавьте сайты-доноры."
+      :ui="{ content: 'max-w-md' }"
+    >
+      <template #body>
+        <div class="form-stack">
+          <UFormField label="Группа">
+            <UInput v-model="createGroup" placeholder="Например, Маржа" class="w-full" />
+          </UFormField>
+          <UFormField label="Название бренда">
+            <UInput
+              v-model="createBrand"
+              autofocus
+              placeholder="Например, MAUNFELD"
+              class="w-full"
+              @keyup.enter="createMonitor"
+            />
+          </UFormField>
+        </div>
+      </template>
+      <template #footer>
+        <UButton color="neutral" variant="soft" @click="createOpen = false">Отмена</UButton>
+        <UButton color="primary" :loading="creating" @click="createMonitor">Добавить</UButton>
+      </template>
+    </UModal>
+
+    <UModal
+      v-model:open="deleteOpen"
+      title="Удалить бренд?"
+      description="Будут удалены бренд и все привязанные к нему доноры."
+      :ui="{ content: 'max-w-md' }"
+    >
+      <template #footer>
+        <UButton color="neutral" variant="soft" @click="deleteOpen = false">Отмена</UButton>
+        <UButton color="error" @click="deleteBrand">Удалить</UButton>
+      </template>
+    </UModal>
+  </div>
+</template>

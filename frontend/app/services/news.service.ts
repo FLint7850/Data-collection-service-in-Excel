@@ -1,0 +1,86 @@
+import type {
+  NewsBrand,
+  NewsMonitor,
+  NewsSettings,
+  OwnSite,
+  SmtpSettings,
+} from "~/types/api";
+
+export interface MonitorPayload {
+  brand?: string;
+  site_url?: string;
+  start_urls?: string[];
+  enabled?: boolean;
+  schedule_type?: string;
+  scan_time?: string;
+  weekday?: number;
+  next_run_at?: string;
+  thread_count?: number;
+  connection_method?: string;
+  auto_connection_fallback?: boolean;
+  exclusions?: string[];
+  product_url_filters?: string[];
+  product_url_exclusions?: string[];
+  extraction_rules?: NewsMonitor["extraction_rules"];
+  selector_settings?: NewsMonitor["selector_settings"];
+  primary_donor_id?: string | number | null;
+}
+
+export const newsService = {
+  get: (options: { summary?: boolean; monitors?: boolean } = {}) =>
+    $fetch<NewsSettings>("/api/news", {
+      query: {
+        summary: options.summary ? 1 : undefined,
+        monitors: options.monitors === false ? 0 : undefined,
+      },
+    }),
+
+  getBrand: (brandId: number | string) =>
+    $fetch<{ brand: NewsBrand }>(
+      `/api/news/brands/${encodeURIComponent(String(brandId))}`,
+    ),
+
+  getMonitor: (monitorId: string) =>
+    $fetch<{ monitor: NewsMonitor; brand_monitors: NewsMonitor[] }>(
+      `/api/news/monitors/${encodeURIComponent(monitorId)}`,
+    ),
+
+  updateSettings: (body: { own_sites?: OwnSite[]; smtp?: Partial<SmtpSettings> }) =>
+    $fetch<NewsSettings>("/api/news/settings", { method: "PATCH", body }),
+
+  testEmail: () =>
+    $fetch<{ ok: boolean }>("/api/news/email/test", { method: "POST" }),
+
+  createMonitor: (body: {
+    group: string;
+    brand: string;
+    site_url?: string;
+    start_urls?: string[];
+    create_new_brand?: boolean;
+  }) =>
+    $fetch<{ monitor: NewsMonitor }>("/api/news/monitors", {
+      method: "POST",
+      body,
+    }),
+
+  updateMonitor: (monitorId: string, body: MonitorPayload) =>
+    $fetch<{ monitor: NewsMonitor }>(
+      `/api/news/monitors/${encodeURIComponent(monitorId)}`,
+      { method: "PATCH", body },
+    ),
+
+  removeMonitor: (monitorId: string, mode: "donor" | "brand" = "donor") =>
+    $fetch<{ ok: boolean; monitors: NewsMonitor[] }>(
+      `/api/news/monitors/${encodeURIComponent(monitorId)}`,
+      { method: "DELETE", query: mode === "brand" ? { mode: "brand" } : undefined },
+    ),
+
+  action: (
+    monitorId: string,
+    action: "scan" | "stop" | "pause" | "resume" | "reset-visual",
+  ) =>
+    $fetch<{ monitor: NewsMonitor }>(
+      `/api/news/monitors/${encodeURIComponent(monitorId)}/${action}`,
+      { method: "POST" },
+    ),
+};

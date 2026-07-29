@@ -2,7 +2,19 @@
 
 Сервис сбора данных в Excel: https://github.com/FLint7850/Data-collection-service-in-Excel
 
-Локальный Flask-сервис для обхода каталогов, сбора моделей и цен, управления исключениями и выгрузки CSV.
+Сервис для обхода каталогов, сбора моделей и цен, управления исключениями и выгрузки CSV.
+
+Интерфейс полностью перенесён на Nuxt 4, Nuxt UI, TypeScript, Nitro и Tailwind CSS.
+Python/Flask отвечает только за API, фоновые задания и хранение данных.
+
+## Запуск в Docker
+
+```powershell
+docker compose up -d --build
+```
+
+После запуска откройте `http://127.0.0.1/`. В Docker наружу публикуется только
+Nginx с Nuxt-интерфейсом; Flask API доступен только внутри Docker-сети.
 
 ## Быстрый запуск в PowerShell
 
@@ -12,7 +24,9 @@
 START_PARSER.cmd
 ```
 
-Он сам перейдет в папку проекта, создаст виртуальное окружение, установит зависимости и откроет `http://127.0.0.1:5000`.
+Он сам перейдет в папку проекта, подготовит Python и Node.js-зависимости, запустит API и Nuxt-интерфейс, затем откроет `http://127.0.0.1:3000`.
+
+Для запуска нужны Python 3.10+ и Node.js 20+.
 
 ## Публичная ссылка через xTunnel
 
@@ -63,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 После запуска откройте:
 
 ```text
-http://127.0.0.1:5000
+http://127.0.0.1:3000
 ```
 
 ## Ручной запуск
@@ -76,6 +90,18 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe app.py
 ```
+
+Во втором окне PowerShell запустите frontend:
+
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
+
+Nuxt будет доступен на `http://127.0.0.1:3000`, а Nitro автоматически проксирует API в Python-сервис.
+При таком ручном запуске Python API работает на `http://127.0.0.1:5000`.
+Nuxt читает адрес API из корневого `.env`, поэтому отдельный `frontend/.env` не нужен.
 
 Если команда `python` тоже не найдена, установите Python 3.10+ с https://www.python.org/downloads/ и отметьте пункт `Add python.exe to PATH` при установке.
 

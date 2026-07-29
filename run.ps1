@@ -1,6 +1,10 @@
 $ErrorActionPreference = "Stop"
-$Port = 5055
-$AppUrl = "http://127.0.0.1:$Port"
+
+$BackendPort = 5055
+$FrontendPort = 3000
+$BackendUrl = "http://127.0.0.1:$BackendPort"
+$AppUrl = "http://127.0.0.1:$FrontendPort"
+$FrontendDir = Join-Path $PSScriptRoot "frontend"
 
 function Load-LocalEnv {
     $envPath = Join-Path $PSScriptRoot ".env"
@@ -22,8 +26,6 @@ function Load-LocalEnv {
     }
 }
 
-Load-LocalEnv
-
 function Find-Python {
     $candidates = @(
         @{ Command = "python"; Args = @("--version") },
@@ -32,11 +34,9 @@ function Find-Python {
     )
 
     foreach ($candidate in $candidates) {
-        $command = Get-Command $candidate.Command -ErrorAction SilentlyContinue
-        if (-not $command) {
+        if (-not (Get-Command $candidate.Command -ErrorAction SilentlyContinue)) {
             continue
         }
-
         try {
             & $candidate.Command @($candidate.Args) *> $null
             return $candidate.Command
@@ -45,29 +45,71 @@ function Find-Python {
             continue
         }
     }
-
     return $null
 }
 
-$python = Find-Python
+function Test-PortBusy {
+    param([int]$PortToCheck)
+    try {
+        return $null -ne (Get-NetTCPConnection -LocalPort $PortToCheck -ErrorAction SilentlyContinue | Select-Object -First 1)
+    }
+    catch {
+        return $false
+    }
+}
 
+function Find-FreePort {
+    param([int]$Preferred, [int]$Last)
+    for ($candidate = $Preferred; $candidate -le $Last; $candidate++) {
+        if (-not (Test-PortBusy -PortToCheck $candidate)) {
+            return $candidate
+        }
+    }
+    throw "No free port found in range $Preferred-$Last."
+}
+
+function Test-JsonHealth {
+    param([string]$Url)
+    try {
+        $response = Invoke-WebRequest -Uri "$Url/api/health" -UseBasicParsing -TimeoutSec 2
+        if ($response.StatusCode -ne 200) {
+            return $false
+        }
+        return ($response.Content | ConvertFrom-Json).ok -eq $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Stop-StartedProcess {
+    param($Process)
+    if ($Process -and -not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Load-LocalEnv
+
+$python = Find-Python
 if (-not $python) {
     Write-Host "Python was not found in PATH." -ForegroundColor Red
-    Write-Host "Install Python 3.10+ from https://www.python.org/downloads/ and enable 'Add python.exe to PATH'." -ForegroundColor Yellow
-    Write-Host "Then close PowerShell, open it again, and run: .\run.ps1" -ForegroundColor Yellow
+    Write-Host "Install Python 3.10+ and enable 'Add python.exe to PATH'." -ForegroundColor Yellow
     exit 1
 }
 
-if ($python -eq "py") {
-    $pythonArgs = @("-3")
-}
-else {
-    $pythonArgs = @()
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+$npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $nodeCommand -or -not $npmCommand) {
+    Write-Host "Node.js was not found in PATH." -ForegroundColor Red
+    Write-Host "Install Node.js 20+ from https://nodejs.org/ and run this file again." -ForegroundColor Yellow
+    exit 1
 }
 
+$pythonArgs = if ($python -eq "py") { @("-3") } else { @() }
 $createdVenv = $false
 if (-not (Test-Path ".venv")) {
-    Write-Host "Creating virtual environment..." -ForegroundColor Cyan
+    Write-Host "Creating Python environment..." -ForegroundColor Cyan
     & $python @pythonArgs -m venv .venv
     $createdVenv = $true
 }
@@ -75,161 +117,119 @@ if (-not (Test-Path ".venv")) {
 $venvPython = Join-Path ".venv" "Scripts\python.exe"
 $ForceBrowserSetup = $env:FORCE_BROWSER_SETUP -eq "1"
 
-Write-Host "Upgrading pip..." -ForegroundColor Cyan
-& $venvPython -m pip install --upgrade pip
-
-Write-Host "Installing dependencies..." -ForegroundColor Cyan
+Write-Host "Installing Python dependencies..." -ForegroundColor Cyan
 $env:STATIC_DEPS = "true"
+& $venvPython -m pip install --upgrade pip
 & $venvPython -m pip install -r requirements.txt
 
 if ($createdVenv -or $ForceBrowserSetup) {
-    Write-Host "Installing Playwright Chromium and headless shell..." -ForegroundColor Cyan
+    Write-Host "Preparing parser browsers..." -ForegroundColor Cyan
     & $venvPython -m playwright install chromium chromium-headless-shell
-}
-else {
-    Write-Host "Skipping browser setup for existing .venv. Set FORCE_BROWSER_SETUP=1 to reinstall." -ForegroundColor DarkGray
-}
-
-if ($createdVenv -or $ForceBrowserSetup) {
-    Write-Host "Preparing Crawl4AI browsers..." -ForegroundColor Cyan
     $crawl4aiSetup = Join-Path ".venv" "Scripts\crawl4ai-setup.exe"
-    if (-not (Test-Path $crawl4aiSetup)) {
-        Write-Host "crawl4ai-setup.exe was not found. Updating Crawl4AI..." -ForegroundColor Yellow
-        & $venvPython -m pip install -U crawl4ai
-    }
     if (Test-Path $crawl4aiSetup) {
         & $crawl4aiSetup
     }
-    else {
-        Write-Host "crawl4ai-setup.exe is still missing after install. Skipping Crawl4AI browser preparation." -ForegroundColor Yellow
-    }
 }
 
-function Test-AppReady {
+if (-not (Test-Path (Join-Path $FrontendDir "node_modules\.bin\nuxt.cmd"))) {
+    Write-Host "Installing Nuxt dependencies..." -ForegroundColor Cyan
+    Push-Location $FrontendDir
     try {
-        $response = Invoke-WebRequest -Uri "$AppUrl/api/health" -UseBasicParsing -TimeoutSec 2
-        if ($response.StatusCode -ne 200) {
-            return $false
-        }
-        $data = $response.Content | ConvertFrom-Json
-        return $data.ok -eq $true
+        & $($npmCommand.Source) ci
     }
-    catch {
-        return $false
+    finally {
+        Pop-Location
     }
 }
 
-function Test-PortBusy {
-    param([int]$PortToCheck)
-    try {
-        $connection = Get-NetTCPConnection -LocalPort $PortToCheck -ErrorAction SilentlyContinue | Select-Object -First 1
-        return $null -ne $connection
-    }
-    catch {
-        return $false
-    }
-}
+$BackendPort = Find-FreePort -Preferred $BackendPort -Last 5065
+$FrontendPort = Find-FreePort -Preferred $FrontendPort -Last 3010
+$BackendUrl = "http://127.0.0.1:$BackendPort"
+$AppUrl = "http://127.0.0.1:$FrontendPort"
 
-if (Test-AppReady) {
-    Write-Host "The app is already running at $AppUrl" -ForegroundColor Green
-    Start-Process $AppUrl
-    Write-Host "Press Enter to close this window." -ForegroundColor Yellow
-    Read-Host
-    exit 0
-}
-
-if (Test-PortBusy -PortToCheck $Port) {
-    for ($candidate = 5056; $candidate -le 5065; $candidate++) {
-        if (-not (Test-PortBusy -PortToCheck $candidate)) {
-            $Port = $candidate
-            $AppUrl = "http://127.0.0.1:$Port"
-            Write-Host "Default parser port is busy. Using $AppUrl instead." -ForegroundColor Yellow
-            break
-        }
-    }
-}
-
-$LogStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $LogDir = Join-Path $PSScriptRoot "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$AppLog = Join-Path $LogDir "app.log"
-Add-Content -Path $AppLog -Encoding UTF8 -Value ""
-Add-Content -Path $AppLog -Encoding UTF8 -Value "[$(Get-Date -Format o)] Starting local server on port $Port"
+$BackendLog = Join-Path $LogDir "backend.log"
+$FrontendLog = Join-Path $LogDir "frontend.log"
+Add-Content -Path $BackendLog -Encoding UTF8 -Value ""
+Add-Content -Path $FrontendLog -Encoding UTF8 -Value ""
 
-Write-Host "Starting Flask app..." -ForegroundColor Green
-$env:PORT = "$Port"
-$script:AppLogWriter = [System.IO.StreamWriter]::new($AppLog, $true, [System.Text.UTF8Encoding]::new($false))
-$script:AppLogWriter.AutoFlush = $true
-$process = [System.Diagnostics.Process]::new()
-$process.StartInfo.FileName = (Resolve-Path $venvPython).Path
-$process.StartInfo.Arguments = "app.py"
-$process.StartInfo.WorkingDirectory = $PSScriptRoot
-$process.StartInfo.UseShellExecute = $false
-$process.StartInfo.CreateNoWindow = $true
-$process.StartInfo.RedirectStandardOutput = $true
-$process.StartInfo.RedirectStandardError = $true
-$process.StartInfo.Environment["PORT"] = "$Port"
-$outputHandler = [System.Diagnostics.DataReceivedEventHandler]{
-    param($sender, $eventArgs)
-    if ($eventArgs.Data) {
-        $script:AppLogWriter.WriteLine($eventArgs.Data)
-    }
-}
-$errorHandler = [System.Diagnostics.DataReceivedEventHandler]{
-    param($sender, $eventArgs)
-    if ($eventArgs.Data) {
-        $script:AppLogWriter.WriteLine($eventArgs.Data)
-    }
-}
-$process.add_OutputDataReceived($outputHandler)
-$process.add_ErrorDataReceived($errorHandler)
-[void]$process.Start()
-$process.BeginOutputReadLine()
-$process.BeginErrorReadLine()
-
-Write-Host "Waiting for $AppUrl ..." -ForegroundColor Cyan
-$ready = $false
-for ($i = 0; $i -lt 40; $i++) {
-    if ($process.HasExited) {
-        break
-    }
-    if (Test-AppReady) {
-        $ready = $true
-        break
-    }
-    Start-Sleep -Milliseconds 500
-}
-
-if (-not $ready) {
-    Write-Host "The app did not start correctly." -ForegroundColor Red
-    if (Test-Path $AppLog) {
-        Write-Host ""
-        Write-Host "${AppLog}:" -ForegroundColor Yellow
-        Get-Content $AppLog -Tail 160
-    }
-    Write-Host ""
-    Write-Host "Press Enter to close this window." -ForegroundColor Yellow
-    Read-Host
-    if ($script:AppLogWriter) {
-        $script:AppLogWriter.Dispose()
-    }
-    exit 1
-}
-
-Write-Host "App is ready: $AppUrl" -ForegroundColor Green
-Start-Process $AppUrl
-Write-Host ""
-Write-Host "Keep this window open while using the app." -ForegroundColor Yellow
-Write-Host "Press Enter here to stop the local server." -ForegroundColor Yellow
-Read-Host
+$backendProcess = $null
+$frontendProcess = $null
 
 try {
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    Write-Host "Starting API at $BackendUrl ..." -ForegroundColor Green
+    $backendCommand = "set PORT=$BackendPort&& set PYTHONIOENCODING=utf-8&& `"$venvPython`" `"app.py`" >> `"$BackendLog`" 2>>&1"
+    $backendProcess = Start-Process `
+        -FilePath "cmd.exe" `
+        -ArgumentList "/d", "/c", $backendCommand `
+        -WorkingDirectory $PSScriptRoot `
+        -PassThru `
+        -WindowStyle Hidden
+
+    $backendReady = $false
+    for ($i = 0; $i -lt 60; $i++) {
+        if ($backendProcess.HasExited) {
+            break
+        }
+        if (Test-JsonHealth -Url $BackendUrl) {
+            $backendReady = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $backendReady) {
+        throw "The API did not start. Check $BackendLog."
+    }
+
+    Write-Host "Starting Nuxt at $AppUrl ..." -ForegroundColor Green
+    $frontendCommand = "set PORT=$FrontendPort&& set NUXT_BACKEND_URL=$BackendUrl&& `"$($npmCommand.Source)`" run dev -- --host 127.0.0.1 --port $FrontendPort >> `"$FrontendLog`" 2>>&1"
+    $frontendProcess = Start-Process `
+        -FilePath "cmd.exe" `
+        -ArgumentList "/d", "/c", $frontendCommand `
+        -WorkingDirectory $FrontendDir `
+        -PassThru `
+        -WindowStyle Hidden
+
+    $frontendReady = $false
+    for ($i = 0; $i -lt 80; $i++) {
+        if ($frontendProcess.HasExited) {
+            break
+        }
+        if (Test-JsonHealth -Url $AppUrl) {
+            $frontendReady = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $frontendReady) {
+        throw "Nuxt did not start. Check $FrontendLog."
+    }
+
+    Write-Host "Application is ready: $AppUrl" -ForegroundColor Green
+    Start-Process $AppUrl
+    Write-Host ""
+    Write-Host "Keep this window open while using the application." -ForegroundColor Yellow
+    Write-Host "Press Enter here to stop Nuxt and the API." -ForegroundColor Yellow
+    Read-Host
 }
 catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    if (Test-Path $BackendLog) {
+        Write-Host ""
+        Write-Host "Backend log:" -ForegroundColor Yellow
+        Get-Content $BackendLog -Tail 60
+    }
+    if (Test-Path $FrontendLog) {
+        Write-Host ""
+        Write-Host "Frontend log:" -ForegroundColor Yellow
+        Get-Content $FrontendLog -Tail 60
+    }
+    Write-Host ""
+    Write-Host "Press Enter to close this window."
+    Read-Host
 }
 finally {
-    if ($script:AppLogWriter) {
-        $script:AppLogWriter.Dispose()
-    }
+    Stop-StartedProcess $frontendProcess
+    Stop-StartedProcess $backendProcess
 }

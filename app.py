@@ -32,7 +32,7 @@ import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, Response, g, jsonify as flask_jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, g, jsonify as flask_jsonify, request, send_file, session
 from sqlalchemy import delete, select
 from sqlalchemy.exc import OperationalError
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -67,7 +67,7 @@ def load_local_env() -> None:
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             if key:
-                os.environ[key] = value
+                os.environ.setdefault(key, value)
     except OSError:
         return
 
@@ -202,7 +202,7 @@ BLOCKED_PAGE_MARKERS = tuple(
     )
 )
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 app.secret_key = env_str("FLASK_SECRET_KEY", "change-this-secret-key")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -242,7 +242,12 @@ def ensure_default_user() -> None:
 
 def is_public_endpoint() -> bool:
     endpoint = request.endpoint or ""
-    return endpoint in {"healthcheck", "login", "static"} or request.path.startswith("/static/")
+    return endpoint in {
+        "healthcheck",
+        "api_auth_session",
+        "api_auth_login",
+        "api_auth_logout",
+    }
 
 
 @app.before_request
@@ -251,7 +256,7 @@ def require_login() -> Optional[Response]:
         return None
     if session.get("user_id"):
         return None
-    return redirect(url_for("login"))
+    return jsonify({"error": "Требуется авторизация"}), 401
 
 
 @app.teardown_request
@@ -8443,16 +8448,6 @@ def refresh_monitor_schedule_from_brand(monitor: Dict[str, object]) -> None:
         monitor.update(brand_schedule_fields(brand))
 
 
-def safe_next_path(value: object) -> str:
-    text = str(value or "").strip()
-    if not text.startswith("/") or text.startswith("//"):
-        return url_for("index")
-    parsed = urlparse(text)
-    if parsed.scheme or parsed.netloc:
-        return url_for("index")
-    return urlunparse(("", "", parsed.path or "/", "", parsed.query, ""))
-
-
 def start_news_scheduler() -> None:
     global news_scheduler_thread
     if isinstance(news_scheduler_thread, threading.Thread) and news_scheduler_thread.is_alive():
@@ -8512,100 +8507,42 @@ def start_news_scheduler() -> None:
     news_scheduler_thread.start()
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login() -> str | Response:
-    ensure_storage()
-    if session.get("user_id"):
-        return redirect(url_for("index"))
-    error = ""
-    if request.method == "POST":
-        username = str(request.form.get("username") or "").strip()
-        password = str(request.form.get("password") or "")
-        user = g.db.scalar(select(User).where(User.username == username, User.is_active.is_(True)))
-        if user and check_password_hash(user.password_hash, password):
-            session.clear()
-            session["user_id"] = int(user.id)
-            session["username"] = user.username
-            return redirect(url_for("index"))
-        error = "Неверный логин или пароль"
-    return render_template("login.html", error=error)
-
-
 @app.get("/api/health")
 def healthcheck():
     ensure_storage()
     return jsonify({"ok": True})
 
 
-@app.post("/logout")
-def logout() -> Response:
-    session.clear()
-    return redirect(url_for("login"))
-
-
-def render_app_page(active_view: str = "projects", active_project_id: str = "", active_news_id: str = "") -> str:
+@app.get("/api/auth/session")
+def api_auth_session():
     ensure_storage()
-    static_files = [BASE_DIR / "static" / "js" / "app.js", BASE_DIR / "static" / "css" / "styles.css"]
-    static_version = max((int(path.stat().st_mtime) for path in static_files if path.exists()), default=0)
-    return render_template(
-        "index.html",
-        default_start_url=DEFAULT_START_URL,
-        static_version=static_version,
-        active_view=active_view,
-        active_project_id=active_project_id,
-        active_news_id=active_news_id,
-        progress_interval_ms=int(PROGRESS_STREAM_INTERVAL_SECONDS * 1000),
+    return jsonify(
+        {
+            "authenticated": bool(session.get("user_id")),
+            "username": str(session.get("username") or ""),
+        }
     )
 
 
-@app.route("/")
-def index() -> Response:
-    return redirect(url_for("projects_page"))
+@app.post("/api/auth/login")
+def api_auth_login():
+    ensure_storage()
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    user = g.db.scalar(select(User).where(User.username == username, User.is_active.is_(True)))
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify({"error": "Неверный логин или пароль"}), 401
+    session.clear()
+    session["user_id"] = int(user.id)
+    session["username"] = user.username
+    return jsonify({"authenticated": True, "username": user.username})
 
 
-@app.get("/projects")
-def projects_page() -> str:
-    return render_app_page("projects")
-
-
-@app.get("/projects/edit/<project_id>")
-def project_edit_page(project_id: str) -> str:
-    return render_app_page("projects", active_project_id=project_id)
-
-
-@app.get("/news")
-def news_page() -> str:
-    return render_app_page("news")
-
-
-@app.get("/news/edit/<brand_id>")
-def news_edit_page(brand_id: str) -> str:
-    return render_app_page("news", active_news_id=brand_id)
-
-
-@app.get("/file-import")
-def file_import_page() -> str:
-    return render_app_page("import")
-
-
-@app.get("/feed-comparison")
-def feed_comparison_page() -> str:
-    return render_app_page("feed-comparison")
-
-
-@app.get("/logs")
-def logs_page() -> str:
-    return render_app_page("logs")
-
-
-@app.get("/settings")
-def settings_page() -> str:
-    return render_app_page("settings")
-
-
-@app.get("/api/state")
-def api_state():
-    return jsonify(snapshot_state())
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    session.clear()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/connection-methods")
@@ -9906,91 +9843,6 @@ def api_logs_settings():
     return jsonify({"auto_cleanup": auto_cleanup})
 
 
-@app.post("/start")
-def start_scan():
-    global active_crawler, active_finish_event, active_run_id, active_stop_event, worker_thread
-
-    current_status = snapshot_state()["status"]
-    if current_status == "running" and worker_thread and worker_thread.is_alive():
-        return jsonify({"error": "Сбор уже выполняется"}), 409
-
-    payload = request.get_json(silent=True) or {}
-    start_url = str(payload.get("start_url") or DEFAULT_START_URL).strip()
-    thread_count = parse_thread_count(payload.get("thread_count"))
-
-    with state_lock:
-        active_run_id += 1
-        run_id = active_run_id
-        active_stop_event = threading.Event()
-        active_finish_event = threading.Event()
-        stop_signal = active_stop_event
-        finish_signal = active_finish_event
-
-    reset_state("running", thread_count=thread_count)
-
-    crawler = ProductSiteCrawler([start_url], run_id, stop_signal, finish_signal, thread_count)
-    active_crawler = crawler
-
-    def target() -> None:
-        try:
-            crawler.run()
-        except Exception as exc:  # noqa: BLE001 - показываем ошибку пользователю в интерфейсе.
-            update_state(run_id, status="error", error=str(exc), currenturl="", download_ready=False)
-
-    worker_thread = threading.Thread(target=target, daemon=True)
-    worker_thread.start()
-    return jsonify(snapshot_state())
-
-
-@app.post("/stop")
-def stop_scan():
-    global active_crawler, active_run_id
-
-    active_stop_event.set()
-    with state_lock:
-        active_run_id += 1
-        active_crawler = None
-    reset_state("idle")
-    return jsonify(snapshot_state())
-
-
-@app.post("/pause")
-def pause_scan_with_result():
-    global active_crawler, active_run_id
-
-    if snapshot_state()["status"] != "running":
-        return jsonify({"error": "Сбор не выполняется"}), 409
-
-    active_finish_event.set()
-    active_stop_event.set()
-    crawler = active_crawler
-    if crawler:
-        crawler.finish_with_excel(partial=True)
-        with state_lock:
-            active_run_id += 1
-            active_crawler = None
-        return jsonify(snapshot_state())
-
-    update_state(
-        active_run_id,
-        error="Останавливаю сбор и формирую Excel по уже найденным товарам...",
-        currenturl="",
-    )
-    return jsonify(snapshot_state())
-
-
-@app.post("/restart")
-def restart_scan():
-    global active_crawler, active_run_id
-
-    active_stop_event.set()
-    with state_lock:
-        active_run_id += 1
-        active_crawler = None
-    reset_state("idle")
-    return start_scan()
-
-
 @app.get("/progress")
 def progress_stream():
     include_projects = request.args.get("projects", "1") == "1"
@@ -10043,16 +9895,6 @@ def progress_stream():
     response.headers["Cache-Control"] = "no-cache"
     response.headers["X-Accel-Buffering"] = "no"
     return response
-
-
-@app.get("/download")
-def download_excel():
-    current_state = snapshot_state()
-    filename = str(current_state.get("filename") or "")
-    path = EXPORT_DIR / filename
-    if not filename or not path.exists():
-        return jsonify({"error": "Файл еще не готов"}), 404
-    return send_file(path, as_attachment=True, download_name=output_text(filename))
 
 
 @app.get("/api/projects/<project_id>/download")

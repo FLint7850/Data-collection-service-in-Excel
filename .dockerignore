@@ -13,6 +13,7 @@ profiles/
 data/*.db-wal
 data/*.db-shm
 node_modules
+frontend/
 .env
 .env.*
 !/.env.example
