@@ -6611,11 +6611,13 @@ def prepare_supplier_feed_item(
     replace_rules: object = "",
 ) -> Optional[Dict[str, object]]:
     raw_name = str(item.get("name") or item.get("source_model") or "")
-    if file_import_exclusion_matches(raw_name, "", normalize_file_import_exclusions(exclusions)):
+    source_model = str(item.get("source_model") or raw_name)
+    brand = str(item.get("brand") or "")
+    if file_import_exclusion_matches(f"{source_model} {raw_name}", brand, normalize_file_import_exclusions(exclusions)):
         return None
     rules = normalize_file_import_rules_text(replace_rules)
     prepared_name = prepare_rule_model(raw_name, {"model_replace_rules": rules})
-    prepared_model = prepare_file_import_model(str(item.get("source_model") or ""), rules)
+    prepared_model = prepare_file_import_model(source_model, rules)
     prepared_name_model = prepare_file_import_model(raw_name, rules)
     candidates: List[str] = []
     for source_value in (prepared_model, prepared_name_model):
