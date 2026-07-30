@@ -302,6 +302,12 @@ news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
 NEWS_TRANSITION_TIMEOUT_SECONDS = 180
 PROGRESS_STREAM_INTERVAL_SECONDS = env_float("PROGRESS_STREAM_INTERVAL_SECONDS", 2.0, minimum=0.5, maximum=30.0)
+FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS = env_float(
+    "FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS",
+    2.0,
+    minimum=0.5,
+    maximum=30.0,
+)
 
 
 @dataclass(frozen=True)
@@ -5685,7 +5691,7 @@ def missing_feed_labels(
     for feed in feed_indexes:
         stop_file_import_if_requested(stop_event)
         index = feed.get("index", {})
-        if not isinstance(index, dict) or not (keys & set(index.keys())):
+        if not isinstance(index, dict) or not any(key in index for key in keys):
             labels.append(str(feed.get("source_label") or feed.get("url") or "Фид"))
     return labels
 
@@ -6495,7 +6501,8 @@ def read_supplier_tabular_feed_rows(
             "наименование товара",
             "название товара",
             "наименование",
-            "название",
+            "название"
+            "товар",
             "product name",
             "product_name",
             "item name",
@@ -6715,25 +6722,29 @@ def compare_supplier_feeds(
     update_feed_comparison_state(db, stage="Загружаю фиды поставщиков", percent=15)
     db.commit()
 
-    downloaded_suppliers: List[tuple[SupplierFeed, bytes]] = []
     total_rows = 0
-    for supplier in suppliers:
-        stop_file_import_if_requested(stop_event)
-        content = download_comparison_feed(supplier.feed_url)
-        downloaded_suppliers.append((supplier, content))
     supplier_results: List[Dict[str, object]] = []
     processed_rows = 0
     excluded_rows = 0
     missing_rows = 0
+    progress_persisted_at = time.monotonic()
 
-    for supplier_index, (supplier, content) in enumerate(downloaded_suppliers, start=1):
+    for supplier_index, supplier in enumerate(suppliers, start=1):
+        stop_file_import_if_requested(stop_event)
+        update_feed_comparison_state(
+            db,
+            stage="Загружаю фид поставщика",
+            current_supplier=supplier.name,
+            suppliers_done=supplier_index - 1,
+            percent=15 + int((supplier_index - 1) / max(len(suppliers), 1) * 75),
+        )
+        db.commit()
+        content = download_comparison_feed(supplier.feed_url)
         stop_file_import_if_requested(stop_event)
         update_feed_comparison_state(
             db,
             stage="Читаю фид поставщика",
             current_supplier=supplier.name,
-            suppliers_done=supplier_index - 1,
-            percent=15 + int((supplier_index - 1) / max(len(suppliers), 1) * 75),
         )
         db.commit()
         source_rows = read_supplier_feed_rows(content, supplier.model_field, stop_event=stop_event)
@@ -6756,6 +6767,7 @@ def compare_supplier_feeds(
                 f'"{configured_field}". Проверьте имя поля модели в '
                 f'{feed_format.upper()}.{available_hint}'
             )
+        del content
         total_rows += len(source_rows)
         result_rows: List[Dict[str, object]] = []
         for row_index, item in enumerate(source_rows, start=1):
@@ -6785,7 +6797,12 @@ def compare_supplier_feeds(
                             }
                         )
             processed_rows += 1
-            if row_index == len(source_rows) or row_index % 25 == 0:
+            progress_checked_at = time.monotonic()
+            if (
+                row_index == len(source_rows)
+                or progress_checked_at - progress_persisted_at
+                >= FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS
+            ):
                 supplier_progress = row_index / max(len(source_rows), 1)
                 overall_progress = (supplier_index - 1 + supplier_progress) / max(len(suppliers), 1)
                 update_feed_comparison_state(
@@ -6801,7 +6818,9 @@ def compare_supplier_feeds(
                     elapsed_seconds=int(time.time() - started_at),
                 )
                 db.commit()
+                progress_persisted_at = progress_checked_at
         supplier_results.append({"name": supplier.name, "rows": result_rows})
+        del source_rows
         update_feed_comparison_state(db, suppliers_done=supplier_index)
         db.commit()
 
