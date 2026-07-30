@@ -1,12 +1,13 @@
 import { newsService } from "~/services/news.service";
 import type { NewsMonitor, NewsSettings } from "~/types/api";
+import { mergeProgressState } from "~/utils/progress-state";
 
 function mergeMonitor(current: NewsMonitor | undefined, incoming: NewsMonitor): NewsMonitor {
   if (!current) return incoming;
   return {
     ...current,
     ...incoming,
-    state: { ...current.state, ...incoming.state },
+    state: mergeProgressState(current.state, incoming.state),
   };
 }
 

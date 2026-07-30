@@ -29,6 +29,28 @@ const progress = computed(() => {
   return Math.max(0, Math.min(100, Number(props.state.percent || 0)));
 });
 const missingFeeds = computed(() => props.state.missing_by_feed || []);
+const isActive = computed(() =>
+  ["running", "queued", "pausing", "stopping"].includes(props.state.status),
+);
+const menuItems = computed(() => [
+  [
+    ...(!isActive.value
+      ? [
+          {
+            label: "Сбросить",
+            icon: "i-lucide-rotate-ccw",
+            onSelect: () => emit("action", "reset-visual"),
+          },
+        ]
+      : []),
+    {
+      label: "Удалить бренд",
+      icon: "i-lucide-trash-2",
+      color: "error" as const,
+      onSelect: () => emit("remove"),
+    },
+  ],
+]);
 const hasDiagnostics = computed(() =>
   [
     props.state.in_memory_products,
@@ -48,7 +70,6 @@ const hasDiagnostics = computed(() =>
     tabindex="0"
     :ui="{ body: 'news-brand-card-body' }"
     @click="emit('open')"
-    @keyup.enter="emit('open')"
   >
     <div class="news-card-head">
       <div class="brand-avatar">{{ brand.slice(0, 2).toUpperCase() }}</div>
@@ -56,18 +77,7 @@ const hasDiagnostics = computed(() =>
         <strong>{{ brand }}</strong>
         <span>{{ monitors.length }} {{ monitors.length === 1 ? "донор" : "донора" }}</span>
       </div>
-      <UDropdownMenu
-        :items="[
-          [
-            {
-              label: 'Удалить бренд',
-              icon: 'i-lucide-trash-2',
-              color: 'error',
-              onSelect: () => emit('remove'),
-            },
-          ],
-        ]"
-      >
+      <UDropdownMenu :items="menuItems">
         <UButton
           icon="i-lucide-ellipsis"
           color="neutral"
@@ -148,7 +158,7 @@ const hasDiagnostics = computed(() =>
       as="section"
       variant="subtle"
       class="news-card-missing"
-      :ui="{ body: 'p-3' }"
+      :ui="{ body: 'p-3 sm:p-3' }"
     >
       <div class="news-card-missing-head">
         <span>Результат по фидам</span>
@@ -184,12 +194,11 @@ const hasDiagnostics = computed(() =>
     </div>
 
     <div class="news-card-last-scan">
-      <UIcon name="i-lucide-calendar-clock" />
       <span>Последняя проверка</span>
       <strong>{{ state.last_scan_at ? formatDateTime(state.last_scan_at) : "—" }}</strong>
     </div>
 
-    <div class="news-card-actions" @click.stop>
+    <div v-if="isActive || state.status === 'partial'" class="news-card-actions" @click.stop>
       <UButton
         v-if="['running', 'queued'].includes(state.status)"
         color="warning"
@@ -219,25 +228,6 @@ const hasDiagnostics = computed(() =>
         @click="emit('action', 'stop')"
       >
         Стоп
-      </UButton>
-      <UButton
-        v-else
-        color="neutral"
-        variant="ghost"
-        size="sm"
-        icon="i-lucide-rotate-ccw"
-        @click="emit('action', 'reset-visual')"
-      >
-        Сбросить
-      </UButton>
-      <UButton
-        color="neutral"
-        variant="ghost"
-        size="sm"
-        trailing-icon="i-lucide-arrow-up-right"
-        @click="emit('open')"
-      >
-        Настроить
       </UButton>
     </div>
   </UCard>

@@ -21,7 +21,7 @@ export function formatDateTime(value?: string): string {
   if (Number.isNaN(date.getTime())) return value;
   return new Intl.DateTimeFormat("ru-RU", {
     dateStyle: "short",
-    timeStyle: "medium",
+    timeStyle: "short",
   }).format(date);
 }
 

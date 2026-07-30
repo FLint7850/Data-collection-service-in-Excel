@@ -2,6 +2,7 @@
 definePageMeta({
   title: "Новинки",
   eyebrow: "МОНИТОРИНГ БРЕНДОВ",
+  scrollToTop: false,
 });
 </script>
 

@@ -4,13 +4,14 @@ import type {
   ProgressPayload,
   Project,
 } from "~/types/api";
+import { mergeProgressState } from "~/utils/progress-state";
 
 function mergeProject(current: Project | undefined, incoming: Project): Project {
   if (!current) return incoming;
   return {
     ...current,
     ...incoming,
-    state: { ...current.state, ...incoming.state },
+    state: mergeProgressState(current.state, incoming.state),
   };
 }
 

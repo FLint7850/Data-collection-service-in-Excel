@@ -4,6 +4,7 @@ import { normalizeBrandRouteId } from "~/utils/route-id";
 definePageMeta({
   title: "Новинки",
   eyebrow: "МОНИТОРИНГ БРЕНДОВ",
+  scrollToTop: false,
   middleware: (route) => {
     if (!normalizeBrandRouteId(route.params.id)) {
       return navigateTo("/news", { redirectCode: 302, replace: true });

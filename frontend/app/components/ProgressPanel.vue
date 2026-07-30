@@ -37,7 +37,7 @@ const hasDiagnostics = computed(() =>
     <div class="panel-header">
       <div>
         <p class="eyebrow">ТЕКУЩАЯ СЕССИЯ</p>
-        <h3>Ход сбора</h3>
+        <h2><strong>Ход сбора</strong></h2>
       </div>
       <div class="progress-actions">
         <StatusBadge v-if="showStatus !== false" :status="state.status" />
@@ -94,16 +94,13 @@ const hasDiagnostics = computed(() =>
         <span>Прошло</span>
         <strong>{{ formatDuration(state.elapsed_seconds) }}</strong>
       </div>
-      <div>
-        <span>Осталось</span>
-        <strong>{{ state.eta_seconds == null ? "—" : formatDuration(state.eta_seconds) }}</strong>
+      <div v-if="state.last_scan_at">
+        <span class="flex gap-1 align-center items-center">
+          <UIcon name="i-lucide-calendar-check-2" />
+          <span>Последнее сканирование</span>
+        </span>
+        <strong>{{ formatDateTime(state.last_scan_at) }}</strong>
       </div>
-    </div>
-
-    <div v-if="state.last_scan_at" class="last-scan-row">
-      <UIcon name="i-lucide-calendar-check-2" />
-      <span>Последнее сканирование</span>
-      <strong>{{ formatDateTime(state.last_scan_at) }}</strong>
     </div>
 
     <div class="current-url">
