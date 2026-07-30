@@ -6,6 +6,7 @@ const props = defineProps<{
   state: ScanState;
   downloadUrl?: string;
   showStatus?: boolean;
+  showActiveUrls?: boolean;
 }>();
 
 const percent = computed(() => Math.max(0, Math.min(100, Number(props.state.percent || 0))));
@@ -108,7 +109,7 @@ const hasDiagnostics = computed(() =>
       <span>{{ state.currenturl || "Текущий URL появится после запуска." }}</span>
     </div>
 
-    <div v-if="activeUrls.length" class="active-url-list">
+    <div v-if="showActiveUrls !== false && activeUrls.length" class="active-url-list">
       <div class="active-url-list-title">
         <span>Сейчас собираются</span>
         <UBadge color="primary" variant="subtle">{{ activeUrls.length }}</UBadge>
