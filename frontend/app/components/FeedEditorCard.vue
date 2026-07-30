@@ -60,7 +60,7 @@ function submit() {
             <small>{{ draft.feed_url || "Ссылка не указана" }}</small>
           </span>
           <UIcon
-            name="i-lucide-chevron-right"
+            name="i-lucide-chevron-down"
             class="settings-details-chevron"
             :class="{ open: isOpen }"
           />

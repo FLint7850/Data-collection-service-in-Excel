@@ -2588,7 +2588,7 @@ textarea.code-input {
 }
 
 .settings-details-chevron.open {
-  transform: rotate(90deg);
+  transform: rotate(180deg);
 }
 
 .settings-details-content {
@@ -3361,21 +3361,16 @@ textarea.code-input {
   color: var(--muted);
 }
 
-.comparison-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
-  gap: 14px;
-}
 
 .feed-column > .panel-header {
   margin-bottom: 17px;
 }
 
 .feed-list {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  margin-top: 12px;
 }
 
 .feed-card {

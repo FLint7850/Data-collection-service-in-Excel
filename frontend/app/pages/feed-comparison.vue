@@ -215,109 +215,69 @@ onMounted(load);
         <MetricCard label="Не найдено" :value="data.state.missing_rows" icon="i-lucide-package-x" tone="red" />
       </div>
 
-      <div class="comparison-grid">
-        <UCard as="section" variant="outline" class="panel feed-column">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">ЭТАЛОН</p>
-              <h3>Фиды моих сайтов</h3>
-              <p>Они также используются в мониторинге новинок и импорте файлов.</p>
+      <UCard as="section" variant="outline" class="panel feed-column">
+        <UCollapsible>
+          <template #default="{ open }">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">ИСТОЧНИКИ</p>
+                <h3>Фиды поставщиков</h3>
+                <p>Для каждого поставщика укажите точное имя XML-поля с моделью.</p>
+              </div>
+              <div class="flex flex-col gap-3">
+                <UIcon
+                    name="i-lucide-chevron-down"
+                    class="settings-details-chevron"
+                    :class="{ open }"
+                />
+                <UButton
+                    color="neutral"
+                    variant="soft"
+                    icon="i-lucide-plus"
+                    :disabled="isActive"
+                    @click.stop="addSupplier"
+                >
+                  Поставщик
+                </UButton>
+              </div>
             </div>
-            <UButton
-              color="neutral"
-              variant="soft"
-              icon="i-lucide-plus"
-              :disabled="isActive"
-              @click="addOwnSite"
-            >
-              Фид
-            </UButton>
-          </div>
-
-          <div class="feed-list">
-            <FeedEditorCard
-              v-for="site in data.own_sites"
-              :key="`own-${site.id}`"
-              kind="own-site"
-              :item="site"
-              :disabled="isActive"
-              :saving="savingKey === `own-${site.id}`"
-              @save="saveOwnSite($event as OwnSite)"
-              @remove="removeOwnSite($event as OwnSite)"
-            />
-            <FeedEditorCard
-              v-for="(site, index) in pendingOwnSites"
-              :key="`new-own-${index}`"
-              kind="own-site"
-              :item="site"
-              :disabled="isActive"
-              :saving="savingKey === `own-${index}`"
-              @save="saveOwnSite($event as OwnSite, index)"
-              @remove="pendingOwnSites.splice(index, 1)"
-            />
-          </div>
-
-          <EmptyState
-            v-if="!data.own_sites.length && !pendingOwnSites.length"
-            icon="i-lucide-store"
-            title="Нет фидов сайтов"
-            description="Добавьте хотя бы один XML-фид своего магазина."
-          >
-            <UButton color="primary" variant="soft" icon="i-lucide-plus" @click="addOwnSite">Добавить</UButton>
-          </EmptyState>
-        </UCard>
-
-        <UCard as="section" variant="outline" class="panel feed-column">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">ИСТОЧНИКИ</p>
-              <h3>Фиды поставщиков</h3>
-              <p>Для каждого поставщика укажите точное имя XML-поля с моделью.</p>
+          </template>
+          <template #content>
+            <div class="feed-list">
+              <FeedEditorCard
+                  v-for="supplier in data.suppliers"
+                  :key="`supplier-${supplier.id}`"
+                  kind="supplier"
+                  :item="supplier"
+                  :disabled="isActive"
+                  :saving="savingKey === `supplier-${supplier.id}`"
+                  @save="saveSupplier($event as SupplierFeed)"
+                  @remove="removeSupplier($event as SupplierFeed)"
+              />
+              <FeedEditorCard
+                  v-for="(supplier, index) in pendingSuppliers"
+                  :key="`new-supplier-${index}`"
+                  kind="supplier"
+                  :item="supplier"
+                  :disabled="isActive"
+                  :saving="savingKey === `supplier-${index}`"
+                  @save="saveSupplier($event as SupplierFeed, index)"
+                  @remove="pendingSuppliers.splice(index, 1)"
+              />
             </div>
-            <UButton
-              color="neutral"
-              variant="soft"
-              icon="i-lucide-plus"
-              :disabled="isActive"
-              @click="addSupplier"
-            >
-              Поставщик
-            </UButton>
-          </div>
+          </template>
+        </UCollapsible>
 
-          <div class="feed-list">
-            <FeedEditorCard
-              v-for="supplier in data.suppliers"
-              :key="`supplier-${supplier.id}`"
-              kind="supplier"
-              :item="supplier"
-              :disabled="isActive"
-              :saving="savingKey === `supplier-${supplier.id}`"
-              @save="saveSupplier($event as SupplierFeed)"
-              @remove="removeSupplier($event as SupplierFeed)"
-            />
-            <FeedEditorCard
-              v-for="(supplier, index) in pendingSuppliers"
-              :key="`new-supplier-${index}`"
-              kind="supplier"
-              :item="supplier"
-              :disabled="isActive"
-              :saving="savingKey === `supplier-${index}`"
-              @save="saveSupplier($event as SupplierFeed, index)"
-              @remove="pendingSuppliers.splice(index, 1)"
-            />
-          </div>
+        <EmptyState
+          v-if="!data.suppliers.length && !pendingSuppliers.length"
+          icon="i-lucide-truck"
+          title="Нет поставщиков"
+          description="Добавьте XML-фид поставщика для сравнения."
+        >
+          <UButton color="primary" variant="soft" icon="i-lucide-plus" @click="addSupplier">Добавить</UButton>
+        </EmptyState>
+      </UCard>
 
-          <EmptyState
-            v-if="!data.suppliers.length && !pendingSuppliers.length"
-            icon="i-lucide-truck"
-            title="Нет поставщиков"
-            description="Добавьте XML-фид поставщика для сравнения."
-          >
-            <UButton color="primary" variant="soft" icon="i-lucide-plus" @click="addSupplier">Добавить</UButton>
-          </EmptyState>
-        </UCard>
-      </div>
 
       <UCard as="section" variant="outline" class="panel comparison-progress-panel">
         <div class="panel-header">

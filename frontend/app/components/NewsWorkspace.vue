@@ -322,7 +322,7 @@ onMounted(async () => {
                 <small>{{ section.items.length }} брендов</small>
               </span>
               <UIcon
-                name="i-lucide-chevron-right"
+                name="i-lucide-chevron-down"
                 class="settings-details-chevron"
                 :class="{ open }"
               />
