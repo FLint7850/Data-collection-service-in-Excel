@@ -19,7 +19,8 @@ export function useProjects() {
   const projects = useState<Project[]>("projects", () => []);
   const progressCursor = useState<string>("projects-progress-cursor", () => "");
   const connectionMethods = useState<ConnectionMethod[]>("connection-methods", () => []);
-  const loading = useState<boolean>("projects-loading", () => false);
+  const loading = useState<boolean>("projects-loading", () => true);
+  const loaded = useState<boolean>("projects-loaded", () => false);
 
   const upsert = (project: Project) => {
     const index = projects.value.findIndex((item) => item.id === project.id);
@@ -36,6 +37,7 @@ export function useProjects() {
       );
       connectionMethods.value = data.connection_methods;
       if (data.progress_cursor) progressCursor.value = data.progress_cursor;
+      loaded.value = true;
       return data;
     } finally {
       loading.value = false;
@@ -74,6 +76,7 @@ export function useProjects() {
     progressCursor,
     connectionMethods,
     loading,
+    loaded,
     load,
     loadProject,
     upsert,

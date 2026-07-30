@@ -11,6 +11,7 @@ const {
   data,
   progressCursor,
   loading,
+  loaded,
   load,
   mergeProgress,
   upsertMonitor,
@@ -288,7 +289,7 @@ onMounted(async () => {
     </div>
 
     <EmptyState
-      v-else-if="!brands.length"
+      v-else-if="loaded && !brands.length"
       icon="i-lucide-radar"
       title="Мониторинг ещё не настроен"
       description="Добавьте бренд, укажите сайт-донора и стартовые URL."
@@ -298,7 +299,7 @@ onMounted(async () => {
       </UButton>
     </EmptyState>
 
-    <div v-else class="news-groups">
+    <div v-else-if="loaded" class="news-groups">
       <UCard
         v-for="section in groupedBrands"
         :key="section.group"

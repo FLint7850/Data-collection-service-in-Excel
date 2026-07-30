@@ -14,6 +14,7 @@ const {
   progressCursor,
   connectionMethods,
   loading,
+  loaded,
   load,
   loadProject,
   upsert,
@@ -386,7 +387,7 @@ onBeforeUnmount(() => {
     </div>
 
     <EmptyState
-      v-else-if="!projects.length"
+      v-else-if="loaded && !projects.length"
       icon="i-lucide-folder-plus"
       title="Пока нет проектов"
       description="Создайте первый проект и добавьте стартовую ссылку каталога."
@@ -396,7 +397,7 @@ onBeforeUnmount(() => {
       </UButton>
     </EmptyState>
 
-    <div v-else class="project-layout">
+    <div v-else-if="loaded" class="project-layout">
       <UCard as="aside" variant="outline" class="project-rail panel">
         <div class="panel-header">
           <div>

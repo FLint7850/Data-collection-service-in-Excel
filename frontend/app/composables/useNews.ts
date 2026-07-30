@@ -13,7 +13,8 @@ import {
 export function useNews() {
   const data = useState<NewsWorkspaceData | null>("news-workspace", () => null);
   const progressCursor = useState<string>("news-progress-cursor", () => "");
-  const loading = useState<boolean>("news-loading", () => false);
+  const loading = useState<boolean>("news-loading", () => true);
+  const loaded = useState<boolean>("news-loaded", () => false);
 
   const merge = (incoming: NewsWorkspaceData) => {
     const previous = data.value;
@@ -35,6 +36,7 @@ export function useNews() {
     try {
       const incoming = await newsService.getWorkspace();
       merge(incoming);
+      loaded.value = true;
       return data.value;
     } finally {
       loading.value = false;
@@ -56,6 +58,7 @@ export function useNews() {
     data,
     progressCursor,
     loading,
+    loaded,
     load,
     merge,
     mergeProgress,
