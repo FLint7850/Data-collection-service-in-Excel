@@ -17,6 +17,7 @@ function mergeProject(current: Project | undefined, incoming: Project): Project 
 
 export function useProjects() {
   const projects = useState<Project[]>("projects", () => []);
+  const progressCursor = useState<string>("projects-progress-cursor", () => "");
   const connectionMethods = useState<ConnectionMethod[]>("connection-methods", () => []);
   const loading = useState<boolean>("projects-loading", () => false);
 
@@ -34,6 +35,7 @@ export function useProjects() {
         mergeProject(projects.value.find((current) => current.id === item.id), item),
       );
       connectionMethods.value = data.connection_methods;
+      if (data.progress_cursor) progressCursor.value = data.progress_cursor;
       return data;
     } finally {
       loading.value = false;
@@ -47,13 +49,29 @@ export function useProjects() {
   };
 
   const mergeProgress = (payload: ProgressPayload) => {
-    if (payload.connection_methods) connectionMethods.value = payload.connection_methods;
-    if (!payload.projects) return;
-    for (const project of payload.projects) upsert(project);
+    if (payload.cursor) progressCursor.value = payload.cursor;
+    if (payload.replace_projects) {
+      const currentIds = new Set(
+        (payload.upsert_projects || []).map((project) => project.id),
+      );
+      projects.value = projects.value.filter((project) =>
+        currentIds.has(project.id),
+      );
+    }
+    for (const project of payload.upsert_projects || []) upsert(project);
+    for (const incoming of payload.projects || []) {
+      const project = projects.value.find((item) => item.id === incoming.id);
+      if (project) project.state = mergeProgressState(project.state, incoming.state);
+    }
+    if (payload.removed_projects_ids?.length) {
+      const removed = new Set(payload.removed_projects_ids);
+      projects.value = projects.value.filter((project) => !removed.has(project.id));
+    }
   };
 
   return {
     projects,
+    progressCursor,
     connectionMethods,
     loading,
     load,

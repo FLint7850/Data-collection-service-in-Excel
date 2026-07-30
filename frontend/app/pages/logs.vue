@@ -17,6 +17,7 @@ const confirmClear = ref(false);
 const search = ref("");
 const level = ref("all");
 const error = ref("");
+let loadInFlight = false;
 
 const levelOptions = [
   { label: "Все уровни", value: "all" },
@@ -60,14 +61,33 @@ function logIcon(item: LogEntry) {
 }
 
 async function load(silent = false) {
+  if (loadInFlight) return;
+  loadInFlight = true;
   if (!silent) refreshing.value = true;
   try {
-    data.value = await logService.list();
+    const response = await logService.list(
+      1,
+      200,
+      silent ? data.value?.logs_signature || "" : "",
+      silent ? data.value?.logs_total : undefined,
+    );
+    if (!("not_modified" in response)) {
+      if (response.delta && data.value) {
+        data.value = {
+          ...data.value,
+          ...response,
+          logs: [...data.value.logs, ...response.logs].slice(-response.logs_limit),
+        };
+      } else {
+        data.value = response;
+      }
+    }
   } catch (caught) {
     error.value = errorMessage(caught, "Не удалось загрузить логи");
   } finally {
     loading.value = false;
     refreshing.value = false;
+    loadInFlight = false;
   }
 }
 
@@ -96,14 +116,13 @@ async function clearLogs() {
   }
 }
 
-let timer: ReturnType<typeof setInterval> | undefined;
-onMounted(async () => {
-  await load();
-  timer = setInterval(() => void load(true), 5000);
-});
-onBeforeUnmount(() => {
-  if (timer) clearInterval(timer);
-});
+useProgressPolling(
+  () => load(true),
+  computed(() => Boolean(data.value)),
+  5000,
+);
+
+onMounted(load);
 </script>
 
 <template>

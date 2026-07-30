@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import csv
+import copy
 import hashlib
 import html as html_lib
 import io
@@ -17,7 +18,7 @@ import time
 import traceback
 import uuid
 import zipfile
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
@@ -289,6 +290,7 @@ projects: Dict[str, Dict[str, object]] = {}
 news_settings: Dict[str, object] = {}
 news_scheduler_thread: Optional[threading.Thread] = None
 LOG_AUTO_CLEANUP = False
+last_log_cleanup_at = 0.0
 VISIBLE_BROWSER_LOCK = threading.Lock()
 STANDALONE_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
 FEED_STORAGE_LOCK = threading.RLock()
@@ -302,6 +304,9 @@ news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
 NEWS_TRANSITION_TIMEOUT_SECONDS = 180
 PROGRESS_STREAM_INTERVAL_SECONDS = env_float("PROGRESS_STREAM_INTERVAL_SECONDS", 2.0, minimum=0.5, maximum=30.0)
+PROGRESS_CURSOR_CACHE_LIMIT = 128
+progress_cursor_lock = threading.Lock()
+progress_cursor_cache: "OrderedDict[str, Dict[str, object]]" = OrderedDict()
 FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS = env_float(
     "FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS",
     2.0,
@@ -733,6 +738,7 @@ def public_project(project: Dict[str, object], include_details: bool = True) -> 
     payload = {
         "id": project["id"],
         "name": repair_mojibake_text(project["name"]),
+        "start_urls_count": len(project.get("start_urls", [])),
         "thread_count": project["thread_count"],
         "state": state,
         "connection_method": project.get("connection_method", "requests"),
@@ -765,19 +771,187 @@ def projects_progress_payload() -> List[Dict[str, object]]:
         return [public_project(project, include_details=False) for project in projects.values()]
 
 
-def news_progress_payload() -> Dict[str, object]:
-    return public_news_settings(include_connection_methods=False, include_monitor_details=False)
+def news_progress_payload() -> List[Dict[str, object]]:
+    cleanup_stale_news_transitions()
+    with news_lock:
+        return [
+            public_news_monitor(monitor, include_details=False)
+            for monitor in news_settings.get("monitors", [])
+            if isinstance(monitor, dict)
+        ]
 
 
-def progress_payload(include_projects: bool, include_news: bool) -> Dict[str, object]:
-    payload: Dict[str, object] = {
-        "connection_methods": public_connection_methods(),
-        "logs_signature": logs_signature(),
+def progress_item_signatures(
+    items: List[Dict[str, object]],
+) -> Dict[str, Dict[str, str]]:
+    return {
+        str(item["id"]): {
+            "state": payload_signature(item.get("state", {})),
+            "summary": payload_signature(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "state"
+                }
+            ),
+        }
+        for item in items
     }
+
+
+def remember_progress_cursor(
+    cursor: str,
+    signatures: Dict[str, Dict[str, Dict[str, str]]],
+    project_items: Optional[List[Dict[str, object]]] = None,
+    news_items: Optional[List[Dict[str, object]]] = None,
+) -> None:
+    with progress_cursor_lock:
+        if cursor in progress_cursor_cache:
+            progress_cursor_cache.move_to_end(cursor)
+            return
+    states: Dict[str, Dict[str, Dict[str, object]]] = {}
+    if project_items is not None:
+        states["projects"] = {
+            str(item["id"]): copy.deepcopy(
+                item.get("state", {}) if isinstance(item.get("state"), dict) else {}
+            )
+            for item in project_items
+        }
+    if news_items is not None:
+        states["news"] = {
+            str(item["id"]): copy.deepcopy(
+                item.get("state", {}) if isinstance(item.get("state"), dict) else {}
+            )
+            for item in news_items
+        }
+    with progress_cursor_lock:
+        progress_cursor_cache[cursor] = {
+            "signatures": signatures,
+            "states": states,
+        }
+        progress_cursor_cache.move_to_end(cursor)
+        while len(progress_cursor_cache) > PROGRESS_CURSOR_CACHE_LIMIT:
+            progress_cursor_cache.popitem(last=False)
+
+
+def register_progress_items(
+    project_items: Optional[List[Dict[str, object]]] = None,
+    news_items: Optional[List[Dict[str, object]]] = None,
+) -> tuple[str, Dict[str, Dict[str, Dict[str, str]]]]:
+    signatures: Dict[str, Dict[str, Dict[str, str]]] = {}
+    if project_items is not None:
+        signatures["projects"] = progress_item_signatures(project_items)
+    if news_items is not None:
+        signatures["news"] = progress_item_signatures(news_items)
+    cursor = payload_signature(
+        {
+            "projects": signatures.get("projects") if project_items is not None else None,
+            "news": signatures.get("news") if news_items is not None else None,
+        }
+    )
+    remember_progress_cursor(cursor, signatures, project_items, news_items)
+    return cursor, signatures
+
+
+def progress_snapshot(
+    include_projects: bool,
+    include_news: bool,
+) -> tuple[
+    str,
+    Dict[str, List[Dict[str, object]]],
+    Dict[str, Dict[str, Dict[str, str]]],
+]:
+    items: Dict[str, List[Dict[str, object]]] = {}
     if include_projects:
-        payload["projects"] = projects_progress_payload()
+        items["projects"] = projects_progress_payload()
     if include_news:
-        payload["news"] = news_progress_payload()
+        items["news"] = news_progress_payload()
+    cursor, signatures = register_progress_items(
+        items.get("projects") if include_projects else None,
+        items.get("news") if include_news else None,
+    )
+    return cursor, items, signatures
+
+
+def progress_payload(
+    include_projects: bool,
+    include_news: bool,
+    previous_cursor: str = "",
+) -> Dict[str, object]:
+    cursor, items, signatures = progress_snapshot(include_projects, include_news)
+    payload: Dict[str, object] = {"cursor": cursor}
+    if previous_cursor == cursor:
+        return payload
+
+    with progress_cursor_lock:
+        previous = progress_cursor_cache.get(previous_cursor)
+    previous_all_signatures = (
+        previous.get("signatures", {})
+        if isinstance(previous, dict)
+        and isinstance(previous.get("signatures"), dict)
+        else {}
+    )
+    previous_all_states = (
+        previous.get("states", {})
+        if isinstance(previous, dict)
+        and isinstance(previous.get("states"), dict)
+        else {}
+    )
+
+    for section in ("projects", "news"):
+        if section not in items:
+            continue
+        if previous_cursor and previous is None:
+            payload[f"replace_{section}"] = True
+        previous_signatures = previous_all_signatures.get(section, {})
+        previous_states = previous_all_states.get(section, {})
+        state_changes: List[Dict[str, object]] = []
+        upserts: List[Dict[str, object]] = []
+        for item in items[section]:
+            item_id = str(item["id"])
+            previous_item_signatures = previous_signatures.get(item_id)
+            current_item_signatures = signatures[section][item_id]
+            if (
+                previous_item_signatures is None
+                or previous_item_signatures.get("summary")
+                != current_item_signatures["summary"]
+            ):
+                upserts.append(item)
+            elif (
+                previous_item_signatures.get("state")
+                != current_item_signatures["state"]
+            ):
+                current_state = (
+                    item.get("state", {})
+                    if isinstance(item.get("state"), dict)
+                    else {}
+                )
+                previous_state = previous_states.get(item_id, {})
+                state_delta = {
+                    key: copy.deepcopy(value)
+                    for key, value in current_state.items()
+                    if previous_state.get(key) != value
+                }
+                for key in previous_state:
+                    if key not in current_state:
+                        state_delta[key] = None
+                state_changes.append(
+                    {
+                        "id": item_id,
+                        "state": state_delta,
+                    }
+                )
+        removed_ids = [
+            item_id
+            for item_id in previous_signatures
+            if item_id not in signatures[section]
+        ]
+        if state_changes:
+            payload[section] = state_changes
+        if upserts:
+            payload[f"upsert_{section}"] = upserts
+        if removed_ids:
+            payload[f"removed_{section}_ids"] = removed_ids
     return payload
 
 
@@ -2092,11 +2266,24 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
             "start_urls",
             "enabled",
             "state",
-            "created_at",
-            "brand_created_at",
         }
         public_monitor = {key: value for key, value in public_monitor.items() if key in summary_keys}
+        start_urls = (
+            public_monitor.get("start_urls", [])
+            if isinstance(public_monitor.get("start_urls"), list)
+            else []
+        )
+        public_monitor["start_urls_count"] = len(start_urls)
+        public_monitor["start_urls"] = start_urls[:1]
     return public_monitor
+
+
+def public_news_monitor_progress(monitor: Dict[str, object]) -> Dict[str, object]:
+    public_monitor = public_news_monitor(monitor, include_details=False)
+    return {
+        "id": str(public_monitor["id"]),
+        "state": public_monitor["state"],
+    }
 
 
 def public_news_settings(include_connection_methods: bool = True, include_monitor_details: bool = True, include_monitors: bool = True) -> Dict[str, object]:
@@ -2122,6 +2309,41 @@ def public_news_settings(include_connection_methods: bool = True, include_monito
         if include_connection_methods:
             payload["connection_methods"] = public_connection_methods()
         return payload
+
+
+def public_news_workspace() -> Dict[str, object]:
+    cleanup_stale_news_transitions()
+    with news_lock:
+        monitors = [
+            public_news_monitor(monitor, include_details=False)
+            for monitor in news_settings.get("monitors", [])
+            if isinstance(monitor, dict)
+        ]
+    progress_cursor, _ = register_progress_items(news_items=monitors)
+    return {
+        "monitors": monitors,
+        "connection_methods": public_connection_methods(),
+        "progress_cursor": progress_cursor,
+    }
+
+
+def public_news_configuration() -> Dict[str, object]:
+    cleanup_stale_news_transitions()
+    with news_lock:
+        smtp = dict(news_settings.get("smtp", {}))
+        smtp.pop("sender", None)
+        smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
+        return {
+            "own_sites": own_sites_from_settings(news_settings),
+            "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
+            "smtp": smtp,
+            "feed_storage": (
+                list(news_settings.get("feed_storage", []))
+                if isinstance(news_settings.get("feed_storage"), list)
+                else []
+            ),
+        }
+
 
 def reset_state(status: str = "idle", run_id: Optional[int] = None, thread_count: Optional[int] = None) -> None:
     with state_lock:
@@ -5149,7 +5371,6 @@ def public_file_import_state() -> Dict[str, object]:
         return {
             "file": None,
             "exclusions": exclusions_text,
-            "exclusions_list": exclusions,
             "model_field": model_field,
             "price_field": price_field,
             "replace_rules": replace_rules,
@@ -5160,7 +5381,6 @@ def public_file_import_state() -> Dict[str, object]:
     stat = path.stat()
     return {
         "exclusions": exclusions_text,
-        "exclusions_list": exclusions,
         "model_field": model_field,
         "price_field": price_field,
         "replace_rules": replace_rules,
@@ -5173,6 +5393,25 @@ def public_file_import_state() -> Dict[str, object]:
             "size": stat.st_size,
             "uploaded_at": str(file_meta.get("uploaded_at") or datetime.fromtimestamp(stat.st_mtime, MSK_TZ).isoformat(timespec="seconds")),
         }
+    }
+
+
+def public_file_import_progress() -> Dict[str, object]:
+    payload = public_file_import_state()
+    return {
+        "state": payload["state"],
+        "result_filename": payload["result_filename"],
+        "result_ready": payload["result_ready"],
+    }
+
+
+def public_file_import_settings() -> Dict[str, object]:
+    payload = public_file_import_state()
+    return {
+        "model_field": payload["model_field"],
+        "price_field": payload["price_field"],
+        "exclusions": payload["exclusions"],
+        "replace_rules": payload["replace_rules"],
     }
 
 
@@ -6140,7 +6379,6 @@ def public_supplier_feed(row: SupplierFeed) -> Dict[str, object]:
         "feed_url": str(row.feed_url or ""),
         "model_field": normalize_supplier_model_field(row.model_field),
         "exclusions": "\n".join(exclusions),
-        "exclusions_list": exclusions,
         "replace_rules": normalize_file_import_rules_text(getattr(row, "replace_rules", "")),
     }
 
@@ -6157,6 +6395,20 @@ def public_feed_comparison_state(db_session=None) -> Dict[str, object]:
         "suppliers": [public_supplier_feed(row) for row in suppliers],
         "state": state,
         "result_ready": bool(result_path and not is_feed_comparison_active_state(state)),
+        "result_filename": result_path.name if result_path else "",
+    }
+
+
+def public_feed_comparison_progress(db_session=None) -> Dict[str, object]:
+    db = db_session or g.db
+    comparison = get_feed_comparison_row(db)
+    state = normalize_feed_comparison_state(comparison.state)
+    result_path = resolve_feed_comparison_export_path(str(comparison.export_path or ""))
+    return {
+        "state": state,
+        "result_ready": bool(
+            result_path and not is_feed_comparison_active_state(state)
+        ),
         "result_filename": result_path.name if result_path else "",
     }
 
@@ -8580,6 +8832,11 @@ def api_connection_methods():
 @app.get("/api/news")
 def api_news():
     ensure_storage()
+    scope = str(request.args.get("scope") or "").strip().lower()
+    if scope == "workspace":
+        return jsonify(public_news_workspace())
+    if scope == "settings":
+        return jsonify(public_news_configuration())
     summary = request.args.get("summary") == "1"
     include_monitors = request.args.get("monitors", "1") != "0"
     return jsonify(public_news_settings(include_monitor_details=not summary, include_monitors=include_monitors))
@@ -8653,7 +8910,7 @@ def api_update_news_settings():
                 smtp["recipients"] = normalize_emails(smtp_payload.get("recipients"))
             news_settings["smtp"] = smtp
         save_news_settings()
-    return jsonify(public_news_settings())
+    return jsonify(public_news_configuration())
 
 
 @app.post("/api/news/email/test")
@@ -8693,7 +8950,7 @@ def api_get_news_monitor(monitor_id: str):
             and clean_text(str(item.get("group") or "")) == group
             and clean_text(str(item.get("brand") or "")) == brand
         ]
-    return jsonify({"monitor": public_news_monitor(monitor), "brand_monitors": brand_monitors})
+    return jsonify({"monitors": brand_monitors})
 
 
 @app.patch("/api/news/monitors/<monitor_id>")
@@ -8788,7 +9045,7 @@ def api_scan_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
-        response_monitor = public_news_monitor(monitor)
+        response_monitor = public_news_monitor_progress(monitor)
     if not enqueue_news_scan(monitor_id, manual=True):
         return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     return jsonify({"monitor": response_monitor})
@@ -8801,7 +9058,7 @@ def api_stop_news_monitor(monitor_id: str):
         return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "stop")
     with news_lock:
-        response_monitor = public_news_monitor(monitor)
+        response_monitor = public_news_monitor_progress(monitor)
     threading.Thread(
         target=add_news_log,
         args=(monitor, "Запрошена остановка сканирования новинок", "warning"),
@@ -8817,7 +9074,7 @@ def api_pause_news_monitor(monitor_id: str):
         return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "pause")
     with news_lock:
-        response_monitor = public_news_monitor(monitor)
+        response_monitor = public_news_monitor_progress(monitor)
     threading.Thread(
         target=add_news_log,
         args=(monitor, "Запрошена приостановка сканирования новинок с сохранением результата", "warning"),
@@ -8837,7 +9094,7 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["state"] = {**monitor.get("state", {}), "status": "queued", "stage": "Продолжение"}
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
-        response_monitor = public_news_monitor(monitor)
+        response_monitor = public_news_monitor_progress(monitor)
     if not enqueue_news_scan(monitor_id, manual=True):
         return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
     add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
@@ -8927,32 +9184,55 @@ def api_delete_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
-    if request.args.get("mode") != "brand":
-        group = clean_text(str(monitor.get("group") or ""))
-        brand = clean_text(str(monitor.get("brand") or ""))
-        with news_lock:
-            brand_monitors = [
-                item
-                for item in news_settings.get("monitors", [])
-                if isinstance(item, dict)
-                and clean_text(str(item.get("group") or "")) == group
-                and clean_text(str(item.get("brand") or "")) == brand
-            ]
-        if len(brand_monitors) < 2:
-            return jsonify({"error": "Нельзя удалить единственного донора бренда"}), 409
-    request_news_stop(monitor_id, "stop")
-    delete_news_csv_for_monitor(monitor)
+    group = clean_text(str(monitor.get("group") or ""))
+    brand = clean_text(str(monitor.get("brand") or ""))
+    remove_brand = request.args.get("mode") == "brand"
+    with news_lock:
+        brand_monitors = [
+            item
+            for item in news_settings.get("monitors", [])
+            if isinstance(item, dict)
+            and clean_text(str(item.get("group") or "")) == group
+            and clean_text(str(item.get("brand") or "")) == brand
+        ]
+    if not remove_brand and len(brand_monitors) < 2:
+        return jsonify({"error": "Нельзя удалить единственного донора бренда"}), 409
+
+    removed_monitors = (
+        brand_monitors
+        if remove_brand
+        else [item for item in brand_monitors if str(item.get("id")) == monitor_id]
+    )
+    removed_ids = {str(item.get("id")) for item in removed_monitors}
+    for removed_monitor in removed_monitors:
+        request_news_stop(str(removed_monitor.get("id") or ""), "stop")
+        delete_news_csv_for_monitor(removed_monitor)
+
     with news_lock:
         monitors = news_settings.get("monitors", [])
         news_settings["monitors"] = [
             item
             for item in monitors
-            if isinstance(item, dict) and str(item.get("id")) != monitor_id
+            if isinstance(item, dict) and str(item.get("id")) not in removed_ids
         ]
-        news_stop_events.pop(monitor_id, None)
+        for item_id in removed_ids:
+            news_stop_events.pop(item_id, None)
         save_news_settings()
+        remaining_brand_monitors = [
+            public_news_monitor(item)
+            for item in news_settings.get("monitors", [])
+            if isinstance(item, dict)
+            and clean_text(str(item.get("group") or "")) == group
+            and clean_text(str(item.get("brand") or "")) == brand
+        ]
     add_news_log(monitor, "Монитор новинок удален", "warning")
-    return jsonify({"ok": True, "monitors": [public_news_monitor(item) for item in news_settings.get("monitors", []) if isinstance(item, dict)]})
+    return jsonify(
+        {
+            "ok": True,
+            "removed_ids": sorted(removed_ids),
+            "monitors": remaining_brand_monitors,
+        }
+    )
 
 
 @app.get("/api/news/monitors/<monitor_id>/download")
@@ -8999,6 +9279,8 @@ def api_download_news_feed(source: str, filename: str):
 @app.get("/api/file-import")
 def api_file_import_state():
     ensure_storage()
+    if request.args.get("compact") == "1":
+        return jsonify(public_file_import_progress())
     return jsonify(public_file_import_state())
 
 
@@ -9029,7 +9311,7 @@ def api_update_file_import():
                     "stored_filename": path.name,
                     "uploaded_at": str(file_payload.get("uploaded_at") or datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")),
                 }
-    return jsonify(public_file_import_state())
+    return jsonify(public_file_import_settings())
 
 
 @app.post("/api/file-import")
@@ -9108,7 +9390,7 @@ def api_stop_file_import():
             "stage": "Остановлено",
             "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         }
-    return jsonify(public_file_import_state())
+    return jsonify(public_file_import_progress())
 
 
 @app.get("/api/file-import/download")
@@ -9135,6 +9417,8 @@ def ensure_feed_comparison_editable() -> Optional[tuple[Response, int]]:
 @app.get("/api/feed-comparison")
 def api_feed_comparison_state():
     ensure_storage()
+    if request.args.get("compact") == "1":
+        return jsonify(public_feed_comparison_progress())
     return jsonify(public_feed_comparison_state())
 
 
@@ -9155,7 +9439,7 @@ def api_create_feed_comparison_own_site():
     g.db.add(row)
     g.db.flush()
     sync_own_sites_runtime(g.db)
-    return jsonify(public_feed_comparison_state()), 201
+    return jsonify({"own_site": public_own_site(row)}), 201
 
 
 @app.patch("/api/feed-comparison/own-sites/<int:site_id>")
@@ -9181,7 +9465,7 @@ def api_update_feed_comparison_own_site(site_id: int):
     row.feed_generate_url = data["feed_generate_url"]
     g.db.flush()
     sync_own_sites_runtime(g.db)
-    return jsonify(public_feed_comparison_state())
+    return jsonify({"own_site": public_own_site(row)})
 
 
 @app.delete("/api/feed-comparison/own-sites/<int:site_id>")
@@ -9196,7 +9480,7 @@ def api_delete_feed_comparison_own_site(site_id: int):
     g.db.delete(row)
     g.db.flush()
     sync_own_sites_runtime(g.db)
-    return jsonify(public_feed_comparison_state())
+    return jsonify({"ok": True, "id": site_id})
 
 
 @app.post("/api/feed-comparison/suppliers")
@@ -9215,7 +9499,7 @@ def api_create_supplier_feed():
     row = SupplierFeed(**data)
     g.db.add(row)
     g.db.flush()
-    return jsonify(public_feed_comparison_state()), 201
+    return jsonify({"supplier": public_supplier_feed(row)}), 201
 
 
 @app.patch("/api/feed-comparison/suppliers/<int:supplier_id>")
@@ -9245,7 +9529,7 @@ def api_update_supplier_feed(supplier_id: int):
     row.exclusions = data["exclusions"]
     row.replace_rules = data["replace_rules"]
     g.db.flush()
-    return jsonify(public_feed_comparison_state())
+    return jsonify({"supplier": public_supplier_feed(row)})
 
 
 @app.delete("/api/feed-comparison/suppliers/<int:supplier_id>")
@@ -9259,7 +9543,7 @@ def api_delete_supplier_feed(supplier_id: int):
         return jsonify({"error": "Фид поставщика не найден"}), 404
     g.db.delete(row)
     g.db.flush()
-    return jsonify(public_feed_comparison_state())
+    return jsonify({"ok": True, "id": supplier_id})
 
 
 @app.post("/api/feed-comparison/start")
@@ -9288,7 +9572,7 @@ def api_stop_feed_comparison():
             "stage": "Остановка",
             "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         }
-    return jsonify(public_feed_comparison_state())
+    return jsonify(public_feed_comparison_progress())
 
 
 @app.get("/api/feed-comparison/download")
@@ -9308,12 +9592,18 @@ def api_projects():
     ensure_storage()
     summary = request.args.get("summary") == "1"
     with projects_lock:
-        return jsonify(
-            {
-                "projects": [public_project(project, include_details=not summary) for project in projects.values()],
-                "connection_methods": public_connection_methods(),
-            }
+        response = {
+            "projects": [
+                public_project(project, include_details=not summary)
+                for project in projects.values()
+            ],
+            "connection_methods": public_connection_methods(),
+        }
+    if summary:
+        response["progress_cursor"], _ = register_progress_items(
+            project_items=response["projects"]
         )
+    return jsonify(response)
 
 
 @app.get("/api/projects/<project_id>")
@@ -9408,12 +9698,14 @@ def api_project_add_exclusion(project_id: str):
     pattern = str(payload.get("pattern", "")).strip()
     if not pattern:
         return jsonify({"error": "Пустое исключение"}), 400
+    added = False
     with projects_lock:
         exclusions = project.setdefault("exclusions", [])
         if pattern not in exclusions:
             exclusions.append(pattern)
+            added = True
             save_projects()
-    return jsonify({"exclusions": project.get("exclusions", [])})
+    return jsonify({"ok": True, "added": added, "pattern": pattern})
 
 
 @app.delete("/api/projects/<project_id>/exclusions/<int:index>")
@@ -9425,9 +9717,9 @@ def api_project_delete_exclusion(project_id: str, index: int):
         exclusions = project.setdefault("exclusions", [])
         if index < 0 or index >= len(exclusions):
             return jsonify({"error": "Исключение не найдено"}), 404
-        exclusions.pop(index)
+        removed = exclusions.pop(index)
         save_projects()
-    return jsonify({"exclusions": project.get("exclusions", [])})
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.get("/api/projects/<project_id>/product-url-filters")
@@ -9447,12 +9739,14 @@ def api_project_add_product_url_filter(project_id: str):
     pattern = str(payload.get("pattern", "")).strip()
     if not pattern:
         return jsonify({"error": "Пустой фильтр ссылки"}), 400
+    added = False
     with projects_lock:
         filters = project.setdefault("product_url_filters", [])
         if pattern not in filters:
             filters.append(pattern)
+            added = True
             save_projects()
-    return jsonify({"product_url_filters": project.get("product_url_filters", [])})
+    return jsonify({"ok": True, "added": added, "pattern": pattern})
 
 
 @app.delete("/api/projects/<project_id>/product-url-filters/<int:index>")
@@ -9464,9 +9758,9 @@ def api_project_delete_product_url_filter(project_id: str, index: int):
         filters = project.setdefault("product_url_filters", [])
         if index < 0 or index >= len(filters):
             return jsonify({"error": "Фильтр ссылки не найден"}), 404
-        filters.pop(index)
+        removed = filters.pop(index)
         save_projects()
-    return jsonify({"product_url_filters": project.get("product_url_filters", [])})
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.get("/api/projects/<project_id>/product-url-exclusions")
@@ -9486,12 +9780,14 @@ def api_project_add_product_url_exclusion(project_id: str):
     pattern = str(payload.get("pattern", "")).strip()
     if not pattern:
         return jsonify({"error": "Пустое исключение товарной ссылки"}), 400
+    added = False
     with projects_lock:
         exclusions = project.setdefault("product_url_exclusions", [])
         if pattern not in exclusions:
             exclusions.append(pattern)
+            added = True
             save_projects()
-    return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
+    return jsonify({"ok": True, "added": added, "pattern": pattern})
 
 
 @app.delete("/api/projects/<project_id>/product-url-exclusions/<int:index>")
@@ -9503,9 +9799,9 @@ def api_project_delete_product_url_exclusion(project_id: str, index: int):
         exclusions = project.setdefault("product_url_exclusions", [])
         if index < 0 or index >= len(exclusions):
             return jsonify({"error": "Исключение товарной ссылки не найдено"}), 404
-        exclusions.pop(index)
+        removed = exclusions.pop(index)
         save_projects()
-    return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
+    return jsonify({"ok": True, "removed": removed})
 
 
 def close_project_browser_session(project: Dict[str, object]) -> None:
@@ -9786,12 +10082,32 @@ def api_project_restart(project_id: str):
 @app.get("/api/logs")
 def api_logs():
     ensure_storage()
-    global LOG_AUTO_CLEANUP
+    global LOG_AUTO_CLEANUP, last_log_cleanup_at
     auto_cleanup = get_log_auto_cleanup()
     LOG_AUTO_CLEANUP = auto_cleanup
+    cleanup_due = auto_cleanup and time.time() - last_log_cleanup_at >= 60
+    requested_signature = str(request.args.get("signature") or "")
+    try:
+        requested_total = max(0, int(request.args.get("since_total") or 0))
+    except (TypeError, ValueError):
+        requested_total = 0
+    current_logs_signature = logs_signature()
+    if (
+        requested_signature
+        and requested_signature == current_logs_signature
+        and not cleanup_due
+    ):
+        return jsonify(
+            {
+                "not_modified": True,
+                "logs_signature": current_logs_signature,
+                "logs_total": requested_total,
+                "auto_cleanup": auto_cleanup,
+            }
+        )
 
     json_logs = read_logs_file()
-    if auto_cleanup:
+    if cleanup_due:
         cutoff = time.time() - 7 * 24 * 60 * 60
         filtered_logs = [
             item
@@ -9817,6 +10133,7 @@ def api_logs():
                 for item in logs
                 if is_recent_log_entry(item, cutoff)
             ]
+        last_log_cleanup_at = time.time()
 
     all_logs = combined_log_entries()
     all_logs.sort(key=lambda item: item.get("time", ""))
@@ -9829,9 +10146,20 @@ def api_logs():
     except (TypeError, ValueError):
         page = 1
     total = len(all_logs)
+    current_logs_signature = logs_signature()
     end = max(0, total - (page - 1) * limit)
     start = max(0, end - limit)
     page_logs = all_logs[start:end]
+    delta = False
+    if page == 1 and requested_signature:
+        try:
+            since_total = int(request.args.get("since_total") or -1)
+        except (TypeError, ValueError):
+            since_total = -1
+        added_count = total - since_total
+        if since_total >= 0 and 0 < added_count <= limit:
+            page_logs = all_logs[since_total:total]
+            delta = True
     return jsonify(
         {
             "logs": page_logs,
@@ -9839,7 +10167,8 @@ def api_logs():
             "logs_page": page,
             "logs_limit": limit,
             "auto_cleanup": auto_cleanup,
-            "logs_signature": logs_signature(),
+            "logs_signature": current_logs_signature,
+            "delta": delta,
         }
     )
 
@@ -9868,50 +10197,30 @@ def api_logs_settings():
 
 @app.get("/progress")
 def progress_stream():
+    ensure_storage()
     include_projects = request.args.get("projects", "1") == "1"
     include_news = request.args.get("news") == "1"
     if request.args.get("once") == "1":
-        return jsonify(progress_payload(include_projects, include_news))
+        return jsonify(
+            progress_payload(
+                include_projects,
+                include_news,
+                str(request.args.get("cursor") or ""),
+            )
+        )
 
     def stream():
-        last_projects_signature = ""
-        last_news_signature = ""
-        last_logs_signature = ""
-        last_connection_methods_signature = ""
+        cursor = str(request.args.get("cursor") or "")
         while True:
             ensure_storage()
-            payload: Dict[str, object] = {}
-
-            if include_projects:
-                projects_payload = projects_progress_payload()
-                projects_signature = payload_signature(projects_payload)
-                if projects_signature != last_projects_signature:
-                    payload["projects"] = projects_payload
-                    last_projects_signature = projects_signature
-
-            if include_news:
-                news_payload = news_progress_payload()
-                news_signature = payload_signature(news_payload)
-                if news_signature != last_news_signature:
-                    payload["news"] = news_payload
-                    last_news_signature = news_signature
-
-            connection_methods = public_connection_methods()
-            connection_methods_signature = payload_signature(connection_methods)
-            if connection_methods_signature != last_connection_methods_signature:
-                payload["connection_methods"] = connection_methods
-                last_connection_methods_signature = connection_methods_signature
-
-            current_logs_signature = logs_signature()
-            if current_logs_signature != last_logs_signature:
-                payload["logs_signature"] = current_logs_signature
-                last_logs_signature = current_logs_signature
-
-            if payload:
+            payload = progress_payload(include_projects, include_news, cursor)
+            next_cursor = str(payload.get("cursor") or "")
+            if len(payload) > 1 or not cursor:
                 data = json.dumps(payload, ensure_ascii=False)
                 yield f"event: progress\ndata: {data}\n\n"
             else:
                 yield ": keep-alive\n\n"
+            cursor = next_cursor
             time.sleep(PROGRESS_STREAM_INTERVAL_SECONDS)
 
     response = Response(stream(), mimetype="text/event-stream")

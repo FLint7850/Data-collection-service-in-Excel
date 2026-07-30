@@ -1,8 +1,9 @@
 import type {
-  NewsBrand,
+  NewsConfiguration,
   NewsMonitor,
-  NewsSettings,
+  NewsWorkspaceData,
   OwnSite,
+  ProgressEntity,
   SmtpSettings,
 } from "~/types/api";
 
@@ -27,26 +28,23 @@ export interface MonitorPayload {
 }
 
 export const newsService = {
-  get: (options: { summary?: boolean; monitors?: boolean } = {}) =>
-    $fetch<NewsSettings>("/api/news", {
-      query: {
-        summary: options.summary ? 1 : undefined,
-        monitors: options.monitors === false ? 0 : undefined,
-      },
+  getWorkspace: () =>
+    $fetch<NewsWorkspaceData>("/api/news", {
+      query: { scope: "workspace" },
     }),
 
-  getBrand: (brandId: number | string) =>
-    $fetch<{ brand: NewsBrand }>(
-      `/api/news/brands/${encodeURIComponent(String(brandId))}`,
-    ),
+  getSettings: () =>
+    $fetch<NewsConfiguration>("/api/news", {
+      query: { scope: "settings" },
+    }),
 
   getMonitor: (monitorId: string) =>
-    $fetch<{ monitor: NewsMonitor; brand_monitors: NewsMonitor[] }>(
+    $fetch<{ monitors: NewsMonitor[] }>(
       `/api/news/monitors/${encodeURIComponent(monitorId)}`,
     ),
 
   updateSettings: (body: { own_sites?: OwnSite[]; smtp?: Partial<SmtpSettings> }) =>
-    $fetch<NewsSettings>("/api/news/settings", { method: "PATCH", body }),
+    $fetch<NewsConfiguration>("/api/news/settings", { method: "PATCH", body }),
 
   testEmail: () =>
     $fetch<{ ok: boolean }>("/api/news/email/test", { method: "POST" }),
@@ -70,7 +68,7 @@ export const newsService = {
     ),
 
   removeMonitor: (monitorId: string, mode: "donor" | "brand" = "donor") =>
-    $fetch<{ ok: boolean; monitors: NewsMonitor[] }>(
+    $fetch<{ ok: boolean; removed_ids: string[]; monitors: NewsMonitor[] }>(
       `/api/news/monitors/${encodeURIComponent(monitorId)}`,
       { method: "DELETE", query: mode === "brand" ? { mode: "brand" } : undefined },
     ),
@@ -79,7 +77,7 @@ export const newsService = {
     monitorId: string,
     action: "scan" | "stop" | "pause" | "resume" | "reset-visual",
   ) =>
-    $fetch<{ monitor: NewsMonitor }>(
+    $fetch<{ monitor: ProgressEntity }>(
       `/api/news/monitors/${encodeURIComponent(monitorId)}/${action}`,
       { method: "POST" },
     ),

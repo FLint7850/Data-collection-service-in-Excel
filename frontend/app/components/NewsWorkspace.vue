@@ -2,11 +2,19 @@
 import { newsService } from "~/services/news.service";
 import type { NewsMonitor, ProgressPayload, ScanState } from "~/types/api";
 import { errorMessage } from "~/utils/format";
+import { mergeProgressState } from "~/utils/progress-state";
 
 const props = withDefaults(defineProps<{ brandId?: string }>(), { brandId: "" });
 const toast = useToast();
 const route = useRoute();
-const { data, loading, load, merge, upsertMonitor } = useNews();
+const {
+  data,
+  progressCursor,
+  loading,
+  load,
+  mergeProgress,
+  upsertMonitor,
+} = useNews();
 const modalOpen = ref(false);
 const selectedMonitorId = ref("");
 const createOpen = ref(false);
@@ -113,18 +121,14 @@ async function openBrand(brand: BrandGroup) {
 }
 
 async function openRequestedBrand(brandId: string) {
-  const response = await newsService.getBrand(brandId);
-  for (const donor of response.brand.donors) upsertMonitor(donor);
-  const selected =
-    response.brand.donors.find(
-      (item) => String(item.id) === String(response.brand.primary_donor_id || ""),
-    ) || response.brand.donors[0];
-  if (!selected) {
-    pageError.value = "У этого бренда нет ни одного сайта-донора";
+  const brand = brands.value.find(
+    (item) => String(item.brandId || "") === String(brandId),
+  );
+  if (!brand) {
+    pageError.value = "Бренд не найден";
     return;
   }
-  selectedMonitorId.value = selected.id;
-  modalOpen.value = true;
+  await openBrand(brand);
 }
 
 async function closeModal() {
@@ -146,7 +150,6 @@ async function createMonitor() {
     upsertMonitor(result.monitor);
     createOpen.value = false;
     createBrand.value = "";
-    await load(true);
     const created = brands.value.find((item) =>
       item.monitors.some((monitor) => monitor.id === result.monitor.id),
     );
@@ -168,7 +171,7 @@ async function runBrandAction(brand: BrandGroup, action: "pause" | "resume" | "s
   if (!monitor) return;
   try {
     const result = await newsService.action(monitor.id, action);
-    upsertMonitor(result.monitor);
+    monitor.state = mergeProgressState(monitor.state, result.monitor.state);
   } catch (caught) {
     pageError.value = errorMessage(caught);
   }
@@ -185,7 +188,12 @@ async function deleteBrand() {
   if (!monitor) return;
   try {
     const result = await newsService.removeMonitor(monitor.id, "brand");
-    if (data.value) data.value.monitors = result.monitors;
+    if (data.value) {
+      const removed = new Set(result.removed_ids);
+      data.value.monitors = data.value.monitors.filter(
+        (item) => !removed.has(item.id),
+      );
+    }
     deleteOpen.value = false;
     toast.add({ title: "Бренд удалён", color: "success" });
   } catch (caught) {
@@ -193,14 +201,42 @@ async function deleteBrand() {
   }
 }
 
-async function pollProgress() {
-  const payload = await $fetch<ProgressPayload>("/progress", {
-    query: { once: 1, projects: 0, news: 1 },
-  });
-  if (payload.news) merge(payload.news);
+function handleModalChanged(incoming: NewsMonitor[]) {
+  if (!data.value || !incoming.length) return;
+  const brandId = incoming[0]?.brand_id;
+  if (brandId != null) {
+    const incomingIds = new Set(incoming.map((monitor) => monitor.id));
+    data.value.monitors = data.value.monitors.filter(
+      (monitor) =>
+        monitor.brand_id !== brandId || incomingIds.has(monitor.id),
+    );
+  }
+  for (const monitor of incoming) upsertMonitor(monitor);
 }
 
-useProgressPolling(pollProgress);
+async function pollProgress() {
+  const selectedBefore = data.value?.monitors.find(
+    (monitor) => monitor.id === selectedMonitorId.value,
+  );
+  const payload = await $fetch<ProgressPayload>("/progress", {
+    query: {
+      once: 1,
+      projects: 0,
+      news: 1,
+      cursor: progressCursor.value || undefined,
+    },
+  });
+  mergeProgress(payload);
+  if (
+    modalOpen.value &&
+    selectedBefore &&
+    !data.value?.monitors.some((monitor) => monitor.id === selectedBefore.id)
+  ) {
+    await closeModal();
+  }
+}
+
+useProgressPolling(pollProgress, computed(() => Boolean(data.value)));
 
 onMounted(async () => {
   try {
@@ -318,7 +354,7 @@ onMounted(async () => {
       :connection-methods="data?.connection_methods || []"
       :live-monitors="data?.monitors || []"
       @close="closeModal"
-      @changed="load(true)"
+      @changed="handleModalChanged"
     />
 
     <UModal

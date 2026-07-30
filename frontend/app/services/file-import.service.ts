@@ -1,15 +1,19 @@
-import type { FileImportData, FileImportState } from "~/types/api";
+import type {
+  FileImportData,
+  FileImportProgress,
+  FileImportSettings,
+  FileImportState,
+} from "~/types/api";
 
 export const fileImportService = {
   get: () => $fetch<FileImportData>("/api/file-import"),
+  getProgress: () =>
+    $fetch<FileImportProgress>("/api/file-import", {
+      query: { compact: 1 },
+    }),
 
-  saveSettings: (body: {
-    model_field: string;
-    price_field: string;
-    exclusions: string;
-    replace_rules: string;
-  }) =>
-    $fetch<FileImportData>("/api/file-import", {
+  saveSettings: (body: Partial<FileImportSettings>) =>
+    $fetch<FileImportSettings>("/api/file-import", {
       method: "PATCH",
       body,
     }),
@@ -34,7 +38,7 @@ export const fileImportService = {
     }),
 
   stop: () =>
-    $fetch<FileImportData>("/api/file-import/stop", {
+    $fetch<FileImportProgress>("/api/file-import/stop", {
       method: "POST",
     }),
 };

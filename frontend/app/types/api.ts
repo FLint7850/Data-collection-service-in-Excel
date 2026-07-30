@@ -91,6 +91,7 @@ export interface Project {
   id: string;
   name: string;
   start_urls: string[];
+  start_urls_count?: number;
   thread_count: number;
   exclusions: string[];
   product_url_filters: string[];
@@ -106,17 +107,28 @@ export interface Project {
 export interface ProjectsResponse {
   projects: Project[];
   connection_methods: ConnectionMethod[];
+  progress_cursor?: string;
 }
 
 export interface ProjectResponse {
   project: Project;
 }
 
+export interface ProgressEntity {
+  id: string;
+  state: Partial<ScanState>;
+}
+
 export interface ProgressPayload {
-  projects?: Project[];
-  news?: NewsSettings;
-  connection_methods?: ConnectionMethod[];
-  logs_signature?: string;
+  cursor: string;
+  projects?: ProgressEntity[];
+  news?: ProgressEntity[];
+  upsert_projects?: Project[];
+  upsert_news?: NewsMonitor[];
+  removed_projects_ids?: string[];
+  removed_news_ids?: string[];
+  replace_projects?: boolean;
+  replace_news?: boolean;
 }
 
 export interface OwnSite {
@@ -144,6 +156,7 @@ export interface NewsMonitor {
   brand: string;
   site_url: string;
   start_urls: string[];
+  start_urls_count?: number;
   enabled: boolean;
   schedule_type: "daily" | "weekly" | "once" | string;
   scan_time: string;
@@ -201,6 +214,19 @@ export interface NewsSettings {
   connection_methods: ConnectionMethod[];
 }
 
+export interface NewsWorkspaceData {
+  monitors: NewsMonitor[];
+  connection_methods: ConnectionMethod[];
+  progress_cursor?: string;
+}
+
+export interface NewsConfiguration {
+  own_sites: OwnSite[];
+  auto_cleanup: boolean;
+  smtp: SmtpSettings;
+  feed_storage: StoredFeed[];
+}
+
 export interface FileImportState {
   status: string;
   stage: string;
@@ -229,13 +255,25 @@ export interface UploadedFile {
 export interface FileImportData {
   file: UploadedFile | null;
   exclusions: string;
-  exclusions_list: string[];
   model_field: string;
   price_field: string;
   replace_rules: string;
   result_filename: string;
   result_ready: boolean;
   state: FileImportState;
+}
+
+export interface FileImportSettings {
+  exclusions: string;
+  model_field: string;
+  price_field: string;
+  replace_rules: string;
+}
+
+export interface FileImportProgress {
+  state: FileImportState;
+  result_filename: string;
+  result_ready: boolean;
 }
 
 export interface SupplierFeed {
@@ -275,6 +313,12 @@ export interface FeedComparisonData {
   result_filename: string;
 }
 
+export interface FeedComparisonProgress {
+  state: FeedComparisonState;
+  result_ready: boolean;
+  result_filename: string;
+}
+
 export interface LogEntry {
   time: string;
   level: "info" | "success" | "warning" | "error" | string;
@@ -292,4 +336,14 @@ export interface LogsResponse {
   logs_limit: number;
   auto_cleanup: boolean;
   logs_signature: string;
+  delta?: boolean;
 }
+
+export type LogsPollResponse =
+  | LogsResponse
+  | {
+      not_modified: true;
+      logs_signature: string;
+      logs_total: number;
+      auto_cleanup: boolean;
+    };
