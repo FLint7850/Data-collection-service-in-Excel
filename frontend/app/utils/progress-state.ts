@@ -87,9 +87,9 @@ function isTransientEmpty(value: unknown, previous: unknown) {
 
 export function mergeProgressState<T extends object>(
   previous: T | null | undefined,
-  incoming: T,
+  incoming: Partial<T>,
 ): T {
-  if (!previous) return incoming;
+  if (!previous) return incoming as T;
 
   const previousRecord = previous as Record<string, unknown>;
   const incomingRecord = incoming as Record<string, unknown>;

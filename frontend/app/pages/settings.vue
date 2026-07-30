@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { newsService } from "~/services/news.service";
-import type { NewsSettings, OwnSite } from "~/types/api";
+import type { NewsConfiguration, OwnSite, SmtpSettings } from "~/types/api";
 import { errorMessage, formatFileSize } from "~/utils/format";
 
 definePageMeta({
@@ -9,7 +9,7 @@ definePageMeta({
 });
 
 const toast = useToast();
-const data = ref<NewsSettings | null>(null);
+const data = ref<NewsConfiguration | null>(null);
 const loading = ref(true);
 const saving = ref(false);
 const testing = ref(false);
@@ -24,21 +24,38 @@ const smtp = reactive({
   password: "",
   recipients: "",
 });
+let lastSavedSites = "";
+let lastSavedSmtp = "";
 
-function applyData(value: NewsSettings) {
+function smtpPayload(): Partial<SmtpSettings> {
+  return {
+    host: smtp.host.trim(),
+    port: Number(smtp.port || 465),
+    security: smtp.security,
+    username: smtp.username.trim(),
+    recipients: smtp.recipients
+      .split(/\r?\n|,/)
+      .map((item) => item.trim())
+      .filter(Boolean),
+  };
+}
+
+function applyData(value: NewsConfiguration) {
   data.value = value;
-  sites.value = structuredClone(value.own_sites || []);
+  sites.value = JSON.parse(JSON.stringify(value.own_sites || [])) as OwnSite[];
   smtp.host = value.smtp.host || "";
   smtp.port = Number(value.smtp.port || 465);
   smtp.security = value.smtp.security || "ssl";
   smtp.username = value.smtp.username || "";
   smtp.password = "";
   smtp.recipients = (value.smtp.recipients || []).join("\n");
+  lastSavedSites = JSON.stringify(sites.value);
+  lastSavedSmtp = JSON.stringify(smtpPayload());
 }
 
 async function load() {
   try {
-    applyData(await newsService.get({ summary: true, monitors: false }));
+    applyData(await newsService.getSettings());
   } catch (caught) {
     error.value = errorMessage(caught, "Не удалось загрузить настройки");
   } finally {
@@ -62,19 +79,24 @@ async function save(showToast = true) {
   saving.value = true;
   error.value = "";
   try {
-    const smtpPayload: Record<string, unknown> = {
-      host: smtp.host.trim(),
-      port: Number(smtp.port || 465),
-      security: smtp.security,
-      username: smtp.username.trim(),
-      recipients: smtp.recipients,
-    };
-    if (smtp.password.trim()) smtpPayload.password = smtp.password;
-
-    const response = await newsService.updateSettings({
-      own_sites: sites.value.filter((site) => site.feed_url.trim()),
-      smtp: smtpPayload,
-    });
+    const currentSites = sites.value.filter((site) => site.feed_url.trim());
+    const currentSmtp = smtpPayload();
+    const body: Parameters<typeof newsService.updateSettings>[0] = {};
+    if (JSON.stringify(currentSites) !== lastSavedSites) {
+      body.own_sites = currentSites;
+    }
+    if (
+      JSON.stringify(currentSmtp) !== lastSavedSmtp ||
+      smtp.password.trim()
+    ) {
+      body.smtp = currentSmtp;
+      if (smtp.password.trim()) body.smtp.password = smtp.password.trim();
+    }
+    if (!Object.keys(body).length) {
+      if (showToast) toast.add({ title: "Изменений нет", color: "neutral" });
+      return true;
+    }
+    const response = await newsService.updateSettings(body);
     applyData(response);
     if (showToast) toast.add({ title: "Настройки сохранены", color: "success" });
     return true;

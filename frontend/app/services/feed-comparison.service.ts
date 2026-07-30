@@ -1,5 +1,6 @@
 import type {
   FeedComparisonData,
+  FeedComparisonProgress,
   FeedComparisonState,
   OwnSite,
   SupplierFeed,
@@ -7,30 +8,38 @@ import type {
 
 export const feedComparisonService = {
   get: () => $fetch<FeedComparisonData>("/api/feed-comparison"),
+  getProgress: () =>
+    $fetch<FeedComparisonProgress>("/api/feed-comparison", {
+      query: { compact: 1 },
+    }),
 
-  saveOwnSite: (site: OwnSite) =>
-    $fetch<FeedComparisonData>(
+  saveOwnSite: (site: OwnSite) => {
+    const { id, ...body } = site;
+    return $fetch<{ own_site: OwnSite }>(
       site.id
         ? `/api/feed-comparison/own-sites/${site.id}`
         : "/api/feed-comparison/own-sites",
-      { method: site.id ? "PATCH" : "POST", body: site },
-    ),
+      { method: id ? "PATCH" : "POST", body },
+    );
+  },
 
   removeOwnSite: (id: number) =>
-    $fetch<FeedComparisonData>(`/api/feed-comparison/own-sites/${id}`, {
+    $fetch<{ ok: boolean; id: number }>(`/api/feed-comparison/own-sites/${id}`, {
       method: "DELETE",
     }),
 
-  saveSupplier: (supplier: SupplierFeed) =>
-    $fetch<FeedComparisonData>(
+  saveSupplier: (supplier: SupplierFeed) => {
+    const { id, ...body } = supplier;
+    return $fetch<{ supplier: SupplierFeed }>(
       supplier.id
         ? `/api/feed-comparison/suppliers/${supplier.id}`
         : "/api/feed-comparison/suppliers",
-      { method: supplier.id ? "PATCH" : "POST", body: supplier },
-    ),
+      { method: id ? "PATCH" : "POST", body },
+    );
+  },
 
   removeSupplier: (id: number) =>
-    $fetch<FeedComparisonData>(`/api/feed-comparison/suppliers/${id}`, {
+    $fetch<{ ok: boolean; id: number }>(`/api/feed-comparison/suppliers/${id}`, {
       method: "DELETE",
     }),
 
@@ -40,7 +49,7 @@ export const feedComparisonService = {
     }),
 
   stop: () =>
-    $fetch<FeedComparisonData>("/api/feed-comparison/stop", {
+    $fetch<FeedComparisonProgress>("/api/feed-comparison/stop", {
       method: "POST",
     }),
 };

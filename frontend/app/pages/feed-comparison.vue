@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { feedComparisonService } from "~/services/feed-comparison.service";
-import type { FeedComparisonData, OwnSite, SupplierFeed } from "~/types/api";
+import type {
+  FeedComparisonData,
+  FeedComparisonProgress,
+  OwnSite,
+  SupplierFeed,
+} from "~/types/api";
 import { errorMessage } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
 
@@ -28,6 +33,13 @@ function applyData(value: FeedComparisonData) {
     ...value,
     state: mergeProgressState(data.value?.state, value.state),
   };
+}
+
+function applyProgress(value: FeedComparisonProgress) {
+  if (!data.value) return;
+  data.value.state = mergeProgressState(data.value.state, value.state);
+  data.value.result_ready = value.result_ready;
+  data.value.result_filename = value.result_filename;
 }
 
 async function load() {
@@ -61,7 +73,14 @@ function addSupplier() {
 async function saveOwnSite(site: OwnSite, pendingIndex?: number) {
   savingKey.value = `own-${site.id || pendingIndex}`;
   try {
-    applyData(await feedComparisonService.saveOwnSite(site));
+    const response = await feedComparisonService.saveOwnSite(site);
+    const index = data.value?.own_sites.findIndex(
+      (item) => item.id === response.own_site.id,
+    ) ?? -1;
+    if (data.value) {
+      if (index >= 0) data.value.own_sites[index] = response.own_site;
+      else data.value.own_sites.push(response.own_site);
+    }
     if (pendingIndex != null) pendingOwnSites.value.splice(pendingIndex, 1);
     toast.add({ title: "Фид сайта сохранён", color: "success" });
   } catch (caught) {
@@ -74,7 +93,14 @@ async function saveOwnSite(site: OwnSite, pendingIndex?: number) {
 async function saveSupplier(supplier: SupplierFeed, pendingIndex?: number) {
   savingKey.value = `supplier-${supplier.id || pendingIndex}`;
   try {
-    applyData(await feedComparisonService.saveSupplier(supplier));
+    const response = await feedComparisonService.saveSupplier(supplier);
+    const index = data.value?.suppliers.findIndex(
+      (item) => item.id === response.supplier.id,
+    ) ?? -1;
+    if (data.value) {
+      if (index >= 0) data.value.suppliers[index] = response.supplier;
+      else data.value.suppliers.push(response.supplier);
+    }
     if (pendingIndex != null) pendingSuppliers.value.splice(pendingIndex, 1);
     toast.add({ title: "Фид поставщика сохранён", color: "success" });
   } catch (caught) {
@@ -87,7 +113,12 @@ async function saveSupplier(supplier: SupplierFeed, pendingIndex?: number) {
 async function removeOwnSite(site: OwnSite) {
   if (!site.id) return;
   try {
-    applyData(await feedComparisonService.removeOwnSite(site.id));
+    const response = await feedComparisonService.removeOwnSite(site.id);
+    if (data.value) {
+      data.value.own_sites = data.value.own_sites.filter(
+        (item) => item.id !== response.id,
+      );
+    }
   } catch (caught) {
     error.value = errorMessage(caught);
   }
@@ -96,7 +127,12 @@ async function removeOwnSite(site: OwnSite) {
 async function removeSupplier(supplier: SupplierFeed) {
   if (!supplier.id) return;
   try {
-    applyData(await feedComparisonService.removeSupplier(supplier.id));
+    const response = await feedComparisonService.removeSupplier(supplier.id);
+    if (data.value) {
+      data.value.suppliers = data.value.suppliers.filter(
+        (item) => item.id !== response.id,
+      );
+    }
   } catch (caught) {
     error.value = errorMessage(caught);
   }
@@ -117,7 +153,7 @@ async function start() {
 async function stop() {
   actionLoading.value = "stop";
   try {
-    applyData(await feedComparisonService.stop());
+    applyProgress(await feedComparisonService.stop());
   } catch (caught) {
     error.value = errorMessage(caught);
   } finally {
@@ -127,7 +163,7 @@ async function stop() {
 
 useProgressPolling(
   async () => {
-    if (isActive.value) applyData(await feedComparisonService.get());
+    if (isActive.value) applyProgress(await feedComparisonService.getProgress());
   },
   computed(() => isActive.value),
 );

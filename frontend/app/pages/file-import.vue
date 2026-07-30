@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { fileImportService } from "~/services/file-import.service";
-import type { FileImportData } from "~/types/api";
+import type {
+  FileImportData,
+  FileImportProgress,
+  FileImportSettings,
+} from "~/types/api";
 import { errorMessage, formatFileSize } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
 
@@ -18,6 +22,7 @@ const actionLoading = ref("");
 const dragActive = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 const error = ref("");
+let lastSavedSettings: FileImportSettings | null = null;
 const form = reactive({
   model_field: "",
   price_field: "",
@@ -30,16 +35,50 @@ const isActive = computed(() =>
 );
 const hasFile = computed(() => Boolean(data.value?.file));
 
+function currentSettings(): FileImportSettings {
+  return {
+    model_field: form.model_field,
+    price_field: form.price_field,
+    exclusions: form.exclusions,
+    replace_rules: form.replace_rules,
+  };
+}
+
+function applySettings(value: FileImportSettings) {
+  form.model_field = value.model_field || "";
+  form.price_field = value.price_field || "";
+  form.exclusions = value.exclusions || "";
+  form.replace_rules = value.replace_rules || "";
+  if (data.value) Object.assign(data.value, value);
+  lastSavedSettings = currentSettings();
+}
+
 function applyData(value: FileImportData) {
   data.value = {
     ...(data.value || value),
     ...value,
     state: mergeProgressState(data.value?.state, value.state),
   };
-  form.model_field = value.model_field || "";
-  form.price_field = value.price_field || "";
-  form.exclusions = value.exclusions || "";
-  form.replace_rules = value.replace_rules || "";
+  applySettings(value);
+}
+
+function applyProgress(value: FileImportProgress) {
+  if (!data.value) return;
+  data.value.state = mergeProgressState(data.value.state, value.state);
+  data.value.result_filename = value.result_filename;
+  data.value.result_ready = value.result_ready;
+}
+
+function changedSettings(
+  current: FileImportSettings,
+): Partial<FileImportSettings> {
+  if (!lastSavedSettings) return current;
+  return Object.fromEntries(
+    Object.entries(current).filter(
+      ([key, value]) =>
+        value !== lastSavedSettings?.[key as keyof FileImportSettings],
+    ),
+  ) as Partial<FileImportSettings>;
 }
 
 async function load() {
@@ -53,9 +92,12 @@ async function load() {
 }
 
 async function saveSettings(showToast = true) {
+  const current = currentSettings();
+  const changes = changedSettings(current);
+  if (!Object.keys(changes).length) return true;
   saving.value = true;
   try {
-    applyData(await fileImportService.saveSettings(form));
+    applySettings(await fileImportService.saveSettings(changes));
     if (showToast) toast.add({ title: "Настройки сохранены", color: "success" });
     return true;
   } catch (caught) {
@@ -127,7 +169,7 @@ async function compare() {
 async function stop() {
   actionLoading.value = "stop";
   try {
-    applyData(await fileImportService.stop());
+    applyProgress(await fileImportService.stop());
   } catch (caught) {
     error.value = errorMessage(caught);
   } finally {
@@ -137,7 +179,7 @@ async function stop() {
 
 useProgressPolling(
   async () => {
-    if (isActive.value) applyData(await fileImportService.get());
+    if (isActive.value) applyProgress(await fileImportService.getProgress());
   },
   computed(() => isActive.value),
 );

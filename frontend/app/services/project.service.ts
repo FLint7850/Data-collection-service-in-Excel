@@ -48,7 +48,7 @@ export const projectService = {
     collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
     pattern: string,
   ) =>
-    $fetch<Record<string, string[]>>(
+    $fetch<{ ok: boolean; added: boolean; pattern: string }>(
       `/api/projects/${encodeURIComponent(projectId)}/${collection}`,
       { method: "POST", body: { pattern } },
     ),
@@ -58,15 +58,14 @@ export const projectService = {
     collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
     index: number,
   ) =>
-    $fetch<Record<string, string[]>>(
+    $fetch<{ ok: boolean; removed: string }>(
       `/api/projects/${encodeURIComponent(projectId)}/${collection}/${index}`,
       { method: "DELETE" },
     ),
 
-  start: (projectId: string, body: ProjectSavePayload) =>
+  start: (projectId: string) =>
     $fetch<ScanState>(`/api/projects/${encodeURIComponent(projectId)}/start`, {
       method: "POST",
-      body,
     }),
 
   action: (

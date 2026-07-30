@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { newsService } from "~/services/news.service";
+import {
+  newsService,
+  type MonitorPayload,
+} from "~/services/news.service";
 import type { ConnectionMethod, NewsMonitor } from "~/types/api";
 import { errorMessage, hostFromUrl } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
@@ -12,7 +15,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: [];
-  changed: [];
+  changed: [monitors: NewsMonitor[]];
 }>();
 
 const toast = useToast();
@@ -26,6 +29,7 @@ const addDonorUrl = ref("");
 const addingDonor = ref(false);
 const confirmDelete = ref(false);
 const error = ref("");
+let lastSavedPayload: MonitorPayload | null = null;
 
 const connectionOptions = computed(() =>
   props.connectionMethods.map((method) => ({ label: method.name, value: method.code })),
@@ -38,6 +42,43 @@ const canResume = computed(() => draft.value?.state.status === "partial");
 
 function cloneMonitor(monitor: NewsMonitor): NewsMonitor {
   return JSON.parse(JSON.stringify(monitor)) as NewsMonitor;
+}
+
+function monitorPayload(monitor: NewsMonitor): MonitorPayload {
+  return {
+    brand: monitor.brand,
+    site_url: monitor.site_url,
+    start_urls: monitor.start_urls,
+    enabled: monitor.enabled,
+    schedule_type: monitor.schedule_type,
+    scan_time: monitor.scan_time,
+    weekday: monitor.weekday,
+    next_run_at: monitor.next_run_at,
+    thread_count: monitor.thread_count,
+    connection_method: monitor.connection_method,
+    auto_connection_fallback: monitor.auto_connection_fallback,
+    exclusions: monitor.exclusions,
+    product_url_filters: monitor.product_url_filters,
+    product_url_exclusions: monitor.product_url_exclusions,
+    extraction_rules: monitor.extraction_rules,
+    selector_settings: monitor.selector_settings,
+    primary_donor_id: selectedId.value,
+  };
+}
+
+function changedMonitorPayload(current: MonitorPayload): MonitorPayload {
+  if (!lastSavedPayload) return current;
+  const changes: MonitorPayload = {};
+  for (const key of Object.keys(current) as (keyof MonitorPayload)[]) {
+    if (JSON.stringify(current[key]) !== JSON.stringify(lastSavedPayload[key])) {
+      (changes as Record<string, unknown>)[key] = current[key];
+    }
+  }
+  return changes;
+}
+
+function emitChanged() {
+  emit("changed", monitors.value.map(cloneMonitor));
 }
 
 function setDraft(monitor: NewsMonitor) {
@@ -53,6 +94,15 @@ function setDraft(monitor: NewsMonitor) {
   };
   selectedId.value = monitor.id;
   draft.value = next;
+  lastSavedPayload = JSON.parse(
+    JSON.stringify({
+      ...monitorPayload(next),
+      primary_donor_id:
+        next.primary_donor_id == null
+          ? selectedId.value
+          : String(next.primary_donor_id),
+    }),
+  ) as MonitorPayload;
 }
 
 function mergeLiveState(incoming: NewsMonitor[]) {
@@ -79,12 +129,11 @@ async function load() {
   draft.value = null;
   try {
     const response = await newsService.getMonitor(selectedId.value || props.monitorId);
-    monitors.value = response.brand_monitors.length
-      ? response.brand_monitors
-      : [response.monitor];
-    const monitor =
-      monitors.value.find((item) => item.id === selectedId.value) ||
-      response.monitor;
+    monitors.value = response.monitors;
+    const monitor = monitors.value.find(
+      (item) => String(item.id) === String(selectedId.value || props.monitorId),
+    ) || monitors.value[0];
+    if (!monitor) throw new Error("Донор не найден");
     setDraft(monitor);
   } catch (caught) {
     error.value = errorMessage(caught, "Не удалось открыть настройки донора");
@@ -106,31 +155,16 @@ watch(
 
 async function save(showToast = true) {
   if (!draft.value) return null;
+  const current = monitorPayload(draft.value);
+  const changes = changedMonitorPayload(current);
+  if (!Object.keys(changes).length) return draft.value;
   saving.value = true;
   try {
-    const response = await newsService.updateMonitor(draft.value.id, {
-      brand: draft.value.brand,
-      site_url: draft.value.site_url,
-      start_urls: draft.value.start_urls,
-      enabled: draft.value.enabled,
-      schedule_type: draft.value.schedule_type,
-      scan_time: draft.value.scan_time,
-      weekday: draft.value.weekday,
-      next_run_at: draft.value.next_run_at,
-      thread_count: draft.value.thread_count,
-      connection_method: draft.value.connection_method,
-      auto_connection_fallback: draft.value.auto_connection_fallback,
-      exclusions: draft.value.exclusions,
-      product_url_filters: draft.value.product_url_filters,
-      product_url_exclusions: draft.value.product_url_exclusions,
-      extraction_rules: draft.value.extraction_rules,
-      selector_settings: draft.value.selector_settings,
-      primary_donor_id: selectedId.value,
-    });
+    const response = await newsService.updateMonitor(draft.value.id, changes);
     const index = monitors.value.findIndex((item) => item.id === response.monitor.id);
     if (index >= 0) monitors.value[index] = response.monitor;
     setDraft(response.monitor);
-    emit("changed");
+    emitChanged();
     if (showToast) toast.add({ title: "Настройки сохранены", color: "success" });
     return response.monitor;
   } catch (caught) {
@@ -152,9 +186,15 @@ async function runAction(action: "scan" | "pause" | "resume" | "stop" | "reset-v
     }
     const response = await newsService.action(draft.value.id, action);
     const index = monitors.value.findIndex((item) => item.id === response.monitor.id);
-    if (index >= 0) monitors.value[index] = { ...monitors.value[index], ...response.monitor };
-    draft.value.state = { ...draft.value.state, ...response.monitor.state };
-    emit("changed");
+    const currentMonitor = monitors.value[index];
+    if (currentMonitor) {
+      currentMonitor.state = mergeProgressState(
+        currentMonitor.state,
+        response.monitor.state,
+      );
+    }
+    draft.value.state = mergeProgressState(draft.value.state, response.monitor.state);
+    emitChanged();
   } catch (caught) {
     error.value = errorMessage(caught);
   } finally {
@@ -166,8 +206,12 @@ async function choosePrimary(value: string | number) {
   if (!draft.value) return;
   selectedId.value = String(value);
   try {
-    await newsService.updateMonitor(draft.value.id, { primary_donor_id: value });
-    emit("changed");
+    const response = await newsService.updateMonitor(draft.value.id, {
+      primary_donor_id: value,
+    });
+    const index = monitors.value.findIndex((item) => item.id === response.monitor.id);
+    if (index >= 0) monitors.value[index] = response.monitor;
+    emitChanged();
   } catch (caught) {
     error.value = errorMessage(caught);
   }
@@ -186,7 +230,7 @@ async function addDonor() {
     monitors.value.push(response.monitor);
     addDonorUrl.value = "";
     setDraft(response.monitor);
-    emit("changed");
+    emitChanged();
     toast.add({ title: "Донор добавлен", color: "success" });
   } catch (caught) {
     error.value = errorMessage(caught);
@@ -199,14 +243,12 @@ async function deleteDonor() {
   if (!draft.value) return;
   try {
     const response = await newsService.removeMonitor(draft.value.id);
-    monitors.value = response.monitors.filter(
-      (item) => item.group === draft.value?.group && item.brand === draft.value?.brand,
-    );
+    monitors.value = response.monitors;
     confirmDelete.value = false;
     const next = monitors.value[0];
     if (next) setDraft(next);
     else emit("close");
-    emit("changed");
+    if (monitors.value.length) emitChanged();
   } catch (caught) {
     error.value = errorMessage(caught);
   }

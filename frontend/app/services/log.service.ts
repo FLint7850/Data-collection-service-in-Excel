@@ -1,9 +1,14 @@
-import type { LogsResponse } from "~/types/api";
+import type { LogsPollResponse } from "~/types/api";
 
 export const logService = {
-  list: (page = 1, limit = 200) =>
-    $fetch<LogsResponse>("/api/logs", {
-      query: { page, limit },
+  list: (page = 1, limit = 200, signature = "", sinceTotal?: number) =>
+    $fetch<LogsPollResponse>("/api/logs", {
+      query: {
+        page,
+        limit,
+        signature: signature || undefined,
+        since_total: sinceTotal,
+      },
     }),
 
   clear: () =>

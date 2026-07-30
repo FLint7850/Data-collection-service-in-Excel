@@ -1,13 +1,18 @@
 export function useProgressPolling(
   callback: () => Promise<void> | void,
   enabled: Ref<boolean> | ComputedRef<boolean> = ref(true),
+  intervalMs?: number,
 ) {
   const config = useRuntimeConfig();
   const inFlight = ref(false);
   let timer: ReturnType<typeof setInterval> | undefined;
 
   const run = async () => {
-    if (!enabled.value || inFlight.value) return;
+    if (
+      !enabled.value ||
+      inFlight.value ||
+      (import.meta.client && document.visibilityState === "hidden")
+    ) return;
     inFlight.value = true;
     try {
       await callback();
@@ -27,13 +32,26 @@ export function useProgressPolling(
     void run();
     const interval = Math.max(
       500,
-      Math.min(Number(config.public.progressIntervalMs || 2000), 30000),
+      Math.min(
+        Number(intervalMs || config.public.progressIntervalMs || 2000),
+        30000,
+      ),
     );
     timer = setInterval(run, interval);
   };
 
-  onMounted(start);
-  onBeforeUnmount(stop);
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === "visible") void run();
+  };
+
+  onMounted(() => {
+    start();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+  });
+  onBeforeUnmount(() => {
+    stop();
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
+  });
   watch(enabled, start);
 
   return { inFlight, refresh: run, stop };

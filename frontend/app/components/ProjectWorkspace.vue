@@ -11,6 +11,7 @@ const props = withDefaults(defineProps<{ projectId?: string }>(), { projectId: "
 const toast = useToast();
 const {
   projects,
+  progressCursor,
   connectionMethods,
   loading,
   load,
@@ -24,6 +25,7 @@ const draft = ref<Project | null>(null);
 const detailLoading = ref(false);
 const saving = ref(false);
 const initialized = ref(false);
+const workspaceReady = ref(false);
 const createOpen = ref(false);
 const deleteOpen = ref(false);
 const newProjectName = ref("");
@@ -32,6 +34,7 @@ const deleting = ref(false);
 const actionLoading = ref("");
 const pageError = ref("");
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+let lastSavedPayload: ProjectSavePayload | null = null;
 
 const activeProject = computed(
   () => projects.value.find((item) => item.id === activeProjectId.value) || null,
@@ -49,7 +52,7 @@ const canResume = computed(() =>
 const startButtonLabel = computed(() => (canResume.value ? "Продолжить" : "Запустить сбор"));
 
 function cloneProject(project: Project) {
-  return structuredClone(project);
+  return JSON.parse(JSON.stringify(project)) as Project;
 }
 
 async function selectProject(projectId: string, updateRoute = true) {
@@ -62,9 +65,13 @@ async function selectProject(projectId: string, updateRoute = true) {
   pageError.value = "";
   activeProjectId.value = normalizedId;
   draft.value = null;
+  lastSavedPayload = null;
   try {
     const project = await loadProject(normalizedId);
     draft.value = cloneProject(project);
+    lastSavedPayload = JSON.parse(
+      JSON.stringify(savePayload()),
+    ) as ProjectSavePayload;
     if (updateRoute && useRoute().path !== `/projects/edit/${normalizedId}`) {
       await navigateTo(`/projects/edit/${normalizedId}`);
     }
@@ -95,15 +102,32 @@ function savePayload(): ProjectSavePayload | null {
   };
 }
 
+function changedSavePayload(
+  current: ProjectSavePayload,
+): Partial<ProjectSavePayload> {
+  if (!lastSavedPayload) return current;
+  const changes: Partial<ProjectSavePayload> = {};
+  for (const key of Object.keys(current) as (keyof ProjectSavePayload)[]) {
+    if (JSON.stringify(current[key]) !== JSON.stringify(lastSavedPayload[key])) {
+      (changes as Record<string, unknown>)[key] = current[key];
+    }
+  }
+  return changes;
+}
+
 async function save(silent = false) {
   const payload = savePayload();
   if (!payload || !activeProjectId.value || draft.value?.id !== activeProjectId.value) return;
+  const changes = changedSavePayload(payload);
+  if (!Object.keys(changes).length) return true;
   saving.value = true;
   try {
-    const response = await projectService.update(activeProjectId.value, payload);
+    const response = await projectService.update(activeProjectId.value, changes);
     upsert(response.project);
     if (draft.value) draft.value.state = response.project.state;
+    lastSavedPayload = JSON.parse(JSON.stringify(payload)) as ProjectSavePayload;
     if (!silent) toast.add({ title: "Проект сохранён", color: "success" });
+    return true;
   } catch (caught) {
     const message = errorMessage(caught, "Не удалось сохранить проект");
     pageError.value = message;
@@ -195,9 +219,14 @@ async function addPattern(
   try {
     const response = await projectService.addPattern(draft.value.id, collection, pattern);
     const key = collectionKey(collection);
-    draft.value[key] = response[key] || [];
+    if (!draft.value[key].includes(response.pattern)) {
+      draft.value[key].push(response.pattern);
+    }
     const current = activeProject.value;
     if (current) current[key] = [...draft.value[key]];
+    if (lastSavedPayload && key !== "exclusions") {
+      lastSavedPayload[key] = [...draft.value[key]];
+    }
   } catch (caught) {
     toast.add({ title: errorMessage(caught), color: "error" });
   }
@@ -209,11 +238,19 @@ async function removePattern(
 ) {
   if (!draft.value) return;
   try {
-    const response = await projectService.removePattern(draft.value.id, collection, index);
+    const response = await projectService.removePattern(
+      draft.value.id,
+      collection,
+      index,
+    );
     const key = collectionKey(collection);
-    draft.value[key] = response[key] || [];
+    const localIndex = draft.value[key].indexOf(response.removed);
+    if (localIndex >= 0) draft.value[key].splice(localIndex, 1);
     const current = activeProject.value;
     if (current) current[key] = [...draft.value[key]];
+    if (lastSavedPayload && key !== "exclusions") {
+      lastSavedPayload[key] = [...draft.value[key]];
+    }
   } catch (caught) {
     toast.add({ title: errorMessage(caught), color: "error" });
   }
@@ -228,10 +265,9 @@ async function startOrResume() {
     if (canResume.value) {
       state = await projectService.action(draft.value.id, "resume");
     } else {
-      await save(true);
-      const payload = savePayload();
-      if (!payload) return;
-      state = await projectService.start(draft.value.id, payload);
+      const saved = await save(true);
+      if (!saved) return;
+      state = await projectService.start(draft.value.id);
     }
     draft.value.state = state;
     if (activeProject.value) activeProject.value.state = state;
@@ -259,9 +295,21 @@ async function runAction(action: "pause" | "soft-pause" | "stop" | "restart") {
 
 async function pollProgress() {
   const payload = await $fetch<ProgressPayload>("/progress", {
-    query: { once: 1, projects: 1, news: 0 },
+    query: {
+      once: 1,
+      projects: 1,
+      news: 0,
+      cursor: progressCursor.value || undefined,
+    },
   });
   mergeProgress(payload);
+  if (activeProjectId.value && !activeProject.value) {
+    draft.value = null;
+    lastSavedPayload = null;
+    const next = projects.value[0];
+    if (next) await selectProject(next.id);
+    return;
+  }
   if (draft.value && activeProject.value) {
     draft.value.state = { ...draft.value.state, ...activeProject.value.state };
   }
@@ -269,12 +317,13 @@ async function pollProgress() {
 
 useProgressPolling(
   pollProgress,
-  computed(() => Boolean(draft.value?.id && draft.value.id === activeProjectId.value)),
+  workspaceReady,
 );
 
 onMounted(async () => {
   try {
     await load(true);
+    workspaceReady.value = true;
     const requested = normalizeProjectRouteId(props.projectId);
     if (requested) {
       const selected = projects.value.find((item) => item.id === requested);
@@ -370,7 +419,10 @@ onBeforeUnmount(() => {
             </span>
             <span>
               <strong>{{ project.name }}</strong>
-              <small>{{ project.start_urls?.length || 0 }} стартовых URL</small>
+              <small>
+                {{ project.start_urls_count ?? project.start_urls?.length ?? 0 }}
+                стартовых URL
+              </small>
             </span>
             <StatusBadge :status="project.state.status" />
           </button>
