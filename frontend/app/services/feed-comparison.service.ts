@@ -1,7 +1,6 @@
 import type {
   FeedComparisonData,
   FeedComparisonProgress,
-  FeedComparisonState,
   OwnSite,
   SupplierFeed,
 } from "~/types/api";
@@ -44,7 +43,7 @@ export const feedComparisonService = {
     }),
 
   start: () =>
-    $fetch<FeedComparisonState>("/api/feed-comparison/start", {
+    $fetch<FeedComparisonProgress>("/api/feed-comparison/start", {
       method: "POST",
     }),
 

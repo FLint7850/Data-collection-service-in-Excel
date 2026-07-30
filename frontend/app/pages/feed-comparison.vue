@@ -141,8 +141,7 @@ async function removeSupplier(supplier: SupplierFeed) {
 async function start() {
   actionLoading.value = "start";
   try {
-    const state = await feedComparisonService.start();
-    if (data.value) data.value.state = state;
+    applyProgress(await feedComparisonService.start());
   } catch (caught) {
     error.value = errorMessage(caught);
   } finally {

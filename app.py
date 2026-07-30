@@ -7157,10 +7157,10 @@ def start_feed_comparison() -> Dict[str, object]:
     global feed_comparison_worker_thread
     with feed_comparison_lock:
         if feed_comparison_worker_thread and feed_comparison_worker_thread.is_alive():
-            return public_feed_comparison_state()
+            return public_feed_comparison_progress()
         comparison = get_feed_comparison_row()
         if is_feed_comparison_active_state(comparison.state):
-            return public_feed_comparison_state()
+            return public_feed_comparison_progress()
         if not g.db.scalar(select(OwnSite.id).limit(1)):
             raise ValueError("Добавьте хотя бы один фид вашего сайта")
         if not g.db.scalar(select(SupplierFeed.id).limit(1)):
@@ -7180,7 +7180,7 @@ def start_feed_comparison() -> Dict[str, object]:
             daemon=True,
         )
         feed_comparison_worker_thread.start()
-        return public_feed_comparison_state()
+        return public_feed_comparison_progress()
 
 
 def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, object]] = None) -> Path:
