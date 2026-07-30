@@ -40,6 +40,16 @@ export interface SelectorSettings {
   availability_exclusions?: string[];
 }
 
+export interface MissingByFeed {
+  source?: string;
+  source_label?: string;
+  name?: string;
+  url?: string;
+  count?: number;
+  codes_count?: number;
+  error?: string;
+}
+
 export interface ScanState {
   status: string;
   stage?: string;
@@ -55,17 +65,19 @@ export interface ScanState {
   queue_size?: number;
   active_tasks?: number;
   active_urls?: string[];
-  skipped: number;
+  skipped?: number;
   failed_pages?: number;
   availability_skipped?: number;
+  stall_seconds?: number;
   new_count?: number;
-  missing_by_feed?: Array<{ source?: string; name?: string; count?: number }>;
+  missing_by_feed?: MissingByFeed[];
   last_event?: string;
   last_warning?: string;
   last_scan_at?: string;
   last_csv?: string;
   error: string;
   download_ready?: boolean;
+  csv_ready?: boolean;
   download_url?: string;
   filename?: string;
   thread_count?: number;

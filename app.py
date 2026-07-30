@@ -1418,12 +1418,10 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "in_memory_products": 0,
         "availability_skipped": 0,
         "failed_pages": 0,
-        "stall_seconds": 0,
         "last_event": "",
         "last_warning": "",
         "new_count": 0,
         "missing_by_feed": [],
-        "skipped": 0,
         "last_scan_at": "",
         "last_csv": "",
         "error": "",
@@ -1432,6 +1430,22 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "elapsed_seconds": 0,
         "next_run_at": "",
     }
+
+
+def normalize_news_state(value: object) -> Dict[str, object]:
+    raw = dict(value) if isinstance(value, dict) else {}
+    legacy_data = raw.pop("data", {})
+    if isinstance(legacy_data, dict):
+        if not raw.get("last_csv") and legacy_data.get("csv"):
+            raw["last_csv"] = str(legacy_data.get("csv") or "")
+        if not raw.get("missing_by_feed") and isinstance(legacy_data.get("missing_by_feed"), list):
+            raw["missing_by_feed"] = legacy_data["missing_by_feed"]
+        if "availability_skipped" not in raw and legacy_data.get("availability_skipped") is not None:
+            raw["availability_skipped"] = progress_int(legacy_data.get("availability_skipped"))
+    raw.pop("last_feeds", None)
+    raw.pop("skipped", None)
+    raw.pop("stall_seconds", None)
+    return repair_mojibake({**make_news_state(), **raw})
 
 
 def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
@@ -1461,9 +1475,7 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     monitor["seen_models"] = [normalize_model_key(str(value)) for value in item.get("seen_models", []) if str(value).strip()]
     known = item.get("known_new_products", {})
     monitor["known_new_products"] = known if isinstance(known, dict) else {}
-    state = item.get("state", {})
-    monitor["state"] = {**make_news_state(), **state} if isinstance(state, dict) else make_news_state()
-    monitor["state"].pop("last_feeds", None)
+    monitor["state"] = normalize_news_state(item.get("state"))
     monitor["brand_state"] = dict(monitor["state"])
     monitor["collapsed"] = bool(item.get("collapsed", True))
     return monitor
@@ -1507,7 +1519,7 @@ def donor_connection_code(row: Donor) -> str:
 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
     brand = row.brand
-    brand_state = repair_mojibake({**make_news_state(), **(brand.state or {})}) if brand else make_news_state()
+    brand_state = normalize_news_state(brand.state if brand else None)
     site_url = str(row.site_url or "").strip()
     start_urls = normalize_start_urls(getattr(row, "start_urls", None) or "", allow_empty=True)
     monitor = {
@@ -1579,7 +1591,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
         row = Brand(
             name=name,
             group_name=group_name,
-            state={**make_news_state(), **(monitor.get("brand_state") or monitor.get("state") or {})},
+            state=normalize_news_state(monitor.get("brand_state") or monitor.get("state")),
             enabled=bool(monitor.get("enabled", True)),
             schedule_type=str(monitor.get("schedule_type") or "daily"),
             scan_time=str(monitor.get("scan_time") or "01:00")[:5],
@@ -1590,7 +1602,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
         session.flush()
     else:
         row.group_name = group_name
-        row.state = {**make_news_state(), **(monitor.get("brand_state") or monitor.get("state") or row.state or {})}
+        row.state = normalize_news_state(monitor.get("brand_state") or monitor.get("state") or row.state)
         row.enabled = bool(monitor.get("enabled", row.enabled))
         schedule_type = str(monitor.get("schedule_type") or row.schedule_type or "daily")
         row.schedule_type = schedule_type if schedule_type in {"daily", "weekly", "once"} else "daily"
@@ -1637,12 +1649,12 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
 
 
 def aggregate_brand_state(monitors: List[Dict[str, object]]) -> Dict[str, object]:
-    states = [{**make_news_state(), **(monitor.get("state") or {})} for monitor in monitors if isinstance(monitor, dict)]
+    states = [normalize_news_state(monitor.get("state")) for monitor in monitors if isinstance(monitor, dict)]
     if not states:
         return make_news_state()
     priority = ["running", "queued", "pausing", "stopping", "error", "partial", "completed"]
     selected = next((state for status in priority for state in states if state.get("status") == status), states[0])
-    result = {**make_news_state(), **selected}
+    result = normalize_news_state(selected)
     last_scan_at = max((str(state.get("last_scan_at") or state.get("finished_at") or "") for state in states), default="")
     if last_scan_at:
         result["last_scan_at"] = last_scan_at
@@ -1982,7 +1994,7 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
         runtime_by_id = {str(monitor.get("id")): monitor for monitor in runtime_monitors}
         runtime_brand_state = aggregate_brand_state(runtime_monitors) if runtime_monitors else None
 
-    brand_state = repair_mojibake({**make_news_state(), **(runtime_brand_state or brand.state or {})})
+    brand_state = normalize_news_state(runtime_brand_state or brand.state)
     primary_donor_id = brand.primary_donor_id
     if primary_donor_id and not any(donor.id == primary_donor_id for donor in brand.donors):
         primary_donor_id = brand.donors[0].id if brand.donors else None
@@ -1990,7 +2002,7 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
     donors = []
     for donor in sorted(brand.donors, key=lambda item: item.id):
         runtime_monitor = runtime_by_id.get(str(donor.id)) or {}
-        donor_state = repair_mojibake({**brand_state, **(runtime_monitor.get("state") or {})})
+        donor_state = normalize_news_state({**brand_state, **(runtime_monitor.get("state") or {})})
         site_url = str(donor.site_url or "").strip()
         donors.append(
             {
@@ -2046,7 +2058,7 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
     public_monitor = repair_mojibake(dict(monitor))
     public_monitor.pop("known_new_products", None)
     public_monitor.pop("brand_state", None)
-    state = dict(public_monitor.get("state") or make_news_state())
+    state = normalize_news_state(public_monitor.get("state"))
     original_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     original_data = original_state.get("data", {}) if isinstance(original_state.get("data"), dict) else {}
     public_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
@@ -7399,7 +7411,7 @@ def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) 
     if not force and now - news_state_persisted_at.get(monitor_id, 0) < 1:
         return
     news_state_persisted_at[monitor_id] = now
-    state = repair_mojibake({**make_news_state(), **(monitor.get("state") or {})})
+    state = normalize_news_state(monitor.get("state"))
     for attempt in range(4):
         try:
             with session_scope() as session:
@@ -7528,15 +7540,16 @@ def update_brand_scan_state(
         "last_scan_at": existing_state.get("last_scan_at") or finished_at,
         "found_products": found_products,
         "new_count": new_count,
-        "data": data,
     }
     if data.get("csv"):
         state["last_csv"] = str(data.get("csv") or "")
-    if data.get("missing_by_feed"):
-        state["missing_by_feed"] = data.get("missing_by_feed")
+    if isinstance(data.get("missing_by_feed"), list):
+        state["missing_by_feed"] = data["missing_by_feed"]
+    if data.get("availability_skipped") is not None:
+        state["availability_skipped"] = progress_int(data.get("availability_skipped"))
     if data.get("error"):
         state["error"] = str(data.get("error") or "")
-    state = repair_mojibake(state)
+    state = normalize_news_state(state)
     with session_scope() as session:
         donor = get_donor_row(session, target_id)
         if donor and donor.brand:
@@ -8860,12 +8873,10 @@ def api_reset_news_monitor_visual(monitor_id: str):
         "in_memory_products": 0,
         "availability_skipped": 0,
         "failed_pages": 0,
-        "stall_seconds": 0,
         "last_event": "",
         "last_warning": "",
         "new_count": 0,
         "missing_by_feed": [],
-        "skipped": 0,
         "last_scan_at": "",
         "error": "",
         "started_at": "",

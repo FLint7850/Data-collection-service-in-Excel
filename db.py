@@ -30,12 +30,10 @@ DEFAULT_BRAND_STATE = {
     "active_urls": [],
     "in_memory_products": 0,
     "failed_pages": 0,
-    "stall_seconds": 0,
     "last_event": "",
     "last_warning": "",
     "new_count": 0,
     "missing_by_feed": [],
-    "skipped": 0,
     "last_scan_at": "",
     "last_csv": "",
     "error": "",
@@ -208,6 +206,7 @@ def migrate_schema(connection) -> None:
     migrate_projects_table(connection)
     migrate_file_import_table(connection)
     migrate_supplier_feeds_table(connection)
+    cleanup_brand_state_payloads(connection)
 
 
 def reset_brand_states(connection) -> None:
@@ -218,6 +217,43 @@ def reset_brand_states(connection) -> None:
         text("UPDATE brands SET state = json(:state)"),
         {"state": DEFAULT_BRAND_STATE_JSON},
     )
+
+
+def cleanup_brand_state_payloads(connection) -> None:
+    columns = table_columns(connection, "brands")
+    if not columns or "state" not in columns:
+        return
+    rows = connection.execute(text("SELECT id, state FROM brands")).mappings().all()
+    for row in rows:
+        stored = row["state"]
+        try:
+            state = json.loads(stored) if isinstance(stored, str) else dict(stored or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            state = dict(DEFAULT_BRAND_STATE)
+        if not isinstance(state, dict):
+            state = dict(DEFAULT_BRAND_STATE)
+
+        original = dict(state)
+        legacy_data = state.pop("data", None)
+        if isinstance(legacy_data, dict):
+            if not state.get("last_csv") and legacy_data.get("csv"):
+                state["last_csv"] = legacy_data["csv"]
+            if not state.get("missing_by_feed") and isinstance(legacy_data.get("missing_by_feed"), list):
+                state["missing_by_feed"] = legacy_data["missing_by_feed"]
+            if "availability_skipped" not in state and legacy_data.get("availability_skipped") is not None:
+                state["availability_skipped"] = legacy_data["availability_skipped"]
+
+        for key in ("last_feeds", "skipped", "stall_seconds"):
+            state.pop(key, None)
+
+        if state != original:
+            connection.execute(
+                text("UPDATE brands SET state = :state WHERE id = :brand_id"),
+                {
+                    "state": json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    "brand_id": row["id"],
+                },
+            )
 
 
 def migrate_app_settings_current_table(connection) -> None:

@@ -6,6 +6,7 @@ import { errorMessage, hostFromUrl } from "~/utils/format";
 const props = defineProps<{
   monitorId: string;
   connectionMethods: ConnectionMethod[];
+  liveMonitors: NewsMonitor[];
 }>();
 
 const emit = defineEmits<{
@@ -35,8 +36,30 @@ const isActive = computed(() =>
 const canResume = computed(() => draft.value?.state.status === "partial");
 
 function setDraft(monitor: NewsMonitor) {
+  const next = structuredClone(toRaw(monitor));
+  next.extraction_rules = {
+    ...next.extraction_rules,
+    model_start_marker: next.extraction_rules.model_start_marker || "",
+    model_end_marker: next.extraction_rules.model_end_marker || "",
+  };
+  next.selector_settings = {
+    ...next.selector_settings,
+    availability_exclusions: [...(next.selector_settings.availability_exclusions || [])],
+  };
   selectedId.value = monitor.id;
-  draft.value = structuredClone(toRaw(monitor));
+  draft.value = next;
+}
+
+function mergeLiveState(incoming: NewsMonitor[]) {
+  if (!incoming.length) return;
+  monitors.value = monitors.value.map((monitor) => {
+    const live = incoming.find((item) => String(item.id) === String(monitor.id));
+    return live ? { ...monitor, state: { ...monitor.state, ...live.state } } : monitor;
+  });
+  const live = incoming.find((item) => String(item.id) === String(selectedId.value));
+  if (live && draft.value && String(draft.value.id) === String(live.id)) {
+    draft.value.state = { ...draft.value.state, ...live.state };
+  }
 }
 
 function handleModalOpen(open: boolean) {
@@ -68,6 +91,11 @@ watch(selectedId, (id, previous) => {
   const monitor = monitors.value.find((item) => item.id === id);
   if (monitor) setDraft(monitor);
 });
+
+watch(
+  () => props.liveMonitors,
+  (incoming) => mergeLiveState(incoming),
+);
 
 async function save(showToast = true) {
   if (!draft.value) return null;
@@ -194,7 +222,7 @@ onMounted(load);
     @update:open="handleModalOpen"
   >
     <template #actions>
-      <StatusBadge v-if="draft" :status="draft.state.status" />
+      <StatusBadge v-if="draft" :status="draft.state.status" context="news" />
     </template>
 
     <template #body>
@@ -236,6 +264,16 @@ onMounted(load);
             @update:model-value="choosePrimary($event as string)"
           />
           <div class="news-run-actions">
+            <UButton
+                v-if="draft.state.csv_ready"
+                :to="`/api/news/monitors/${draft.id}/download`"
+                external
+                color="primary"
+                variant="soft"
+                icon="i-lucide-download"
+            >
+              Скачать CSV
+            </UButton>
             <UButton
               v-if="!isActive && !canResume"
               icon="i-lucide-radar"
@@ -427,8 +465,44 @@ onMounted(load);
                   <UFormField label="Селектор цены">
                     <UInput v-model="draft.extraction_rules.price_selector" placeholder=".price" class="w-full" />
                   </UFormField>
+                  <UFormField label="Начало парсинга модели" class="field-span-2">
+                    <UInput
+                      v-model="draft.extraction_rules.model_start_marker"
+                      placeholder="<h1 class=&quot;detail__title&quot;>"
+                      class="w-full"
+                    />
+                  </UFormField>
+                  <UFormField label="Конец парсинга модели" class="field-span-2">
+                    <UInput
+                      v-model="draft.extraction_rules.model_end_marker"
+                      placeholder="</h1>"
+                      class="w-full"
+                    />
+                  </UFormField>
                   <UFormField label="Правила замены" class="field-span-2">
                     <UTextarea v-model="draft.extraction_rules.model_replace_rules" :rows="4" class="w-full code-input" />
+                  </UFormField>
+                </div>
+              </details>
+              <details class="settings-details">
+                <summary>
+                  Исключения по статусу
+                  <UBadge color="neutral" variant="subtle">
+                    {{ draft.selector_settings.availability_exclusions?.length || 0 }}
+                  </UBadge>
+                </summary>
+                <div class="settings-details-content">
+                  <UFormField
+                    label="Статусы, при которых товар не считается новинкой"
+                    description="По одному фрагменту статуса на строку."
+                  >
+                    <UTextarea
+                      :model-value="(draft.selector_settings.availability_exclusions || []).join('\n')"
+                      :rows="4"
+                      class="w-full"
+                      placeholder="Снят с производства&#10;Нет в наличии"
+                      @update:model-value="draft.selector_settings.availability_exclusions = String($event).split(/\r?\n/).map((item) => item.trim()).filter(Boolean)"
+                    />
                   </UFormField>
                 </div>
               </details>
@@ -436,10 +510,7 @@ onMounted(load);
           </div>
 
           <aside class="news-progress-column">
-            <ProgressPanel
-              :state="draft.state"
-              :download-url="`/api/news/monitors/${draft.id}/download`"
-            />
+            <ProgressPanel :state="draft.state" :show-status="false" />
 
             <UCard as="section" variant="outline" class="panel inset-panel">
               <div class="panel-header">

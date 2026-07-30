@@ -5,6 +5,7 @@ import { errorMessage } from "~/utils/format";
 
 const props = withDefaults(defineProps<{ brandId?: string }>(), { brandId: "" });
 const toast = useToast();
+const route = useRoute();
 const { data, loading, load, merge, upsertMonitor } = useNews();
 const modalOpen = ref(false);
 const selectedMonitorId = ref("");
@@ -12,7 +13,9 @@ const createOpen = ref(false);
 const createGroup = ref("Маржа");
 const createBrand = ref("");
 const creating = ref(false);
-const collapsedGroups = ref<Set<string>>(new Set());
+const collapsedGroupNames = useState<string[]>("news-collapsed-groups", () => []);
+const collapsedGroups = computed(() => new Set(collapsedGroupNames.value));
+const savedListScrollY = useState<number>("news-list-scroll-y", () => 0);
 const deletingKey = ref("");
 const deleteOpen = ref(false);
 const pageError = ref("");
@@ -41,7 +44,6 @@ function aggregateState(monitors: NewsMonitor[]): ScanState {
       totalprocessed: 0,
       processed_products: 0,
       found_products: 0,
-      skipped: 0,
       error: "",
       elapsed_seconds: 0,
     };
@@ -102,7 +104,7 @@ function toggleGroup(group: string) {
   const next = new Set(collapsedGroups.value);
   if (next.has(group)) next.delete(group);
   else next.add(group);
-  collapsedGroups.value = next;
+  collapsedGroupNames.value = [...next];
 }
 
 async function openBrand(brand: BrandGroup) {
@@ -110,11 +112,15 @@ async function openBrand(brand: BrandGroup) {
     brand.monitors.find((item) => String(item.id) === String(item.primary_donor_id)) ||
     brand.monitors[0];
   if (!selected) return;
+  if (import.meta.client) savedListScrollY.value = window.scrollY;
+
+  if (brand.brandId && route.path !== `/news/edit/${brand.brandId}`) {
+    await navigateTo(`/news/edit/${brand.brandId}`, { replace: true });
+    return;
+  }
+
   selectedMonitorId.value = selected.id;
   modalOpen.value = true;
-  if (brand.brandId && useRoute().path !== `/news/edit/${brand.brandId}`) {
-    await navigateTo(`/news/edit/${brand.brandId}`, { replace: true });
-  }
 }
 
 async function openRequestedBrand(brandId: string) {
@@ -132,10 +138,24 @@ async function openRequestedBrand(brandId: string) {
   modalOpen.value = true;
 }
 
-function closeModal() {
+async function closeModal() {
   modalOpen.value = false;
   selectedMonitorId.value = "";
-  if (useRoute().path.startsWith("/news/edit/")) void navigateTo("/news", { replace: true });
+  if (route.path.startsWith("/news/edit/")) {
+    await navigateTo("/news", { replace: true });
+  }
+}
+
+async function restoreListScroll() {
+  if (!import.meta.client || savedListScrollY.value <= 0) return;
+  const top = savedListScrollY.value;
+  await nextTick();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      window.scrollTo({ top, left: 0 });
+      savedListScrollY.value = 0;
+    });
+  });
 }
 
 async function createMonitor() {
@@ -210,6 +230,8 @@ onMounted(async () => {
     await load(true);
     if (props.brandId) {
       await openRequestedBrand(props.brandId);
+    } else {
+      await restoreListScroll();
     }
   } catch (caught) {
     pageError.value = errorMessage(caught, "Не удалось загрузить мониторинг");
@@ -310,6 +332,7 @@ onMounted(async () => {
       v-if="modalOpen && selectedMonitorId"
       :monitor-id="selectedMonitorId"
       :connection-methods="data?.connection_methods || []"
+      :live-monitors="data?.monitors || []"
       @close="closeModal"
       @changed="load(true)"
     />
