@@ -25,7 +25,6 @@ const activeProjectId = ref(normalizeProjectRouteId(props.projectId));
 const draft = ref<Project | null>(null);
 const detailLoading = ref(false);
 const saving = ref(false);
-const initialized = ref(false);
 const workspaceReady = ref(false);
 const createOpen = ref(false);
 const deleteOpen = ref(false);
@@ -34,7 +33,6 @@ const creating = ref(false);
 const deleting = ref(false);
 const actionLoading = ref("");
 const pageError = ref("");
-let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let lastSavedPayload: ProjectSavePayload | null = null;
 
 const activeProject = computed(
@@ -59,9 +57,6 @@ function cloneProject(project: Project) {
 async function selectProject(projectId: string, updateRoute = true) {
   const normalizedId = normalizeProjectRouteId(projectId);
   if (!normalizedId || normalizedId === activeProjectId.value && draft.value) return false;
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = undefined;
-  initialized.value = false;
   detailLoading.value = true;
   pageError.value = "";
   activeProjectId.value = normalizedId;
@@ -76,8 +71,6 @@ async function selectProject(projectId: string, updateRoute = true) {
     if (updateRoute && useRoute().path !== `/projects/edit/${normalizedId}`) {
       await navigateTo(`/projects/edit/${normalizedId}`);
     }
-    await nextTick();
-    initialized.value = true;
     return true;
   } catch (caught) {
     pageError.value = errorMessage(caught, "Не удалось открыть проект");
@@ -97,6 +90,7 @@ function savePayload(): ProjectSavePayload | null {
     connection_method: draft.value.connection_method,
     auto_connection_fallback: draft.value.auto_connection_fallback,
     persist_profile: draft.value.persist_profile,
+    exclusions: draft.value.exclusions,
     product_url_filters: draft.value.product_url_filters,
     product_url_exclusions: draft.value.product_url_exclusions,
     extraction_rules: draft.value.extraction_rules,
@@ -138,17 +132,6 @@ async function save(silent = false) {
   }
 }
 
-function scheduleSave() {
-  if (
-    !initialized.value ||
-    !draft.value ||
-    draft.value.id !== activeProjectId.value ||
-    isActive.value
-  ) return;
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => void save(true), 800);
-}
-
 watch(
   () => props.projectId,
   (id) => {
@@ -157,14 +140,6 @@ watch(
       void selectProject(normalizedId, false);
     }
   },
-);
-
-watch(
-  () => {
-    const payload = savePayload();
-    return payload ? JSON.stringify(payload) : "";
-  },
-  () => scheduleSave(),
 );
 
 async function createProject() {
@@ -212,49 +187,23 @@ function collectionKey(
       : "product_url_exclusions";
 }
 
-async function addPattern(
+function addPattern(
   collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
   pattern: string,
 ) {
   if (!draft.value) return;
-  try {
-    const response = await projectService.addPattern(draft.value.id, collection, pattern);
-    const key = collectionKey(collection);
-    if (!draft.value[key].includes(response.pattern)) {
-      draft.value[key].push(response.pattern);
-    }
-    const current = activeProject.value;
-    if (current) current[key] = [...draft.value[key]];
-    if (lastSavedPayload && key !== "exclusions") {
-      lastSavedPayload[key] = [...draft.value[key]];
-    }
-  } catch (caught) {
-    toast.add({ title: errorMessage(caught), color: "error" });
-  }
+  const value = pattern.trim();
+  const key = collectionKey(collection);
+  if (value && !draft.value[key].includes(value)) draft.value[key].push(value);
 }
 
-async function removePattern(
+function removePattern(
   collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
   index: number,
 ) {
   if (!draft.value) return;
-  try {
-    const response = await projectService.removePattern(
-      draft.value.id,
-      collection,
-      index,
-    );
-    const key = collectionKey(collection);
-    const localIndex = draft.value[key].indexOf(response.removed);
-    if (localIndex >= 0) draft.value[key].splice(localIndex, 1);
-    const current = activeProject.value;
-    if (current) current[key] = [...draft.value[key]];
-    if (lastSavedPayload && key !== "exclusions") {
-      lastSavedPayload[key] = [...draft.value[key]];
-    }
-  } catch (caught) {
-    toast.add({ title: errorMessage(caught), color: "error" });
-  }
+  const values = draft.value[collectionKey(collection)];
+  if (index >= 0 && index < values.length) values.splice(index, 1);
 }
 
 async function startOrResume() {
@@ -284,6 +233,10 @@ async function runAction(action: "pause" | "soft-pause" | "stop" | "restart") {
   actionLoading.value = action;
   pageError.value = "";
   try {
+    if (action === "restart") {
+      const saved = await save(true);
+      if (!saved) return;
+    }
     const state = await projectService.action(draft.value.id, action);
     draft.value.state = state;
     if (activeProject.value) activeProject.value.state = state;
@@ -341,10 +294,6 @@ onMounted(async () => {
   } catch (caught) {
     pageError.value = errorMessage(caught, "Не удалось загрузить проекты");
   }
-});
-
-onBeforeUnmount(() => {
-  if (saveTimer) clearTimeout(saveTimer);
 });
 </script>
 

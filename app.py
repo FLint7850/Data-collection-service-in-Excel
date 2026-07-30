@@ -9640,6 +9640,8 @@ def api_update_project(project_id: str):
             project["name"] = str(payload.get("name") or project["name"]).strip() or project["name"]
         if "start_urls" in payload:
             project["start_urls"] = normalize_start_urls(payload.get("start_urls"))
+        if "exclusions" in payload:
+            project["exclusions"] = normalize_patterns(payload.get("exclusions"))
         if "product_url_filters" in payload:
             project["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
         if "product_url_exclusions" in payload:

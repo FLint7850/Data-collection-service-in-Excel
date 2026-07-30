@@ -12,6 +12,7 @@ export interface ProjectSavePayload {
   connection_method: string;
   auto_connection_fallback: boolean;
   persist_profile: boolean;
+  exclusions: string[];
   product_url_filters: string[];
   product_url_exclusions: string[];
   extraction_rules: Project["extraction_rules"];
@@ -42,26 +43,6 @@ export const projectService = {
     $fetch<{ ok: boolean }>(`/api/projects/${encodeURIComponent(projectId)}`, {
       method: "DELETE",
     }),
-
-  addPattern: (
-    projectId: string,
-    collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
-    pattern: string,
-  ) =>
-    $fetch<{ ok: boolean; added: boolean; pattern: string }>(
-      `/api/projects/${encodeURIComponent(projectId)}/${collection}`,
-      { method: "POST", body: { pattern } },
-    ),
-
-  removePattern: (
-    projectId: string,
-    collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
-    index: number,
-  ) =>
-    $fetch<{ ok: boolean; removed: string }>(
-      `/api/projects/${encodeURIComponent(projectId)}/${collection}/${index}`,
-      { method: "DELETE" },
-    ),
 
   start: (projectId: string) =>
     $fetch<ScanState>(`/api/projects/${encodeURIComponent(projectId)}/start`, {
