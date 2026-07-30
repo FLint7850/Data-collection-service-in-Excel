@@ -36,8 +36,12 @@ const isActive = computed(() =>
 );
 const canResume = computed(() => draft.value?.state.status === "partial");
 
+function cloneMonitor(monitor: NewsMonitor): NewsMonitor {
+  return JSON.parse(JSON.stringify(monitor)) as NewsMonitor;
+}
+
 function setDraft(monitor: NewsMonitor) {
-  const next = structuredClone(toRaw(monitor));
+  const next = cloneMonitor(monitor);
   next.extraction_rules = {
     ...next.extraction_rules,
     model_start_marker: next.extraction_rules.model_start_marker || "",
