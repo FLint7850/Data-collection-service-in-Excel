@@ -159,7 +159,7 @@ onMounted(load);
         <div class="panel-header">
           <div>
             <p class="eyebrow">ИСТОЧНИКИ ДАННЫХ</p>
-            <h3>Фиды моих сайтов</h3>
+            <h2><strong>Фиды моих сайтов</strong></h2>
             <p>Используются в мониторинге новинок, импорте файлов и сравнении поставщиков.</p>
           </div>
           <UButton color="neutral" variant="soft" icon="i-lucide-plus" @click="addSite">
@@ -215,7 +215,7 @@ onMounted(load);
           <div class="panel-header">
             <div>
               <p class="eyebrow">УВЕДОМЛЕНИЯ</p>
-              <h3>SMTP-почта</h3>
+              <h2><strong>SMTP-почта</strong></h2>
               <p>Отправка результатов мониторинга ответственным сотрудникам.</p>
             </div>
             <span class="settings-icon amber-icon"><UIcon name="i-lucide-mail" /></span>
@@ -291,7 +291,7 @@ onMounted(load);
           <div class="panel-header">
             <div>
               <p class="eyebrow">ХРАНИЛИЩЕ</p>
-              <h3>Последние фиды</h3>
+              <h2><strong>Последние фиды</strong></h2>
             </div>
             <span class="settings-icon blue-icon"><UIcon name="i-lucide-database" /></span>
           </div>

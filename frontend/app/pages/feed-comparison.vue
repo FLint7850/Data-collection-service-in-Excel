@@ -221,7 +221,7 @@ onMounted(load);
             <div class="panel-header">
               <div>
                 <p class="eyebrow">ИСТОЧНИКИ</p>
-                <h3>Фиды поставщиков</h3>
+                <h2><strong>Фиды поставщиков</strong></h2>
                 <p>Для каждого поставщика укажите точное имя XML-поля с моделью.</p>
               </div>
               <div class="flex flex-col gap-3">

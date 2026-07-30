@@ -237,7 +237,7 @@ onMounted(load);
           <div class="panel-header">
             <div>
               <p class="eyebrow">ШАГ 1</p>
-              <h3>Поля и правила</h3>
+              <h2><strong>Поля и правила</strong></h2>
             </div>
             <UBadge color="neutral" variant="subtle">Настройки</UBadge>
           </div>
@@ -284,7 +284,7 @@ onMounted(load);
           <div class="panel-header">
             <div>
               <p class="eyebrow">ШАГ 2</p>
-              <h3>Исходный файл</h3>
+              <h2><strong>Исходный файл</strong></h2>
             </div>
             <UBadge :color="hasFile ? 'success' : 'neutral'" variant="subtle">
               {{ hasFile ? "Загружен" : "Не выбран" }}

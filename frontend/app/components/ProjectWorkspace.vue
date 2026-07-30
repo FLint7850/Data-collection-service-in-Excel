@@ -444,7 +444,7 @@ onBeforeUnmount(() => {
           <div class="panel-header">
             <div>
               <p class="eyebrow">НАСТРОЙКИ СБОРА</p>
-              <h3>{{ draft.name || "Без названия" }}</h3>
+              <h2><strong>{{ draft.name || "Без названия" }}</strong></h2>
             </div>
             <div class="project-panel-actions">
               <UButton
@@ -602,11 +602,11 @@ onBeforeUnmount(() => {
           <div class="panel-header">
             <div>
               <p class="eyebrow">ФИЛЬТРАЦИЯ</p>
-              <h3>Исключения и URL-фильтры</h3>
+              <h2><strong>Исключения и URL-фильтры</strong></h2>
             </div>
           </div>
 
-          <SettingsCollapsible default-open>
+          <SettingsCollapsible class="mt-3">
             <template #label>
               Исключения разделов
               <UBadge color="neutral" variant="subtle">{{ draft.exclusions.length }}</UBadge>
@@ -653,11 +653,11 @@ onBeforeUnmount(() => {
           <div class="panel-header">
             <div>
               <p class="eyebrow">ТОЧНАЯ НАСТРОЙКА</p>
-              <h3>Селекторы и правила модели</h3>
+              <h2><strong>Селекторы и правила модели</strong></h2>
             </div>
           </div>
 
-          <SettingsCollapsible content-class="form-grid">
+          <SettingsCollapsible content-class="form-grid" class="mt-3">
             <template #label>CSS-селекторы карточек</template>
             <UFormField label="Карточка товара">
               <UInput v-model="draft.extraction_rules.product_card_selector" placeholder=".product-card" class="w-full" />
