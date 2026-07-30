@@ -150,14 +150,6 @@ body {
   font-weight: 800;
   text-align: center;
 }
-.status-dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--mint);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ui-primary) 9%, transparent);
-}
 
 .main-area {
   min-width: 0;
@@ -1944,18 +1936,6 @@ a {
 
 .mobile-menu-button {
   display: none !important;
-}
-
-.system-ready {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--panel);
-  padding: 8px 11px;
-  color: #9ba7a0;
-  font-weight: 680;
 }
 
 .user-button {
@@ -3824,7 +3804,6 @@ textarea.code-input {
 }
 
 @media (max-width: 680px) {
-  .system-ready,
   .user-copy {
     display: none;
   }

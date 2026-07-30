@@ -48,10 +48,6 @@ async function logout() {
     </div>
 
     <div class="topbar-actions">
-      <div class="system-ready">
-        <span class="status-dot" />
-        <span>Сервис доступен</span>
-      </div>
       <UDropdownMenu
         :items="[
           [
