@@ -5,8 +5,9 @@ const props = withDefaults(
   defineProps<{
     status?: string;
     context?: "default" | "news";
+    size?: "xs" | "sm" | "md" | "lg" | "xl";
   }>(),
-  { context: "default" },
+  { context: "default", size: 'md' },
 );
 
 const newsLabels: Record<string, string> = {
@@ -33,7 +34,7 @@ const label = computed(() =>
   <UBadge
     :color="scanStatusColor(props.status)"
     variant="subtle"
-    size="sm"
+    :size="size"
     class="status-badge"
   >
     <span class="status-dot-mini" />

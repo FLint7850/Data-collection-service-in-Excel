@@ -2,6 +2,7 @@
 import { fileImportService } from "~/services/file-import.service";
 import type { FileImportData } from "~/types/api";
 import { errorMessage, formatFileSize } from "~/utils/format";
+import { mergeProgressState } from "~/utils/progress-state";
 
 definePageMeta({
   title: "Выгрузка из файла",
@@ -30,7 +31,11 @@ const isActive = computed(() =>
 const hasFile = computed(() => Boolean(data.value?.file));
 
 function applyData(value: FileImportData) {
-  data.value = value;
+  data.value = {
+    ...(data.value || value),
+    ...value,
+    state: mergeProgressState(data.value?.state, value.state),
+  };
   form.model_field = value.model_field || "";
   form.price_field = value.price_field || "";
   form.exclusions = value.exclusions || "";
@@ -132,7 +137,7 @@ async function stop() {
 
 useProgressPolling(
   async () => {
-    if (isActive.value) data.value = await fileImportService.get();
+    if (isActive.value) applyData(await fileImportService.get());
   },
   computed(() => isActive.value),
 );
@@ -204,37 +209,33 @@ onMounted(load);
             </UFormField>
           </div>
 
-          <details class="settings-details">
-            <summary>
+          <SettingsCollapsible>
+            <template #label>
               Исключения
               <span class="summary-hint">по одному значению на строку</span>
-            </summary>
-            <div class="settings-details-content">
-              <UTextarea
-                v-model="form.exclusions"
-                :disabled="isActive"
-                :rows="7"
-                class="w-full"
-                placeholder="Автомобильный холодильник&#10;Гриль из чугуна"
-              />
-            </div>
-          </details>
+            </template>
+            <UTextarea
+              v-model="form.exclusions"
+              :disabled="isActive"
+              :rows="7"
+              class="w-full"
+              placeholder="Автомобильный холодильник&#10;Гриль из чугуна"
+            />
+          </SettingsCollapsible>
 
-          <details class="settings-details">
-            <summary>
+          <SettingsCollapsible>
+            <template #label>
               Правила поиск/замены
               <span class="summary-hint">подготовка модели</span>
-            </summary>
-            <div class="settings-details-content">
-              <UTextarea
-                v-model="form.replace_rules"
-                :disabled="isActive"
-                :rows="7"
-                class="w-full code-input"
-                placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|"
-              />
-            </div>
-          </details>
+            </template>
+            <UTextarea
+              v-model="form.replace_rules"
+              :disabled="isActive"
+              :rows="7"
+              class="w-full code-input"
+              placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|"
+            />
+          </SettingsCollapsible>
         </UCard>
 
         <UCard as="section" variant="outline" class="panel upload-panel">

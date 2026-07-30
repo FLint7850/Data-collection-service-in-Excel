@@ -2,6 +2,7 @@
 import { newsService } from "~/services/news.service";
 import type { ConnectionMethod, NewsMonitor } from "~/types/api";
 import { errorMessage, hostFromUrl } from "~/utils/format";
+import { mergeProgressState } from "~/utils/progress-state";
 
 const props = defineProps<{
   monitorId: string;
@@ -54,11 +55,13 @@ function mergeLiveState(incoming: NewsMonitor[]) {
   if (!incoming.length) return;
   monitors.value = monitors.value.map((monitor) => {
     const live = incoming.find((item) => String(item.id) === String(monitor.id));
-    return live ? { ...monitor, state: { ...monitor.state, ...live.state } } : monitor;
+    return live
+      ? { ...monitor, state: mergeProgressState(monitor.state, live.state) }
+      : monitor;
   });
   const live = incoming.find((item) => String(item.id) === String(selectedId.value));
   if (live && draft.value && String(draft.value.id) === String(live.id)) {
-    draft.value.state = { ...draft.value.state, ...live.state };
+    draft.value.state = mergeProgressState(draft.value.state, live.state);
   }
 }
 
@@ -211,18 +214,87 @@ onMounted(load);
 <template>
   <UModal
     :open="true"
-    :title="draft?.brand || 'Настройки донора'"
     :description="draft ? `${draft.group} · ${monitors.length} ${monitors.length === 1 ? 'донор' : 'донора'}` : 'Параметры мониторинга бренда'"
     :scrollable="false"
+    :close="false"
     :ui="{
       content: 'news-monitor-panel max-w-[1320px]',
+      description: 'mt-0',
       body: 'p-0',
       footer: 'news-modal-footer',
     }"
     @update:open="handleModalOpen"
   >
+    <template #title>
+      <div class="flex gap-3 items-center">
+        {{draft?.brand || 'Настройки донора'}}
+        <div v-if="draft">
+          <USwitch v-model="draft.enabled" />
+        </div>
+      </div>
+    </template>
     <template #actions>
-      <StatusBadge v-if="draft" :status="draft.state.status" context="news" />
+      <div v-if="draft" class="news-run-actions flex-1 justify-between">
+        <StatusBadge :status="draft.state.status" context="news" size="xl" />
+        <div class="flex gap-1">
+          <UButton
+              v-if="draft.state.csv_ready"
+              :to="`/api/news/monitors/${draft.id}/download`"
+              external
+              color="primary"
+              variant="soft"
+              icon="i-lucide-download"
+          >
+            Скачать CSV
+          </UButton>
+          <UButton
+              v-if="!isActive && !canResume"
+              icon="i-lucide-radar"
+              :loading="actionLoading === 'scan'"
+              @click="runAction('scan')"
+          >
+            Проверить новинки
+          </UButton>
+          <UButton
+              v-if="canResume"
+              color="primary"
+              icon="i-lucide-play"
+              :loading="actionLoading === 'resume'"
+              @click="runAction('resume')"
+          >
+            Продолжить
+          </UButton>
+          <UButton
+              v-if="['running', 'queued'].includes(draft.state.status)"
+              color="warning"
+              variant="soft"
+              icon="i-lucide-pause"
+              :loading="actionLoading === 'pause'"
+              @click="runAction('pause')"
+          >
+            Пауза
+          </UButton>
+          <UButton
+              v-if="isActive"
+              color="error"
+              variant="soft"
+              icon="i-lucide-square"
+              :loading="actionLoading === 'stop'"
+              @click="runAction('stop')"
+          >
+            Стоп
+          </UButton>
+          <UButton
+              v-if="!isActive"
+              color="neutral"
+              variant="ghost"
+              icon="i-lucide-rotate-ccw"
+              @click="runAction('reset-visual')"
+          >
+            Сбросить
+          </UButton>
+        </div>
+      </div>
     </template>
 
     <template #body>
@@ -256,82 +328,51 @@ onMounted(load);
           @update:open="error = ''"
         />
 
-        <div class="news-modal-toolbar">
-          <USelect
-            :model-value="selectedId"
-            :items="monitors.map((item) => ({ label: hostFromUrl(item.site_url || item.start_urls?.[0]), value: item.id }))"
-            class="donor-select"
-            @update:model-value="choosePrimary($event as string)"
-          />
-          <div class="news-run-actions">
-            <UButton
-                v-if="draft.state.csv_ready"
-                :to="`/api/news/monitors/${draft.id}/download`"
-                external
-                color="primary"
-                variant="soft"
-                icon="i-lucide-download"
-            >
-              Скачать CSV
-            </UButton>
-            <UButton
-              v-if="!isActive && !canResume"
-              icon="i-lucide-radar"
-              :loading="actionLoading === 'scan'"
-              @click="runAction('scan')"
-            >
-              Проверить новинки
-            </UButton>
-            <UButton
-              v-if="canResume"
-              color="primary"
-              icon="i-lucide-play"
-              :loading="actionLoading === 'resume'"
-              @click="runAction('resume')"
-            >
-              Продолжить
-            </UButton>
-            <UButton
-              v-if="['running', 'queued'].includes(draft.state.status)"
-              color="warning"
-              variant="soft"
-              icon="i-lucide-pause"
-              :loading="actionLoading === 'pause'"
-              @click="runAction('pause')"
-            >
-              Пауза
-            </UButton>
-            <UButton
-              v-if="isActive"
-              color="error"
-              variant="soft"
-              icon="i-lucide-square"
-              :loading="actionLoading === 'stop'"
-              @click="runAction('stop')"
-            >
-              Стоп
-            </UButton>
-            <UButton
-              v-if="!isActive"
-              color="neutral"
-              variant="ghost"
-              icon="i-lucide-rotate-ccw"
-              @click="runAction('reset-visual')"
-            >
-              Сбросить
-            </UButton>
-          </div>
-        </div>
-
         <div class="news-modal-grid">
           <div class="news-settings-column">
-            <UCard as="section" variant="outline" class="panel inset-panel">
+            <UCard as="section" variant="outline" class="panel">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">ДОНОРЫ</p>
+                  <h2><strong>Добавить сайт</strong></h2>
+                </div>
+              </div>
+              <div class="add-donor-form">
+                <UInput v-model="addDonorUrl" placeholder="https://supplier.ru" class="w-full" />
+                <UButton
+                    color="neutral"
+                    variant="soft"
+                    icon="i-lucide-plus"
+                    :loading="addingDonor"
+                    :disabled="!addDonorUrl.trim()"
+                    @click="addDonor"
+                >
+                  Добавить
+                </UButton>
+              </div>
+              <div class="donor-mini-list">
+                <button
+                    v-for="monitor in monitors"
+                    :key="monitor.id"
+                    type="button"
+                    :class="{ active: monitor.id === selectedId }"
+                    @click="selectedId = monitor.id"
+                >
+                  <span class="tiny-dot" />
+                  <span>
+                    <strong>{{ hostFromUrl(monitor.site_url || monitor.start_urls?.[0]) }}</strong>
+                    <small>{{ monitor.start_urls.length }} стартовых URL</small>
+                  </span>
+                </button>
+              </div>
+            </UCard>
+
+            <UCard as="section" variant="outline" class="panel">
               <div class="panel-header">
                 <div>
                   <p class="eyebrow">ОСНОВНОЕ</p>
-                  <h3>Донор и расписание</h3>
+                  <h2><strong>Донор и расписание</strong></h2>
                 </div>
-                <USwitch v-model="draft.enabled" />
               </div>
 
               <div class="form-grid">
@@ -377,6 +418,16 @@ onMounted(load);
                   <UInput v-model.number="draft.thread_count" type="number" :min="1" :max="16" class="w-full" />
                 </UFormField>
                 <UFormField label="Подключение">
+                  <template #label>
+                    <div class="flex gap-3">
+                      Подключение
+                      <USwitch v-model="draft.auto_connection_fallback" />
+                      <span>
+                      <strong>Авто</strong>
+                    </span>
+                    </div>
+
+                  </template>
                   <USelect v-model="draft.connection_method" :items="connectionOptions" class="w-full" />
                 </UFormField>
                 <UFormField label="Стартовые URL" class="field-span-2">
@@ -390,165 +441,114 @@ onMounted(load);
                 </UFormField>
               </div>
 
-              <UCard
-                as="label"
-                variant="subtle"
-                class="switch-card compact-switch"
-                :ui="{ body: 'switch-card-body' }"
-              >
-                <USwitch v-model="draft.auto_connection_fallback" />
-                <span>
-                  <strong>Резервное подключение</strong>
-                  <small>Переключаться автоматически при блокировке.</small>
-                </span>
-              </UCard>
             </UCard>
 
-            <UCard as="section" variant="outline" class="panel inset-panel settings-stack">
+            <UCard as="section" variant="outline" class="panel settings-stack">
               <div class="panel-header">
                 <div>
                   <p class="eyebrow">ФИЛЬТРЫ</p>
-                  <h3>Правила обхода</h3>
+                  <h2><strong>Правила обхода</strong></h2>
                 </div>
               </div>
-              <details class="settings-details">
-                <summary>Исключения разделов <UBadge color="neutral" variant="subtle">{{ draft.exclusions.length }}</UBadge></summary>
-                <div class="settings-details-content">
-                  <PatternEditor
-                    :model-value="draft.exclusions"
-                    placeholder="/catalog/sale/"
-                    @add="draft.exclusions.push($event)"
-                    @remove="draft.exclusions.splice($event, 1)"
+              <SettingsCollapsible class="mt-3">
+                <template #label>
+                  Исключения разделов
+                  <UBadge color="neutral" variant="subtle">{{ draft.exclusions.length }}</UBadge>
+                </template>
+                <PatternEditor
+                  :model-value="draft.exclusions"
+                  placeholder="/catalog/sale/"
+                  @add="draft.exclusions.push($event)"
+                  @remove="draft.exclusions.splice($event, 1)"
+                />
+              </SettingsCollapsible>
+              <SettingsCollapsible>
+                <template #label>
+                  Фильтр товарных URL
+                  <UBadge color="neutral" variant="subtle">{{ draft.product_url_filters.length }}</UBadge>
+                </template>
+                <PatternEditor
+                  :model-value="draft.product_url_filters"
+                  placeholder="-model-"
+                  @add="draft.product_url_filters.push($event)"
+                  @remove="draft.product_url_filters.splice($event, 1)"
+                />
+              </SettingsCollapsible>
+              <SettingsCollapsible>
+                <template #label>
+                  Исключения товарных URL
+                  <UBadge color="neutral" variant="subtle">{{ draft.product_url_exclusions.length }}</UBadge>
+                </template>
+                <PatternEditor
+                  :model-value="draft.product_url_exclusions"
+                  placeholder="/recommend"
+                  @add="draft.product_url_exclusions.push($event)"
+                  @remove="draft.product_url_exclusions.splice($event, 1)"
+                />
+              </SettingsCollapsible>
+              <SettingsCollapsible content-class="form-grid">
+                <template #label>Селекторы и правила модели</template>
+                <UFormField label="Селектор названия">
+                  <UInput v-model="draft.selector_settings.name_selector" placeholder="h1" class="w-full" />
+                </UFormField>
+                <UFormField label="Селектор наличия">
+                  <UInput v-model="draft.selector_settings.availability_selector" placeholder=".stock" class="w-full" />
+                </UFormField>
+                <UFormField label="Карточка товара">
+                  <UInput v-model="draft.extraction_rules.product_card_selector" placeholder=".product-card" class="w-full" />
+                </UFormField>
+                <UFormField label="Ссылка товара">
+                  <UInput v-model="draft.extraction_rules.product_url_selector" placeholder="a[href]" class="w-full" />
+                </UFormField>
+                <UFormField label="Селектор модели">
+                  <UInput v-model="draft.extraction_rules.model_selector" placeholder=".model" class="w-full" />
+                </UFormField>
+                <UFormField label="Селектор цены">
+                  <UInput v-model="draft.extraction_rules.price_selector" placeholder=".price" class="w-full" />
+                </UFormField>
+                <UFormField label="Начало парсинга модели" class="field-span-2">
+                  <UInput
+                    v-model="draft.extraction_rules.model_start_marker"
+                    placeholder="<h1 class=&quot;detail__title&quot;>"
+                    class="w-full"
                   />
-                </div>
-              </details>
-              <details class="settings-details">
-                <summary>Фильтр товарных URL <UBadge color="neutral" variant="subtle">{{ draft.product_url_filters.length }}</UBadge></summary>
-                <div class="settings-details-content">
-                  <PatternEditor
-                    :model-value="draft.product_url_filters"
-                    placeholder="-model-"
-                    @add="draft.product_url_filters.push($event)"
-                    @remove="draft.product_url_filters.splice($event, 1)"
+                </UFormField>
+                <UFormField label="Конец парсинга модели" class="field-span-2">
+                  <UInput
+                    v-model="draft.extraction_rules.model_end_marker"
+                    placeholder="</h1>"
+                    class="w-full"
                   />
-                </div>
-              </details>
-              <details class="settings-details">
-                <summary>Исключения товарных URL <UBadge color="neutral" variant="subtle">{{ draft.product_url_exclusions.length }}</UBadge></summary>
-                <div class="settings-details-content">
-                  <PatternEditor
-                    :model-value="draft.product_url_exclusions"
-                    placeholder="/recommend"
-                    @add="draft.product_url_exclusions.push($event)"
-                    @remove="draft.product_url_exclusions.splice($event, 1)"
-                  />
-                </div>
-              </details>
-              <details class="settings-details">
-                <summary>Селекторы и правила модели</summary>
-                <div class="settings-details-content form-grid">
-                  <UFormField label="Селектор названия">
-                    <UInput v-model="draft.selector_settings.name_selector" placeholder="h1" class="w-full" />
-                  </UFormField>
-                  <UFormField label="Селектор наличия">
-                    <UInput v-model="draft.selector_settings.availability_selector" placeholder=".stock" class="w-full" />
-                  </UFormField>
-                  <UFormField label="Карточка товара">
-                    <UInput v-model="draft.extraction_rules.product_card_selector" placeholder=".product-card" class="w-full" />
-                  </UFormField>
-                  <UFormField label="Ссылка товара">
-                    <UInput v-model="draft.extraction_rules.product_url_selector" placeholder="a[href]" class="w-full" />
-                  </UFormField>
-                  <UFormField label="Селектор модели">
-                    <UInput v-model="draft.extraction_rules.model_selector" placeholder=".model" class="w-full" />
-                  </UFormField>
-                  <UFormField label="Селектор цены">
-                    <UInput v-model="draft.extraction_rules.price_selector" placeholder=".price" class="w-full" />
-                  </UFormField>
-                  <UFormField label="Начало парсинга модели" class="field-span-2">
-                    <UInput
-                      v-model="draft.extraction_rules.model_start_marker"
-                      placeholder="<h1 class=&quot;detail__title&quot;>"
-                      class="w-full"
-                    />
-                  </UFormField>
-                  <UFormField label="Конец парсинга модели" class="field-span-2">
-                    <UInput
-                      v-model="draft.extraction_rules.model_end_marker"
-                      placeholder="</h1>"
-                      class="w-full"
-                    />
-                  </UFormField>
-                  <UFormField label="Правила замены" class="field-span-2">
-                    <UTextarea v-model="draft.extraction_rules.model_replace_rules" :rows="4" class="w-full code-input" />
-                  </UFormField>
-                </div>
-              </details>
-              <details class="settings-details">
-                <summary>
+                </UFormField>
+                <UFormField label="Правила замены" class="field-span-2">
+                  <UTextarea v-model="draft.extraction_rules.model_replace_rules" :rows="4" class="w-full code-input" />
+                </UFormField>
+              </SettingsCollapsible>
+              <SettingsCollapsible>
+                <template #label>
                   Исключения по статусу
                   <UBadge color="neutral" variant="subtle">
                     {{ draft.selector_settings.availability_exclusions?.length || 0 }}
                   </UBadge>
-                </summary>
-                <div class="settings-details-content">
-                  <UFormField
-                    label="Статусы, при которых товар не считается новинкой"
-                    description="По одному фрагменту статуса на строку."
-                  >
-                    <UTextarea
-                      :model-value="(draft.selector_settings.availability_exclusions || []).join('\n')"
-                      :rows="4"
-                      class="w-full"
-                      placeholder="Снят с производства&#10;Нет в наличии"
-                      @update:model-value="draft.selector_settings.availability_exclusions = String($event).split(/\r?\n/).map((item) => item.trim()).filter(Boolean)"
-                    />
-                  </UFormField>
-                </div>
-              </details>
+                </template>
+                <UFormField
+                  label="Статусы, при которых товар не считается новинкой"
+                  description="По одному фрагменту статуса на строку."
+                >
+                  <UTextarea
+                    :model-value="(draft.selector_settings.availability_exclusions || []).join('\n')"
+                    :rows="4"
+                    class="w-full"
+                    placeholder="Снят с производства&#10;Нет в наличии"
+                    @update:model-value="draft.selector_settings.availability_exclusions = String($event).split(/\r?\n/).map((item) => item.trim()).filter(Boolean)"
+                  />
+                </UFormField>
+              </SettingsCollapsible>
             </UCard>
           </div>
 
           <aside class="news-progress-column">
             <ProgressPanel :state="draft.state" :show-status="false" />
-
-            <UCard as="section" variant="outline" class="panel inset-panel">
-              <div class="panel-header">
-                <div>
-                  <p class="eyebrow">ДОНОРЫ</p>
-                  <h3>Добавить сайт</h3>
-                </div>
-              </div>
-              <div class="add-donor-form">
-                <UInput v-model="addDonorUrl" placeholder="https://supplier.ru" class="w-full" />
-                <UButton
-                  color="neutral"
-                  variant="soft"
-                  icon="i-lucide-plus"
-                  :loading="addingDonor"
-                  :disabled="!addDonorUrl.trim()"
-                  @click="addDonor"
-                >
-                  Добавить
-                </UButton>
-              </div>
-              <div class="donor-mini-list">
-                <button
-                  v-for="monitor in monitors"
-                  :key="monitor.id"
-                  type="button"
-                  :class="{ active: monitor.id === selectedId }"
-                  @click="selectedId = monitor.id"
-                >
-                  <span class="tiny-dot" />
-                  <span>
-                    <strong>{{ hostFromUrl(monitor.site_url || monitor.start_urls?.[0]) }}</strong>
-                    <small>{{ monitor.start_urls.length }} стартовых URL</small>
-                  </span>
-                  <UIcon v-if="String(monitor.id) === String(monitor.primary_donor_id)" name="i-lucide-star" />
-                </button>
-              </div>
-            </UCard>
           </aside>
         </div>
       </div>

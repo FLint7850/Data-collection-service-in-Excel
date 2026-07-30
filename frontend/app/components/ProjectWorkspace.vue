@@ -554,53 +554,47 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <details class="settings-details" open>
-            <summary>
+          <SettingsCollapsible default-open>
+            <template #label>
               Исключения разделов
               <UBadge color="neutral" variant="subtle">{{ draft.exclusions.length }}</UBadge>
-            </summary>
-            <div class="settings-details-content">
-              <PatternEditor
-                :model-value="draft.exclusions"
-                placeholder="/catalog/rasprodazha/"
-                :disabled="isActive"
-                @add="addPattern('exclusions', $event)"
-                @remove="removePattern('exclusions', $event)"
-              />
-            </div>
-          </details>
+            </template>
+            <PatternEditor
+              :model-value="draft.exclusions"
+              placeholder="/catalog/rasprodazha/"
+              :disabled="isActive"
+              @add="addPattern('exclusions', $event)"
+              @remove="removePattern('exclusions', $event)"
+            />
+          </SettingsCollapsible>
 
-          <details class="settings-details">
-            <summary>
+          <SettingsCollapsible>
+            <template #label>
               Фильтр товарных URL
               <UBadge color="neutral" variant="subtle">{{ draft.product_url_filters.length }}</UBadge>
-            </summary>
-            <div class="settings-details-content">
-              <PatternEditor
-                :model-value="draft.product_url_filters"
-                placeholder="-qyron-"
-                :disabled="isActive"
-                @add="addPattern('product-url-filters', $event)"
-                @remove="removePattern('product-url-filters', $event)"
-              />
-            </div>
-          </details>
+            </template>
+            <PatternEditor
+              :model-value="draft.product_url_filters"
+              placeholder="-qyron-"
+              :disabled="isActive"
+              @add="addPattern('product-url-filters', $event)"
+              @remove="removePattern('product-url-filters', $event)"
+            />
+          </SettingsCollapsible>
 
-          <details class="settings-details">
-            <summary>
+          <SettingsCollapsible>
+            <template #label>
               Исключения товарных ссылок
               <UBadge color="neutral" variant="subtle">{{ draft.product_url_exclusions.length }}</UBadge>
-            </summary>
-            <div class="settings-details-content">
-              <PatternEditor
-                :model-value="draft.product_url_exclusions"
-                placeholder="/recommend"
-                :disabled="isActive"
-                @add="addPattern('product-url-exclusions', $event)"
-                @remove="removePattern('product-url-exclusions', $event)"
-              />
-            </div>
-          </details>
+            </template>
+            <PatternEditor
+              :model-value="draft.product_url_exclusions"
+              placeholder="/recommend"
+              :disabled="isActive"
+              @add="addPattern('product-url-exclusions', $event)"
+              @remove="removePattern('product-url-exclusions', $event)"
+            />
+          </SettingsCollapsible>
         </UCard>
 
         <UCard as="section" variant="outline" class="panel settings-stack">
@@ -611,43 +605,39 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <details class="settings-details">
-            <summary>CSS-селекторы карточек</summary>
-            <div class="settings-details-content form-grid">
-              <UFormField label="Карточка товара">
-                <UInput v-model="draft.extraction_rules.product_card_selector" placeholder=".product-card" class="w-full" />
-              </UFormField>
-              <UFormField label="Ссылка товара">
-                <UInput v-model="draft.extraction_rules.product_url_selector" placeholder="a[href]" class="w-full" />
-              </UFormField>
-              <UFormField label="Модель">
-                <UInput v-model="draft.extraction_rules.model_selector" placeholder=".product-title" class="w-full" />
-              </UFormField>
-              <UFormField label="Цена">
-                <UInput v-model="draft.extraction_rules.price_selector" placeholder=".price" class="w-full" />
-              </UFormField>
-            </div>
-          </details>
+          <SettingsCollapsible content-class="form-grid">
+            <template #label>CSS-селекторы карточек</template>
+            <UFormField label="Карточка товара">
+              <UInput v-model="draft.extraction_rules.product_card_selector" placeholder=".product-card" class="w-full" />
+            </UFormField>
+            <UFormField label="Ссылка товара">
+              <UInput v-model="draft.extraction_rules.product_url_selector" placeholder="a[href]" class="w-full" />
+            </UFormField>
+            <UFormField label="Модель">
+              <UInput v-model="draft.extraction_rules.model_selector" placeholder=".product-title" class="w-full" />
+            </UFormField>
+            <UFormField label="Цена">
+              <UInput v-model="draft.extraction_rules.price_selector" placeholder=".price" class="w-full" />
+            </UFormField>
+          </SettingsCollapsible>
 
-          <details class="settings-details">
-            <summary>Маркеры и поиск/замена</summary>
-            <div class="settings-details-content form-grid">
-              <UFormField label="Начальный маркер">
-                <UInput v-model="draft.extraction_rules.model_start_marker" placeholder="<h1 class=&quot;detail__title&quot;>" class="w-full" />
-              </UFormField>
-              <UFormField label="Конечный маркер">
-                <UInput v-model="draft.extraction_rules.model_end_marker" placeholder="</h1>" class="w-full" />
-              </UFormField>
-              <UFormField label="Правила замены" class="field-span-2">
-                <UTextarea
-                  v-model="draft.extraction_rules.model_replace_rules"
-                  :rows="5"
-                  class="w-full code-input"
-                  placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|"
-                />
-              </UFormField>
-            </div>
-          </details>
+          <SettingsCollapsible content-class="form-grid">
+            <template #label>Маркеры и поиск/замена</template>
+            <UFormField label="Начальный маркер">
+              <UInput v-model="draft.extraction_rules.model_start_marker" placeholder="<h1 class=&quot;detail__title&quot;>" class="w-full" />
+            </UFormField>
+            <UFormField label="Конечный маркер">
+              <UInput v-model="draft.extraction_rules.model_end_marker" placeholder="</h1>" class="w-full" />
+            </UFormField>
+            <UFormField label="Правила замены" class="field-span-2">
+              <UTextarea
+                v-model="draft.extraction_rules.model_replace_rules"
+                :rows="5"
+                class="w-full code-input"
+                placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|"
+              />
+            </UFormField>
+          </SettingsCollapsible>
         </UCard>
       </div>
     </div>

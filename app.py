@@ -447,7 +447,6 @@ def make_state(thread_count: int = 4) -> Dict[str, object]:
         "started_at": "",
         "finished_at": "",
         "elapsed_seconds": 0,
-        "eta_seconds": None,
         "paused_with_result": False,
     }
 
@@ -701,7 +700,6 @@ def merge_stable_progress_state(
         "last_event",
         "last_warning",
         "elapsed_seconds",
-        "eta_seconds",
         "stall_seconds",
     ):
         value = merged.get(field)
@@ -779,6 +777,8 @@ def progress_payload(include_projects: bool, include_news: bool) -> Dict[str, ob
 
 def project_model_to_dict(row: Project) -> Dict[str, object]:
     thread_count = parse_thread_count(row.thread_count)
+    state = {**make_state(thread_count), **(row.state or {})}
+    state.pop("eta_seconds", None)
     project = {
         "id": str(row.id),
         "name": row.name,
@@ -788,7 +788,7 @@ def project_model_to_dict(row: Project) -> Dict[str, object]:
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "product_url_exclusions": normalize_patterns(getattr(row, "product_url_exclusions", None) or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
-        "state": {**make_state(thread_count), **(row.state or {})},
+        "state": state,
         "logs": [],
         "auto_cleanup": bool(row.auto_cleanup),
         "connection_method": normalize_connection_method(row.connection_method),
@@ -4610,9 +4610,6 @@ class ProductSiteCrawler:
         total_known = processed + remaining
         percent = int((processed / total_known) * 100) if total_known else 0
         elapsed = self.elapsed_seconds()
-        eta = None
-        if processed > 0 and remaining > 0:
-            eta = int((elapsed / processed) * remaining)
         self.update_state(
             percent=percent,
             currenturl=current_url,
@@ -4628,7 +4625,6 @@ class ProductSiteCrawler:
             skipped=counts["skipped"],
             thread_count=self.thread_count,
             elapsed_seconds=int(elapsed),
-            eta_seconds=eta,
         )
 
     def progress_signature(self, pending_urls: Iterable[str]) -> tuple:
@@ -4781,7 +4777,6 @@ class ProductSiteCrawler:
             error=final_error,
             thread_count=self.thread_count,
             elapsed_seconds=int(self.elapsed_seconds()),
-            eta_seconds=None,
             finished_at=now_iso() if not partial else "",
             paused_with_result=partial,
         )
@@ -4897,7 +4892,6 @@ class ProductSiteCrawler:
                     active_tasks=0,
                     queue_size=self.queue.qsize(),
                     elapsed_seconds=int(self.elapsed_before_resume),
-                    eta_seconds=None,
                     error=self.fatal_error,
                 )
                 return
@@ -4909,7 +4903,6 @@ class ProductSiteCrawler:
                     status="paused",
                     currenturl="",
                     elapsed_seconds=int(self.elapsed_before_resume),
-                    eta_seconds=None,
                     error="Сбор на паузе",
                 )
                 if (self.project or {}).get("state", {}).get("status") == "paused":
@@ -4922,7 +4915,6 @@ class ProductSiteCrawler:
                     active_tasks=0,
                     queue_size=0,
                     elapsed_seconds=int(self.elapsed_before_resume),
-                    eta_seconds=None,
                     error="",
                     paused_with_result=False,
                 )
@@ -9735,7 +9727,6 @@ def api_project_stop(project_id: str):
                 "active_tasks": 0,
                 "queue_size": 0,
                 "error": "",
-                "eta_seconds": None,
                 "finished_at": now_iso(),
                 "paused_with_result": False,
             }

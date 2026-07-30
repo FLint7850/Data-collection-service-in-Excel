@@ -13,9 +13,6 @@ const createOpen = ref(false);
 const createGroup = ref("Маржа");
 const createBrand = ref("");
 const creating = ref(false);
-const collapsedGroupNames = useState<string[]>("news-collapsed-groups", () => []);
-const collapsedGroups = computed(() => new Set(collapsedGroupNames.value));
-const savedListScrollY = useState<number>("news-list-scroll-y", () => 0);
 const deletingKey = ref("");
 const deleteOpen = ref(false);
 const pageError = ref("");
@@ -100,19 +97,11 @@ const totals = computed(() => ({
   news: brands.value.reduce((total, brand) => total + Number(brand.state.new_count || 0), 0),
 }));
 
-function toggleGroup(group: string) {
-  const next = new Set(collapsedGroups.value);
-  if (next.has(group)) next.delete(group);
-  else next.add(group);
-  collapsedGroupNames.value = [...next];
-}
-
 async function openBrand(brand: BrandGroup) {
   const selected =
     brand.monitors.find((item) => String(item.id) === String(item.primary_donor_id)) ||
     brand.monitors[0];
   if (!selected) return;
-  if (import.meta.client) savedListScrollY.value = window.scrollY;
 
   if (brand.brandId && route.path !== `/news/edit/${brand.brandId}`) {
     await navigateTo(`/news/edit/${brand.brandId}`, { replace: true });
@@ -144,18 +133,6 @@ async function closeModal() {
   if (route.path.startsWith("/news/edit/")) {
     await navigateTo("/news", { replace: true });
   }
-}
-
-async function restoreListScroll() {
-  if (!import.meta.client || savedListScrollY.value <= 0) return;
-  const top = savedListScrollY.value;
-  await nextTick();
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      window.scrollTo({ top, left: 0 });
-      savedListScrollY.value = 0;
-    });
-  });
 }
 
 async function createMonitor() {
@@ -230,8 +207,6 @@ onMounted(async () => {
     await load(true);
     if (props.brandId) {
       await openRequestedBrand(props.brandId);
-    } else {
-      await restoreListScroll();
     }
   } catch (caught) {
     pageError.value = errorMessage(caught, "Не удалось загрузить мониторинг");
@@ -296,35 +271,44 @@ onMounted(async () => {
         class="news-group-panel"
         :ui="{ body: 'p-3' }"
       >
-        <button
-          type="button"
-          class="news-group-header"
-          :aria-expanded="!collapsedGroups.has(section.group)"
-          @click="toggleGroup(section.group)"
-        >
-          <span class="news-group-icon"><UIcon name="i-lucide-layers-3" /></span>
-          <span>
-            <strong>{{ section.group }}</strong>
-            <small>{{ section.items.length }} брендов</small>
-          </span>
-          <UIcon
-            :name="collapsedGroups.has(section.group) ? 'i-lucide-chevron-right' : 'i-lucide-chevron-down'"
-          />
-        </button>
+        <UCollapsible default-open>
+          <template #default="{ open }">
+            <UButton
+              type="button"
+              color="neutral"
+              variant="ghost"
+              block
+              class="news-group-header"
+            >
+              <span class="news-group-icon"><UIcon name="i-lucide-layers-3" /></span>
+              <span>
+                <strong>{{ section.group }}</strong>
+                <small>{{ section.items.length }} брендов</small>
+              </span>
+              <UIcon
+                name="i-lucide-chevron-right"
+                class="settings-details-chevron"
+                :class="{ open }"
+              />
+            </UButton>
+          </template>
 
-        <div v-if="!collapsedGroups.has(section.group)" class="news-brand-grid">
-          <NewsBrandCard
-            v-for="brand in section.items"
-            :key="brand.key"
-            :brand="brand.brand"
-            :group="brand.group"
-            :monitors="brand.monitors"
-            :state="brand.state"
-            @open="openBrand(brand)"
-            @action="runBrandAction(brand, $event)"
-            @remove="requestDelete(brand)"
-          />
-        </div>
+          <template #content>
+            <div class="news-brand-grid">
+              <NewsBrandCard
+                v-for="brand in section.items"
+                :key="brand.key"
+                :brand="brand.brand"
+                :group="brand.group"
+                :monitors="brand.monitors"
+                :state="brand.state"
+                @open="openBrand(brand)"
+                @action="runBrandAction(brand, $event)"
+                @remove="requestDelete(brand)"
+              />
+            </div>
+          </template>
+        </UCollapsible>
       </UCard>
     </div>
 
