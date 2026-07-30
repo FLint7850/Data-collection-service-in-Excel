@@ -3177,6 +3177,11 @@ textarea.code-input {
   gap: 14px;
 }
 
+.news-modal-active-urls {
+  width: 100%;
+  margin-top: 14px;
+}
+
 .inset-panel {
   box-shadow: none;
 }

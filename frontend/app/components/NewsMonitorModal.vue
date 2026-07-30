@@ -30,9 +30,15 @@ const addingDonor = ref(false);
 const confirmDelete = ref(false);
 const error = ref("");
 let lastSavedPayload: MonitorPayload | null = null;
+let liveSyncPending = false;
 
 const connectionOptions = computed(() =>
   props.connectionMethods.map((method) => ({ label: method.name, value: method.code })),
+);
+const activeUrls = computed(() =>
+  (draft.value?.state.active_urls || []).filter(
+    (url): url is string => Boolean(url?.trim()),
+  ),
 );
 const selected = computed(() => monitors.value.find((item) => item.id === selectedId.value) || null);
 const isActive = computed(() =>
@@ -139,6 +145,10 @@ async function load() {
     error.value = errorMessage(caught, "Не удалось открыть настройки донора");
   } finally {
     loading.value = false;
+    if (liveSyncPending && draft.value) {
+      liveSyncPending = false;
+      mergeLiveState(props.liveMonitors);
+    }
   }
 }
 
@@ -150,7 +160,13 @@ watch(selectedId, (id, previous) => {
 
 watch(
   () => props.liveMonitors,
-  (incoming) => mergeLiveState(incoming),
+  (incoming) => {
+    if (loading.value || !draft.value) {
+      liveSyncPending = true;
+      return;
+    }
+    mergeLiveState(incoming);
+  },
 );
 
 async function save(showToast = true) {
@@ -594,8 +610,23 @@ onMounted(load);
           </div>
 
           <aside class="news-progress-column">
-            <ProgressPanel :state="draft.state" :show-status="false" />
+            <ProgressPanel
+              :state="draft.state"
+              :show-status="false"
+              :show-active-urls="false"
+            />
           </aside>
+        </div>
+
+        <div v-if="activeUrls.length" class="active-url-list news-modal-active-urls">
+          <div class="active-url-list-title">
+            <span>Сейчас собираются</span>
+            <UBadge color="primary" variant="subtle">{{ activeUrls.length }}</UBadge>
+          </div>
+          <div v-for="url in activeUrls" :key="url" class="active-url-item">
+            <span class="tiny-dot" />
+            <span>{{ url }}</span>
+          </div>
         </div>
       </div>
     </template>
