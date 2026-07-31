@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { newsService } from "~/services/news.service";
-import type { NewsMonitor, ProgressPayload, ScanState } from "~/types/api";
+import type {
+  NewsBrandSearchResult,
+  NewsMonitor,
+  ProgressPayload,
+  ScanState,
+} from "~/types/api";
 import { errorMessage } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
 
@@ -25,6 +30,13 @@ const creating = ref(false);
 const deletingKey = ref("");
 const deleteOpen = ref(false);
 const pageError = ref("");
+const selectedSearchBrand = ref<NewsBrandSearchResult>();
+const {
+  searchTerm: brandSearchTerm,
+  results: brandSearchResults,
+  loading: brandSearchLoading,
+  error: brandSearchError,
+} = useNewsBrandSearch();
 
 interface BrandGroup {
   key: string;
@@ -130,6 +142,21 @@ async function openRequestedBrand(brandId: string) {
     return;
   }
   await openBrand(brand);
+}
+
+async function openSearchedBrand(brand: NewsBrandSearchResult | undefined) {
+  if (!brand) return;
+  const brandId = String(brand.id);
+  const target = `/news/edit/${brandId}`;
+  selectedSearchBrand.value = undefined;
+  brandSearchTerm.value = "";
+  brandSearchResults.value = [];
+
+  if (route.path === target) {
+    await openRequestedBrand(brandId);
+    return;
+  }
+  await navigateTo(target);
 }
 
 async function closeModal() {
@@ -249,6 +276,7 @@ onMounted(async () => {
     pageError.value = errorMessage(caught, "Не удалось загрузить мониторинг");
   }
 });
+
 </script>
 
 <template>
@@ -259,9 +287,34 @@ onMounted(async () => {
       description="Сверяйте каталоги поставщиков с собственными фидами и выгружайте только новые модели."
     >
       <template #actions>
-        <UButton color="primary" icon="i-lucide-plus" @click="createOpen = true">
-          Добавить бренд
-        </UButton>
+        <div class="flex flex-wrap items-center gap-2">
+          <UInputMenu
+            v-model="selectedSearchBrand"
+            v-model:search-term="brandSearchTerm"
+            :items="brandSearchResults"
+            :loading="brandSearchLoading"
+            label-key="name"
+            by="id"
+            ignore-filter
+            icon="i-lucide-search"
+            placeholder="Найти бренд…"
+            class="w-72 max-w-full"
+            :ui="{ item: 'cursor-pointer' }"
+            @update:model-value="openSearchedBrand"
+          >
+            <template #empty>
+              <span v-if="brandSearchTerm.trim().length < 2">
+                Введите минимум 2 символа
+              </span>
+              <span v-else-if="brandSearchLoading">Ищем бренды…</span>
+              <span v-else-if="brandSearchError">{{ brandSearchError }}</span>
+              <span v-else>Совпадений не найдено</span>
+            </template>
+          </UInputMenu>
+          <UButton color="primary" icon="i-lucide-plus" @click="createOpen = true">
+            Добавить бренд
+          </UButton>
+        </div>
       </template>
     </SectionHeader>
 

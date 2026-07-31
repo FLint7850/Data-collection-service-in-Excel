@@ -192,6 +192,15 @@ export interface NewsBrand {
   donors: NewsMonitor[];
 }
 
+export interface NewsBrandSearchResult {
+  id: number;
+  name: string;
+}
+
+export interface NewsBrandSearchResponse {
+  brands: NewsBrandSearchResult[];
+}
+
 export interface StoredFeed {
   source?: string;
   filename?: string;

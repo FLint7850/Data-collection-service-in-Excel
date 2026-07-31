@@ -36,6 +36,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, g, jsonify as flask_jsonify, request, send_file, session
 from sqlalchemy import delete, select
 from sqlalchemy.exc import OperationalError
+from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from db import SessionLocal, init_db, session_scope
@@ -213,11 +214,14 @@ app.config.update(
 
 @app.errorhandler(Exception)
 def log_unhandled_exception(error: Exception):
+    if isinstance(error, HTTPException):
+        return flask_jsonify({"error": error.description}), error.code or 500
+
     LOG_DIR.mkdir(exist_ok=True)
     with (LOG_DIR / "flask-error.log").open("a", encoding="utf-8") as error_file:
         error_file.write(f"\n[{datetime.now().isoformat(timespec='seconds')}] {request.method} {request.path}\n")
         error_file.write("".join(traceback.format_exception(type(error), error, error.__traceback__)))
-    raise error
+    return flask_jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
 @app.before_request
@@ -8920,6 +8924,29 @@ def api_test_news_email():
     if not send_news_email(None, 0, test=True, error_holder=errors):
         return jsonify({"error": errors[-1] if errors else "Email не отправлен. Проверьте SMTP-настройки и логи мониторинга."}), 500
     return jsonify({"ok": True})
+
+
+@app.get("/api/news/brands")
+def api_search_news_brands():
+    ensure_storage()
+    query = clean_text(str(request.args.get("q") or ""))[:255]
+    if len(query) < 2:
+        return jsonify({"brands": []})
+
+    normalized_query = query.casefold()
+    with session_scope() as session:
+        rows = session.execute(
+            select(Brand.id, Brand.name)
+            .order_by(Brand.name, Brand.id)
+        ).all()
+
+    return jsonify({
+        "brands": [
+            {"id": int(brand_id), "name": str(name)}
+            for brand_id, name in rows
+            if normalized_query in clean_text(str(name or "")).casefold()
+        ],
+    })
 
 
 @app.get("/api/news/brands/<brand_id>")
