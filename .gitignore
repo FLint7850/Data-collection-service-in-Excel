@@ -38,7 +38,8 @@ data/*.db-wal
 *.log
 server-output*.log
 server-error*.log
-runtime/
+runtime/*
+!runtime/*.py
 
 # Local tunnel/runtime tools
 tools/
