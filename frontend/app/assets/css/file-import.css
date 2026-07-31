@@ -1,0 +1,122 @@
+.file-import-layout,
+.settings-page-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(370px, 0.8fr);
+  align-items: start;
+  gap: 14px;
+}
+
+.file-dropzone {
+  display: flex;
+  min-height: 260px;
+  width: 100%;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 20px;
+  border: 1px dashed #36433c;
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 50% 15%, color-mix(in srgb, var(--ui-primary) 5.5%, transparent), transparent 13rem),
+    rgba(0, 0, 0, 0.1);
+  color: #c9d3cd;
+  cursor: pointer;
+  transition: 160ms ease;
+}
+
+.file-dropzone:hover,
+.file-dropzone.active {
+  border-color: var(--mint);
+  background-color: color-mix(in srgb, var(--ui-primary) 3.5%, transparent);
+}
+
+.file-dropzone:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.dropzone-icon {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  margin-bottom: 6px;
+  place-items: center;
+  border-radius: 15px;
+  background: color-mix(in srgb, var(--ui-primary) 9%, transparent);
+  color: var(--mint);
+}
+
+.dropzone-icon svg {
+  width: 24px;
+}
+
+.file-dropzone span:not(.dropzone-icon) {
+  color: var(--muted);
+}
+
+.file-dropzone small {
+  margin-top: 4px;
+  color: var(--muted-2);
+}
+
+.selected-file-card {
+  margin-top: 20px;
+}
+
+.selected-file-card-body {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+}
+
+.file-type-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--ui-primary) 10%, transparent);
+  color: var(--mint);
+}
+
+.file-type-icon svg {
+  width: 19px;
+}
+
+.selected-file-card-body > div {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.selected-file-card strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-file-card span {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.import-action-card {
+  margin-top: 16px;
+}
+
+.file-progress-stats {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 9px;
+  color: var(--muted);
+}
+
+
+.feed-column > .panel-header {
+  margin-bottom: 17px;
+}
+

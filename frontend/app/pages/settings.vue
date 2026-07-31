@@ -317,3 +317,7 @@ onMounted(load);
     </div>
   </div>
 </template>
+
+<style src="../assets/css/file-import.css"></style>
+<style src="../assets/css/feed-comparison.css"></style>
+<style src="../assets/css/settings.css"></style>

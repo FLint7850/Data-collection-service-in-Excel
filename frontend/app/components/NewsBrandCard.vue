@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import type { NewsMonitor, ScanState } from "~/types/api";
+import type { NewsMonitorSummary, NewsSummaryState } from "~/types/api";
 import { formatDateTime, hostFromUrl } from "~/utils/format";
 
 const props = defineProps<{
   brand: string;
   group: string;
-  monitors: NewsMonitor[];
-  state: ScanState;
+  monitors: NewsMonitorSummary[];
+  state: NewsSummaryState;
 }>();
 
 const emit = defineEmits<{

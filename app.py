@@ -1,7 +1,6 @@
 ﻿import json
 import os
 import csv
-import copy
 import hashlib
 import html as html_lib
 import io
@@ -18,7 +17,7 @@ import time
 import traceback
 import uuid
 import zipfile
-from collections import OrderedDict, deque
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
@@ -39,6 +38,7 @@ from sqlalchemy.exc import OperationalError
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from api_dto import news_monitor_dto, news_monitor_state_dto
 from db import SessionLocal, init_db, session_scope
 from models import (
     AppSetting,
@@ -52,6 +52,8 @@ from models import (
     SupplierFeed,
     User,
 )
+from progress_tracker import ProgressTracker
+from query_utils import normalize_search_text
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -308,9 +310,14 @@ news_scan_threads: Dict[str, threading.Thread] = {}
 news_state_persisted_at: Dict[str, float] = {}
 NEWS_TRANSITION_TIMEOUT_SECONDS = 180
 PROGRESS_STREAM_INTERVAL_SECONDS = env_float("PROGRESS_STREAM_INTERVAL_SECONDS", 2.0, minimum=0.5, maximum=30.0)
-PROGRESS_CURSOR_CACHE_LIMIT = 128
-progress_cursor_lock = threading.Lock()
-progress_cursor_cache: "OrderedDict[str, Dict[str, object]]" = OrderedDict()
+progress_tracker = ProgressTracker(
+    journal_limit=env_int(
+        "PROGRESS_REVISION_JOURNAL_LIMIT",
+        4096,
+        minimum=128,
+        maximum=100_000,
+    )
+)
 FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS = env_float(
     "FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS",
     2.0,
@@ -764,12 +771,6 @@ def public_project(project: Dict[str, object], include_details: bool = True) -> 
     return payload
 
 
-def payload_signature(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
-
-
 def projects_progress_payload() -> List[Dict[str, object]]:
     with projects_lock:
         return [public_project(project, include_details=False) for project in projects.values()]
@@ -785,96 +786,30 @@ def news_progress_payload() -> List[Dict[str, object]]:
         ]
 
 
-def progress_item_signatures(
-    items: List[Dict[str, object]],
-) -> Dict[str, Dict[str, str]]:
-    return {
-        str(item["id"]): {
-            "state": payload_signature(item.get("state", {})),
-            "summary": payload_signature(
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key != "state"
-                }
-            ),
-        }
-        for item in items
-    }
-
-
-def remember_progress_cursor(
-    cursor: str,
-    signatures: Dict[str, Dict[str, Dict[str, str]]],
-    project_items: Optional[List[Dict[str, object]]] = None,
-    news_items: Optional[List[Dict[str, object]]] = None,
-) -> None:
-    with progress_cursor_lock:
-        if cursor in progress_cursor_cache:
-            progress_cursor_cache.move_to_end(cursor)
-            return
-    states: Dict[str, Dict[str, Dict[str, object]]] = {}
-    if project_items is not None:
-        states["projects"] = {
-            str(item["id"]): copy.deepcopy(
-                item.get("state", {}) if isinstance(item.get("state"), dict) else {}
-            )
-            for item in project_items
-        }
-    if news_items is not None:
-        states["news"] = {
-            str(item["id"]): copy.deepcopy(
-                item.get("state", {}) if isinstance(item.get("state"), dict) else {}
-            )
-            for item in news_items
-        }
-    with progress_cursor_lock:
-        progress_cursor_cache[cursor] = {
-            "signatures": signatures,
-            "states": states,
-        }
-        progress_cursor_cache.move_to_end(cursor)
-        while len(progress_cursor_cache) > PROGRESS_CURSOR_CACHE_LIMIT:
-            progress_cursor_cache.popitem(last=False)
-
-
 def register_progress_items(
     project_items: Optional[List[Dict[str, object]]] = None,
     news_items: Optional[List[Dict[str, object]]] = None,
-) -> tuple[str, Dict[str, Dict[str, Dict[str, str]]]]:
-    signatures: Dict[str, Dict[str, Dict[str, str]]] = {}
+) -> tuple[str, Dict[str, object]]:
     if project_items is not None:
-        signatures["projects"] = progress_item_signatures(project_items)
+        progress_tracker.synchronize("projects", project_items)
     if news_items is not None:
-        signatures["news"] = progress_item_signatures(news_items)
-    cursor = payload_signature(
-        {
-            "projects": signatures.get("projects") if project_items is not None else None,
-            "news": signatures.get("news") if news_items is not None else None,
-        }
-    )
-    remember_progress_cursor(cursor, signatures, project_items, news_items)
-    return cursor, signatures
+        progress_tracker.synchronize("news", news_items)
+    return progress_tracker.cursor, {}
 
 
-def progress_snapshot(
-    include_projects: bool,
-    include_news: bool,
-) -> tuple[
-    str,
-    Dict[str, List[Dict[str, object]]],
-    Dict[str, Dict[str, Dict[str, str]]],
-]:
-    items: Dict[str, List[Dict[str, object]]] = {}
-    if include_projects:
-        items["projects"] = projects_progress_payload()
-    if include_news:
-        items["news"] = news_progress_payload()
-    cursor, signatures = register_progress_items(
-        items.get("projects") if include_projects else None,
-        items.get("news") if include_news else None,
+def publish_project_progress(project: Dict[str, object]) -> None:
+    progress_tracker.publish(
+        "projects",
+        public_project(project, include_details=False),
     )
-    return cursor, items, signatures
+
+
+def publish_projects_progress_snapshot(*, initialize: bool = False) -> str:
+    return progress_tracker.synchronize(
+        "projects",
+        projects_progress_payload(),
+        initialize=initialize,
+    )
 
 
 def progress_payload(
@@ -882,80 +817,28 @@ def progress_payload(
     include_news: bool,
     previous_cursor: str = "",
 ) -> Dict[str, object]:
-    cursor, items, signatures = progress_snapshot(include_projects, include_news)
-    payload: Dict[str, object] = {"cursor": cursor}
-    if previous_cursor == cursor:
-        return payload
+    sections = []
+    if include_projects:
+        sections.append("projects")
+    if include_news:
+        sections.append("news")
 
-    with progress_cursor_lock:
-        previous = progress_cursor_cache.get(previous_cursor)
-    previous_all_signatures = (
-        previous.get("signatures", {})
-        if isinstance(previous, dict)
-        and isinstance(previous.get("signatures"), dict)
-        else {}
-    )
-    previous_all_states = (
-        previous.get("states", {})
-        if isinstance(previous, dict)
-        and isinstance(previous.get("states"), dict)
-        else {}
-    )
+    delta = progress_tracker.delta(previous_cursor, sections)
+    if delta is not None:
+        return delta
 
-    for section in ("projects", "news"):
-        if section not in items:
-            continue
-        if previous_cursor and previous is None:
-            payload[f"replace_{section}"] = True
-        previous_signatures = previous_all_signatures.get(section, {})
-        previous_states = previous_all_states.get(section, {})
-        state_changes: List[Dict[str, object]] = []
-        upserts: List[Dict[str, object]] = []
-        for item in items[section]:
-            item_id = str(item["id"])
-            previous_item_signatures = previous_signatures.get(item_id)
-            current_item_signatures = signatures[section][item_id]
-            if (
-                previous_item_signatures is None
-                or previous_item_signatures.get("summary")
-                != current_item_signatures["summary"]
-            ):
-                upserts.append(item)
-            elif (
-                previous_item_signatures.get("state")
-                != current_item_signatures["state"]
-            ):
-                current_state = (
-                    item.get("state", {})
-                    if isinstance(item.get("state"), dict)
-                    else {}
-                )
-                previous_state = previous_states.get(item_id, {})
-                state_delta = {
-                    key: copy.deepcopy(value)
-                    for key, value in current_state.items()
-                    if previous_state.get(key) != value
-                }
-                for key in previous_state:
-                    if key not in current_state:
-                        state_delta[key] = None
-                state_changes.append(
-                    {
-                        "id": item_id,
-                        "state": state_delta,
-                    }
-                )
-        removed_ids = [
-            item_id
-            for item_id in previous_signatures
-            if item_id not in signatures[section]
-        ]
-        if state_changes:
-            payload[section] = state_changes
-        if upserts:
-            payload[f"upsert_{section}"] = upserts
-        if removed_ids:
-            payload[f"removed_{section}_ids"] = removed_ids
+    payload: Dict[str, object] = {}
+    if include_projects:
+        project_items = projects_progress_payload()
+        progress_tracker.synchronize("projects", project_items)
+        payload["replace_projects"] = True
+        payload["upsert_projects"] = project_items
+    if include_news:
+        news_items = news_progress_payload()
+        progress_tracker.synchronize("news", news_items)
+        payload["replace_news"] = True
+        payload["upsert_news"] = news_items
+    payload["cursor"] = progress_tracker.cursor
     return payload
 
 
@@ -1028,6 +911,7 @@ def save_projects() -> None:
                 projects[new_key] = projects.pop(old_key)
             if current_ids:
                 session.execute(delete(Project).where(Project.id.not_in(current_ids)))
+        publish_projects_progress_snapshot()
 
 
 def write_logs_file(data: List[Dict[str, object]]) -> None:
@@ -1378,6 +1262,7 @@ def load_projects() -> None:
             projects[project["id"]] = project
             save_projects()
         load_logs()
+        publish_projects_progress_snapshot(initialize=True)
 
 
 def get_project(project_id: str) -> Optional[Dict[str, object]]:
@@ -1402,6 +1287,7 @@ def update_project_state(project: Dict[str, object], **kwargs: object) -> None:
         else:
             project.pop("_last_progress_state", None)
         project["state"] = state
+        publish_project_progress(project)
 
 
 def reset_project_state(project: Dict[str, object], status: str = "idle") -> None:
@@ -1410,6 +1296,7 @@ def reset_project_state(project: Dict[str, object], status: str = "idle") -> Non
     state["status"] = status
     project["state"] = state
     project.pop("_last_progress_state", None)
+    publish_project_progress(project)
 
 
 def project_worker_alive(project: Dict[str, object]) -> bool:
@@ -1774,6 +1661,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
     if row is None:
         row = Brand(
             name=name,
+            search_name=normalize_search_text(name),
             group_name=group_name,
             state=normalize_news_state(monitor.get("brand_state") or monitor.get("state")),
             enabled=bool(monitor.get("enabled", True)),
@@ -1785,6 +1673,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
         session.add(row)
         session.flush()
     else:
+        row.search_name = normalize_search_text(name)
         row.group_name = group_name
         row.state = normalize_news_state(monitor.get("brand_state") or monitor.get("state") or row.state)
         row.enabled = bool(monitor.get("enabled", row.enabled))
@@ -1957,6 +1846,7 @@ def save_news_settings() -> None:
                     row.feed_generate_url = site["feed_generate_url"]
             if current_feed_urls:
                 session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
+        publish_news_progress_snapshot()
 
 
 def load_news_settings() -> None:
@@ -1971,6 +1861,11 @@ def load_news_settings() -> None:
                 .join(Brand, Donor.brand_id == Brand.id)
                 .order_by(Brand.group_name, Brand.name, Donor.id)
             ).all()
+            for donor_row in donor_rows:
+                if donor_row.brand:
+                    donor_row.brand.search_name = normalize_search_text(
+                        donor_row.brand.name
+                    )
             app_setting = session.get(AppSetting, 1)
             if app_setting:
                 settings["auto_cleanup"] = bool(app_setting.auto_cleanup)
@@ -2027,6 +1922,7 @@ def reload_news_monitors_from_db() -> None:
             active_by_id.get(str(monitor.get("id")), monitor)
             for monitor in monitors
         ]
+        publish_news_progress_snapshot()
 
 
 def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str = "info") -> None:
@@ -2204,7 +2100,6 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
                 "product_url_exclusions": normalize_patterns(getattr(donor, "product_url_exclusions", None) or []),
                 "extraction_rules": normalize_extraction_rules(donor.extraction_rules or {}),
                 "selector_settings": normalize_selector_settings(donor.selector_settings or {}),
-                "seen_models": [normalize_model_key(str(value)) for value in (donor.seen_models or []) if str(value).strip()],
                 "created_at": donor.created_at.isoformat(timespec="milliseconds") if donor.created_at else "",
                 "updated_at": donor.updated_at.isoformat(timespec="milliseconds") if donor.updated_at else "",
                 "state": donor_state,
@@ -2239,10 +2134,8 @@ def public_news_brand(brand: Brand) -> Dict[str, object]:
         "donors": donors,
     }
 def public_news_monitor(monitor: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
-    public_monitor = repair_mojibake(dict(monitor))
-    public_monitor.pop("known_new_products", None)
-    public_monitor.pop("brand_state", None)
-    state = normalize_news_state(public_monitor.get("state"))
+    source = repair_mojibake(dict(monitor))
+    state = normalize_news_state(source.get("state"))
     original_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     original_data = original_state.get("data", {}) if isinstance(original_state.get("data"), dict) else {}
     public_data = state.get("data", {}) if isinstance(state.get("data"), dict) else {}
@@ -2258,20 +2151,12 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
     state["csv_ready"] = bool(resolve_export_file(filename))
     if state.get("last_csv"):
         state["last_csv"] = str(repair_mojibake_text(state["last_csv"]) or state["last_csv"])
-    public_monitor["state"] = state
+    source["state"] = news_monitor_state_dto(
+        state,
+        include_details=include_details,
+    )
+    public_monitor = news_monitor_dto(source, include_details=include_details)
     if not include_details:
-        summary_keys = {
-            "id",
-            "brand_id",
-            "primary_donor_id",
-            "group",
-            "brand",
-            "site_url",
-            "start_urls",
-            "enabled",
-            "state",
-        }
-        public_monitor = {key: value for key, value in public_monitor.items() if key in summary_keys}
         start_urls = (
             public_monitor.get("start_urls", [])
             if isinstance(public_monitor.get("start_urls"), list)
@@ -2282,8 +2167,38 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
     return public_monitor
 
 
+def publish_news_monitor_progress(monitor: Dict[str, object]) -> None:
+    progress_tracker.publish(
+        "news",
+        public_news_monitor(monitor, include_details=False),
+    )
+
+
+def publish_news_brand_progress(monitor: Dict[str, object]) -> None:
+    group = clean_text(str(monitor.get("group") or ""))
+    brand = clean_text(str(monitor.get("brand") or ""))
+    with news_lock:
+        brand_monitors = [
+            item
+            for item in news_settings.get("monitors", [])
+            if isinstance(item, dict)
+            and clean_text(str(item.get("group") or "")) == group
+            and clean_text(str(item.get("brand") or "")) == brand
+        ]
+        for item in brand_monitors:
+            publish_news_monitor_progress(item)
+
+
+def publish_news_progress_snapshot(*, initialize: bool = False) -> str:
+    return progress_tracker.synchronize(
+        "news",
+        news_progress_payload(),
+        initialize=initialize,
+    )
+
+
 def public_news_monitor_progress(monitor: Dict[str, object]) -> Dict[str, object]:
-    public_monitor = public_news_monitor(monitor, include_details=False)
+    public_monitor = public_news_monitor(monitor, include_details=True)
     return {
         "id": str(public_monitor["id"]),
         "state": public_monitor["state"],
@@ -7668,6 +7583,7 @@ def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, 
             ):
                 item["state"] = dict(state)
                 item["brand_state"] = dict(state)
+                publish_news_monitor_progress(item)
     if persist:
         persist_news_monitor_state(monitor)
 
@@ -7676,6 +7592,7 @@ def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) 
     monitor_id = str(monitor.get("id") or "").strip()
     if not monitor_id:
         return
+    publish_news_brand_progress(monitor)
     now = time.time()
     if not force and now - news_state_persisted_at.get(monitor_id, 0) < 1:
         return
@@ -8930,21 +8847,22 @@ def api_test_news_email():
 def api_search_news_brands():
     ensure_storage()
     query = clean_text(str(request.args.get("q") or ""))[:255]
-    if len(query) < 2:
+    normalized_query = normalize_search_text(query)
+    if len(normalized_query) < 2:
         return jsonify({"brands": []})
 
-    normalized_query = query.casefold()
     with session_scope() as session:
         rows = session.execute(
             select(Brand.id, Brand.name)
+            .where(Brand.search_name.contains(normalized_query, autoescape=True))
             .order_by(Brand.name, Brand.id)
+            .limit(20)
         ).all()
 
     return jsonify({
         "brands": [
             {"id": int(brand_id), "name": str(name)}
             for brand_id, name in rows
-            if normalized_query in clean_text(str(name or "")).casefold()
         ],
     })
 
@@ -10230,13 +10148,24 @@ def progress_stream():
     include_projects = request.args.get("projects", "1") == "1"
     include_news = request.args.get("news") == "1"
     if request.args.get("once") == "1":
-        return jsonify(
-            progress_payload(
-                include_projects,
-                include_news,
-                str(request.args.get("cursor") or ""),
-            )
+        payload = progress_payload(
+            include_projects,
+            include_news,
+            str(request.args.get("cursor") or ""),
         )
+        detail_monitor_id = str(request.args.get("news_detail") or "")
+        if include_news and detail_monitor_id:
+            detail_monitor = get_news_monitor(detail_monitor_id)
+            if detail_monitor:
+                detail_progress = public_news_monitor_progress(detail_monitor)
+                state_changes = [
+                    item
+                    for item in payload.get("news", [])
+                    if str(item.get("id")) != detail_monitor_id
+                ]
+                state_changes.append(detail_progress)
+                payload["news"] = state_changes
+        return jsonify(payload)
 
     def stream():
         cursor = str(request.args.get("cursor") or "")

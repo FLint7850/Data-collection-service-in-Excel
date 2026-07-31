@@ -1,6 +1,6 @@
 import { newsService } from "~/services/news.service";
 import type {
-  NewsMonitor,
+  NewsMonitorSummary,
   NewsWorkspaceData,
   ProgressPayload,
 } from "~/types/api";
@@ -43,7 +43,7 @@ export function useNews() {
     }
   };
 
-  const upsertMonitor = (monitor: NewsMonitor) => {
+  const upsertMonitor = (monitor: NewsMonitorSummary) => {
     if (!data.value) return;
     data.value.monitors = upsertNewsMonitor(data.value.monitors, monitor);
   };

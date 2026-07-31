@@ -347,37 +347,11 @@ onMounted(async () => {
     </EmptyState>
 
     <div v-else-if="loaded" class="project-layout">
-      <UCard as="aside" variant="outline" class="project-rail panel">
-        <div class="panel-header">
-          <div>
-            <p class="eyebrow">СПИСОК</p>
-            <h3>Проекты</h3>
-          </div>
-          <UBadge color="neutral" variant="subtle">{{ projects.length }}</UBadge>
-        </div>
-        <div class="project-list">
-          <button
-            v-for="project in projects"
-            :key="project.id"
-            type="button"
-            class="project-list-item"
-            :class="{ active: project.id === activeProjectId }"
-            @click="selectProject(project.id)"
-          >
-            <span class="project-list-icon">
-              <UIcon name="i-lucide-folder-kanban" />
-            </span>
-            <span>
-              <strong>{{ project.name }}</strong>
-              <small>
-                {{ project.start_urls_count ?? project.start_urls?.length ?? 0 }}
-                стартовых URL
-              </small>
-            </span>
-            <StatusBadge :status="project.state.status" />
-          </button>
-        </div>
-      </UCard>
+      <ProjectRail
+        :projects="projects"
+        :active-project-id="activeProjectId"
+        @select="selectProject"
+      />
 
       <UCard v-if="detailLoading" variant="outline" class="panel project-loading-card">
         <UIcon name="i-lucide-loader-circle" class="spin" />
@@ -490,57 +464,14 @@ onMounted(async () => {
             </UCard>
           </div>
 
-          <div class="run-actions">
-            <UButton
-              color="primary"
-              icon="i-lucide-play"
-              :loading="actionLoading === 'start' || actionLoading === 'resume'"
-              :disabled="isActive && activeState?.status !== 'paused'"
-              @click="startOrResume"
-            >
-              {{ startButtonLabel }}
-            </UButton>
-            <UButton
-              color="neutral"
-              variant="soft"
-              :icon="activeState?.status === 'paused' ? 'i-lucide-play' : 'i-lucide-pause'"
-              :loading="actionLoading === 'soft-pause'"
-              :disabled="!['running', 'paused'].includes(activeState?.status || '')"
-              @click="activeState?.status === 'paused' ? startOrResume() : runAction('soft-pause')"
-            >
-              {{ activeState?.status === "paused" ? "Продолжить" : "Пауза" }}
-            </UButton>
-            <UButton
-              color="warning"
-              variant="soft"
-              icon="i-lucide-file-check-2"
-              :loading="actionLoading === 'pause'"
-              :disabled="activeState?.status !== 'running'"
-              @click="runAction('pause')"
-            >
-              Пауза с результатом
-            </UButton>
-            <UButton
-              color="neutral"
-              variant="soft"
-              icon="i-lucide-rotate-cw"
-              :loading="actionLoading === 'restart'"
-              :disabled="isActive"
-              @click="runAction('restart')"
-            >
-              Перезапустить
-            </UButton>
-            <UButton
-              color="error"
-              variant="soft"
-              icon="i-lucide-square"
-              :loading="actionLoading === 'stop'"
-              :disabled="!isActive && activeState?.status === 'idle'"
-              @click="runAction('stop')"
-            >
-              Остановить
-            </UButton>
-          </div>
+          <ProjectRunActions
+            :status="activeState?.status || 'idle'"
+            :action-loading="actionLoading"
+            :active="isActive"
+            :start-button-label="startButtonLabel"
+            @start="startOrResume"
+            @action="runAction"
+          />
         </UCard>
 
         <ProgressPanel
@@ -680,3 +611,5 @@ onMounted(async () => {
     </UModal>
   </div>
 </template>
+
+<style src="../assets/css/project.css"></style>

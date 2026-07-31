@@ -48,6 +48,7 @@ class Brand(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    search_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     group_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -73,6 +74,7 @@ class Brand(Base):
 
     __table_args__ = (
         Index("ix_brands_name", "name"),
+        Index("ix_brands_search_name", "search_name"),
         UniqueConstraint("name", "group_name", name="uq_brands_name_group_name"),
     )
 

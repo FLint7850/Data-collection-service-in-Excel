@@ -1,0 +1,110 @@
+.feed-column > .panel-header {
+  margin-bottom: 17px;
+}
+
+.feed-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.feed-card {
+  overflow: hidden;
+}
+
+.feed-card.open {
+  --tw-ring-color: var(--ui-border-accented);
+}
+
+.feed-card-summary {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  background: transparent;
+  padding: 11px;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.feed-card-icon,
+.settings-icon {
+  display: grid;
+  width: 35px;
+  height: 35px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+}
+
+.feed-card-icon svg,
+.settings-icon svg {
+  width: 16px;
+}
+
+.feed-card-summary > span:nth-child(2) {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.feed-card-summary small {
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed-card-summary > svg {
+  width: 14px;
+  color: var(--muted);
+}
+
+.feed-card-body {
+  border-top: 1px solid var(--line-soft);
+  padding: 14px;
+}
+
+.feed-card-actions {
+  justify-content: space-between;
+  margin-top: 14px;
+}
+
+.comparison-progress-panel {
+  margin-top: 14px;
+}
+
+.comparison-progress-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.7fr);
+  gap: 20px;
+  margin-top: 22px;
+}
+
+.comparison-progress-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.comparison-progress-metrics > div {
+  display: flex;
+  justify-content: center;
+  flex-direction: column;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 11px;
+}
+
+.comparison-progress-metrics span {
+  margin-top: 4px;
+  color: var(--muted);
+}
+

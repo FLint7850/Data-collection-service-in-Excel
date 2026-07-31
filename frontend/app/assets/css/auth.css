@@ -1,0 +1,47 @@
+.auth-layout {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at 50% 0, color-mix(in srgb, var(--ui-primary) 9%, transparent), transparent 30rem),
+    linear-gradient(145deg, #080b09, #0c100e);
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.42);
+}
+
+.auth-card-body {
+  padding: 30px;
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.auth-copy {
+  margin: 34px 0 25px;
+}
+
+.auth-copy h1 {
+  margin: 7px 0 9px;
+  font-size: 34px;
+  letter-spacing: -0.045em;
+}
+
+.auth-copy > p:last-child {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+

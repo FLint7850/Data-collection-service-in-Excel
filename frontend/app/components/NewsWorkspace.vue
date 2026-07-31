@@ -3,8 +3,9 @@ import { newsService } from "~/services/news.service";
 import type {
   NewsBrandSearchResult,
   NewsMonitor,
+  NewsMonitorSummary,
+  NewsSummaryState,
   ProgressPayload,
-  ScanState,
 } from "~/types/api";
 import { errorMessage } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
@@ -30,24 +31,17 @@ const creating = ref(false);
 const deletingKey = ref("");
 const deleteOpen = ref(false);
 const pageError = ref("");
-const selectedSearchBrand = ref<NewsBrandSearchResult>();
-const {
-  searchTerm: brandSearchTerm,
-  results: brandSearchResults,
-  loading: brandSearchLoading,
-  error: brandSearchError,
-} = useNewsBrandSearch();
 
 interface BrandGroup {
   key: string;
   group: string;
   brand: string;
   brandId?: number;
-  monitors: NewsMonitor[];
-  state: ScanState;
+  monitors: NewsMonitorSummary[];
+  state: NewsSummaryState;
 }
 
-function aggregateState(monitors: NewsMonitor[]): ScanState {
+function aggregateState(monitors: NewsMonitorSummary[]): NewsSummaryState {
   const active =
     monitors.find((item) =>
       ["running", "queued", "pausing", "stopping"].includes(item.state?.status),
@@ -78,7 +72,7 @@ function aggregateState(monitors: NewsMonitor[]): ScanState {
 }
 
 const brands = computed<BrandGroup[]>(() => {
-  const map = new Map<string, NewsMonitor[]>();
+  const map = new Map<string, NewsMonitorSummary[]>();
   for (const monitor of data.value?.monitors || []) {
     const key = `${monitor.group || "Без группы"}::${monitor.brand || "Без бренда"}`;
     const list = map.get(key) || [];
@@ -148,9 +142,6 @@ async function openSearchedBrand(brand: NewsBrandSearchResult | undefined) {
   if (!brand) return;
   const brandId = String(brand.id);
   const target = `/news/edit/${brandId}`;
-  selectedSearchBrand.value = undefined;
-  brandSearchTerm.value = "";
-  brandSearchResults.value = [];
 
   if (route.path === target) {
     await openRequestedBrand(brandId);
@@ -252,6 +243,7 @@ async function pollProgress() {
       projects: 0,
       news: 1,
       cursor: progressCursor.value || undefined,
+      news_detail: modalOpen.value ? selectedMonitorId.value : undefined,
     },
   });
   mergeProgress(payload);
@@ -287,34 +279,10 @@ onMounted(async () => {
       description="Сверяйте каталоги поставщиков с собственными фидами и выгружайте только новые модели."
     >
       <template #actions>
-        <div class="flex flex-wrap items-center gap-2">
-          <UInputMenu
-            v-model="selectedSearchBrand"
-            v-model:search-term="brandSearchTerm"
-            :items="brandSearchResults"
-            :loading="brandSearchLoading"
-            label-key="name"
-            by="id"
-            ignore-filter
-            icon="i-lucide-search"
-            placeholder="Найти бренд…"
-            class="w-72 max-w-full"
-            :ui="{ item: 'cursor-pointer' }"
-            @update:model-value="openSearchedBrand"
-          >
-            <template #empty>
-              <span v-if="brandSearchTerm.trim().length < 2">
-                Введите минимум 2 символа
-              </span>
-              <span v-else-if="brandSearchLoading">Ищем бренды…</span>
-              <span v-else-if="brandSearchError">{{ brandSearchError }}</span>
-              <span v-else>Совпадений не найдено</span>
-            </template>
-          </UInputMenu>
-          <UButton color="primary" icon="i-lucide-plus" @click="createOpen = true">
-            Добавить бренд
-          </UButton>
-        </div>
+        <NewsBrandToolbar
+          @select="openSearchedBrand"
+          @create="createOpen = true"
+        />
       </template>
     </SectionHeader>
 
@@ -402,7 +370,7 @@ onMounted(async () => {
       </UCard>
     </div>
 
-    <NewsMonitorModal
+    <LazyNewsMonitorModal
       v-if="modalOpen && selectedMonitorId"
       :monitor-id="selectedMonitorId"
       :connection-methods="data?.connection_methods || []"
@@ -411,44 +379,16 @@ onMounted(async () => {
       @changed="handleModalChanged"
     />
 
-    <UModal
-      v-model:open="createOpen"
-      title="Новый бренд"
-      description="Создайте мониторинг бренда и затем добавьте сайты-доноры."
-      :ui="{ content: 'max-w-md' }"
-    >
-      <template #body>
-        <div class="form-stack">
-          <UFormField label="Группа">
-            <UInput v-model="createGroup" placeholder="Например, Маржа" class="w-full" />
-          </UFormField>
-          <UFormField label="Название бренда">
-            <UInput
-              v-model="createBrand"
-              autofocus
-              placeholder="Например, MAUNFELD"
-              class="w-full"
-              @keyup.enter="createMonitor"
-            />
-          </UFormField>
-        </div>
-      </template>
-      <template #footer>
-        <UButton color="neutral" variant="soft" @click="createOpen = false">Отмена</UButton>
-        <UButton color="primary" :loading="creating" @click="createMonitor">Добавить</UButton>
-      </template>
-    </UModal>
-
-    <UModal
-      v-model:open="deleteOpen"
-      title="Удалить бренд?"
-      description="Будут удалены бренд и все привязанные к нему доноры."
-      :ui="{ content: 'max-w-md' }"
-    >
-      <template #footer>
-        <UButton color="neutral" variant="soft" @click="deleteOpen = false">Отмена</UButton>
-        <UButton color="error" @click="deleteBrand">Удалить</UButton>
-      </template>
-    </UModal>
+    <NewsBrandDialogs
+      v-model:create-open="createOpen"
+      v-model:delete-open="deleteOpen"
+      v-model:create-group="createGroup"
+      v-model:create-brand="createBrand"
+      :creating="creating"
+      @create="createMonitor"
+      @remove="deleteBrand"
+    />
   </div>
 </template>
+
+<style src="../assets/css/news.css"></style>

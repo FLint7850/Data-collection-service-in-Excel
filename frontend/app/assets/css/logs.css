@@ -1,0 +1,112 @@
+.logs-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 17px;
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 17px;
+}
+
+.logs-filters {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-search {
+  width: min(360px, 45vw);
+}
+
+.level-select {
+  width: 160px;
+}
+
+.cleanup-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+}
+
+.cleanup-toggle > span {
+  display: flex;
+  flex-direction: column;
+}
+
+.cleanup-toggle small {
+  margin-top: 3px;
+  color: var(--muted);
+}
+
+.logs-loading {
+  min-height: 300px;
+}
+
+.logs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.log-item-body {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 11px;
+}
+
+.log-icon {
+  display: grid;
+  width: 29px;
+  height: 29px;
+  place-items: center;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ui-info) 8%, transparent);
+  color: var(--blue);
+}
+
+.log-icon svg {
+  width: 14px;
+}
+
+.log-item--success .log-icon {
+  background: color-mix(in srgb, var(--ui-primary) 8%, transparent);
+  color: var(--mint);
+}
+
+.log-item--warning .log-icon {
+  background: color-mix(in srgb, var(--ui-warning) 8%, transparent);
+  color: var(--amber);
+}
+
+.log-item--error .log-icon {
+  background: color-mix(in srgb, var(--ui-error) 8%, transparent);
+  color: var(--red);
+}
+
+.log-copy {
+  min-width: 0;
+}
+
+.log-copy > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-copy span {
+  color: var(--muted-2);
+}
+
+.log-copy p {
+  margin: 5px 0 0;
+  color: #aeb9b2;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+

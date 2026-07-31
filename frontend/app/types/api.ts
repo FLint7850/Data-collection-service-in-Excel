@@ -87,6 +87,12 @@ export interface ScanState {
   paused_with_result?: boolean;
 }
 
+export type NewsSummaryState = Pick<
+  ScanState,
+  "status" | "percent" | "error"
+> &
+  Partial<ScanState>;
+
 export interface Project {
   id: string;
   name: string;
@@ -124,7 +130,7 @@ export interface ProgressPayload {
   projects?: ProgressEntity[];
   news?: ProgressEntity[];
   upsert_projects?: Project[];
-  upsert_news?: NewsMonitor[];
+  upsert_news?: NewsMonitorSummary[];
   removed_projects_ids?: string[];
   removed_news_ids?: string[];
   replace_projects?: boolean;
@@ -148,7 +154,7 @@ export interface SmtpSettings {
   recipients: string[];
 }
 
-export interface NewsMonitor {
+export interface NewsMonitorSummary {
   id: string;
   brand_id?: number;
   primary_donor_id?: number | string | null;
@@ -158,6 +164,11 @@ export interface NewsMonitor {
   start_urls: string[];
   start_urls_count?: number;
   enabled: boolean;
+  state: NewsSummaryState;
+}
+
+export interface NewsMonitor extends NewsMonitorSummary {
+  state: ScanState;
   schedule_type: "daily" | "weekly" | "once" | string;
   scan_time: string;
   weekday: number;
@@ -170,7 +181,6 @@ export interface NewsMonitor {
   product_url_exclusions: string[];
   extraction_rules: ExtractionRules;
   selector_settings: SelectorSettings;
-  state: ScanState;
   created_at?: string;
   brand_created_at?: string;
 }
@@ -224,7 +234,7 @@ export interface NewsSettings {
 }
 
 export interface NewsWorkspaceData {
-  monitors: NewsMonitor[];
+  monitors: NewsMonitorSummary[];
   connection_methods: ConnectionMethod[];
   progress_cursor?: string;
 }

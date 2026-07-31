@@ -362,3 +362,5 @@ onMounted(load);
     </template>
   </div>
 </template>
+
+<style src="../assets/css/feed-comparison.css"></style>

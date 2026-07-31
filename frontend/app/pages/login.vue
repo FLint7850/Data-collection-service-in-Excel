@@ -108,7 +108,7 @@ async function submit() {
         Войти в сервис
       </UButton>
     </form>
-
-    <p class="auth-footnote">Защищённая локальная сессия · cookies HttpOnly</p>
   </UCard>
 </template>
+
+<style src="../assets/css/auth.css"></style>

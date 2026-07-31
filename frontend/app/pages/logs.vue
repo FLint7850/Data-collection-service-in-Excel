@@ -244,3 +244,5 @@ onMounted(load);
     </UModal>
   </div>
 </template>
+
+<style src="../assets/css/logs.css"></style>

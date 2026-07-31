@@ -1,10 +1,10 @@
-import type { NewsMonitor, ProgressPayload } from "../types/api";
+import type { NewsMonitorSummary, ProgressPayload } from "../types/api";
 import { mergeProgressState } from "./progress-state";
 
 export function mergeNewsMonitor(
-  current: NewsMonitor | undefined,
-  incoming: NewsMonitor,
-): NewsMonitor {
+  current: NewsMonitorSummary | undefined,
+  incoming: NewsMonitorSummary,
+): NewsMonitorSummary {
   if (!current) return incoming;
   return {
     ...current,
@@ -14,9 +14,9 @@ export function mergeNewsMonitor(
 }
 
 export function upsertNewsMonitor(
-  monitors: NewsMonitor[],
-  incoming: NewsMonitor,
-): NewsMonitor[] {
+  monitors: NewsMonitorSummary[],
+  incoming: NewsMonitorSummary,
+): NewsMonitorSummary[] {
   const index = monitors.findIndex((monitor) => monitor.id === incoming.id);
   if (index === -1) return [...monitors, incoming];
   return monitors.map((monitor, currentIndex) =>
@@ -25,9 +25,9 @@ export function upsertNewsMonitor(
 }
 
 export function mergeNewsProgress(
-  current: NewsMonitor[],
+  current: NewsMonitorSummary[],
   payload: ProgressPayload,
-): NewsMonitor[] {
+): NewsMonitorSummary[] {
   const hasChanges = Boolean(
     payload.replace_news ||
       payload.upsert_news?.length ||

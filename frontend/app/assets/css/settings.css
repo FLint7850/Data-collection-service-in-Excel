@@ -1,0 +1,94 @@
+.site-settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.site-settings-card {
+  min-width: 0;
+}
+
+.site-settings-card-body {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px;
+}
+
+.site-settings-fields {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  grid-template-columns: 0.65fr 1fr 1fr;
+  gap: 10px;
+}
+
+.smtp-form {
+  margin-top: 20px;
+}
+
+.settings-actions {
+  justify-content: flex-start;
+  margin-top: 16px;
+}
+
+.stored-feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 15px;
+}
+
+.stored-feed-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: var(--panel-2);
+  padding: 9px;
+  transition: 150ms ease;
+}
+
+.stored-feed-item:hover {
+  border-color: #37413c;
+  background: var(--panel-3);
+}
+
+.stored-feed-item > span:first-child {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--ui-info) 9%, transparent);
+  color: var(--blue);
+}
+
+.stored-feed-item svg {
+  width: 14px;
+}
+
+.stored-feed-item > div {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.stored-feed-item strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stored-feed-item small {
+  margin-top: 3px;
+  color: var(--muted);
+}
+
+.stored-feed-item > svg {
+  color: var(--muted);
+}
+

@@ -433,6 +433,7 @@ def migrate_news_tables(connection) -> None:
     # Additive migration only: never drop/recreate brands or donors in production data.
     if brand_columns:
         brand_additions = {
+            "search_name": "VARCHAR(255) NOT NULL DEFAULT ''",
             "group_name": "VARCHAR(255) NOT NULL DEFAULT ''",
             "enabled": "BOOLEAN NOT NULL DEFAULT 1",
             "schedule_type": "VARCHAR(32) NOT NULL DEFAULT 'daily'",
@@ -459,6 +460,7 @@ def migrate_news_tables(connection) -> None:
                 )
             )
         connection.execute(text("UPDATE brands SET group_name = 'Маржа' WHERE group_name IS NULL OR trim(group_name) = ''"))
+        connection.execute(text("UPDATE brands SET search_name = lower(trim(name)) WHERE search_name IS NULL OR trim(search_name) = ''"))
         connection.execute(text("UPDATE brands SET enabled = 1 WHERE enabled IS NULL"))
         connection.execute(text("UPDATE brands SET schedule_type = 'daily' WHERE schedule_type IS NULL OR trim(schedule_type) = ''"))
         connection.execute(text("UPDATE brands SET scan_time = '01:00' WHERE scan_time IS NULL OR trim(scan_time) = ''"))
@@ -466,6 +468,7 @@ def migrate_news_tables(connection) -> None:
         connection.execute(text("UPDATE brands SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
         connection.execute(text("UPDATE brands SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_search_name ON brands (search_name)"))
 
     if donor_columns:
         if "connections_method" in donor_columns and "connection_method" not in donor_columns:
@@ -587,6 +590,7 @@ def migrate_news_tables(connection) -> None:
     )
     if not brand_needs_rebuild and not donor_needs_rebuild:
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_search_name ON brands (search_name)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
         return
 
@@ -606,6 +610,7 @@ def migrate_news_tables(connection) -> None:
         "CREATE TABLE brands ("
         "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
         "name VARCHAR(255) NOT NULL, "
+        "search_name VARCHAR(255) NOT NULL DEFAULT '', "
         "group_name VARCHAR(255) NOT NULL DEFAULT '', "
         f"state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}', "
         "enabled BOOLEAN NOT NULL DEFAULT 1, "
@@ -646,6 +651,7 @@ def migrate_news_tables(connection) -> None:
         )
     )
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_name ON brands (name)"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_brands_search_name ON brands (search_name)"))
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_donors_brand_id ON donors (brand_id)"))
 
     inserted_brand_ids = set()
@@ -657,8 +663,8 @@ def migrate_news_tables(connection) -> None:
         connection.execute(
             text(
                 "INSERT OR IGNORE INTO brands "
-                "(id, name, group_name, state, enabled, schedule_type, scan_time, weekday, next_run_at, created_at, updated_at) "
-                "VALUES (:id, :name, :group_name, json(:state), :enabled, :schedule_type, :scan_time, :weekday, :next_run_at, :created_at, :updated_at)"
+                "(id, name, search_name, group_name, state, enabled, schedule_type, scan_time, weekday, next_run_at, created_at, updated_at) "
+                "VALUES (:id, :name, lower(trim(:name)), :group_name, json(:state), :enabled, :schedule_type, :scan_time, :weekday, :next_run_at, :created_at, :updated_at)"
             ),
             {
                 "id": brand_id,

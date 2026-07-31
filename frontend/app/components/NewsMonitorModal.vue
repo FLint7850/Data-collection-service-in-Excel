@@ -3,14 +3,18 @@ import {
   newsService,
   type MonitorPayload,
 } from "~/services/news.service";
-import type { ConnectionMethod, NewsMonitor } from "~/types/api";
-import { errorMessage, hostFromUrl } from "~/utils/format";
+import type {
+  ConnectionMethod,
+  NewsMonitor,
+  NewsMonitorSummary,
+} from "~/types/api";
+import { errorMessage } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
 
 const props = defineProps<{
   monitorId: string;
   connectionMethods: ConnectionMethod[];
-  liveMonitors: NewsMonitor[];
+  liveMonitors: NewsMonitorSummary[];
 }>();
 
 const emit = defineEmits<{
@@ -111,7 +115,7 @@ function setDraft(monitor: NewsMonitor) {
   ) as MonitorPayload;
 }
 
-function mergeLiveState(incoming: NewsMonitor[]) {
+function mergeLiveState(incoming: NewsMonitorSummary[]) {
   if (!incoming.length) return;
   monitors.value = monitors.value.map((monitor) => {
     const live = incoming.find((item) => String(item.id) === String(monitor.id));
@@ -290,73 +294,19 @@ onMounted(load);
     <template #title>
       <div class="flex gap-3 items-center">
         {{draft?.brand || 'Настройки донора'}}
-        <div v-if="draft">
-          <USwitch v-model="draft.enabled" />
-        </div>
       </div>
     </template>
     <template #actions>
-      <div v-if="draft" class="news-run-actions flex-1 justify-between">
-        <StatusBadge :status="draft.state.status" context="news" size="xl" />
-        <div class="flex gap-1">
-          <UButton
-              v-if="draft.state.csv_ready"
-              :to="`/api/news/monitors/${draft.id}/download`"
-              external
-              color="primary"
-              variant="soft"
-              icon="i-lucide-download"
-          >
-            Скачать CSV
-          </UButton>
-          <UButton
-              v-if="!isActive && !canResume"
-              icon="i-lucide-radar"
-              :loading="actionLoading === 'scan'"
-              @click="runAction('scan')"
-          >
-            Проверить новинки
-          </UButton>
-          <UButton
-              v-if="canResume"
-              color="primary"
-              icon="i-lucide-play"
-              :loading="actionLoading === 'resume'"
-              @click="runAction('resume')"
-          >
-            Продолжить
-          </UButton>
-          <UButton
-              v-if="['running', 'queued'].includes(draft.state.status)"
-              color="warning"
-              variant="soft"
-              icon="i-lucide-pause"
-              :loading="actionLoading === 'pause'"
-              @click="runAction('pause')"
-          >
-            Пауза
-          </UButton>
-          <UButton
-              v-if="isActive"
-              color="error"
-              variant="soft"
-              icon="i-lucide-square"
-              :loading="actionLoading === 'stop'"
-              @click="runAction('stop')"
-          >
-            Стоп
-          </UButton>
-          <UButton
-              v-if="!isActive"
-              color="neutral"
-              variant="ghost"
-              icon="i-lucide-rotate-ccw"
-              @click="runAction('reset-visual')"
-          >
-            Сбросить
-          </UButton>
-        </div>
-      </div>
+      <NewsRunActions
+        v-if="draft"
+        v-model:enabled="draft.enabled"
+        :state="draft.state"
+        :monitor-id="draft.id"
+        :action-loading="actionLoading"
+        :active="isActive"
+        :can-resume="canResume"
+        @action="runAction"
+      />
     </template>
 
     <template #body>
@@ -392,42 +342,13 @@ onMounted(load);
 
         <div class="news-modal-grid">
           <div class="news-settings-column">
-            <UCard as="section" variant="outline" class="panel">
-              <div class="panel-header">
-                <div>
-                  <p class="eyebrow">ДОНОРЫ</p>
-                  <h2><strong>Добавить сайт</strong></h2>
-                </div>
-              </div>
-              <div class="add-donor-form">
-                <UInput v-model="addDonorUrl" placeholder="https://supplier.ru" class="w-full" />
-                <UButton
-                    color="neutral"
-                    variant="soft"
-                    icon="i-lucide-plus"
-                    :loading="addingDonor"
-                    :disabled="!addDonorUrl.trim()"
-                    @click="addDonor"
-                >
-                  Добавить
-                </UButton>
-              </div>
-              <div class="donor-mini-list">
-                <button
-                    v-for="monitor in monitors"
-                    :key="monitor.id"
-                    type="button"
-                    :class="{ active: monitor.id === selectedId }"
-                    @click="selectedId = monitor.id"
-                >
-                  <span class="tiny-dot" />
-                  <span>
-                    <strong>{{ hostFromUrl(monitor.site_url || monitor.start_urls?.[0]) }}</strong>
-                    <small>{{ monitor.start_urls.length }} стартовых URL</small>
-                  </span>
-                </button>
-              </div>
-            </UCard>
+            <NewsDonorSelector
+              v-model:selected-id="selectedId"
+              v-model:add-url="addDonorUrl"
+              :monitors="monitors"
+              :adding="addingDonor"
+              @add="addDonor"
+            />
 
             <UCard as="section" variant="outline" class="panel">
               <div class="panel-header">

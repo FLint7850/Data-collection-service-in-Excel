@@ -1,0 +1,141 @@
+.project-layout {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+
+.project-rail {
+  position: sticky;
+  top: 96px;
+}
+
+.project-rail > [data-slot="body"] {
+  padding: 14px 10px;
+}
+
+.project-rail .panel-header {
+  padding: 4px 7px 12px;
+}
+
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.project-list-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 61px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  background: transparent;
+  padding: 9px;
+  color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  transition: 150ms ease;
+}
+
+.project-list-item:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.project-list-item.active {
+  border-color: color-mix(in srgb, var(--ui-primary) 14%, transparent);
+  background: color-mix(in srgb, var(--ui-primary) 7.5%, transparent);
+}
+
+.project-list-item > span:nth-child(2) {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.project-list-item strong {
+  overflow: hidden;
+  color: #dce4df;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-list-item small {
+  margin-top: 4px;
+  color: var(--muted-2);
+}
+
+.project-list-item .status-badge {
+  grid-column: 2;
+  width: max-content;
+  margin-top: -2px;
+}
+
+.project-list-icon {
+  display: grid;
+  grid-row: 1 / 3;
+  width: 33px;
+  height: 33px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--panel-3);
+  color: #78847d;
+}
+
+.project-list-icon svg {
+  width: 15px;
+}
+
+.project-list-item.active .project-list-icon {
+  background: color-mix(in srgb, var(--ui-primary) 12%, transparent);
+  color: var(--mint);
+}
+
+.project-main,
+.settings-side-column,
+.news-settings-column,
+.news-progress-column {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.project-loading-card {
+  min-height: 260px;
+}
+
+.project-loading-card > [data-slot="body"] {
+  display: flex;
+  min-height: 258px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted);
+}
+
+.project-loading-card svg {
+  width: 20px;
+}
+
+.panel-header > div > p:not(.eyebrow) {
+  max-width: 610px;
+  margin: 7px 0 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+
+.project-error-card {
+  color: var(--muted);
+}
+
+.project-error-card > svg {
+  width: 28px;
+  height: 28px;
+  color: var(--red);
+}
