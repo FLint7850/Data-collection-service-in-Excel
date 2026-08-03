@@ -345,6 +345,11 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         self.assertEqual(sites[0]["id"], 17)
 
+    def test_explicit_empty_own_sites_do_not_restore_the_default_feed(self) -> None:
+        from services.news import own_sites_from_settings
+
+        self.assertEqual(own_sites_from_settings({"own_sites": []}), [])
+
     def test_suspicious_xlsx_compression_is_rejected(self) -> None:
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:

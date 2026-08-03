@@ -2,7 +2,7 @@
 
 from flask import Blueprint
 
-from runtime.news_tasks import feed_source_label, send_news_email
+from runtime.news_tasks import send_news_email
 from config import DEFAULT_FEED_GENERATE_URL, DEFAULT_FEED_URL
 from flask import request
 from runtime.state import news_lock, news_settings
@@ -47,13 +47,11 @@ def api_update_news_settings():
                 for item in own_sites
                 if item.get("feed_generate_url")
             ]
-            feed_urls = feed_urls or [DEFAULT_FEED_URL]
-            feed_generate_urls = feed_generate_urls or [DEFAULT_FEED_GENERATE_URL]
-            news_settings["own_sites"] = own_sites or [{"name": feed_source_label(DEFAULT_FEED_URL), "feed_url": DEFAULT_FEED_URL, "feed_generate_url": DEFAULT_FEED_GENERATE_URL}]
+            news_settings["own_sites"] = own_sites
             news_settings["feed_urls"] = feed_urls
-            news_settings["feed_url"] = feed_urls[0] if feed_urls else DEFAULT_FEED_URL
+            news_settings["feed_url"] = feed_urls[0] if feed_urls else ""
             news_settings["feed_generate_urls"] = feed_generate_urls
-            news_settings["feed_generate_url"] = feed_generate_urls[0] if feed_generate_urls else DEFAULT_FEED_GENERATE_URL
+            news_settings["feed_generate_url"] = feed_generate_urls[0] if feed_generate_urls else ""
         if "feed_url" in payload:
             news_settings["feed_url"] = str(payload.get("feed_url") or DEFAULT_FEED_URL).strip()
         if "feed_generate_url" in payload:

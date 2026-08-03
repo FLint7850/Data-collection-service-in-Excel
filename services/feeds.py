@@ -195,6 +195,9 @@ def sync_own_sites_runtime(db_session) -> None:
         if payload:
             news_settings["feed_url"] = str(payload[0]["feed_url"])
             news_settings["feed_generate_url"] = str(payload[0].get("feed_generate_url") or "")
+        else:
+            news_settings["feed_url"] = ""
+            news_settings["feed_generate_url"] = ""
     bump_domain_revision("feed_comparison")
     bump_domain_revision("settings")
 

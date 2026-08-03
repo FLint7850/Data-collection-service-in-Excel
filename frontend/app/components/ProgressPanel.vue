@@ -2,19 +2,23 @@
 import type { ScanState } from "~/types/api";
 import { formatDateTime, formatDuration } from "~/utils/format";
 
-const props = defineProps<{
-  state: ScanState;
-  downloadUrl?: string;
-  showStatus?: boolean;
-  showActiveUrls?: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    state: ScanState;
+    downloadUrl?: string;
+    showStatus?: boolean;
+    showActiveUrls?: boolean;
+    showNewsSummary?: boolean;
+  }>(),
+  { showNewsSummary: true },
+);
 
 const percent = computed(() => Math.max(0, Math.min(100, Number(props.state.percent || 0))));
 const activeUrls = computed(() =>
   (props.state.active_urls || []).filter((url): url is string => Boolean(url?.trim())),
 );
 const hasNewsSummary = computed(() =>
-  [
+  props.showNewsSummary && [
     props.state.new_count,
     props.state.candidate_products,
     props.state.compared_products,

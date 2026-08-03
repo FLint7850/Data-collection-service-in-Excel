@@ -449,6 +449,7 @@ onMounted(async () => {
         <ProgressPanel
           :state="activeState!"
           :download-url="`/api/projects/${draft.id}/download`"
+          :show-news-summary="false"
         />
 
         <ProjectFiltersPanel v-model="draft" :disabled="isActive" />

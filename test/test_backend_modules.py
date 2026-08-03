@@ -136,6 +136,33 @@ class BackendModuleTests(unittest.TestCase):
 
         self.assertEqual(payload, {"revision": "settings-r2"})
 
+    def test_settings_accept_an_explicit_empty_feed_list(self) -> None:
+        from app import app
+        from routes.settings import api_update_news_settings
+
+        settings = {"monitors": []}
+        with (
+            app.test_request_context(
+                "/api/news/settings",
+                method="PATCH",
+                json={"own_sites": []},
+            ),
+            patch("routes.settings.ensure_storage"),
+            patch("routes.settings.news_settings", settings),
+            patch("routes.settings.save_news_configuration"),
+            patch("routes.settings.bump_domain_revision"),
+            patch(
+                "routes.settings.public_news_configuration",
+                return_value={"own_sites": []},
+            ),
+        ):
+            response = api_update_news_settings()
+
+        self.assertEqual(response.get_json()["own_sites"], [])
+        self.assertEqual(settings["own_sites"], [])
+        self.assertEqual(settings["feed_urls"], [])
+        self.assertEqual(settings["feed_generate_urls"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -400,8 +400,7 @@ def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, objec
             if site_id:
                 site["id"] = site_id
             sites.append(site)
-        if sites:
-            return sites
+        return sites
     feed_urls = normalize_feed_urls(settings.get("feed_urls") or settings.get("feed_url") or DEFAULT_FEED_URL, DEFAULT_FEED_URL)
     generate_urls = normalize_feed_urls(settings.get("feed_generate_urls") or settings.get("feed_generate_url") or DEFAULT_FEED_GENERATE_URL, DEFAULT_FEED_GENERATE_URL)
     sites = []
@@ -468,6 +467,8 @@ def synchronize_news_settings() -> None:
                     row.feed_generate_url = site["feed_generate_url"]
             if current_feed_urls:
                 session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
+            else:
+                session.execute(delete(OwnSite))
         publish_news_progress_snapshot()
 
 
@@ -644,6 +645,12 @@ def load_news_settings() -> None:
                 settings["feed_generate_urls"] = generate_urls
                 settings["feed_url"] = feed_urls[0]
                 settings["feed_generate_url"] = generate_urls[0] if generate_urls else DEFAULT_FEED_GENERATE_URL
+            else:
+                settings["own_sites"] = []
+                settings["feed_urls"] = []
+                settings["feed_generate_urls"] = []
+                settings["feed_url"] = ""
+                settings["feed_generate_url"] = ""
             settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
             recover_interrupted_news_scans(settings["monitors"])
             ensure_brand_primary_flags(settings["monitors"])

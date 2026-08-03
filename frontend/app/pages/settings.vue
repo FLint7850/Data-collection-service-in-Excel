@@ -2,6 +2,7 @@
 import { newsService } from "~/services/news.service";
 import type { NewsConfiguration, OwnSite, SmtpSettings } from "~/types/api";
 import { errorMessage } from "~/utils/format";
+import { cloneOwnSites, mergeOwnSiteMembership } from "~/utils/settings-sites";
 
 definePageMeta({
   title: "Настройки",
@@ -54,7 +55,7 @@ function configurationSmtp(value: NewsConfiguration): Partial<SmtpSettings> {
 }
 
 function replaceData(value: NewsConfiguration) {
-  const remoteSites = cloneValue(value.own_sites || []);
+  const remoteSites = cloneOwnSites(value.own_sites || []);
   const remoteSmtp = configurationSmtp(value);
 
   data.value = value;
@@ -65,7 +66,7 @@ function replaceData(value: NewsConfiguration) {
   smtp.username = remoteSmtp.username || "";
   smtp.password = "";
   smtp.recipients = (remoteSmtp.recipients || []).join("\n");
-  lastSavedSites = remoteSites;
+  lastSavedSites = cloneOwnSites(remoteSites);
   lastSavedSmtp = remoteSmtp;
 }
 
@@ -75,37 +76,13 @@ function applyRemoteData(value: NewsConfiguration) {
     return;
   }
 
-  const remoteSites = cloneValue(value.own_sites || []);
-  const remoteIds = new Set(
-    remoteSites
-      .filter((site) => site.id != null)
-      .map((site) => String(site.id)),
+  const membership = mergeOwnSiteMembership(
+    sites.value,
+    lastSavedSites || [],
+    value.own_sites || [],
   );
-  const nextSites = sites.value.filter(
-    (site) => site.id == null || remoteIds.has(String(site.id)),
-  );
-  const currentIds = new Set(
-    nextSites
-      .filter((site) => site.id != null)
-      .map((site) => String(site.id)),
-  );
-  for (const site of remoteSites) {
-    if (site.id == null || currentIds.has(String(site.id))) continue;
-    nextSites.push(site);
-    currentIds.add(String(site.id));
-  }
-  sites.value = nextSites;
-
-  const savedById = new Map(
-    (lastSavedSites || [])
-      .filter((site) => site.id != null)
-      .map((site) => [String(site.id), site]),
-  );
-  lastSavedSites = remoteSites.map((site) =>
-    site.id == null
-      ? site
-      : cloneValue(savedById.get(String(site.id)) || site),
-  );
+  sites.value = membership.sites;
+  lastSavedSites = membership.savedSites;
 
   data.value = {
     ...data.value,
