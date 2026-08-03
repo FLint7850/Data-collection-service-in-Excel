@@ -196,8 +196,7 @@ onMounted(load);
     >
       <template #actions>
         <UButton
-          color="neutral"
-          variant="soft"
+          color="primary"
           icon="i-lucide-save"
           :loading="saving"
           :disabled="isActive"
@@ -294,63 +293,68 @@ onMounted(load);
               @click="removeFile"
             />
           </UCard>
+        </UCard>
 
-          <UCard variant="subtle" class="import-action-card">
-            <div class="progress-value-row">
-              <div>
-                <span class="eyebrow">ШАГ 3</span>
-                <strong>{{ data.state.stage || "Готово к сравнению" }}</strong>
-              </div>
-              <strong>{{ data.state.percent }}%</strong>
+        <UCard
+          variant="subtle"
+          class="import-action-card"
+          :ui="{ body: 'h-full flex flex-col' }"
+        >
+
+          <div class="progress-value-row">
+            <div>
+              <span class="eyebrow">ШАГ 3</span>
+              <strong>{{ data.state.stage || "Готово к сравнению" }}</strong>
             </div>
-            <UProgress :model-value="data.state.percent" color="primary" size="sm" />
+            <strong>{{ data.state.percent }}%</strong>
+          </div>
+          <UProgress :model-value="data.state.percent" color="primary" size="sm" />
 
-            <div class="file-progress-stats">
-              <span>{{ data.state.processed_rows }} обработано</span>
-              <span>{{ data.state.current_row }} / {{ data.state.total_rows }}</span>
-            </div>
+          <div class="file-progress-stats">
+            <span>{{ data.state.processed_rows }} обработано</span>
+            <span>{{ data.state.current_row }} / {{ data.state.total_rows }}</span>
+          </div>
 
-            <UAlert
+          <UAlert
               v-if="data.state.error"
               color="error"
               variant="subtle"
               icon="i-lucide-triangle-alert"
               :description="data.state.error"
-            />
+          />
 
-            <div class="run-actions compact-run-actions">
-              <UButton
+          <div class="run-actions" style="justify-content: space-between; margin-top: auto">
+            <UButton
                 v-if="!isActive"
                 color="primary"
                 icon="i-lucide-git-compare-arrows"
                 :loading="actionLoading === 'compare'"
                 :disabled="!hasFile"
                 @click="compare"
-              >
-                Сравнить
-              </UButton>
-              <UButton
+            >
+              Сравнить
+            </UButton>
+            <UButton
                 v-else
                 color="error"
                 variant="soft"
                 icon="i-lucide-square"
                 :loading="actionLoading === 'stop'"
                 @click="stop"
-              >
-                Остановить
-              </UButton>
-              <UButton
+            >
+              Остановить
+            </UButton>
+            <UButton
                 v-if="data.result_ready"
                 to="/api/file-import/download"
                 external
                 color="primary"
                 variant="soft"
                 icon="i-lucide-download"
-              >
-                Скачать XLSX
-              </UButton>
-            </div>
-          </UCard>
+            >
+              Скачать XLSX
+            </UButton>
+          </div>
         </UCard>
       </div>
     </template>

@@ -1,8 +1,8 @@
 .file-import-layout,
 .settings-page-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(370px, 0.8fr);
-  align-items: start;
+  grid-template-columns: repeat(3, 1fr);
+  align-items: stretch;
   gap: 14px;
 }
 
@@ -102,10 +102,6 @@
 .selected-file-card span {
   margin-top: 4px;
   color: var(--muted);
-}
-
-.import-action-card {
-  margin-top: 16px;
 }
 
 .file-progress-stats {
