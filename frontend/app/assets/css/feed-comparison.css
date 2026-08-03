@@ -24,6 +24,12 @@
   --tw-ring-color: var(--ui-border-accented);
 }
 
+.supplier-fields-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .feed-card-summary {
   display: flex;
   width: 100%;
@@ -110,8 +116,25 @@
   padding: 11px;
 }
 
+@media (max-width: 1040px) {
+  .feed-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 860px) {
+  .supplier-fields-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 680px) {
+  .supplier-fields-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 .comparison-progress-metrics span {
   margin-top: 4px;
   color: var(--muted);
 }
-

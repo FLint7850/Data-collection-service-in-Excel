@@ -148,6 +148,10 @@ def api_update_supplier_feed(supplier_id: int):
     row.name = data["name"]
     row.feed_url = data["feed_url"]
     row.model_field = data["model_field"]
+    row.name_field = data["name_field"]
+    row.price_field = data["price_field"]
+    row.brand_field = data["brand_field"]
+    row.url_field = data["url_field"]
     row.exclusions = data["exclusions"]
     row.replace_rules = data["replace_rules"]
     g.db.flush()
@@ -207,5 +211,4 @@ def api_download_feed_comparison():
     if not path:
         return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(path.name))
-
 

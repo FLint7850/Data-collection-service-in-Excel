@@ -92,14 +92,48 @@ function submit() {
               />
             </UFormField>
             <template v-else>
-              <UFormField label="Поле модели в XML">
-                <UInput
-                  v-model="(draft as SupplierFeed).model_field"
-                  :disabled="disabled"
-                  placeholder="model или param:Модель"
-                  class="w-full"
-                />
-              </UFormField>
+              <div class="supplier-fields-row">
+                <UFormField label="Поле модели">
+                  <UInput
+                    v-model="(draft as SupplierFeed).model_field"
+                    :disabled="disabled"
+                    placeholder="model или param:Модель"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField label="Поле названия">
+                  <UInput
+                    v-model="(draft as SupplierFeed).name_field"
+                    :disabled="disabled"
+                    placeholder="name"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField label="Поле цены">
+                  <UInput
+                    v-model="(draft as SupplierFeed).price_field"
+                    :disabled="disabled"
+                    placeholder="price"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField label="Поле бренда">
+                  <UInput
+                    v-model="(draft as SupplierFeed).brand_field"
+                    :disabled="disabled"
+                    placeholder="vendor"
+                    class="w-full"
+                  />
+                </UFormField>
+                <UFormField label="Поле URL">
+                  <UInput
+                    v-model="(draft as SupplierFeed).url_field"
+                    :disabled="disabled"
+                    placeholder="url"
+                    class="w-full"
+                  />
+                </UFormField>
+              </div>
               <SettingsCollapsible content-class="form-stack">
                 <template #label>Исключения и правила</template>
                 <UFormField label="Исключения">
@@ -128,7 +162,7 @@ function submit() {
               variant="soft"
               icon="i-lucide-save"
               :loading="saving"
-              :disabled="disabled || !draft.name.trim() || !draft.feed_url.trim()"
+              :disabled="disabled || !draft.name.trim() || !draft.feed_url.trim() || (isSupplier && !(draft as SupplierFeed).model_field.trim())"
               @click="submit"
             >
               Сохранить

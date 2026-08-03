@@ -300,6 +300,10 @@ export interface SupplierFeed {
   name: string;
   feed_url: string;
   model_field: string;
+  name_field: string;
+  price_field: string;
+  brand_field: string;
+  url_field: string;
   exclusions: string;
   exclusions_list?: string[];
   replace_rules: string;

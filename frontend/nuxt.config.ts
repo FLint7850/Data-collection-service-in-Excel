@@ -24,7 +24,7 @@ export default defineNuxtConfig({
         },
         { name: "theme-color", content: "#0b0e0d" },
       ],
-      link: [{ rel: "icon", type: "image/png", href: "/logo.png" }],
+      link: [{ rel: "icon", type: "image/svg+xml", href: "/logo.svg" }],
     },
   },
   runtimeConfig: {

@@ -7,7 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -47,6 +47,111 @@ class TargetedPersistenceTests(IsolatedDatabaseTestCase):
         with self.Session() as session:
             self.assertIsNone(session.get(Project, first_id))
             self.assertEqual(session.get(Project, second_id).name, "Second")
+
+
+class SupplierFeedConfigurationTests(unittest.TestCase):
+    def test_supplier_payload_keeps_configured_optional_fields(self) -> None:
+        from services.feeds import validate_feed_comparison_site_payload
+
+        payload = validate_feed_comparison_site_payload(
+            {
+                "name": "Поставщик",
+                "feed_url": "https://example.test/feed.xml",
+                "model_field": "<model>",
+                "name_field": "<product_name>",
+                "price_field": "price",
+                "brand_field": "param:Бренд",
+                "url_field": " ",
+            },
+            supplier=True,
+        )
+
+        self.assertEqual(payload["model_field"], "model")
+        self.assertEqual(payload["name_field"], "product_name")
+        self.assertEqual(payload["price_field"], "price")
+        self.assertEqual(payload["brand_field"], "param:Бренд")
+        self.assertEqual(payload["url_field"], "")
+
+    def test_csv_reads_only_explicitly_configured_optional_columns(self) -> None:
+        from services.feeds import read_supplier_feed_rows
+
+        content = (
+            "SKU;Название поставщика;Стоимость;Марка поставщика;Карточка\n"
+            "A-1;Чайник;12990;MAUNFELD;https://example.test/a-1\n"
+        ).encode("utf-8")
+
+        configured = read_supplier_feed_rows(
+            content,
+            "SKU",
+            name_field="Название поставщика",
+            price_field="Стоимость",
+            brand_field="Марка поставщика",
+            url_field="Карточка",
+        )
+        without_optional_fields = read_supplier_feed_rows(content, "SKU")
+
+        self.assertEqual(
+            configured[0],
+            {
+                "row_number": 2,
+                "source_model": "A-1",
+                "name": "Чайник",
+                "price": "12990",
+                "brand": "MAUNFELD",
+                "url": "https://example.test/a-1",
+            },
+        )
+        self.assertEqual(without_optional_fields[0]["name"], "A-1")
+        self.assertEqual(without_optional_fields[0]["price"], "")
+        self.assertEqual(without_optional_fields[0]["brand"], "")
+        self.assertEqual(without_optional_fields[0]["url"], "")
+
+    def test_xml_reads_only_explicitly_configured_optional_fields(self) -> None:
+        from services.feeds import read_supplier_feed_rows
+
+        content = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <offers><offer>
+          <sku>A-1</sku><display>Chaynik</display><cost>12990</cost>
+          <maker>MAUNFELD</maker><href>https://example.test/a-1</href>
+        </offer></offers>"""
+
+        rows = read_supplier_feed_rows(
+            content,
+            "sku",
+            name_field="display",
+            price_field="cost",
+            brand_field="maker",
+            url_field="href",
+        )
+
+        self.assertEqual(rows[0]["name"], "Chaynik")
+        self.assertEqual(rows[0]["price"], "12990")
+        self.assertEqual(rows[0]["brand"], "MAUNFELD")
+        self.assertEqual(rows[0]["url"], "https://example.test/a-1")
+
+    def test_runtime_migration_adds_supplier_field_columns(self) -> None:
+        from database.session import migrate_supplier_feeds_table
+
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE supplier_feeds ("
+                        "id INTEGER PRIMARY KEY, model_field VARCHAR(255) NOT NULL, "
+                        "exclusions JSON NOT NULL DEFAULT '[]', "
+                        "replace_rules TEXT NOT NULL DEFAULT ''"
+                        ")"
+                    )
+                )
+                migrate_supplier_feeds_table(connection)
+            columns = {column["name"] for column in inspect(engine).get_columns("supplier_feeds")}
+        finally:
+            engine.dispose()
+
+        self.assertTrue(
+            {"name_field", "price_field", "brand_field", "url_field"}.issubset(columns)
+        )
 
 
 class LogStorageTests(IsolatedDatabaseTestCase):

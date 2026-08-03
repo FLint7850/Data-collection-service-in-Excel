@@ -19,6 +19,10 @@ function addSupplier() {
     name: "",
     feed_url: "",
     model_field: "",
+    name_field: "",
+    price_field: "",
+    brand_field: "",
+    url_field: "",
     exclusions: "",
     replace_rules: "",
   });
@@ -33,7 +37,7 @@ function addSupplier() {
           <div>
             <p class="eyebrow">ИСТОЧНИКИ</p>
             <h2><strong>Фиды поставщиков</strong></h2>
-            <p>Для каждого поставщика укажите точное имя XML-поля с моделью.</p>
+            <p>Для каждого поставщика укажите обязательное поле модели и нужные поля результата.</p>
           </div>
           <div class="flex flex-col gap-3">
             <UIcon

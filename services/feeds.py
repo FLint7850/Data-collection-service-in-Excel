@@ -133,6 +133,10 @@ def public_supplier_feed(row: SupplierFeed) -> Dict[str, object]:
         "name": clean_text(str(row.name or "")),
         "feed_url": str(row.feed_url or ""),
         "model_field": normalize_supplier_model_field(row.model_field),
+        "name_field": normalize_supplier_model_field(getattr(row, "name_field", "")),
+        "price_field": normalize_supplier_model_field(getattr(row, "price_field", "")),
+        "brand_field": normalize_supplier_model_field(getattr(row, "brand_field", "")),
+        "url_field": normalize_supplier_model_field(getattr(row, "url_field", "")),
         "exclusions": "\n".join(exclusions),
         "replace_rules": normalize_file_import_rules_text(getattr(row, "replace_rules", "")),
     }
@@ -218,6 +222,8 @@ def validate_feed_comparison_site_payload(payload: object, supplier: bool = Fals
         if not model_field:
             raise ValueError("Укажите название поля модели в фиде поставщика")
         result["model_field"] = model_field
+        for field_name in ("name_field", "price_field", "brand_field", "url_field"):
+            result[field_name] = normalize_supplier_model_field(data.get(field_name))[:255]
         result["exclusions"] = normalize_file_import_exclusions(data.get("exclusions"))
         result["replace_rules"] = normalize_file_import_rules_text(data.get("replace_rules"))
     else:
@@ -382,13 +388,15 @@ def supplier_csv_rows(content: bytes) -> tuple[Iterable[List[str]], List[str], i
     return iter(()), [], 1
 
 
-def supplier_csv_optional_column_index(headers: List[object], aliases: Iterable[str]) -> Optional[int]:
+def supplier_csv_optional_column_index(headers: List[object], field_name: str) -> Optional[int]:
     from services.file_import_service import normalize_file_import_header
+    configured_field = normalize_supplier_model_field(field_name)
+    if not configured_field:
+        return None
     normalized_headers = [normalize_file_import_header(header) for header in headers]
-    for alias in aliases:
-        expected = normalize_file_import_header(alias)
-        if expected in normalized_headers:
-            return normalized_headers.index(expected)
+    expected = normalize_file_import_header(configured_field)
+    if expected in normalized_headers:
+        return normalized_headers.index(expected)
     return None
 
 
@@ -432,20 +440,15 @@ def supplier_xlsx_available_fields(content: bytes, limit: int = 20) -> List[str]
             workbook.close()
 
 
-def supplier_xml_alias_value(node: ET.Element, aliases: Iterable[str]) -> str:
-    expected = {str(alias).casefold() for alias in aliases}
-    for child in list(node):
-        if xml_local_name(child.tag).casefold() in expected:
-            value = clean_text(" ".join(child.itertext()))
-            if value:
-                return value
-    return ""
-
-
 def read_supplier_xml_feed_rows(
     content: bytes,
     model_field: str,
     stop_event: Optional[threading.Event] = None,
+    *,
+    name_field: str = "",
+    price_field: str = "",
+    brand_field: str = "",
+    url_field: str = "",
 ) -> List[Dict[str, object]]:
     from services.file_import_service import normalize_compare_key, stop_file_import_if_requested
     rows: List[Dict[str, object]] = []
@@ -458,20 +461,20 @@ def read_supplier_xml_feed_rows(
             source_model = supplier_xml_field_value(node, model_field)
             if not source_model:
                 continue
-            source_url = supplier_xml_alias_value(node, ("url", "link"))
+            source_url = supplier_xml_field_value(node, url_field)
             dedupe_key = f"{normalize_compare_key(source_model)}|{source_url.casefold()}"
             if dedupe_key in seen:
                 node.clear()
                 continue
             seen.add(dedupe_key)
-            name = supplier_xml_alias_value(node, ("name", "title", "product_name")) or source_model
+            name = supplier_xml_field_value(node, name_field) or source_model
             rows.append(
                 {
                     "row_number": len(rows) + 1,
                     "source_model": source_model,
                     "name": name,
-                    "price": supplier_xml_alias_value(node, ("price", "retail_price", "base_price")),
-                    "brand": supplier_xml_alias_value(node, ("vendor", "brand", "manufacturer")),
+                    "price": supplier_xml_field_value(node, price_field),
+                    "brand": supplier_xml_field_value(node, brand_field),
                     "url": source_url,
                 }
             )
@@ -488,6 +491,11 @@ def read_supplier_tabular_feed_rows(
     model_field: str,
     feed_format: str,
     stop_event: Optional[threading.Event] = None,
+    *,
+    name_field: str = "",
+    price_field: str = "",
+    brand_field: str = "",
+    url_field: str = "",
 ) -> List[Dict[str, object]]:
     from services.file_import_service import file_import_cell_text, file_import_column_index, normalize_compare_key, stop_file_import_if_requested
     if not headers:
@@ -503,34 +511,10 @@ def read_supplier_tabular_feed_rows(
             f'В {feed_format}-фиде не найдена колонка модели "{configured_field}".{available_hint}'
         ) from exc
 
-    name_index = supplier_csv_optional_column_index(
-        headers,
-        (
-            "наименование товара",
-            "название товара",
-            "наименование",
-            "название"
-            "товар",
-            "product name",
-            "product_name",
-            "item name",
-            "item_name",
-            "name",
-            "title",
-        ),
-    )
-    price_index = supplier_csv_optional_column_index(
-        headers,
-        ("цена", "price", "retail_price", "base_price"),
-    )
-    brand_index = supplier_csv_optional_column_index(
-        headers,
-        ("фирма", "бренд", "производитель", "марка", "vendor", "brand", "manufacturer"),
-    )
-    url_index = supplier_csv_optional_column_index(
-        headers,
-        ("url", "ссылка", "ссылка на товар", "product_url", "link"),
-    )
+    name_index = supplier_csv_optional_column_index(headers, name_field)
+    price_index = supplier_csv_optional_column_index(headers, price_field)
+    brand_index = supplier_csv_optional_column_index(headers, brand_field)
+    url_index = supplier_csv_optional_column_index(headers, url_field)
 
     rows: List[Dict[str, object]] = []
     seen: Set[str] = set()
@@ -572,6 +556,11 @@ def read_supplier_csv_feed_rows(
     content: bytes,
     model_field: str,
     stop_event: Optional[threading.Event] = None,
+    *,
+    name_field: str = "",
+    price_field: str = "",
+    brand_field: str = "",
+    url_field: str = "",
 ) -> List[Dict[str, object]]:
     try:
         source_rows, headers, first_row_number = supplier_csv_rows(content)
@@ -584,6 +573,10 @@ def read_supplier_csv_feed_rows(
         model_field,
         "CSV",
         stop_event=stop_event,
+        name_field=name_field,
+        price_field=price_field,
+        brand_field=brand_field,
+        url_field=url_field,
     )
 
 
@@ -591,6 +584,11 @@ def read_supplier_xlsx_feed_rows(
     content: bytes,
     model_field: str,
     stop_event: Optional[threading.Event] = None,
+    *,
+    name_field: str = "",
+    price_field: str = "",
+    brand_field: str = "",
+    url_field: str = "",
 ) -> List[Dict[str, object]]:
     workbook = None
     try:
@@ -602,6 +600,10 @@ def read_supplier_xlsx_feed_rows(
             model_field,
             "XLSX",
             stop_event=stop_event,
+            name_field=name_field,
+            price_field=price_field,
+            brand_field=brand_field,
+            url_field=url_field,
         )
     finally:
         if workbook is not None:
@@ -612,13 +614,30 @@ def read_supplier_feed_rows(
     content: bytes,
     model_field: str,
     stop_event: Optional[threading.Event] = None,
+    *,
+    name_field: str = "",
+    price_field: str = "",
+    brand_field: str = "",
+    url_field: str = "",
 ) -> List[Dict[str, object]]:
     feed_format = detect_supplier_feed_format(content)
+    field_kwargs = {
+        "name_field": name_field,
+        "price_field": price_field,
+        "brand_field": brand_field,
+        "url_field": url_field,
+    }
     if feed_format == "xml":
-        return read_supplier_xml_feed_rows(content, model_field, stop_event=stop_event)
+        return read_supplier_xml_feed_rows(
+            content, model_field, stop_event=stop_event, **field_kwargs
+        )
     if feed_format == "xlsx":
-        return read_supplier_xlsx_feed_rows(content, model_field, stop_event=stop_event)
-    return read_supplier_csv_feed_rows(content, model_field, stop_event=stop_event)
+        return read_supplier_xlsx_feed_rows(
+            content, model_field, stop_event=stop_event, **field_kwargs
+        )
+    return read_supplier_csv_feed_rows(
+        content, model_field, stop_event=stop_event, **field_kwargs
+    )
 
 
 def prepare_supplier_feed_item(
@@ -762,7 +781,15 @@ def compare_supplier_feeds(
             current_supplier=supplier.name,
         )
         db.commit()
-        source_rows = read_supplier_feed_rows(content, supplier.model_field, stop_event=stop_event)
+        source_rows = read_supplier_feed_rows(
+            content,
+            supplier.model_field,
+            stop_event=stop_event,
+            name_field=supplier.name_field,
+            price_field=supplier.price_field,
+            brand_field=supplier.brand_field,
+            url_field=supplier.url_field,
+        )
         if not source_rows:
             configured_field = normalize_supplier_model_field(supplier.model_field)
             feed_format = detect_supplier_feed_format(content)
@@ -955,5 +982,4 @@ def start_feed_comparison() -> Dict[str, object]:
 
 def feed_comparison_worker_alive() -> bool:
     return bool(feed_comparison_worker_thread and feed_comparison_worker_thread.is_alive())
-
 

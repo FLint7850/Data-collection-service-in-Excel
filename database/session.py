@@ -406,6 +406,17 @@ def migrate_supplier_feeds_table(connection) -> None:
     columns = table_columns(connection, "supplier_feeds")
     if not columns:
         return
+    field_additions = {
+        "name_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "price_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "brand_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "url_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+    }
+    for column_name, definition in field_additions.items():
+        if column_name not in columns:
+            connection.execute(
+                text(f"ALTER TABLE supplier_feeds ADD COLUMN {column_name} {definition}")
+            )
     if "exclusions" not in columns:
         connection.execute(text("ALTER TABLE supplier_feeds ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
     if "replace_rules" not in columns:
