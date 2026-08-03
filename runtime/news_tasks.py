@@ -1,76 +1,35 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    BeautifulSoup,
-    Brand,
-    DEFAULT_EXCLUSIONS,
-    Dict,
-    ET,
-    EXPORT_DIR,
-    EmailMessage,
-    FEED_DIR,
-    FEED_SNAPSHOT_CACHE_SECONDS,
-    FEED_SNAPSHOT_RETAIN,
-    FEED_STORAGE_LOCK,
-    FEED_WORKER_COUNT,
-    FIRST_COMPLETED,
-    List,
-    MSK_TZ,
-    NEWS_PROGRESS_FIELDS,
-    NEWS_TRANSITION_TIMEOUT_SECONDS,
-    OperationalError,
-    Optional,
-    PROJECT_PROFILE_DIR,
-    Path,
-    SCHEDULE_DUE_GRACE_SECONDS,
-    Set,
-    ThreadPoolExecutor,
-    as_completed,
-    csv,
-    datetime,
-    datetime_time,
-    datetime_to_input_value,
-    feed_snapshot_cache,
-    get_donor_row,
-    io,
-    news_lock,
-    news_scan_threads,
-    news_scheduler_thread,
-    news_settings,
-    news_state_persisted_at,
-    news_stop_events,
-    news_stop_modes,
-    normalize_connection_method,
-    normalize_emails,
-    normalize_extraction_rules,
-    normalize_model_key,
-    normalize_patterns,
-    normalize_start_urls,
-    os,
-    output_text,
-    parse_db_int,
-    parse_qsl,
-    re,
-    repair_mojibake,
-    repair_mojibake_text,
-    requests,
-    safe_filename,
-    scan_dispatcher,
-    select,
-    session_scope,
-    shutil,
-    smtplib,
-    ssl,
-    threading,
-    time,
-    timedelta,
-    urlencode,
-    urlparse,
-    urlunparse,
-    uuid,
-    wait,
-)
-from services.scraping_service import (
+from datetime import time as datetime_time
+import csv
+import io
+import os
+import re
+import requests
+import shutil
+import smtplib
+import ssl
+import threading
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from config import DEFAULT_EXCLUSIONS, EXPORT_DIR, FEED_DIR, FEED_SNAPSHOT_CACHE_SECONDS, FEED_SNAPSHOT_RETAIN, FEED_WORKER_COUNT, MSK_TZ, NEWS_TRANSITION_TIMEOUT_SECONDS, PROJECT_PROFILE_DIR, SCHEDULE_DUE_GRACE_SECONDS
+from database.session import session_scope
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+from models import Brand, utc_now
+from pathlib import Path
+from runtime import state as runtime_state
+from runtime.state import FEED_STORAGE_LOCK, NEWS_PROGRESS_FIELDS, feed_snapshot_cache, news_lock, news_scan_threads, news_settings, news_state_persisted_at, news_stop_events, news_stop_modes
+from services.connections import get_donor_row, normalize_connection_method
+from services.normalization import datetime_to_input_value, normalize_emails, normalize_extraction_rules, normalize_model_key, normalize_patterns, normalize_start_urls, output_text, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+from typing import Dict, List, Optional, Set
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from services.scraping import (
     BotasaurusBrowserSession,
     ProductSiteCrawler,
     clean_text,
@@ -80,6 +39,8 @@ from services.scraping_service import (
     first_by_selector,
     first_text,
 )
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import selectinload
 
 
 class CollectOnlyCrawler(ProductSiteCrawler):
@@ -216,16 +177,6 @@ def generation_file_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-def clear_source_feeds(source: str) -> Path:
-    feed_dir = source_feed_dir(source)
-    if feed_dir.exists():
-        for path in feed_dir.glob("*"):
-            if path.is_file():
-                path.unlink(missing_ok=True)
-    feed_dir.mkdir(parents=True, exist_ok=True)
-    return feed_dir
-
-
 def make_feed_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -241,24 +192,26 @@ def make_feed_session() -> requests.Session:
 
 def trigger_feed_generation(generate_url: str) -> None:
     try:
-        response = make_feed_session().get(generation_file_url(generate_url), timeout=60)
-        response.raise_for_status()
+        with make_feed_session().get(generation_file_url(generate_url), timeout=60) as response:
+            response.raise_for_status()
     except Exception:
         pass
 
 
 def download_feed_site(index: int, site: Dict[str, str], snapshot_dir: Path, snapshot: str) -> Optional[Dict[str, object]]:
+    from services.file_validation import write_limited_response
     url = site["feed_url"]
+    temporary_path: Optional[Path] = None
     try:
-        response = make_feed_session().get(url, timeout=60)
-        response.raise_for_status()
-        source = feed_source_key(url)
-        feed_dir = snapshot_dir / source
-        feed_dir.mkdir(parents=True, exist_ok=True)
-        filename = local_feed_filename("feed", index, url)
-        path = feed_dir / filename
-        temporary_path = path.with_suffix(path.suffix + ".part")
-        temporary_path.write_bytes(response.content)
+        with make_feed_session().get(url, timeout=60, stream=True) as response:
+            response.raise_for_status()
+            source = feed_source_key(url)
+            feed_dir = snapshot_dir / source
+            feed_dir.mkdir(parents=True, exist_ok=True)
+            filename = local_feed_filename("feed", index, url)
+            path = feed_dir / filename
+            temporary_path = path.with_suffix(path.suffix + ".part")
+            write_limited_response(response, temporary_path)
         os.replace(temporary_path, path)
         return {
             "kind": "feed",
@@ -271,6 +224,8 @@ def download_feed_site(index: int, site: Dict[str, str], snapshot_dir: Path, sna
             "downloaded_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         }
     except Exception:
+        if temporary_path:
+            temporary_path.unlink(missing_ok=True)
         return None
 
 
@@ -311,10 +266,9 @@ def wait_feed_futures(futures, stop_event: Optional[threading.Event]) -> List[ob
 
 def download_feed_files(stop_event: Optional[threading.Event] = None) -> List[Dict[str, object]]:
     from services.file_import_service import FileImportStopped, stop_file_import_if_requested
-    from services.news_service import own_sites_from_settings
+    from services.news import own_sites_from_settings
     with news_lock:
         own_sites = own_sites_from_settings(news_settings)
-        feed_urls = [site["feed_url"] for site in own_sites]
         generate_urls = [site["feed_generate_url"] for site in own_sites if site.get("feed_generate_url")]
     signature = tuple((site["feed_url"], site.get("feed_generate_url", "")) for site in own_sites)
     with FEED_STORAGE_LOCK:
@@ -377,14 +331,8 @@ def download_feed_files(stop_event: Optional[threading.Event] = None) -> List[Di
         return downloaded
 
 
-def fetch_existing_vendor_codes() -> tuple[Set[str], List[Dict[str, object]]]:
-    codes, feeds, _feed_code_sets = fetch_existing_vendor_code_sets()
-    return codes, feeds
-
-
 def fetch_existing_vendor_code_sets() -> tuple[Set[str], List[Dict[str, object]], List[Dict[str, object]]]:
-    from services.log_service import save_logs
-    from services.news_service import save_news_settings
+    from services.news import save_news_configuration
     downloaded_feeds = download_feed_files()
     codes: Set[str] = set()
     feeds: List[Dict[str, object]] = []
@@ -403,8 +351,7 @@ def fetch_existing_vendor_code_sets() -> tuple[Set[str], List[Dict[str, object]]
             feed_code_sets.append({**feed, "codes_count": 0, "codes": set(), "error": str(exc)})
     with news_lock:
         news_settings["feed_storage"] = feeds
-        save_news_settings()
-    save_logs()
+        save_news_configuration()
     return codes, feeds, feed_code_sets
 
 
@@ -465,34 +412,6 @@ def parse_vendor_codes_from_xml(content: bytes) -> Set[str]:
     return codes
 
 
-def parse_feed_products_from_xml(content: bytes) -> List[Dict[str, object]]:
-    products: List[Dict[str, object]] = []
-    root = ET.fromstring(content)
-    for node in root.iter():
-        children = list(node)
-        if not children:
-            continue
-        values: Dict[str, str] = {}
-        for child in children:
-            key = str(child.tag).split("}")[-1].lower()
-            values[key] = clean_text(child.text or "")
-        vendor_code = normalize_model_key(values.get("vendorcode", ""))
-        model = values.get("model") or values.get("name") or values.get("title") or vendor_code
-        model_key = normalize_model_key(model)
-        if not vendor_code and not model_key:
-            continue
-        products.append(
-            {
-                "vendor_code": vendor_code,
-                "model_key": model_key,
-                "name": values.get("name") or values.get("model") or values.get("title") or "",
-                "url": values.get("url") or "",
-                "raw": values,
-            }
-        )
-    return products
-
-
 def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
     selector_fields = []
     rules = monitor.get("extraction_rules", {}) if isinstance(monitor.get("extraction_rules"), dict) else {}
@@ -512,7 +431,7 @@ def validate_monitor_selectors(monitor: Dict[str, object]) -> None:
 
 
 def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, **kwargs: object) -> None:
-    from services.news_service import make_news_state
+    from services.news import make_news_state
     from services.progress_service import has_positive_progress_value, is_active_status, merge_stable_progress_state, publish_news_monitor_progress
     with news_lock:
         previous_state = dict(monitor.get("state", make_news_state()))
@@ -560,7 +479,7 @@ def update_news_monitor_state(monitor: Dict[str, object], persist: bool = True, 
 
 
 def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) -> None:
-    from services.news_service import normalize_news_state
+    from services.news import normalize_news_state
     from services.progress_service import publish_news_brand_progress
     monitor_id = str(monitor.get("id") or "").strip()
     if not monitor_id:
@@ -577,7 +496,7 @@ def persist_news_monitor_state(monitor: Dict[str, object], force: bool = False) 
                 donor = get_donor_row(session, monitor_id)
                 if donor is None:
                     return
-                donor.updated_at = datetime.utcnow()
+                donor.updated_at = utc_now()
                 if donor.brand:
                     donor.brand.state = state
             return
@@ -596,28 +515,39 @@ def news_monitor_thread_alive(monitor_id: object) -> bool:
     return isinstance(thread, threading.Thread) and thread.is_alive()
 
 
-def enqueue_news_scan(monitor_id: str, manual: bool) -> bool:
+def start_news_scan(monitor_id: str, manual: bool) -> bool:
     monitor_id = str(monitor_id)
 
     def run() -> None:
-        from services.news_service import get_news_monitor
-        monitor = get_news_monitor(monitor_id)
-        state = monitor.get("state", {}) if monitor else {}
-        if monitor and state.get("status") == "queued":
-            scan_news_monitor(monitor_id, manual)
+        try:
+            from services.news import get_news_monitor
+            monitor = get_news_monitor(monitor_id)
+            state = monitor.get("state", {}) if monitor else {}
+            if monitor and state.get("status") == "queued":
+                scan_news_monitor(monitor_id, manual)
+        finally:
+            with news_lock:
+                if news_scan_threads.get(monitor_id) is threading.current_thread():
+                    news_scan_threads.pop(monitor_id, None)
 
-    def on_start(thread: threading.Thread) -> None:
-        with news_lock:
-            news_scan_threads[monitor_id] = thread
-
-    def on_finish(thread: threading.Thread) -> None:
+    with news_lock:
+        current = news_scan_threads.get(monitor_id)
+        if isinstance(current, threading.Thread) and current.is_alive():
+            return False
+        thread = threading.Thread(
+            target=run,
+            name=f"news-scan-{monitor_id}",
+            daemon=True,
+        )
+        news_scan_threads[monitor_id] = thread
+    try:
+        thread.start()
+    except Exception:
         with news_lock:
             if news_scan_threads.get(monitor_id) is thread:
                 news_scan_threads.pop(monitor_id, None)
-
-    return scan_dispatcher.enqueue(
-        ("news", monitor_id), run, on_start=on_start, on_finish=on_finish
-    )
+        raise
+    return True
 
 
 def transition_requested_at(monitor: Dict[str, object]) -> Optional[datetime]:
@@ -682,7 +612,7 @@ def update_brand_scan_state(
     new_count: int = 0,
     data: Optional[Dict[str, object]] = None,
 ) -> None:
-    from services.news_service import make_news_state, normalize_news_state
+    from services.news import make_news_state, normalize_news_state
     from services.progress_service import progress_int
     if target_type not in {"news", "donor"}:
         return
@@ -744,7 +674,7 @@ def get_news_stop_event(monitor_id: str) -> threading.Event:
 
 
 def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
-    from services.news_service import get_news_monitor
+    from services.news import get_news_monitor
     event = get_news_stop_event(monitor_id)
     monitor: Optional[Dict[str, object]] = None
     with news_lock:
@@ -770,14 +700,14 @@ def collect_products_for_monitor(
     stop_signal: threading.Event,
     browser_session: BotasaurusBrowserSession,
 ) -> List[Dict[str, str]]:
-    from services.project_service import parse_thread_count
+    from services.projects import parse_thread_count
     finish_signal = threading.Event()
     start_urls = normalize_start_urls(monitor.get("start_urls") or "", allow_empty=True)
     if not start_urls:
         raise RuntimeError("У донора не указаны стартовые URL для сканирования.")
 
     def progress_callback(payload: Dict[str, object]) -> None:
-        from services.news_service import add_news_log
+        from services.news import add_news_log
         log_message = str(payload.get("log_message") or "").strip()
         log_level = str(payload.get("log_level") or "info").strip() or "info"
         if log_message:
@@ -911,7 +841,7 @@ def enrich_news_product(
 
 
 def create_news_csv(rows: List[Dict[str, str]], monitor: Dict[str, object], filename: str = "") -> Path:
-    from services.news_service import news_csv_filename
+    from services.news import news_csv_filename
     if not filename:
         filename = news_csv_filename(monitor)
     filename = output_text(filename)
@@ -1044,7 +974,7 @@ def enrich_news_candidates(
     browser_session: BotasaurusBrowserSession,
     progress_callback,
 ) -> List[Dict[str, str]]:
-    from services.project_service import parse_thread_count
+    from services.projects import parse_thread_count
     candidates: List[tuple[int, Dict[str, str]]] = []
     resolved: List[Optional[Dict[str, str]]] = [None] * len(products)
 
@@ -1102,69 +1032,6 @@ def enrich_news_candidates(
     return [item for item in resolved if item]
 
 
-def send_news_email_legacy(
-    monitor: Optional[Dict[str, object]],
-    new_count: int,
-    test: bool = False,
-    error_holder: Optional[List[str]] = None,
-    missing_summary: Optional[List[Dict[str, object]]] = None,
-) -> bool:
-    from services.news_service import add_news_log, default_smtp_settings
-    with news_lock:
-        smtp_config = dict(news_settings.get("smtp", {}))
-    recipients = normalize_emails(smtp_config.get("recipients", []))
-    username = str(smtp_config.get("username") or "").strip()
-    password = str(smtp_config.get("password") or "").strip()
-    sender_emails = normalize_emails(username)
-    if not username or not password or not recipients:
-        error_message = "Email не отправлен: заполните email-логин, пароль приложения и получателей SMTP"
-        error_message = str(repair_mojibake_text(error_message))
-        if error_holder is not None:
-            error_holder.append(error_message)
-        add_news_log(monitor, error_message, "warning")
-        return False
-    if not sender_emails:
-        error_message = "Email не отправлен: email-логин должен быть адресом почты"
-        error_message = str(repair_mojibake_text(error_message))
-        if error_holder is not None:
-            error_holder.append(error_message)
-        add_news_log(monitor, error_message, "warning")
-        return False
-    sender_email = sender_emails[0]
-
-    if test:
-        subject = "Тест email-уведомлений"
-        body = "Тестовое письмо отправлено из мониторинга новинок. SMTP-настройки работают."
-    else:
-        brand = str((monitor or {}).get("brand") or "донор")
-        site_url = str((monitor or {}).get("site_url") or "")
-        subject = f"Уведомление о новинках на сайте {brand}"
-        lines = [f"На {site_url or brand} найдено всего: {new_count}"]
-        for item in missing_summary or []:
-            count = int(item.get("count") or 0)
-            label = str(item.get("source_label") or item.get("url") or "сайт")
-            lines.append(f"На сайте {label} не было найдено {count} новинок.")
-        body = "\n".join(lines)
-    subject = str(repair_mojibake_text(subject))
-    body = str(repair_mojibake_text(body))
-
-    smtp_defaults = default_smtp_settings()
-    host = str(smtp_config.get("host") or smtp_defaults["host"])
-    port = int(smtp_config.get("port") or smtp_defaults["port"])
-    security_mode = str(smtp_config.get("security") or smtp_defaults["security"]).lower()
-    try:
-        send_messages_to_recipients(host, port, security_mode, username, password, sender_email, recipients, subject, body)
-    except Exception as exc:
-        error_message = f"Ошибка отправки email: {exc}"
-        error_message = str(repair_mojibake_text(error_message))
-        if error_holder is not None:
-            error_holder.append(error_message)
-        add_news_log(monitor, error_message, "error")
-        return False
-    add_news_log(monitor, "Тестовое email-сообщение отправлено" if test else f"Email-уведомление отправлено. Новинок: {new_count}", "success")
-    return True
-
-
 def send_news_email(
     monitor: Optional[Dict[str, object]],
     new_count: int,
@@ -1172,7 +1039,7 @@ def send_news_email(
     error_holder: Optional[List[str]] = None,
     missing_summary: Optional[List[Dict[str, object]]] = None,
 ) -> bool:
-    from services.news_service import add_news_log, default_smtp_settings, resolve_export_file
+    from services.news import add_news_log, default_smtp_settings, resolve_export_file
     with news_lock:
         smtp_config = dict(news_settings.get("smtp", {}))
     recipients = normalize_emails(smtp_config.get("recipients", []))
@@ -1235,8 +1102,8 @@ def send_news_email(
 
 
 def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
-    from services.news_service import add_news_log, delete_news_csv_for_monitor, get_news_monitor, make_news_state, save_news_settings
-    from services.project_service import parse_thread_count
+    from services.news import add_news_log, delete_news_csv_for_monitor, get_news_monitor, make_news_state, save_news_monitor
+    from services.projects import parse_thread_count
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return
@@ -1388,7 +1255,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             monitor["brand_state"] = dict(monitor["state"])
             if normalize_schedule_type(monitor.get("schedule_type")) != "once":
                 monitor["next_run_at"] = update_brand_next_run_at(monitor.get("brand_id"))
-            save_news_settings()
+            save_news_monitor(monitor)
         add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
         update_brand_scan_state(
             "donor",
@@ -1437,7 +1304,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "active_urls": [],
             }
             monitor["brand_state"] = dict(monitor["state"])
-            save_news_settings()
+            save_news_monitor(monitor)
         add_news_log(
             monitor,
             f"Сканирование новинок приостановлено. CSV: {partial_csv}" if stop_mode == "pause" else "Сканирование новинок остановлено",
@@ -1469,7 +1336,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "active_urls": [],
             }
             monitor["brand_state"] = dict(monitor["state"])
-            save_news_settings()
+            save_news_monitor(monitor)
         add_news_log(monitor, f"Ошибка сканирования новинок: {exc}", "error")
         update_brand_scan_state(
             "donor",
@@ -1564,16 +1431,6 @@ def compute_next_schedule_at(
     return candidate
 
 
-def compute_next_run_at(monitor: Dict[str, object]) -> str:
-    candidate = compute_next_schedule_at(
-        monitor.get("schedule_type"),
-        monitor.get("scan_time"),
-        monitor.get("weekday"),
-        monitor.get("next_run_at"),
-    )
-    return candidate.isoformat(timespec="minutes") if candidate else ""
-
-
 def brand_schedule_fields(brand: Brand) -> Dict[str, object]:
     return {
         "enabled": bool(brand.enabled),
@@ -1581,7 +1438,7 @@ def brand_schedule_fields(brand: Brand) -> Dict[str, object]:
         "scan_time": str(brand.scan_time or "01:00")[:5],
         "weekday": normalize_weekday(brand.weekday),
         "next_run_at": datetime_to_input_value(brand.next_run_at),
-        "primary_donor_id": brand.primary_donor_id,
+        "primary_donor_id": str(brand.primary_donor_id) if brand.primary_donor_id else "",
     }
 
 
@@ -1632,36 +1489,67 @@ def refresh_monitor_schedule_from_brand(monitor: Dict[str, object]) -> None:
         monitor.update(brand_schedule_fields(brand))
 
 
+def scheduled_brand_candidates(now: Optional[datetime] = None) -> List[Brand]:
+    """Load only brands whose schedule can be due in the current grace window."""
+    now = now or datetime.now(MSK_TZ)
+    window_start = now - timedelta(seconds=SCHEDULE_DUE_GRACE_SECONDS)
+    minute_pairs = {
+        (window_start.weekday(), window_start.strftime("%H:%M")),
+        (now.weekday(), now.strftime("%H:%M")),
+    }
+    schedule_conditions = [
+        and_(
+            Brand.schedule_type == "once",
+            Brand.next_run_at.is_not(None),
+            Brand.next_run_at <= now.replace(tzinfo=None),
+        )
+    ]
+    for weekday, scan_time in minute_pairs:
+        schedule_conditions.extend(
+            [
+                and_(Brand.schedule_type == "daily", Brand.scan_time == scan_time),
+                and_(Brand.schedule_type == "weekly", Brand.weekday == weekday, Brand.scan_time == scan_time),
+            ]
+        )
+    with session_scope() as session:
+        rows = session.scalars(
+            select(Brand)
+            .options(selectinload(Brand.donors))
+            .where(Brand.enabled.is_(True), or_(*schedule_conditions))
+            .order_by(Brand.id)
+        ).all()
+        return [brand for brand in rows if is_brand_due(brand, now)]
+
+
 def start_news_scheduler() -> None:
-    global news_scheduler_thread
-    if isinstance(news_scheduler_thread, threading.Thread) and news_scheduler_thread.is_alive():
+    if (
+        isinstance(runtime_state.news_scheduler_thread, threading.Thread)
+        and runtime_state.news_scheduler_thread.is_alive()
+    ):
         return
 
     def scheduler_loop() -> None:
-        from services.news_service import add_news_log, reload_news_monitors_from_db, save_news_settings, sync_brand_runtime_fields
+        from services.news import add_news_log, save_news_monitor, sync_brand_runtime_fields
         while True:
             try:
-                reload_news_monitors_from_db()
                 due_ids: List[str] = []
+                due_brands = scheduled_brand_candidates()
                 with news_lock:
                     monitor_by_id = {
                         str(monitor.get("id")): monitor
                         for monitor in news_settings.get("monitors", [])
                         if isinstance(monitor, dict)
                     }
-                    with session_scope() as session:
-                        brand_rows = session.scalars(select(Brand).order_by(Brand.id)).all()
-                        due_brands = [brand for brand in brand_rows if is_brand_due(brand)]
-                        due_brand_data = [
-                            {
-                                "brand_id": brand.id,
-                                "brand_name": brand.name,
-                                "primary_id": brand.primary_donor_id,
-                                "schedule": brand_schedule_fields(brand),
-                                "donor_ids": [donor.id for donor in brand.donors],
-                            }
-                            for brand in due_brands
-                        ]
+                    due_brand_data = [
+                        {
+                            "brand_id": brand.id,
+                            "brand_name": brand.name,
+                            "primary_id": brand.primary_donor_id,
+                            "schedule": brand_schedule_fields(brand),
+                            "donor_ids": [donor.id for donor in brand.donors],
+                        }
+                        for brand in due_brands
+                    ]
                     for brand_data in due_brand_data:
                         primary_id = str(brand_data.get("primary_id") or "")
                         selected = monitor_by_id.get(primary_id)
@@ -1679,17 +1567,20 @@ def start_news_scheduler() -> None:
                         selected["state"] = {**selected.get("state", {}), "status": "queued"}
                         selected["brand_state"] = dict(selected["state"])
                         sync_brand_runtime_fields(selected)
+                        save_news_monitor(selected)
                         due_ids.append(str(selected.get("id")))
-                    if due_ids:
-                        save_news_settings()
                 for monitor_id in due_ids:
-                    enqueue_news_scan(monitor_id, manual=False)
-            except Exception:
-                pass
+                    start_news_scan(monitor_id, manual=False)
+            except Exception as error:
+                try:
+                    add_news_log(None, f"Ошибка планировщика новинок: {error}", "error")
+                except Exception:
+                    print(f"News scheduler error: {error}", flush=True)
             time.sleep(30)
 
-    news_scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
-    news_scheduler_thread.start()
-
-
-__all__ = ['CollectOnlyCrawler', 'text_by_selector', 'extract_availability', 'availability_is_excluded', 'extract_product_name', 'feed_source_key', 'feed_source_label', 'source_feed_dir', 'feed_snapshots_dir', 'feed_snapshot_path', 'local_feed_filename', 'generation_file_url', 'clear_source_feeds', 'make_feed_session', 'trigger_feed_generation', 'download_feed_site', 'cleanup_feed_snapshots', 'wait_feed_futures', 'download_feed_files', 'fetch_existing_vendor_codes', 'fetch_existing_vendor_code_sets', 'product_compare_keys', 'build_missing_summary', 'parse_vendor_codes_from_xml', 'parse_feed_products_from_xml', 'validate_monitor_selectors', 'update_news_monitor_state', 'persist_news_monitor_state', 'news_monitor_thread_alive', 'enqueue_news_scan', 'transition_requested_at', 'is_stale_news_transition', 'finalize_stale_news_transition', 'cleanup_stale_news_transitions', 'update_brand_scan_state', 'NewsScanStopped', 'get_news_stop_event', 'request_news_stop', 'collect_products_for_monitor', 'enrich_news_product', 'create_news_csv', 'build_email_message', 'send_messages_to_recipients', 'feed_missing_labels', 'news_monitor_profile_storage_dir', 'news_monitor_should_keep_browser_profile', 'enrich_news_candidates', 'send_news_email_legacy', 'send_news_email', 'scan_news_monitor', 'parse_scan_time', 'parse_schedule_datetime', 'normalize_schedule_type', 'normalize_weekday', 'compute_schedule_run_at', 'compute_next_schedule_at', 'compute_next_run_at', 'brand_schedule_fields', 'is_brand_due', 'update_brand_next_run_at', 'refresh_monitor_schedule_from_brand', 'start_news_scheduler']
+    runtime_state.news_scheduler_thread = threading.Thread(
+        target=scheduler_loop,
+        name="news-scheduler",
+        daemon=True,
+    )
+    runtime_state.news_scheduler_thread.start()

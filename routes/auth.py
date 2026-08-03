@@ -2,16 +2,12 @@
 
 from flask import Blueprint
 
-from services.core_service import (
-    User,
-    check_password_hash,
-    ensure_storage,
-    g,
-    jsonify,
-    request,
-    select,
-    session,
-)
+from flask import g, request, session
+from models import User
+from services.application import ensure_storage
+from services.normalization import jsonify
+from sqlalchemy import select
+from werkzeug.security import check_password_hash
 
 bp = Blueprint("routes_auth", __name__)
 

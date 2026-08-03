@@ -1,33 +1,28 @@
-"""HTTP routes for this application area."""
+"""Application log API backed by SQLite."""
 
-from flask import Blueprint
+import time
 
-from services.core_service import (
-    ensure_storage,
-    jsonify,
-    news_lock,
-    news_settings,
-    projects,
-    projects_lock,
-    request,
-    time,
-)
+from flask import Blueprint, jsonify, request
+
+from services.application import ensure_storage
 from services.log_service import (
-    clear_runtime_log_files,
-    combined_log_entries,
+    clear_logs,
     get_log_auto_cleanup,
-    is_recent_log_entry,
     logs_signature,
-    prune_old_log_files,
-    read_logs_file,
+    prune_old_logs,
+    query_logs,
     set_log_auto_cleanup,
-    write_logs_file,
 )
-from services.news_service import save_news_settings
 
 bp = Blueprint("routes_logs", __name__)
-
 _last_cleanup_at = 0.0
+
+
+def _positive_int(name: str, default: int, maximum: int) -> int:
+    try:
+        return max(1, min(int(request.args.get(name) or default), maximum))
+    except (TypeError, ValueError):
+        return default
 
 
 @bp.get("/api/logs")
@@ -35,104 +30,54 @@ def api_logs():
     ensure_storage()
     global _last_cleanup_at
     auto_cleanup = get_log_auto_cleanup()
-    cleanup_due = auto_cleanup and time.time() - _last_cleanup_at >= 60
+    if auto_cleanup and time.time() - _last_cleanup_at >= 60:
+        prune_old_logs()
+        _last_cleanup_at = time.time()
+
+    signature = logs_signature()
     requested_signature = str(request.args.get("signature") or "")
-    try:
-        requested_total = max(0, int(request.args.get("since_total") or 0))
-    except (TypeError, ValueError):
-        requested_total = 0
-    current_logs_signature = logs_signature()
-    if (
-        requested_signature
-        and requested_signature == current_logs_signature
-        and not cleanup_due
-    ):
+    if requested_signature and requested_signature == signature:
         return jsonify(
             {
                 "not_modified": True,
-                "logs_signature": current_logs_signature,
-                "logs_total": requested_total,
+                "logs_signature": signature,
+                "logs_total": int(signature.rsplit(":", 1)[-1]),
                 "auto_cleanup": auto_cleanup,
             }
         )
 
-    json_logs = read_logs_file()
-    if cleanup_due:
-        cutoff = time.time() - 7 * 24 * 60 * 60
-        filtered_logs = [
-            item
-            for item in json_logs
-            if is_recent_log_entry(item, cutoff)
-        ]
-        if len(filtered_logs) != len(json_logs):
-            json_logs = filtered_logs
-            write_logs_file(json_logs)
-        prune_old_log_files(cutoff)
-        with projects_lock:
-            for project in projects.values():
-                logs = project.get("logs", [])
-                project["logs"] = [
-                    item
-                    for item in logs
-                    if is_recent_log_entry(item, cutoff)
-                ]
-        with news_lock:
-            logs = news_settings.get("logs", [])
-            news_settings["logs"] = [
-                item
-                for item in logs
-                if is_recent_log_entry(item, cutoff)
-            ]
-        _last_cleanup_at = time.time()
-
-    all_logs = combined_log_entries()
-    all_logs.sort(key=lambda item: item.get("time", ""))
     try:
-        limit = max(1, min(int(request.args.get("limit") or 200), 1000))
+        after_id = max(0, int(request.args.get("after_id") or 0))
     except (TypeError, ValueError):
-        limit = 200
-    try:
-        page = max(1, int(request.args.get("page") or 1))
-    except (TypeError, ValueError):
-        page = 1
-    total = len(all_logs)
-    current_logs_signature = logs_signature()
-    end = max(0, total - (page - 1) * limit)
-    start = max(0, end - limit)
-    page_logs = all_logs[start:end]
-    delta = False
-    if page == 1 and requested_signature:
+        after_id = 0
+    if requested_signature:
         try:
-            since_total = int(request.args.get("since_total") or -1)
+            requested_last_id, requested_total = (
+                int(part) for part in requested_signature.rsplit(":", 1)
+            )
+            current_last_id, current_total = (
+                int(part) for part in signature.rsplit(":", 1)
+            )
+            if current_last_id < after_id or (
+                current_last_id == requested_last_id
+                and current_total != requested_total
+            ):
+                after_id = 0
         except (TypeError, ValueError):
-            since_total = -1
-        added_count = total - since_total
-        if since_total >= 0 and 0 < added_count <= limit:
-            page_logs = all_logs[since_total:total]
-            delta = True
-    return jsonify(
-        {
-            "logs": page_logs,
-            "logs_total": total,
-            "logs_page": page,
-            "logs_limit": limit,
-            "auto_cleanup": auto_cleanup,
-            "logs_signature": current_logs_signature,
-            "delta": delta,
-        }
+            after_id = 0
+    payload = query_logs(
+        page=_positive_int("page", 1, 100_000),
+        limit=_positive_int("limit", 200, 1000),
+        after_id=after_id,
     )
+    payload["auto_cleanup"] = auto_cleanup
+    return jsonify(payload)
 
 
 @bp.delete("/api/logs")
 def api_clear_logs():
     ensure_storage()
-    with projects_lock:
-        for project in projects.values():
-            project["logs"] = []
-    with news_lock:
-        news_settings["logs"] = []
-        save_news_settings()
-    clear_runtime_log_files()
+    clear_logs()
     return jsonify({"ok": True})
 
 
@@ -140,9 +85,4 @@ def api_clear_logs():
 def api_logs_settings():
     ensure_storage()
     payload = request.get_json(silent=True) or {}
-    auto_cleanup = set_log_auto_cleanup(bool(payload.get("auto_cleanup")))
-    with news_lock:
-        news_settings["auto_cleanup"] = auto_cleanup
-    return jsonify({"auto_cleanup": auto_cleanup})
-
-
+    return jsonify({"auto_cleanup": set_log_auto_cleanup(bool(payload.get("auto_cleanup")))})

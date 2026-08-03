@@ -9,7 +9,7 @@ if (existsSync(rootEnvPath)) {
 
 export default defineNuxtConfig({
   compatibilityDate: "2026-07-29",
-  devtools: { enabled: true },
+  devtools: { enabled: process.env.NODE_ENV !== "production" },
   modules: ["@nuxt/ui", "@nuxt/icon"],
   css: ["~/assets/css/main.css"],
   app: {

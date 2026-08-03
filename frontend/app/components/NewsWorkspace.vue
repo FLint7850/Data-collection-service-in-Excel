@@ -320,55 +320,13 @@ onMounted(async () => {
       </UButton>
     </EmptyState>
 
-    <div v-else-if="loaded" class="news-groups">
-      <UCard
-        v-for="section in groupedBrands"
-        :key="section.group"
-        as="section"
-        variant="outline"
-        class="news-group-panel"
-        :ui="{ body: 'p-3' }"
-      >
-        <UCollapsible default-open>
-          <template #default="{ open }">
-            <UButton
-              type="button"
-              color="neutral"
-              variant="ghost"
-              block
-              class="news-group-header"
-            >
-              <span class="news-group-icon"><UIcon name="i-lucide-layers-3" /></span>
-              <span>
-                <strong>{{ section.group }}</strong>
-                <small>{{ section.items.length }} брендов</small>
-              </span>
-              <UIcon
-                name="i-lucide-chevron-down"
-                class="settings-details-chevron"
-                :class="{ open }"
-              />
-            </UButton>
-          </template>
-
-          <template #content>
-            <div class="news-brand-grid">
-              <NewsBrandCard
-                v-for="brand in section.items"
-                :key="brand.key"
-                :brand="brand.brand"
-                :group="brand.group"
-                :monitors="brand.monitors"
-                :state="brand.state"
-                @open="openBrand(brand)"
-                @action="runBrandAction(brand, $event)"
-                @remove="requestDelete(brand)"
-              />
-            </div>
-          </template>
-        </UCollapsible>
-      </UCard>
-    </div>
+    <NewsBrandGroups
+      v-else-if="loaded"
+      :groups="groupedBrands"
+      @open="openBrand"
+      @action="runBrandAction"
+      @remove="requestDelete"
+    />
 
     <LazyNewsMonitorModal
       v-if="modalOpen && selectedMonitorId"

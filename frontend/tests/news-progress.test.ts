@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { NewsMonitorSummary, ProgressPayload } from "../types/api";
-import { mergeNewsProgress } from "./news-progress";
+import type { NewsMonitorSummary, ProgressPayload } from "../app/types/api";
+import { mergeNewsProgress } from "../app/utils/news-progress";
 
 const monitor: NewsMonitorSummary = {
   id: "1",

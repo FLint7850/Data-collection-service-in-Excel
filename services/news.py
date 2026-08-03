@@ -1,55 +1,20 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    AppSetting,
-    Brand,
-    DEFAULT_EXCLUSIONS,
-    DEFAULT_FEED_GENERATE_URL,
-    DEFAULT_FEED_URL,
-    Dict,
-    Donor,
-    EXPORT_DIR,
-    Iterable,
-    List,
-    MSK_TZ,
-    Optional,
-    OwnSite,
-    Path,
-    connection_method_id_for,
-    datetime,
-    datetime_to_input_value,
-    delete,
-    ensure_storage,
-    env_int,
-    env_list,
-    env_str,
-    get_donor_row,
-    news_lock,
-    news_monitor_dto,
-    news_monitor_state_dto,
-    news_settings,
-    normalize_connection_method,
-    normalize_emails,
-    normalize_extraction_rules,
-    normalize_feed_url,
-    normalize_feed_urls,
-    normalize_model_key,
-    normalize_patterns,
-    normalize_search_text,
-    normalize_selector_settings,
-    normalize_start_urls,
-    parse_datetime_value,
-    parse_db_int,
-    public_connection_methods,
-    repair_mojibake,
-    repair_mojibake_text,
-    safe_filename,
-    select,
-    session_scope,
-    time,
-    uuid,
-)
-from services.scraping_service import clean_text
+import uuid
+from api_dto import news_monitor_dto, news_monitor_state_dto
+from config import DEFAULT_EXCLUSIONS, DEFAULT_FEED_GENERATE_URL, DEFAULT_FEED_URL, EXPORT_DIR, MSK_TZ, env_int, env_list, env_str
+from database.session import session_scope
+from datetime import datetime
+from models import AppSetting, Brand, Donor, OwnSite
+from pathlib import Path
+from query_utils import normalize_search_text
+from runtime.state import news_lock, news_settings
+from services.application import ensure_storage
+from services.connections import connection_method_id_for, get_donor_row, normalize_connection_method, public_connection_methods
+from services.normalization import datetime_to_input_value, normalize_emails, normalize_extraction_rules, normalize_feed_url, normalize_feed_urls, normalize_model_key, normalize_patterns, normalize_selector_settings, normalize_start_urls, parse_datetime_value, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
+from sqlalchemy import delete, select
+from typing import Dict, Iterable, List, Optional
+from services.scraping import clean_text
 
 
 def default_smtp_settings() -> Dict[str, object]:
@@ -90,7 +55,6 @@ def default_news_settings() -> Dict[str, object]:
         "auto_cleanup": False,
         "smtp": default_smtp_settings(),
         "monitors": [],
-        "logs": [],
         "feed_storage": [],
     }
 
@@ -173,7 +137,7 @@ def normalize_news_state(value: object) -> Dict[str, object]:
 
 
 def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
-    from services.project_service import parse_thread_count
+    from services.projects import parse_thread_count
     start_urls = normalize_start_urls(item.get("start_urls") or "", allow_empty=True)
     monitor = make_news_monitor(
         clean_text(str(item.get("group") or "Маржа")),
@@ -206,19 +170,6 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     return monitor
 
 
-def split_news_monitor_by_site(item: Dict[str, object]) -> List[Dict[str, object]]:
-    urls = normalize_start_urls(item.get("start_urls") or "", allow_empty=True)
-    monitors = []
-    if not urls:
-        return [normalize_news_monitor({**item, "site_url": "", "start_urls": []})]
-    for index, url in enumerate(urls):
-        copy_item = dict(item)
-        copy_item["id"] = str(item.get("id") or uuid.uuid4().hex[:10]) if index == 0 else uuid.uuid4().hex[:10]
-        copy_item["start_urls"] = [url]
-        monitors.append(normalize_news_monitor(copy_item))
-    return monitors
-
-
 def unique_news_brand_name(group: str, base_name: str = "Новый бренд") -> str:
     base_name = clean_text(base_name) or "Новый бренд"
     group_name = clean_text(group)
@@ -243,7 +194,7 @@ def donor_connection_code(row: Donor) -> str:
 
 
 def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
-    from services.project_service import parse_thread_count
+    from services.projects import parse_thread_count
     brand = row.brand
     brand_state = normalize_news_state(brand.state if brand else None)
     site_url = str(row.site_url or "").strip()
@@ -254,7 +205,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "brand": brand.name if brand else "Донор",
         "brand_id": brand.id if brand else None,
         "brand_created_at": brand.created_at.isoformat(timespec="milliseconds") if brand and brand.created_at else "",
-        "primary_donor_id": brand.primary_donor_id if brand else None,
+        "primary_donor_id": str(brand.primary_donor_id) if brand and brand.primary_donor_id else "",
         "brand_state": brand_state,
         "created_at": row.created_at.isoformat(timespec="milliseconds") if row.created_at else "",
         "site_url": site_url,
@@ -341,7 +292,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
 
 
 def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
-    from services.project_service import parse_thread_count
+    from services.projects import parse_thread_count
     normalized = normalize_news_monitor(monitor)
     brand = get_or_create_brand(session, normalized)
     row = get_donor_row(session, normalized.get("id"))
@@ -373,7 +324,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     session.flush()
     monitor["brand_id"] = brand.id
     monitor["brand_created_at"] = brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else ""
-    monitor["primary_donor_id"] = brand.primary_donor_id
+    monitor["primary_donor_id"] = str(brand.primary_donor_id) if brand.primary_donor_id else ""
     return int(row.id)
 
 
@@ -448,7 +399,8 @@ def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]
     return sites
 
 
-def save_news_settings() -> None:
+def synchronize_news_settings() -> None:
+    """Full reconciliation reserved for startup and data migration."""
     from services.progress_service import publish_news_progress_snapshot
     with news_lock:
         with session_scope() as session:
@@ -507,9 +459,102 @@ def save_news_settings() -> None:
         publish_news_progress_snapshot()
 
 
+def save_news_configuration() -> None:
+    """Persist global news configuration without touching brands or donors."""
+    with news_lock:
+        with session_scope() as session:
+            smtp = dict(news_settings.get("smtp", {}))
+            smtp.pop("sender", None)
+            app_setting = session.get(AppSetting, 1)
+            if app_setting is None:
+                app_setting = AppSetting(id=1)
+                session.add(app_setting)
+            app_setting.auto_cleanup = bool(news_settings.get("auto_cleanup", False))
+            app_setting.smtp = smtp
+            app_setting.feed_storage = (
+                list(news_settings.get("feed_storage", []))
+                if isinstance(news_settings.get("feed_storage"), list)
+                else []
+            )
+            current_feed_urls = set()
+            for site in own_sites_from_settings(news_settings):
+                current_feed_urls.add(site["feed_url"])
+                row = session.scalar(select(OwnSite).where(OwnSite.feed_url == site["feed_url"]))
+                if row is None:
+                    session.add(
+                        OwnSite(
+                            name=site["name"],
+                            feed_url=site["feed_url"],
+                            feed_generate_url=site["feed_generate_url"],
+                        )
+                    )
+                else:
+                    row.name = site["name"]
+                    row.feed_generate_url = site["feed_generate_url"]
+            if current_feed_urls:
+                session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
+
+
+def save_news_monitor(monitor: Dict[str, object]) -> None:
+    """Persist one donor and its brand state without reconciling other rows."""
+    from services.progress_service import publish_news_progress_snapshot
+    with news_lock:
+        with session_scope() as session:
+            old_id = str(monitor.get("id") or "")
+            db_id = upsert_donor_model(session, monitor)
+            monitor["id"] = str(db_id)
+            brand = session.get(Brand, parse_db_int(monitor.get("brand_id")))
+            if brand:
+                brand_monitors = [
+                    item
+                    for item in news_settings.get("monitors", [])
+                    if isinstance(item, dict)
+                    and parse_db_int(item.get("brand_id")) == brand.id
+                ]
+                brand.state = aggregate_brand_state(brand_monitors or [monitor])
+                requested_primary = parse_db_int(monitor.get("primary_donor_id"))
+                donor_ids = {donor.id for donor in brand.donors}
+                if requested_primary in donor_ids:
+                    brand.primary_donor_id = requested_primary
+                elif brand.primary_donor_id not in donor_ids:
+                    brand.primary_donor_id = min(donor_ids) if donor_ids else None
+                primary_id = str(brand.primary_donor_id) if brand.primary_donor_id else ""
+                for item in brand_monitors:
+                    item["primary_donor_id"] = primary_id
+            if old_id != monitor["id"]:
+                for index, item in enumerate(news_settings.get("monitors", [])):
+                    if item is monitor or str(item.get("id")) == old_id:
+                        news_settings["monitors"][index] = monitor
+                        break
+        publish_news_progress_snapshot()
+
+
+def delete_news_records(monitor_ids: Iterable[object], *, remove_brand: bool = False) -> None:
+    from database.repositories.news import delete_brand, delete_donor
+    ids = [value for value in (parse_db_int(item) for item in monitor_ids) if value]
+    if not ids:
+        return
+    with session_scope() as session:
+        donors = [row for row in (session.get(Donor, item) for item in ids) if row is not None]
+        brand_ids = {row.brand_id for row in donors}
+        if remove_brand:
+            for brand_id in brand_ids:
+                delete_brand(brand_id, session)
+            return
+        for donor in donors:
+            delete_donor(donor.id, session)
+        session.flush()
+        for brand_id in brand_ids:
+            brand = session.get(Brand, brand_id)
+            if not brand:
+                continue
+            donor_ids = [row.id for row in brand.donors]
+            if brand.primary_donor_id not in donor_ids:
+                brand.primary_donor_id = donor_ids[0] if donor_ids else None
+
+
 def load_news_settings() -> None:
     from runtime.news_tasks import feed_source_label
-    from services.log_service import load_news_logs_from_file
     with news_lock:
         if news_settings:
             return
@@ -551,62 +596,23 @@ def load_news_settings() -> None:
             settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
             recover_interrupted_news_scans(settings["monitors"])
             ensure_brand_primary_flags(settings["monitors"])
-            settings["logs"] = load_news_logs_from_file()
         news_settings.update(settings)
-        save_news_settings()
-
-
-def reload_news_monitors_from_db() -> None:
-    from runtime.news_tasks import cleanup_stale_news_transitions, is_stale_news_transition
-    from services.progress_service import publish_news_progress_snapshot
-    load_news_settings()
-    cleanup_stale_news_transitions()
-    with news_lock:
-        active_by_id = {
-            str(monitor.get("id")): monitor
-            for monitor in news_settings.get("monitors", [])
-            if isinstance(monitor, dict)
-            and monitor.get("state", {}).get("status") in {"running", "queued", "pausing", "stopping"}
-            and not is_stale_news_transition(monitor)
-        }
-    with session_scope() as session:
-        donor_rows = session.scalars(
-            select(Donor)
-            .join(Brand, Donor.brand_id == Brand.id)
-            .order_by(Brand.group_name, Brand.name, Donor.id)
-        ).all()
-        monitors = [donor_model_to_monitor(row) for row in donor_rows]
-        ensure_brand_primary_flags(monitors)
-    with news_lock:
-        news_settings["monitors"] = [
-            active_by_id.get(str(monitor.get("id")), monitor)
-            for monitor in monitors
-        ]
-        publish_news_progress_snapshot()
+        synchronize_news_settings()
 
 
 def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str = "info") -> None:
-    from services.log_service import append_unified_log, save_logs
-    with news_lock:
-        logs = news_settings.setdefault("logs", [])
-        logs.append(
-            {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "project_id": f"news:{monitor.get('id')}" if monitor else "news",
-                "project_name": repair_mojibake_text(f"Новинки: {monitor.get('brand')}") if monitor else "Новинки",
-                "level": level,
-                "message": repair_mojibake_text(message),
-            }
-        )
-        append_unified_log(logs[-1])
-        if news_settings.get("auto_cleanup"):
-            cutoff = time.time() - 7 * 24 * 60 * 60
-            logs[:] = [
-                item
-                for item in logs
-                if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
-            ]
-    save_logs()
+    from services.log_service import append_log
+    append_log(
+        {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "project_id": f"news:{monitor.get('id')}" if monitor else "news",
+            "project_name": repair_mojibake_text(f"Новинки: {monitor.get('brand')}") if monitor else "Новинки",
+            "brand": repair_mojibake_text(monitor.get("brand") or "") if monitor else "",
+            "group": repair_mojibake_text(monitor.get("group") or "") if monitor else "",
+            "level": level,
+            "message": repair_mojibake_text(message),
+        }
+    )
 
 
 def get_news_monitor(monitor_id: str) -> Optional[Dict[str, object]]:
@@ -672,16 +678,6 @@ def delete_news_csv_for_monitor(monitor: Dict[str, object], keep_filename: str =
                 pass
 
 
-def runtime_news_monitor_by_id(monitor_id: object) -> Optional[Dict[str, object]]:
-    monitor_id_text = str(monitor_id or "")
-    if not monitor_id_text:
-        return None
-    for monitor in news_settings.get("monitors", []):
-        if isinstance(monitor, dict) and str(monitor.get("id")) == monitor_id_text:
-            return monitor
-    return None
-
-
 def runtime_news_monitors_for_brand(brand_id: object) -> List[Dict[str, object]]:
     brand_id_text = str(brand_id or "")
     if not brand_id_text:
@@ -691,74 +687,6 @@ def runtime_news_monitors_for_brand(brand_id: object) -> List[Dict[str, object]]
         for monitor in news_settings.get("monitors", [])
         if isinstance(monitor, dict) and str(monitor.get("brand_id")) == brand_id_text
     ]
-
-
-def public_news_brand(brand: Brand) -> Dict[str, object]:
-    from services.project_service import parse_thread_count
-    with news_lock:
-        runtime_monitors = runtime_news_monitors_for_brand(brand.id)
-        runtime_by_id = {str(monitor.get("id")): monitor for monitor in runtime_monitors}
-        runtime_brand_state = aggregate_brand_state(runtime_monitors) if runtime_monitors else None
-
-    brand_state = normalize_news_state(runtime_brand_state or brand.state)
-    primary_donor_id = brand.primary_donor_id
-    if primary_donor_id and not any(donor.id == primary_donor_id for donor in brand.donors):
-        primary_donor_id = brand.donors[0].id if brand.donors else None
-
-    donors = []
-    for donor in sorted(brand.donors, key=lambda item: item.id):
-        runtime_monitor = runtime_by_id.get(str(donor.id)) or {}
-        donor_state = normalize_news_state({**brand_state, **(runtime_monitor.get("state") or {})})
-        site_url = str(donor.site_url or "").strip()
-        donors.append(
-            {
-                "id": str(donor.id),
-                "legacy_id": donor.legacy_id or "",
-                "brand_id": brand.id,
-                "site_url": site_url,
-                "start_urls": normalize_start_urls(donor.start_urls or [], allow_empty=True),
-                "thread_count": parse_thread_count(donor.thread_count),
-                "connection_id": donor.connection_id,
-                "connection_method": donor_connection_code(donor),
-                "auto_connection_fallback": bool(donor.auto_connection_fallback),
-                "exclusions": normalize_patterns(donor.exclusions or DEFAULT_EXCLUSIONS),
-                "product_url_filters": normalize_patterns(donor.product_url_filters or []),
-                "product_url_exclusions": normalize_patterns(getattr(donor, "product_url_exclusions", None) or []),
-                "extraction_rules": normalize_extraction_rules(donor.extraction_rules or {}),
-                "selector_settings": normalize_selector_settings(donor.selector_settings or {}),
-                "created_at": donor.created_at.isoformat(timespec="milliseconds") if donor.created_at else "",
-                "updated_at": donor.updated_at.isoformat(timespec="milliseconds") if donor.updated_at else "",
-                "state": donor_state,
-                "group": brand.group_name,
-                "brand": brand.name,
-                "brand_created_at": brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else "",
-                "primary_donor_id": primary_donor_id,
-                "enabled": bool(brand.enabled),
-                "schedule_type": brand.schedule_type or "daily",
-                "scan_time": brand.scan_time or "01:00",
-                "weekday": max(0, min(int(brand.weekday or 0), 6)),
-                "next_run_at": datetime_to_input_value(brand.next_run_at),
-            }
-        )
-
-    return {
-        "id": brand.id,
-        "brand_id": brand.id,
-        "name": brand.name,
-        "brand": brand.name,
-        "group_name": brand.group_name,
-        "group": brand.group_name,
-        "state": brand_state,
-        "enabled": bool(brand.enabled),
-        "schedule_type": brand.schedule_type or "daily",
-        "scan_time": brand.scan_time or "01:00",
-        "weekday": max(0, min(int(brand.weekday or 0), 6)),
-        "next_run_at": datetime_to_input_value(brand.next_run_at),
-        "primary_donor_id": primary_donor_id,
-        "created_at": brand.created_at.isoformat(timespec="milliseconds") if brand.created_at else "",
-        "updated_at": brand.updated_at.isoformat(timespec="milliseconds") if brand.updated_at else "",
-        "donors": donors,
-    }
 
 
 def public_news_monitor(monitor: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
@@ -795,32 +723,6 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
     return public_monitor
 
 
-def public_news_settings(include_connection_methods: bool = True, include_monitor_details: bool = True, include_monitors: bool = True) -> Dict[str, object]:
-    from runtime.news_tasks import cleanup_stale_news_transitions
-    cleanup_stale_news_transitions()
-    with news_lock:
-        smtp = dict(news_settings.get("smtp", {}))
-        smtp.pop("sender", None)
-        smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
-        own_sites = own_sites_from_settings(news_settings)
-        feed_urls = [site["feed_url"] for site in own_sites]
-        feed_generate_urls = [site["feed_generate_url"] for site in own_sites]
-        payload = {
-            "feed_url": feed_urls[0] if feed_urls else DEFAULT_FEED_URL,
-            "feed_generate_url": feed_generate_urls[0] if feed_generate_urls else DEFAULT_FEED_GENERATE_URL,
-            "feed_urls": feed_urls,
-            "feed_generate_urls": feed_generate_urls,
-            "own_sites": own_sites,
-            "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
-            "smtp": smtp,
-            "feed_storage": list(news_settings.get("feed_storage", [])) if isinstance(news_settings.get("feed_storage"), list) else [],
-            "monitors": [public_news_monitor(monitor, include_details=include_monitor_details) for monitor in news_settings.get("monitors", [])] if include_monitors else [],
-        }
-        if include_connection_methods:
-            payload["connection_methods"] = public_connection_methods()
-        return payload
-
-
 def public_news_workspace() -> Dict[str, object]:
     from runtime.news_tasks import cleanup_stale_news_transitions
     from services.progress_service import register_progress_items
@@ -845,6 +747,7 @@ def public_news_configuration() -> Dict[str, object]:
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
         smtp.pop("sender", None)
+        smtp.pop("password", None)
         smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
         return {
             "own_sites": own_sites_from_settings(news_settings),
@@ -857,5 +760,3 @@ def public_news_configuration() -> Dict[str, object]:
             ),
         }
 
-
-__all__ = ['default_smtp_settings', 'merge_smtp_settings', 'default_news_settings', 'make_news_monitor', 'make_news_state', 'normalize_news_state', 'normalize_news_monitor', 'split_news_monitor_by_site', 'unique_news_brand_name', 'donor_connection_code', 'donor_model_to_monitor', 'recover_interrupted_news_scans', 'get_or_create_brand', 'upsert_donor_model', 'aggregate_brand_state', 'sync_brand_runtime_fields', 'ensure_brand_primary_flags', 'own_sites_from_settings', 'save_news_settings', 'load_news_settings', 'reload_news_monitors_from_db', 'add_news_log', 'get_news_monitor', 'resolve_export_file', 'news_csv_prefix', 'news_csv_filename', 'delete_news_csv_for_monitor', 'runtime_news_monitor_by_id', 'runtime_news_monitors_for_brand', 'public_news_brand', 'public_news_monitor', 'public_news_settings', 'public_news_workspace', 'public_news_configuration']

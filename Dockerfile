@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -24,8 +24,19 @@ RUN pip install --upgrade pip \
     && chmod -R a+rwX /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
     && python -m playwright install --with-deps chromium chromium-headless-shell
 
+FROM base AS test
 COPY . .
-RUN mkdir -p data logs exports feeds storage/file-import \
+RUN pip install pyflakes==3.4.0 \
+    && python -m pyflakes app.py config.py models.py api_dto.py progress_tracker.py query_utils.py database routes runtime services test \
+    && python -m unittest discover -s test -v \
+    && python -m compileall -q app.py config.py database routes runtime services
+
+FROM base AS runtime
+COPY --from=test /app /app
+RUN addgroup --system --gid 10001 app \
+    && adduser --system --uid 10001 --ingroup app --home /app app \
+    && mkdir -p data exports feeds storage/file-import profiles/projects \
+    && chown -R app:app /app /ms-playwright /tmp/parser \
     && chmod +x deploy/docker-entrypoint.sh
 
 EXPOSE 5000

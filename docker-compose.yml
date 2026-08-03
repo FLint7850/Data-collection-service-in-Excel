@@ -31,10 +31,7 @@ services:
         required: true
     environment:
       PORT: 5000
-      LOG_DIR: /app/logs
       FEED_DIR: /app/feeds
-      LOGS_FILE: /app/logs/logs.json
-      UNIFIED_LOG_FILE: /app/logs/app.log
       EXPORT_DIR: /app/exports
       FILE_IMPORT_DIR: /app/storage/file-import
       TMPDIR: /tmp/parser
@@ -47,7 +44,6 @@ services:
       GUNICORN_ACCESS_LOG: 0
     volumes:
       - ./data:/app/data
-      - ./logs:/app/logs
       - ./exports:/app/exports
       - ./feeds:/app/feeds
       - ./storage:/app/storage
@@ -68,7 +64,7 @@ services:
       retries: 12
       start_period: 30s
   nginx:
-    image: nginx:alpine
+    image: nginx:alpine@sha256:4a73073bd557c65b759505da037898b61f1be6cbcc3c2c3aeac22d2a470c1752
     container_name: data-service-nginx
     restart: unless-stopped
     depends_on:

@@ -3,35 +3,24 @@
 from flask import Blueprint
 
 from runtime.project_tasks import close_project_browser_session, start_project
-from services.core_service import (
-    DEFAULT_START_URL,
-    EXPORT_DIR,
-    ensure_storage,
-    jsonify,
-    normalize_connection_method,
-    normalize_extraction_rules,
-    normalize_patterns,
-    normalize_start_urls,
-    now_iso,
-    output_text,
-    projects,
-    projects_lock,
-    public_connection_methods,
-    request,
-    scan_dispatcher,
-    send_file,
-    threading,
-)
+import threading
+from config import DEFAULT_START_URL, EXPORT_DIR
+from flask import request, send_file
+from runtime.state import projects, projects_lock
+from services.application import ensure_storage
+from services.connections import normalize_connection_method, public_connection_methods
+from services.normalization import jsonify, normalize_extraction_rules, normalize_patterns, normalize_start_urls, now_iso, output_text
 from services.progress_service import register_progress_items
-from services.project_service import (
+from services.projects import (
     add_project_log,
+    delete_project_record,
     get_project,
     make_project,
     make_state,
     parse_thread_count,
     public_project,
     reset_project_state_after_form_save,
-    save_projects,
+    save_project,
     update_project_state,
 )
 
@@ -74,7 +63,7 @@ def api_create_project():
     project = make_project(name, start_urls)
     with projects_lock:
         projects[project["id"]] = project
-        save_projects()
+        save_project(project)
     add_project_log(project, "Проект создан", "success")
     return jsonify({"project": public_project(project)})
 
@@ -90,7 +79,7 @@ def api_update_project(project_id: str):
         if "name" in payload:
             project["name"] = str(payload.get("name") or project["name"]).strip() or project["name"]
         if "start_urls" in payload:
-            project["start_urls"] = normalize_start_urls(payload.get("start_urls"))
+            project["start_urls"] = normalize_start_urls(payload.get("start_urls"), allow_empty=True)
         if "exclusions" in payload:
             project["exclusions"] = normalize_patterns(payload.get("exclusions"))
         if "product_url_filters" in payload:
@@ -114,7 +103,7 @@ def api_update_project(project_id: str):
         if "auto_cleanup" in payload:
             project["auto_cleanup"] = bool(payload.get("auto_cleanup"))
         reset_project_state_after_form_save(project)
-        save_projects()
+        save_project(project)
     return jsonify({"project": public_project(project)})
 
 
@@ -130,131 +119,8 @@ def api_delete_project(project_id: str):
         if isinstance(stop_event, threading.Event):
             stop_event.set()
         projects.pop(project_id, None)
-        save_projects()
+        delete_project_record(project_id)
     return jsonify({"ok": True})
-
-
-@bp.get("/api/projects/<project_id>/exclusions")
-def api_project_exclusions(project_id: str):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    return jsonify({"exclusions": project.get("exclusions", [])})
-
-
-@bp.post("/api/projects/<project_id>/exclusions")
-def api_project_add_exclusion(project_id: str):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    payload = request.get_json(silent=True) or {}
-    pattern = str(payload.get("pattern", "")).strip()
-    if not pattern:
-        return jsonify({"error": "Пустое исключение"}), 400
-    added = False
-    with projects_lock:
-        exclusions = project.setdefault("exclusions", [])
-        if pattern not in exclusions:
-            exclusions.append(pattern)
-            added = True
-            save_projects()
-    return jsonify({"ok": True, "added": added, "pattern": pattern})
-
-
-@bp.delete("/api/projects/<project_id>/exclusions/<int:index>")
-def api_project_delete_exclusion(project_id: str, index: int):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    with projects_lock:
-        exclusions = project.setdefault("exclusions", [])
-        if index < 0 or index >= len(exclusions):
-            return jsonify({"error": "Исключение не найдено"}), 404
-        removed = exclusions.pop(index)
-        save_projects()
-    return jsonify({"ok": True, "removed": removed})
-
-
-@bp.get("/api/projects/<project_id>/product-url-filters")
-def api_project_product_url_filters(project_id: str):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    return jsonify({"product_url_filters": project.get("product_url_filters", [])})
-
-
-@bp.post("/api/projects/<project_id>/product-url-filters")
-def api_project_add_product_url_filter(project_id: str):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    payload = request.get_json(silent=True) or {}
-    pattern = str(payload.get("pattern", "")).strip()
-    if not pattern:
-        return jsonify({"error": "Пустой фильтр ссылки"}), 400
-    added = False
-    with projects_lock:
-        filters = project.setdefault("product_url_filters", [])
-        if pattern not in filters:
-            filters.append(pattern)
-            added = True
-            save_projects()
-    return jsonify({"ok": True, "added": added, "pattern": pattern})
-
-
-@bp.delete("/api/projects/<project_id>/product-url-filters/<int:index>")
-def api_project_delete_product_url_filter(project_id: str, index: int):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    with projects_lock:
-        filters = project.setdefault("product_url_filters", [])
-        if index < 0 or index >= len(filters):
-            return jsonify({"error": "Фильтр ссылки не найден"}), 404
-        removed = filters.pop(index)
-        save_projects()
-    return jsonify({"ok": True, "removed": removed})
-
-
-@bp.get("/api/projects/<project_id>/product-url-exclusions")
-def api_project_product_url_exclusions(project_id: str):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    return jsonify({"product_url_exclusions": project.get("product_url_exclusions", [])})
-
-
-@bp.post("/api/projects/<project_id>/product-url-exclusions")
-def api_project_add_product_url_exclusion(project_id: str):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    payload = request.get_json(silent=True) or {}
-    pattern = str(payload.get("pattern", "")).strip()
-    if not pattern:
-        return jsonify({"error": "Пустое исключение товарной ссылки"}), 400
-    added = False
-    with projects_lock:
-        exclusions = project.setdefault("product_url_exclusions", [])
-        if pattern not in exclusions:
-            exclusions.append(pattern)
-            added = True
-            save_projects()
-    return jsonify({"ok": True, "added": added, "pattern": pattern})
-
-
-@bp.delete("/api/projects/<project_id>/product-url-exclusions/<int:index>")
-def api_project_delete_product_url_exclusion(project_id: str, index: int):
-    project = get_project(project_id)
-    if not project:
-        return jsonify({"error": "Проект не найден"}), 404
-    with projects_lock:
-        exclusions = project.setdefault("product_url_exclusions", [])
-        if index < 0 or index >= len(exclusions):
-            return jsonify({"error": "Исключение товарной ссылки не найдено"}), 404
-        removed = exclusions.pop(index)
-        save_projects()
-    return jsonify({"ok": True, "removed": removed})
 
 
 @bp.post("/api/projects/<project_id>/start")
@@ -263,25 +129,8 @@ def api_project_start(project_id: str):
     if not project:
         return jsonify({"error": "Проект не найден"}), 404
 
-    payload = request.get_json(silent=True) or {}
-    with projects_lock:
-        if "start_urls" in payload:
-            project["start_urls"] = normalize_start_urls(payload.get("start_urls"))
-        if "product_url_filters" in payload:
-            project["product_url_filters"] = normalize_patterns(payload.get("product_url_filters"))
-        if "product_url_exclusions" in payload:
-            project["product_url_exclusions"] = normalize_patterns(payload.get("product_url_exclusions"))
-        if "extraction_rules" in payload:
-            project["extraction_rules"] = normalize_extraction_rules(payload.get("extraction_rules"))
-        if "thread_count" in payload:
-            project["thread_count"] = parse_thread_count(payload.get("thread_count"))
-        if "connection_method" in payload:
-            project["connection_method"] = normalize_connection_method(payload.get("connection_method"))
-        if "auto_connection_fallback" in payload:
-            project["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
-        if "persist_profile" in payload:
-            project["persist_profile"] = bool(payload.get("persist_profile"))
-        save_projects()
+    if not normalize_start_urls(project.get("start_urls"), allow_empty=True):
+        return jsonify({"error": "У проекта не указаны стартовые URL"}), 400
 
     try:
         state = start_project(project)
@@ -350,7 +199,6 @@ def api_project_stop(project_id: str):
     project = get_project(project_id)
     if not project:
         return jsonify({"error": "Проект не найден"}), 404
-    scan_dispatcher.cancel(("project", str(project["id"])))
     stop_event = project.get("stop_event")
     if isinstance(stop_event, threading.Event):
         stop_event.set()
@@ -373,7 +221,7 @@ def api_project_stop(project_id: str):
             }
         )
         project["state"] = state
-        save_projects()
+        save_project(project)
     add_project_log(project, "Сбор остановлен", "warning")
     return jsonify(project["state"])
 
@@ -414,5 +262,3 @@ def download_project_csv(project_id: str):
     if not filename or not path.exists():
         return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
-
-

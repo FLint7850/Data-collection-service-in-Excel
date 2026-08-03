@@ -6,19 +6,19 @@ from pathlib import Path
 
 class BackendModuleTests(unittest.TestCase):
     def test_core_paths_still_resolve_from_the_repository_root(self) -> None:
-        from services.core_service import BASE_DIR
+        from config import BASE_DIR
 
         self.assertEqual(BASE_DIR, Path(__file__).resolve().parents[1])
 
     def test_service_modules_can_be_imported_without_app_bootstrap(self) -> None:
         modules = [
-            "services.scraping_service",
-            "services.project_service",
-            "services.news_service",
+            "services.scraping",
+            "services.projects",
+            "services.news",
             "services.progress_service",
             "services.log_service",
             "services.file_import_service",
-            "services.feed_service",
+            "services.feeds",
             "runtime.news_tasks",
             "runtime.project_tasks",
         ]
@@ -39,7 +39,6 @@ class BackendModuleTests(unittest.TestCase):
             for rule in app.url_map.iter_rules()
             for method in rule.methods - {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(routes), 63)
         self.assertTrue(
             {
                 ("POST", "/api/auth/login"),
@@ -52,6 +51,12 @@ class BackendModuleTests(unittest.TestCase):
                 ("GET", "/api/logs"),
                 ("GET", "/progress"),
             }.issubset(routes)
+        )
+        self.assertFalse(
+            {
+                ("GET", "/api/connection-methods"),
+                ("GET", "/api/news/brands/<brand_id>"),
+            }.intersection(routes)
         )
 
 

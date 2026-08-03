@@ -2,22 +2,21 @@
 
 from flask import Blueprint
 
-from services.core_service import (
-    FILE_IMPORT_ALLOWED_SUFFIXES,
-    FILE_IMPORT_DIR,
-    MSK_TZ,
-    Path,
-    datetime,
-    ensure_storage,
-    file_import_lock,
-    file_import_stop_event,
+import uuid
+from config import FILE_IMPORT_ALLOWED_SUFFIXES, FILE_IMPORT_DIR, MSK_TZ
+from datetime import datetime
+from flask import request, send_file
+from pathlib import Path
+from runtime.state import file_import_lock, file_import_stop_event
+from services.application import ensure_storage
+from services.normalization import (
     jsonify,
+    normalize_file_import_exclusions,
+    normalize_file_import_rules_text,
     output_text,
-    request,
     safe_filename,
-    send_file,
-    uuid,
 )
+from services.scraping import clean_text
 from services.file_import_service import (
     clear_file_import_storage,
     file_import_worker_alive,
@@ -26,6 +25,7 @@ from services.file_import_service import (
     make_file_import_state,
     normalize_file_import_state,
     public_file_import_progress,
+    public_file_import_settings,
     public_file_import_state,
     remove_file_import_export,
     resolve_file_import_export_path,
@@ -33,6 +33,41 @@ from services.file_import_service import (
 )
 
 bp = Blueprint("routes_file_import", __name__)
+
+
+@bp.patch("/api/file-import")
+def api_update_file_import():
+    ensure_storage()
+    payload = request.get_json(silent=True) or {}
+    row = get_file_import_row()
+    if "exclusions" in payload:
+        row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
+    if "model_field" in payload:
+        row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
+    if "price_field" in payload:
+        row.price_field = clean_text(str(payload.get("price_field") or ""))[:255]
+    if "replace_rules" in payload:
+        row.replace_rules = normalize_file_import_rules_text(payload.get("replace_rules"))
+    if "file" in payload:
+        file_payload = payload.get("file")
+        if not file_payload:
+            row.file = {}
+        elif isinstance(file_payload, dict):
+            stored_filename = str(file_payload.get("stored_filename") or "").strip()
+            base_dir = FILE_IMPORT_DIR.resolve()
+            path = (FILE_IMPORT_DIR / stored_filename).resolve()
+            if stored_filename and base_dir in path.parents and path.exists() and path.is_file():
+                row.file = {
+                    "original_filename": output_text(
+                        str(file_payload.get("filename") or file_payload.get("original_filename") or path.name)
+                    ),
+                    "stored_filename": path.name,
+                    "uploaded_at": str(
+                        file_payload.get("uploaded_at")
+                        or datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")
+                    ),
+                }
+    return jsonify(public_file_import_settings())
 
 
 @bp.get("/api/file-import")
@@ -67,6 +102,13 @@ def api_upload_file_import():
     if FILE_IMPORT_DIR.resolve() not in target.parents:
         return jsonify({"error": "Некорректное имя файла"}), 400
     upload.save(target)
+    if suffix == ".xlsx":
+        from services.file_validation import validate_xlsx_archive
+        try:
+            validate_xlsx_archive(target)
+        except ValueError as error:
+            target.unlink(missing_ok=True)
+            return jsonify({"error": str(error)}), 400
     row.file = {
         "original_filename": original_filename,
         "stored_filename": stored_filename,
@@ -134,5 +176,4 @@ def api_download_file_import_result():
     if not path:
         return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(path.name))
-
 

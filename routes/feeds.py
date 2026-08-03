@@ -2,24 +2,16 @@
 
 from flask import Blueprint
 
-from services.core_service import (
-    MSK_TZ,
-    Optional,
-    OwnSite,
-    Response,
-    SupplierFeed,
-    datetime,
-    ensure_storage,
-    feed_comparison_lock,
-    feed_comparison_stop_event,
-    g,
-    jsonify,
-    output_text,
-    request,
-    select,
-    send_file,
-)
-from services.feed_service import (
+from config import MSK_TZ
+from datetime import datetime
+from flask import Response, g, request, send_file
+from models import OwnSite, SupplierFeed
+from runtime.state import feed_comparison_lock, feed_comparison_stop_event
+from services.application import ensure_storage
+from services.normalization import jsonify, output_text
+from sqlalchemy import select
+from typing import Optional
+from services.feeds import (
     feed_comparison_worker_alive,
     get_feed_comparison_row,
     is_feed_comparison_active_state,

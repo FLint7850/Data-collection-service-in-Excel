@@ -3,57 +3,41 @@
 from flask import Blueprint
 
 from runtime.news_tasks import (
-    enqueue_news_scan,
+    start_news_scan,
     feed_snapshot_path,
     persist_news_monitor_state,
     request_news_stop,
 )
-from services.core_service import (
-    Brand,
-    FILE_IMPORT_DIR,
-    MSK_TZ,
-    datetime,
-    ensure_storage,
-    jsonify,
-    news_lock,
-    news_settings,
-    news_stop_events,
-    normalize_connection_method,
-    normalize_extraction_rules,
-    normalize_file_import_exclusions,
-    normalize_file_import_rules_text,
-    normalize_patterns,
-    normalize_search_text,
-    normalize_selector_settings,
-    normalize_start_urls,
-    output_text,
-    parse_db_int,
-    request,
-    select,
-    send_file,
-    session_scope,
-    threading,
-)
-from services.scraping_service import clean_text
-from services.file_import_service import get_file_import_row, public_file_import_settings
-from services.news_service import (
+import threading
+from config import MSK_TZ
+from database.session import session_scope
+from datetime import datetime
+from flask import request, send_file
+from models import Brand
+from query_utils import normalize_search_text
+from runtime.state import news_lock, news_settings, news_stop_events
+from services.application import ensure_storage
+from services.connections import normalize_connection_method
+from services.normalization import jsonify, normalize_extraction_rules, normalize_patterns, normalize_selector_settings, normalize_start_urls, output_text, parse_db_int
+from sqlalchemy import select
+from services.scraping import clean_text
+from services.news import (
     add_news_log,
+    delete_news_records,
     delete_news_csv_for_monitor,
     get_news_monitor,
     make_news_monitor,
     make_news_state,
-    public_news_brand,
     public_news_configuration,
     public_news_monitor,
-    public_news_settings,
     public_news_workspace,
     resolve_export_file,
-    save_news_settings,
+    save_news_monitor,
     sync_brand_runtime_fields,
     unique_news_brand_name,
 )
 from services.progress_service import public_news_monitor_progress
-from services.project_service import parse_thread_count
+from services.projects import parse_thread_count
 
 bp = Blueprint("routes_news", __name__)
 
@@ -66,9 +50,7 @@ def api_news():
         return jsonify(public_news_workspace())
     if scope == "settings":
         return jsonify(public_news_configuration())
-    summary = request.args.get("summary") == "1"
-    include_monitors = request.args.get("monitors", "1") != "0"
-    return jsonify(public_news_settings(include_monitor_details=not summary, include_monitors=include_monitors))
+    return jsonify({"error": "Укажите scope=workspace или scope=settings"}), 400
 
 
 @bp.get("/api/news/brands")
@@ -93,20 +75,6 @@ def api_search_news_brands():
             for brand_id, name in rows
         ],
     })
-
-
-@bp.get("/api/news/brands/<brand_id>")
-def api_get_news_brand(brand_id: str):
-    ensure_storage()
-    brand_pk = parse_db_int(brand_id)
-    if not brand_pk:
-        return jsonify({"error": "Бренд не найден"}), 404
-    with session_scope() as session:
-        brand = session.get(Brand, brand_pk)
-        if not brand:
-            return jsonify({"error": "Бренд не найден"}), 404
-        payload = public_news_brand(brand)
-    return jsonify({"brand": payload})
 
 
 @bp.get("/api/news/monitors/<monitor_id>")
@@ -149,8 +117,7 @@ def api_update_news_monitor(monitor_id: str):
                 monitor["brand"] = new_brand
         if "start_urls" in payload:
             start_urls = normalize_start_urls(payload.get("start_urls"), allow_empty=True)
-            if start_urls:
-                monitor["start_urls"] = start_urls
+            monitor["start_urls"] = start_urls
         if "site_url" in payload:
             monitor["site_url"] = str(payload.get("site_url") or "").strip()
         if "enabled" in payload:
@@ -193,10 +160,10 @@ def api_update_news_monitor(monitor_id: str):
                     if brand and any(donor.id == primary_donor_pk for donor in brand.donors):
                         brand.primary_donor_id = primary_donor_pk
         sync_brand_runtime_fields(monitor)
-        save_news_settings()
+        save_news_monitor(monitor)
     response_monitor = public_news_monitor(monitor)
     if "primary_donor_id" in payload:
-        response_monitor["primary_donor_id"] = parse_db_int(payload.get("primary_donor_id"))
+        response_monitor["primary_donor_id"] = str(payload.get("primary_donor_id") or "")
     return jsonify({"monitor": response_monitor})
 
 
@@ -212,7 +179,7 @@ def api_scan_news_monitor(monitor_id: str):
     with news_lock:
         monitor["state"] = {
             **make_news_state("queued"),
-            "stage": "В очереди запуска",
+            "stage": "Запуск",
             "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
             "last_csv": str(monitor.get("state", {}).get("last_csv") or ""),
         }
@@ -220,8 +187,8 @@ def api_scan_news_monitor(monitor_id: str):
         sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
         response_monitor = public_news_monitor_progress(monitor)
-    if not enqueue_news_scan(monitor_id, manual=True):
-        return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
+    if not start_news_scan(monitor_id, manual=True):
+        return jsonify({"error": "Сканирование уже выполняется"}), 409
     return jsonify({"monitor": response_monitor})
 
 
@@ -269,9 +236,9 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = public_news_monitor_progress(monitor)
-    if not enqueue_news_scan(monitor_id, manual=True):
-        return jsonify({"error": "Сканирование уже выполняется или ожидает очереди"}), 409
-    add_news_log(monitor, "Продолжение сканирования новинок поставлено в очередь", "info")
+    if not start_news_scan(monitor_id, manual=True):
+        return jsonify({"error": "Сканирование уже выполняется"}), 409
+    add_news_log(monitor, "Продолжение сканирования новинок запущено", "info")
     return jsonify({"monitor": response_monitor})
 
 
@@ -350,7 +317,7 @@ def api_create_news_monitor():
     )
     with news_lock:
         news_settings.setdefault("monitors", []).append(monitor)
-        save_news_settings()
+        save_news_monitor(monitor)
     add_news_log(monitor, "Монитор новинок создан", "success")
     return jsonify({"monitor": public_news_monitor(monitor)})
 
@@ -393,7 +360,7 @@ def api_delete_news_monitor(monitor_id: str):
         ]
         for item_id in removed_ids:
             news_stop_events.pop(item_id, None)
-        save_news_settings()
+        delete_news_records(removed_ids, remove_brand=remove_brand)
         remaining_brand_monitors = [
             public_news_monitor(item)
             for item in news_settings.get("monitors", [])
@@ -450,35 +417,3 @@ def api_download_news_feed(source: str, filename: str):
     if path is None or not path.exists():
         return jsonify({"error": "Фид не найден"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(filename))
-
-
-@bp.patch("/api/file-import")
-def api_update_file_import():
-    ensure_storage()
-    payload = request.get_json(silent=True) or {}
-    row = get_file_import_row()
-    if "exclusions" in payload:
-        row.exclusions = normalize_file_import_exclusions(payload.get("exclusions"))
-    if "model_field" in payload:
-        row.model_field = clean_text(str(payload.get("model_field") or ""))[:255]
-    if "price_field" in payload:
-        row.price_field = clean_text(str(payload.get("price_field") or ""))[:255]
-    if "replace_rules" in payload:
-        row.replace_rules = normalize_file_import_rules_text(payload.get("replace_rules"))
-    if "file" in payload:
-        file_payload = payload.get("file")
-        if not file_payload:
-            row.file = {}
-        elif isinstance(file_payload, dict):
-            stored_filename = str(file_payload.get("stored_filename") or "").strip()
-            base_dir = FILE_IMPORT_DIR.resolve()
-            path = (FILE_IMPORT_DIR / stored_filename).resolve()
-            if stored_filename and base_dir in path.parents and path.exists() and path.is_file():
-                row.file = {
-                    "original_filename": output_text(str(file_payload.get("filename") or file_payload.get("original_filename") or path.name)),
-                    "stored_filename": path.name,
-                    "uploaded_at": str(file_payload.get("uploaded_at") or datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")),
-                }
-    return jsonify(public_file_import_settings())
-
-

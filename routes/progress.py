@@ -1,64 +1,34 @@
-"""HTTP routes for this application area."""
+"""Cursor-based progress polling endpoint."""
 
-from flask import Blueprint
+from flask import Blueprint, jsonify, request
 
-from services.core_service import (
-    PROGRESS_STREAM_INTERVAL_SECONDS,
-    Response,
-    ensure_storage,
-    json,
-    jsonify,
-    request,
-    time,
-)
-from services.news_service import get_news_monitor
+from services.application import ensure_storage
+from services.news import get_news_monitor
 from services.progress_service import progress_payload, public_news_monitor_progress
 
 bp = Blueprint("routes_progress", __name__)
 
 
 @bp.get("/progress")
-def progress_stream():
+def progress_poll():
     ensure_storage()
     include_projects = request.args.get("projects", "1") == "1"
     include_news = request.args.get("news") == "1"
-    if request.args.get("once") == "1":
-        payload = progress_payload(
-            include_projects,
-            include_news,
-            str(request.args.get("cursor") or ""),
-        )
-        detail_monitor_id = str(request.args.get("news_detail") or "")
-        if include_news and detail_monitor_id:
-            detail_monitor = get_news_monitor(detail_monitor_id)
-            if detail_monitor:
-                detail_progress = public_news_monitor_progress(detail_monitor)
-                state_changes = [
-                    item
-                    for item in payload.get("news", [])
-                    if str(item.get("id")) != detail_monitor_id
-                ]
-                state_changes.append(detail_progress)
-                payload["news"] = state_changes
-        return jsonify(payload)
-
-    def stream():
-        cursor = str(request.args.get("cursor") or "")
-        while True:
-            ensure_storage()
-            payload = progress_payload(include_projects, include_news, cursor)
-            next_cursor = str(payload.get("cursor") or "")
-            if len(payload) > 1 or not cursor:
-                data = json.dumps(payload, ensure_ascii=False)
-                yield f"event: progress\ndata: {data}\n\n"
-            else:
-                yield ": keep-alive\n\n"
-            cursor = next_cursor
-            time.sleep(PROGRESS_STREAM_INTERVAL_SECONDS)
-
-    response = Response(stream(), mimetype="text/event-stream")
-    response.headers["Cache-Control"] = "no-cache"
-    response.headers["X-Accel-Buffering"] = "no"
-    return response
-
-
+    payload = progress_payload(
+        include_projects,
+        include_news,
+        str(request.args.get("cursor") or ""),
+    )
+    detail_monitor_id = str(request.args.get("news_detail") or "")
+    if include_news and detail_monitor_id:
+        detail_monitor = get_news_monitor(detail_monitor_id)
+        if detail_monitor:
+            detail_progress = public_news_monitor_progress(detail_monitor)
+            state_changes = [
+                item
+                for item in payload.get("news", [])
+                if str(item.get("id")) != detail_monitor_id
+            ]
+            state_changes.append(detail_progress)
+            payload["news"] = state_changes
+    return jsonify(payload)

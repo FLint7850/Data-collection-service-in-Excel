@@ -1,18 +1,8 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    PROJECT_PROGRESS_FIELDS,
-    news_lock,
-    news_settings,
-    progress_tracker,
-    projects,
-    projects_lock,
-)
-from services.scraping_service import clean_text
+from runtime.state import PROJECT_PROGRESS_FIELDS, news_lock, news_settings, progress_tracker, projects, projects_lock
+from typing import Dict, Iterable, List, Optional
+from services.scraping import clean_text
 
 
 def is_active_status(status: object) -> bool:
@@ -84,14 +74,14 @@ def stable_project_state(project: Dict[str, object], state: Dict[str, object]) -
 
 
 def projects_progress_payload() -> List[Dict[str, object]]:
-    from services.project_service import public_project
+    from services.projects import public_project
     with projects_lock:
         return [public_project(project, include_details=False) for project in projects.values()]
 
 
 def news_progress_payload() -> List[Dict[str, object]]:
     from runtime.news_tasks import cleanup_stale_news_transitions
-    from services.news_service import public_news_monitor
+    from services.news import public_news_monitor
     cleanup_stale_news_transitions()
     with news_lock:
         return [
@@ -113,7 +103,7 @@ def register_progress_items(
 
 
 def publish_project_progress(project: Dict[str, object]) -> None:
-    from services.project_service import public_project
+    from services.projects import public_project
     progress_tracker.publish(
         "projects",
         public_project(project, include_details=False),
@@ -159,7 +149,7 @@ def progress_payload(
 
 
 def publish_news_monitor_progress(monitor: Dict[str, object]) -> None:
-    from services.news_service import public_news_monitor
+    from services.news import public_news_monitor
     progress_tracker.publish(
         "news",
         public_news_monitor(monitor, include_details=False),
@@ -190,12 +180,9 @@ def publish_news_progress_snapshot(*, initialize: bool = False) -> str:
 
 
 def public_news_monitor_progress(monitor: Dict[str, object]) -> Dict[str, object]:
-    from services.news_service import public_news_monitor
+    from services.news import public_news_monitor
     public_monitor = public_news_monitor(monitor, include_details=True)
     return {
         "id": str(public_monitor["id"]),
         "state": public_monitor["state"],
     }
-
-
-__all__ = ['is_active_status', 'progress_int', 'has_positive_progress_value', 'same_progress_run', 'is_empty_active_progress_state', 'merge_stable_progress_state', 'stable_project_state', 'projects_progress_payload', 'news_progress_payload', 'register_progress_items', 'publish_project_progress', 'publish_projects_progress_snapshot', 'progress_payload', 'publish_news_monitor_progress', 'publish_news_brand_progress', 'publish_news_progress_snapshot', 'public_news_monitor_progress']

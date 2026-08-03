@@ -6,11 +6,14 @@ export default defineNuxtRouteMiddleware(async (to) => {
 
   if (import.meta.server) return;
 
+  const previousUsername = session.value?.authenticated ? session.value.username : "";
   try {
     session.value = await authService.session();
   } catch {
     session.value = { authenticated: false, username: "" };
   }
+  const currentUsername = session.value.authenticated ? session.value.username : "";
+  if (previousUsername && previousUsername !== currentUsername) clearDomainCache();
 
   if (to.path === "/login") {
     if (session.value.authenticated) return navigateTo("/projects");

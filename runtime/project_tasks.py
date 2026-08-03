@@ -1,21 +1,13 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    DEFAULT_EXCLUSIONS,
-    DEFAULT_START_URL,
-    Dict,
-    Optional,
-    PROJECT_PROFILE_DIR,
-    Path,
-    normalize_connection_method,
-    normalize_extraction_rules,
-    normalize_patterns,
-    safe_filename,
-    scan_dispatcher,
-    shutil,
-    threading,
-)
-from services.scraping_service import (
+import shutil
+import threading
+from config import DEFAULT_EXCLUSIONS, DEFAULT_START_URL, PROJECT_PROFILE_DIR
+from pathlib import Path
+from services.connections import normalize_connection_method
+from services.normalization import normalize_extraction_rules, normalize_patterns, safe_filename
+from typing import Dict, Optional
+from services.scraping import (
     BotasaurusBrowserSession,
     BotasaurusDebugVisibleSession,
     ProductSiteCrawler,
@@ -62,10 +54,7 @@ def cleanup_project_profile_if_disabled(project: Dict[str, object]) -> None:
 
 
 def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str, object]:
-    from services.project_service import add_project_log, project_runtime_thread_count, reset_project_state
-    task_key = ("project", str(project["id"]))
-    if scan_dispatcher.contains(task_key):
-        raise RuntimeError("Сбор уже выполняется или ожидает очереди")
+    from services.projects import add_project_log, project_runtime_thread_count, reset_project_state
     worker = project.get("worker_thread")
     state = project.get("state", {})
     if isinstance(worker, threading.Thread) and worker.is_alive():
@@ -130,7 +119,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         project["crawler"] = crawler
 
     def target() -> None:
-        from services.project_service import add_project_log, reset_project_state, update_project_state
+        from services.projects import add_project_log, reset_project_state, update_project_state
         try:
             if resume:
                 update_project_state(project, status="running", error="")
@@ -140,18 +129,16 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         except Exception as exc:  # noqa: BLE001
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
             add_project_log(project, f"Критическая ошибка: {exc}", "error")
+        finally:
+            if project.get("worker_thread") is threading.current_thread():
+                project["worker_thread"] = None
 
-    def on_start(thread: threading.Thread) -> None:
-        project["worker_thread"] = thread
-
-    def on_finish(thread: threading.Thread) -> None:
-        if project.get("worker_thread") is thread:
-            project["worker_thread"] = None
-
-    if not scan_dispatcher.enqueue(task_key, target, on_start=on_start, on_finish=on_finish):
-        raise RuntimeError("Сбор уже выполняется или ожидает очереди")
-    add_project_log(project, "Продолжение поставлено в очередь" if resume else "Сбор поставлен в очередь запуска", "info")
+    thread = threading.Thread(
+        target=target,
+        name=f"project-scan-{project['id']}",
+        daemon=True,
+    )
+    project["worker_thread"] = thread
+    thread.start()
+    add_project_log(project, "Продолжение запущено" if resume else "Сбор запущен", "info")
     return project["state"]
-
-
-__all__ = ['close_project_browser_session', 'project_profile_storage_dir', 'project_should_keep_browser_profile', 'project_browser_profile_dir', 'cleanup_project_profile_if_disabled', 'start_project']

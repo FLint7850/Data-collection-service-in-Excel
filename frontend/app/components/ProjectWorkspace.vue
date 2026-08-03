@@ -177,35 +177,6 @@ async function deleteProject() {
   }
 }
 
-function collectionKey(
-  collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
-) {
-  return collection === "exclusions"
-    ? "exclusions"
-    : collection === "product-url-filters"
-      ? "product_url_filters"
-      : "product_url_exclusions";
-}
-
-function addPattern(
-  collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
-  pattern: string,
-) {
-  if (!draft.value) return;
-  const value = pattern.trim();
-  const key = collectionKey(collection);
-  if (value && !draft.value[key].includes(value)) draft.value[key].push(value);
-}
-
-function removePattern(
-  collection: "exclusions" | "product-url-filters" | "product-url-exclusions",
-  index: number,
-) {
-  if (!draft.value) return;
-  const values = draft.value[collectionKey(collection)];
-  if (index >= 0 && index < values.length) values.splice(index, 1);
-}
-
 async function startOrResume() {
   if (!draft.value) return;
   actionLoading.value = canResume.value ? "resume" : "start";
@@ -330,7 +301,7 @@ onMounted(async () => {
       @update:open="pageError = ''"
     />
 
-    <div v-if="loading && !projects.length" class="loading-state">
+    <div v-if="loading" class="loading-state">
       <span class="loading-logo"><UIcon name="i-lucide-sheet" /></span>
       <p>Загружаем проекты…</p>
     </div>
@@ -479,99 +450,9 @@ onMounted(async () => {
           :download-url="`/api/projects/${draft.id}/download`"
         />
 
-        <UCard as="section" variant="outline" class="panel settings-stack">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">ФИЛЬТРАЦИЯ</p>
-              <h2><strong>Исключения и URL-фильтры</strong></h2>
-            </div>
-          </div>
+        <ProjectFiltersPanel v-model="draft" :disabled="isActive" />
 
-          <SettingsCollapsible class="mt-3">
-            <template #label>
-              Исключения разделов
-              <UBadge color="neutral" variant="subtle">{{ draft.exclusions.length }}</UBadge>
-            </template>
-            <PatternEditor
-              :model-value="draft.exclusions"
-              placeholder="/catalog/rasprodazha/"
-              :disabled="isActive"
-              @add="addPattern('exclusions', $event)"
-              @remove="removePattern('exclusions', $event)"
-            />
-          </SettingsCollapsible>
-
-          <SettingsCollapsible>
-            <template #label>
-              Фильтр товарных URL
-              <UBadge color="neutral" variant="subtle">{{ draft.product_url_filters.length }}</UBadge>
-            </template>
-            <PatternEditor
-              :model-value="draft.product_url_filters"
-              placeholder="-qyron-"
-              :disabled="isActive"
-              @add="addPattern('product-url-filters', $event)"
-              @remove="removePattern('product-url-filters', $event)"
-            />
-          </SettingsCollapsible>
-
-          <SettingsCollapsible>
-            <template #label>
-              Исключения товарных ссылок
-              <UBadge color="neutral" variant="subtle">{{ draft.product_url_exclusions.length }}</UBadge>
-            </template>
-            <PatternEditor
-              :model-value="draft.product_url_exclusions"
-              placeholder="/recommend"
-              :disabled="isActive"
-              @add="addPattern('product-url-exclusions', $event)"
-              @remove="removePattern('product-url-exclusions', $event)"
-            />
-          </SettingsCollapsible>
-        </UCard>
-
-        <UCard as="section" variant="outline" class="panel settings-stack">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">ТОЧНАЯ НАСТРОЙКА</p>
-              <h2><strong>Селекторы и правила модели</strong></h2>
-            </div>
-          </div>
-
-          <SettingsCollapsible content-class="form-grid" class="mt-3">
-            <template #label>CSS-селекторы карточек</template>
-            <UFormField label="Карточка товара">
-              <UInput v-model="draft.extraction_rules.product_card_selector" placeholder=".product-card" class="w-full" />
-            </UFormField>
-            <UFormField label="Ссылка товара">
-              <UInput v-model="draft.extraction_rules.product_url_selector" placeholder="a[href]" class="w-full" />
-            </UFormField>
-            <UFormField label="Модель">
-              <UInput v-model="draft.extraction_rules.model_selector" placeholder=".product-title" class="w-full" />
-            </UFormField>
-            <UFormField label="Цена">
-              <UInput v-model="draft.extraction_rules.price_selector" placeholder=".price" class="w-full" />
-            </UFormField>
-          </SettingsCollapsible>
-
-          <SettingsCollapsible content-class="form-grid">
-            <template #label>Маркеры и поиск/замена</template>
-            <UFormField label="Начальный маркер">
-              <UInput v-model="draft.extraction_rules.model_start_marker" placeholder="<h1 class=&quot;detail__title&quot;>" class="w-full" />
-            </UFormField>
-            <UFormField label="Конечный маркер">
-              <UInput v-model="draft.extraction_rules.model_end_marker" placeholder="</h1>" class="w-full" />
-            </UFormField>
-            <UFormField label="Правила замены" class="field-span-2">
-              <UTextarea
-                v-model="draft.extraction_rules.model_replace_rules"
-                :rows="5"
-                class="w-full code-input"
-                placeholder="{reg[#[^A-Za-z0-9./\-\s]#]}|"
-              />
-            </UFormField>
-          </SettingsCollapsible>
-        </UCard>
+        <ProjectExtractionPanel v-model="draft" :disabled="isActive" />
       </div>
     </div>
 

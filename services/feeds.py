@@ -1,45 +1,25 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    Dict,
-    ET,
-    EXPORT_DIR,
-    FEED_COMPARISON_ACTIVE_STATUSES,
-    FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS,
-    FEED_COMPARISON_RESULT_FIELDS,
-    FeedComparison,
-    Iterable,
-    List,
-    MSK_TZ,
-    Optional,
-    OwnSite,
-    Path,
-    SessionLocal,
-    Set,
-    SupplierFeed,
-    csv,
-    datetime,
-    env_str,
-    feed_comparison_lock,
-    feed_comparison_stop_event,
-    feed_comparison_worker_thread,
-    g,
-    io,
-    json,
-    news_lock,
-    news_settings,
-    normalize_feed_url,
-    normalize_file_import_exclusions,
-    normalize_file_import_rules_text,
-    re,
-    select,
-    session_scope,
-    threading,
-    time,
-    urlparse,
-    zipfile,
-)
-from services.scraping_service import clean_text, prepare_rule_model
+import csv
+import io
+import json
+import re
+import threading
+import time
+import xml.etree.ElementTree as ET
+import zipfile
+from config import EXPORT_DIR, FEED_COMPARISON_ACTIVE_STATUSES, FEED_COMPARISON_PROGRESS_COMMIT_INTERVAL_SECONDS, FEED_COMPARISON_RESULT_FIELDS, MSK_TZ, env_str
+from database.session import SessionLocal, session_scope
+from datetime import datetime
+from flask import g
+from models import FeedComparison, OwnSite, SupplierFeed
+from pathlib import Path
+from runtime.state import feed_comparison_lock, feed_comparison_stop_event, feed_comparison_worker_thread, news_lock, news_settings
+from services.normalization import normalize_feed_url, normalize_file_import_exclusions, normalize_file_import_rules_text
+from sqlalchemy import select
+from typing import Dict, Iterable, List, Optional, Set
+from urllib.parse import urlparse
+from services.scraping import clean_text, prepare_rule_model
 
 
 def make_feed_comparison_state(status: str = "idle") -> Dict[str, object]:
@@ -301,19 +281,20 @@ def supplier_feed_basic_auth_for_url(url: str) -> Optional[tuple[str, str]]:
 
 def download_comparison_feed(url: str) -> bytes:
     from runtime.news_tasks import make_feed_session
+    from services.file_validation import read_limited_response
     session = make_feed_session()
     request_kwargs: Dict[str, object] = {"timeout": 60}
     basic_auth = supplier_feed_basic_auth_for_url(url)
     if basic_auth:
         request_kwargs["auth"] = basic_auth
-    response = session.get(url, **request_kwargs)
+    response = session.get(url, stream=True, **request_kwargs)
     if response.status_code == 401:
         if basic_auth:
             raise ValueError("Фид отклонил сохранённые данные авторизации")
         if "basic" in str(response.headers.get("WWW-Authenticate") or "").casefold():
             raise ValueError("Фид требует HTTP Basic Authentication, но данные авторизации не настроены")
     response.raise_for_status()
-    content = response.content
+    content = read_limited_response(response)
     if not content:
         raise ValueError("Фид вернул пустой ответ")
     return content
@@ -421,6 +402,8 @@ def supplier_csv_available_fields(content: bytes, limit: int = 20) -> List[str]:
 
 def supplier_xlsx_rows(content: bytes) -> tuple[object, Iterable[Iterable[object]], List[str], int]:
     from services.file_import_service import file_import_cell_text
+    from services.file_validation import validate_xlsx_archive
+    validate_xlsx_archive(content)
     try:
         from openpyxl import load_workbook
 
@@ -974,4 +957,3 @@ def feed_comparison_worker_alive() -> bool:
     return bool(feed_comparison_worker_thread and feed_comparison_worker_thread.is_alive())
 
 
-__all__ = ['make_feed_comparison_state', 'normalize_feed_comparison_state', 'is_feed_comparison_active_state', 'get_feed_comparison_row', 'resolve_feed_comparison_export_path', 'remove_feed_comparison_export', 'update_feed_comparison_state', 'public_own_site', 'public_supplier_feed', 'public_feed_comparison_state', 'public_feed_comparison_progress', 'sync_own_sites_runtime', 'normalize_supplier_model_field', 'validate_feed_comparison_site_payload', 'supplier_feed_basic_auth_rules', 'supplier_feed_basic_auth_for_url', 'download_comparison_feed', 'xml_local_name', 'supplier_xml_field_value', 'supplier_xml_available_fields', 'detect_supplier_feed_format', 'supplier_csv_rows', 'supplier_csv_optional_column_index', 'supplier_csv_available_fields', 'supplier_xlsx_rows', 'supplier_xlsx_available_fields', 'supplier_xml_alias_value', 'read_supplier_xml_feed_rows', 'read_supplier_tabular_feed_rows', 'read_supplier_csv_feed_rows', 'read_supplier_xlsx_feed_rows', 'read_supplier_feed_rows', 'prepare_supplier_feed_item', 'build_feed_comparison_own_indexes', 'feed_comparison_result_filename', 'write_feed_comparison_workbook', 'compare_supplier_feeds', 'run_feed_comparison', 'recover_interrupted_feed_comparison', 'start_feed_comparison', 'feed_comparison_worker_alive']

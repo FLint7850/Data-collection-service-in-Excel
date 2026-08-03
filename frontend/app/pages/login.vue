@@ -18,7 +18,9 @@ async function submit() {
   error.value = "";
   loading.value = true;
   try {
-    useState("auth-session").value = await authService.login(username.value.trim(), password.value);
+    const authenticated = await authService.login(username.value.trim(), password.value);
+    clearDomainCache();
+    useState("auth-session").value = authenticated;
     const redirect = typeof route.query.redirect === "string" ? route.query.redirect : "/projects";
     await navigateTo(redirect);
   } catch (caught) {

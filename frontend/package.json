@@ -8,14 +8,13 @@
     "build": "nuxt build",
     "preview": "nuxt preview",
     "typecheck": "nuxt typecheck",
-    "test": "vitest run"
+    "test": "nuxt prepare && vitest run"
   },
   "dependencies": {
     "@iconify-json/lucide": "^1.2.120",
     "@nuxt/icon": "^2.4.1",
     "@nuxt/ui": "^4.10.0",
-    "nuxt": "^4.5.1",
-    "zod": "^4.1.12"
+    "nuxt": "^4.5.1"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

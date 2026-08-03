@@ -339,6 +339,7 @@ export interface FeedComparisonProgress {
 }
 
 export interface LogEntry {
+  id: number;
   time: string;
   level: "info" | "success" | "warning" | "error" | string;
   message: string;
@@ -355,6 +356,8 @@ export interface LogsResponse {
   logs_limit: number;
   auto_cleanup: boolean;
   logs_signature: string;
+  logs_last_id: number;
+  logs_counts: Record<string, number>;
   delta?: boolean;
 }
 

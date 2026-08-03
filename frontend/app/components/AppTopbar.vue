@@ -22,6 +22,7 @@ async function logout() {
   loggingOut.value = true;
   try {
     await authService.logout();
+    clearDomainCache();
     session.value = { authenticated: false, username: "" };
     await navigateTo("/login");
   } finally {

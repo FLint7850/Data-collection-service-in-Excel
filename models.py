@@ -1,5 +1,7 @@
 ﻿from datetime import datetime
 
+from datetime import UTC
+
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
@@ -7,6 +9,11 @@ from sqlalchemy.types import JSON
 
 class Base(DeclarativeBase):
     pass
+
+
+def utc_now() -> datetime:
+    """Keep current naive DB columns while deriving time from UTC explicitly."""
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Project(Base):
@@ -26,8 +33,8 @@ class Project(Base):
     connection_method: Mapped[str] = mapped_column(String(64), default="requests", nullable=False)
     auto_connection_fallback: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     persist_profile: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class User(Base):
@@ -37,10 +44,28 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     __table_args__ = (Index("ix_users_username", "username"),)
+
+
+class ApplicationLog(Base):
+    __tablename__ = "application_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    level: Mapped[str] = mapped_column(String(16), default="info", nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    project_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    project_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    brand: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    group_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+
+    __table_args__ = (
+        Index("ix_application_logs_created_at", "created_at"),
+        Index("ix_application_logs_level", "level"),
+    )
 
 
 class Brand(Base):
@@ -57,8 +82,8 @@ class Brand(Base):
     weekday: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     primary_donor_id: Mapped[int | None] = mapped_column(ForeignKey("donors.id", ondelete="SET NULL"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     donors: Mapped[list["Donor"]] = relationship(
         "Donor",
@@ -97,8 +122,8 @@ class Donor(Base):
     selector_settings: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     seen_models: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     known_new_products: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     brand: Mapped[Brand] = relationship("Brand", back_populates="donors", foreign_keys=[brand_id])
     connection_method_row: Mapped["ConnectionMethod | None"] = relationship("ConnectionMethod")
@@ -114,7 +139,7 @@ class ConnectionMethod(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     is_browser_render: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_debug_visible: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
 class OwnSite(Base):
@@ -124,8 +149,8 @@ class OwnSite(Base):
     name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     feed_url: Mapped[str] = mapped_column(Text, nullable=False)
     feed_generate_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     __table_args__ = (UniqueConstraint("feed_url", name="uq_own_sites_feed_url"),)
 
@@ -150,8 +175,8 @@ class FileImport(Base):
     export_path: Mapped[str] = mapped_column(String(500), default="", nullable=False)
     file: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class FeedComparison(Base):
@@ -160,8 +185,8 @@ class FeedComparison(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     export_path: Mapped[str] = mapped_column(String(500), default="", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class SupplierFeed(Base):
@@ -173,8 +198,8 @@ class SupplierFeed(Base):
     model_field: Mapped[str] = mapped_column(String(255), nullable=False)
     exclusions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     replace_rules: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     __table_args__ = (UniqueConstraint("feed_url", name="uq_supplier_feeds_feed_url"),)
 

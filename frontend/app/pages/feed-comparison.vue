@@ -3,7 +3,6 @@ import { feedComparisonService } from "~/services/feed-comparison.service";
 import type {
   FeedComparisonData,
   FeedComparisonProgress,
-  OwnSite,
   SupplierFeed,
 } from "~/types/api";
 import { errorMessage } from "~/utils/format";
@@ -20,7 +19,6 @@ const loading = ref(true);
 const savingKey = ref("");
 const actionLoading = ref("");
 const error = ref("");
-const pendingOwnSites = ref<OwnSite[]>([]);
 const pendingSuppliers = ref<SupplierFeed[]>([]);
 
 const isActive = computed(() =>
@@ -52,44 +50,6 @@ async function load() {
   }
 }
 
-function addOwnSite() {
-  pendingOwnSites.value.push({
-    name: "",
-    feed_url: "",
-    feed_generate_url: "",
-  });
-}
-
-function addSupplier() {
-  pendingSuppliers.value.push({
-    name: "",
-    feed_url: "",
-    model_field: "",
-    exclusions: "",
-    replace_rules: "",
-  });
-}
-
-async function saveOwnSite(site: OwnSite, pendingIndex?: number) {
-  savingKey.value = `own-${site.id || pendingIndex}`;
-  try {
-    const response = await feedComparisonService.saveOwnSite(site);
-    const index = data.value?.own_sites.findIndex(
-      (item) => item.id === response.own_site.id,
-    ) ?? -1;
-    if (data.value) {
-      if (index >= 0) data.value.own_sites[index] = response.own_site;
-      else data.value.own_sites.push(response.own_site);
-    }
-    if (pendingIndex != null) pendingOwnSites.value.splice(pendingIndex, 1);
-    toast.add({ title: "Фид сайта сохранён", color: "success" });
-  } catch (caught) {
-    error.value = errorMessage(caught);
-  } finally {
-    savingKey.value = "";
-  }
-}
-
 async function saveSupplier(supplier: SupplierFeed, pendingIndex?: number) {
   savingKey.value = `supplier-${supplier.id || pendingIndex}`;
   try {
@@ -107,20 +67,6 @@ async function saveSupplier(supplier: SupplierFeed, pendingIndex?: number) {
     error.value = errorMessage(caught);
   } finally {
     savingKey.value = "";
-  }
-}
-
-async function removeOwnSite(site: OwnSite) {
-  if (!site.id) return;
-  try {
-    const response = await feedComparisonService.removeOwnSite(site.id);
-    if (data.value) {
-      data.value.own_sites = data.value.own_sites.filter(
-        (item) => item.id !== response.id,
-      );
-    }
-  } catch (caught) {
-    error.value = errorMessage(caught);
   }
 }
 
@@ -215,68 +161,14 @@ onMounted(load);
         <MetricCard label="Не найдено" :value="data.state.missing_rows" icon="i-lucide-package-x" tone="red" />
       </div>
 
-      <UCard as="section" variant="outline" class="panel feed-column">
-        <UCollapsible>
-          <template #default="{ open }">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">ИСТОЧНИКИ</p>
-                <h2><strong>Фиды поставщиков</strong></h2>
-                <p>Для каждого поставщика укажите точное имя XML-поля с моделью.</p>
-              </div>
-              <div class="flex flex-col gap-3">
-                <UIcon
-                    name="i-lucide-chevron-down"
-                    class="settings-details-chevron"
-                    :class="{ open }"
-                />
-                <UButton
-                    color="neutral"
-                    variant="soft"
-                    icon="i-lucide-plus"
-                    :disabled="isActive"
-                    @click.stop="addSupplier"
-                >
-                  Поставщик
-                </UButton>
-              </div>
-            </div>
-          </template>
-          <template #content>
-            <div class="feed-list">
-              <FeedEditorCard
-                  v-for="supplier in data.suppliers"
-                  :key="`supplier-${supplier.id}`"
-                  kind="supplier"
-                  :item="supplier"
-                  :disabled="isActive"
-                  :saving="savingKey === `supplier-${supplier.id}`"
-                  @save="saveSupplier($event as SupplierFeed)"
-                  @remove="removeSupplier($event as SupplierFeed)"
-              />
-              <FeedEditorCard
-                  v-for="(supplier, index) in pendingSuppliers"
-                  :key="`new-supplier-${index}`"
-                  kind="supplier"
-                  :item="supplier"
-                  :disabled="isActive"
-                  :saving="savingKey === `supplier-${index}`"
-                  @save="saveSupplier($event as SupplierFeed, index)"
-                  @remove="pendingSuppliers.splice(index, 1)"
-              />
-            </div>
-          </template>
-        </UCollapsible>
-
-        <EmptyState
-          v-if="!data.suppliers.length && !pendingSuppliers.length"
-          icon="i-lucide-truck"
-          title="Нет поставщиков"
-          description="Добавьте XML-фид поставщика для сравнения."
-        >
-          <UButton color="primary" variant="soft" icon="i-lucide-plus" @click="addSupplier">Добавить</UButton>
-        </EmptyState>
-      </UCard>
+      <SupplierFeedsPanel
+        v-model:pending="pendingSuppliers"
+        :suppliers="data.suppliers"
+        :disabled="isActive"
+        :saving-key="savingKey"
+        @save="saveSupplier"
+        @remove="removeSupplier"
+      />
 
 
       <UCard as="section" variant="outline" class="panel comparison-progress-panel">

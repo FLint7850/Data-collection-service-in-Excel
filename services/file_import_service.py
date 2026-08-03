@@ -1,46 +1,24 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    BeautifulSoup,
-    Brand,
-    Dict,
-    ET,
-    EXPORT_DIR,
-    FILE_IMPORT_ACTIVE_STATUSES,
-    FILE_IMPORT_ALLOWED_SUFFIXES,
-    FILE_IMPORT_DIR,
-    FILE_IMPORT_RESULT_FIELDS,
-    FileImport,
-    Iterable,
-    List,
-    MSK_TZ,
-    Optional,
-    Path,
-    SessionLocal,
-    Set,
-    VISUAL_MODEL_TRANSLATION,
-    csv,
-    datetime,
-    file_import_lock,
-    file_import_stop_event,
-    file_import_worker_thread,
-    g,
-    html_lib,
-    io,
-    news_lock,
-    news_settings,
-    normalize_file_import_exclusions,
-    normalize_file_import_rules_text,
-    normalize_model_key,
-    output_text,
-    re,
-    safe_filename,
-    select,
-    session_scope,
-    threading,
-    time,
-)
-from services.scraping_service import clean_text, prepare_rule_model
+import csv
+import html as html_lib
+import io
+import re
+import threading
+import time
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+from config import EXPORT_DIR, FILE_IMPORT_ACTIVE_STATUSES, FILE_IMPORT_ALLOWED_SUFFIXES, FILE_IMPORT_DIR, FILE_IMPORT_RESULT_FIELDS, MSK_TZ, VISUAL_MODEL_TRANSLATION
+from database.session import SessionLocal, session_scope
+from datetime import datetime
+from flask import g
+from models import Brand, FileImport
+from pathlib import Path
+from runtime.state import file_import_lock, file_import_stop_event, file_import_worker_thread, news_lock, news_settings
+from services.normalization import normalize_file_import_exclusions, normalize_file_import_rules_text, normalize_model_key, output_text, safe_filename
+from sqlalchemy import select
+from typing import Dict, Iterable, List, Optional, Set
+from services.scraping import clean_text, prepare_rule_model
 
 
 class FileImportStopped(Exception):
@@ -192,11 +170,6 @@ def get_file_import_row(db_session=None) -> FileImport:
             }
             db.flush()
     return row
-
-
-def current_file_import_path() -> Optional[Path]:
-    row = get_file_import_row()
-    return file_import_path_for_row(row)
 
 
 def resolve_file_import_export_path(value: str) -> Optional[Path]:
@@ -710,8 +683,7 @@ def build_feed_index_from_xml(content: bytes, feed: Dict[str, object], stop_even
 
 def build_file_import_feed_indexes(stop_event: Optional[threading.Event] = None) -> List[Dict[str, object]]:
     from runtime.news_tasks import download_feed_files, feed_snapshot_path
-    from services.log_service import save_logs
-    from services.news_service import save_news_settings
+    from services.news import save_news_configuration
     downloaded_feeds = download_feed_files(stop_event=stop_event)
     feed_indexes: List[Dict[str, object]] = []
     for feed in downloaded_feeds:
@@ -731,8 +703,7 @@ def build_file_import_feed_indexes(stop_event: Optional[threading.Event] = None)
             {key: value for key, value in feed.items() if key != "index"}
             for feed in feed_indexes
         ]
-        save_news_settings()
-    save_logs()
+        save_news_configuration()
     return feed_indexes
 
 
@@ -1100,6 +1071,3 @@ def start_file_import_compare() -> Dict[str, object]:
 
 def file_import_worker_alive() -> bool:
     return bool(file_import_worker_thread and file_import_worker_thread.is_alive())
-
-
-__all__ = ['FileImportStopped', 'make_file_import_state', 'normalize_file_import_state', 'is_file_import_active_state', 'file_import_path_for_row', 'update_file_import_state', 'stop_file_import_if_requested', 'clear_file_import_storage', 'stored_file_import_files', 'get_file_import_row', 'current_file_import_path', 'resolve_file_import_export_path', 'remove_file_import_export', 'public_file_import_state', 'public_file_import_progress', 'public_file_import_settings', 'decode_file_import_csv', 'normalize_file_import_header', 'file_import_column_index', 'file_import_optional_brand_index', 'file_import_optional_name_index', 'file_import_cell_text', 'read_file_import_rows', 'strip_file_import_model_special_chars', 'prepare_file_import_model', 'technical_clean_model_text', 'strip_file_import_non_model_phrases', 'normalize_compare_key', 'compact_compare_key', 'visual_compare_key', 'compare_keys_for_value', 'file_import_exclusion_matches', 'known_file_import_brands', 'brand_match_pattern', 'find_brand_in_name', 'tail_after_brand', 'model_signal_token', 'visual_model_suffix_token', 'candidate_until_russian_description', 'first_model_block', 'normalize_candidate_display', 'add_model_candidate', 'code_model_tokens', 'generate_model_candidates', 'feed_index_add', 'index_feed_value', 'build_feed_index_from_xml', 'build_file_import_feed_indexes', 'match_candidates_against_feed_indexes', 'missing_feed_labels', 'file_import_result_filename', 'excel_sheet_title', 'write_file_import_workbook', 'compare_file_import_with_feeds', 'run_file_import_compare', 'recover_interrupted_file_import_scan', 'start_file_import_compare', 'file_import_worker_alive']

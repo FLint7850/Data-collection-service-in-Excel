@@ -45,9 +45,9 @@ const counters = computed(() => {
   const logs = data.value?.logs || [];
   return {
     total: data.value?.logs_total || logs.length,
-    success: logs.filter((item) => item.level === "success").length,
-    warning: logs.filter((item) => item.level === "warning").length,
-    error: logs.filter((item) => item.level === "error").length,
+    success: data.value?.logs_counts.success || 0,
+    warning: data.value?.logs_counts.warning || 0,
+    error: data.value?.logs_counts.error || 0,
   };
 });
 
@@ -69,7 +69,7 @@ async function load(silent = false) {
       1,
       200,
       silent ? data.value?.logs_signature || "" : "",
-      silent ? data.value?.logs_total : undefined,
+      silent ? data.value?.logs_last_id : undefined,
     );
     if (!("not_modified" in response)) {
       if (response.delta && data.value) {
@@ -208,8 +208,8 @@ onMounted(load);
 
       <div v-else class="logs-list">
         <UCard
-            v-for="(item, index) in filteredLogs"
-            :key="`${item.time}-${index}`"
+            v-for="item in filteredLogs"
+            :key="item.id"
             as="article"
             variant="subtle"
             class="log-item shrink-0"

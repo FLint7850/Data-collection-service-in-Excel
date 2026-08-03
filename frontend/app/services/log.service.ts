@@ -1,13 +1,13 @@
 import type { LogsPollResponse } from "~/types/api";
 
 export const logService = {
-  list: (page = 1, limit = 200, signature = "", sinceTotal?: number) =>
+  list: (page = 1, limit = 200, signature = "", afterId?: number) =>
     $fetch<LogsPollResponse>("/api/logs", {
       query: {
         page,
         limit,
         signature: signature || undefined,
-        since_total: sinceTotal,
+        after_id: afterId,
       },
     }),
 

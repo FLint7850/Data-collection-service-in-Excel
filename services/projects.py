@@ -1,37 +1,19 @@
 """Extracted application service module."""
 
-from services.core_service import (
-    DEFAULT_EXCLUSIONS,
-    DEFAULT_START_URL,
-    Dict,
-    EXPORT_DIR,
-    List,
-    Optional,
-    PROJECT_PROGRESS_FIELDS,
-    Path,
-    Project,
-    csv,
-    datetime,
-    delete,
-    ensure_storage,
-    is_debug_visible_method,
-    normalize_connection_method,
-    normalize_extraction_rules,
-    normalize_patterns,
-    normalize_start_urls,
-    output_text,
-    parse_db_int,
-    projects,
-    projects_lock,
-    repair_mojibake,
-    repair_mojibake_text,
-    safe_filename,
-    select,
-    session_scope,
-    threading,
-    time,
-    uuid,
-)
+import csv
+import threading
+import uuid
+from config import DEFAULT_EXCLUSIONS, DEFAULT_START_URL, EXPORT_DIR
+from database.session import session_scope
+from datetime import datetime
+from models import Project
+from pathlib import Path
+from runtime.state import PROJECT_PROGRESS_FIELDS, projects, projects_lock
+from services.application import ensure_storage
+from services.connections import is_debug_visible_method, normalize_connection_method
+from services.normalization import normalize_extraction_rules, normalize_patterns, normalize_start_urls, output_text, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
+from sqlalchemy import delete, select
+from typing import Dict, List, Optional
 
 
 def make_state(thread_count: int = 4) -> Dict[str, object]:
@@ -60,14 +42,13 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
     return {
         "id": project_id,
         "name": name,
-        "start_urls": start_urls or [DEFAULT_START_URL],
+        "start_urls": list(start_urls or []),
         "thread_count": 4,
         "exclusions": DEFAULT_EXCLUSIONS.copy(),
         "product_url_filters": [],
         "product_url_exclusions": [],
         "extraction_rules": {},
         "state": make_state(4),
-        "logs": [],
         "auto_cleanup": False,
         "connection_method": normalize_connection_method(None),
         "auto_connection_fallback": True,
@@ -118,14 +99,13 @@ def project_model_to_dict(row: Project) -> Dict[str, object]:
     project = {
         "id": str(row.id),
         "name": row.name,
-        "start_urls": normalize_start_urls(row.start_urls or [DEFAULT_START_URL]),
+        "start_urls": normalize_start_urls(row.start_urls, allow_empty=True),
         "thread_count": thread_count,
         "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "product_url_exclusions": normalize_patterns(getattr(row, "product_url_exclusions", None) or []),
         "extraction_rules": normalize_extraction_rules(row.extraction_rules or {}),
         "state": state,
-        "logs": [],
         "auto_cleanup": bool(row.auto_cleanup),
         "connection_method": normalize_connection_method(row.connection_method),
         "auto_connection_fallback": bool(row.auto_connection_fallback),
@@ -149,7 +129,7 @@ def upsert_project_model(session, project: Dict[str, object]) -> int:
         row = Project(legacy_id=legacy_id if legacy_id and parse_db_int(legacy_id) is None else "", name=str(project.get("name") or "Проект"))
         session.add(row)
     row.name = str(project.get("name") or "Проект")
-    row.start_urls = normalize_start_urls(project.get("start_urls") or DEFAULT_START_URL)
+    row.start_urls = normalize_start_urls(project.get("start_urls"), allow_empty=True)
     row.thread_count = parse_thread_count(project.get("thread_count", 4))
     row.exclusions = normalize_patterns(project.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(project.get("product_url_filters", []))
@@ -185,8 +165,27 @@ def save_projects() -> None:
         publish_projects_progress_snapshot()
 
 
+def save_project(project: Dict[str, object]) -> None:
+    """Persist one runtime project without reconciling or deleting its siblings."""
+    from services.progress_service import publish_project_progress
+    with projects_lock:
+        old_id = str(project.get("id") or "")
+        with session_scope() as session:
+            db_id = upsert_project_model(session, project)
+            project["id"] = str(db_id)
+        if old_id != project["id"] and projects.get(old_id) is project:
+            projects.pop(old_id, None)
+            projects[project["id"]] = project
+        publish_project_progress(project)
+
+
+def delete_project_record(project_id: object) -> bool:
+    from database.repositories.projects import delete_project
+    parsed_id = parse_db_int(project_id)
+    return bool(parsed_id and delete_project(parsed_id))
+
+
 def load_projects() -> None:
-    from services.log_service import load_logs
     from services.progress_service import publish_projects_progress_snapshot
     with projects_lock:
         if projects:
@@ -206,7 +205,6 @@ def load_projects() -> None:
             project = make_project("Проект 1", [DEFAULT_START_URL])
             projects[project["id"]] = project
             save_projects()
-        load_logs()
         publish_projects_progress_snapshot(initialize=True)
 
 
@@ -263,26 +261,16 @@ def reset_project_state_after_form_save(project: Dict[str, object]) -> None:
 
 
 def add_project_log(project: Dict[str, object], message: str, level: str = "info") -> None:
-    from services.log_service import append_unified_log, save_logs
-    with projects_lock:
-        logs = project.setdefault("logs", [])
-        item = {
+    from services.log_service import append_log
+    append_log(
+        {
             "time": datetime.now().isoformat(timespec="seconds"),
             "project_id": project["id"],
             "project_name": repair_mojibake_text(project["name"]),
             "level": level,
             "message": repair_mojibake_text(message),
         }
-        logs.append(item)
-        append_unified_log(item)
-        if project.get("auto_cleanup"):
-            cutoff = time.time() - 7 * 24 * 60 * 60
-            logs[:] = [
-                item
-                for item in logs
-                if datetime.fromisoformat(item["time"]).timestamp() >= cutoff
-            ]
-        save_logs()
+    )
 
 
 def project_csv_prefix(project: Optional[Dict[str, object]]) -> str:
@@ -296,7 +284,7 @@ def project_csv_filename(project: Optional[Dict[str, object]], created_at: Optio
 
 
 def delete_project_csv_for_project(project: Dict[str, object], keep_filename: str = "") -> None:
-    from services.news_service import resolve_export_file
+    from services.news import resolve_export_file
     keep_filename = str(keep_filename or "").strip()
     state = project.get("state", {}) if isinstance(project.get("state"), dict) else {}
     filenames = {
@@ -361,6 +349,3 @@ def create_export_file(rows: List[Dict[str, str]], project: Optional[Dict[str, o
             writer.writerow([output_text(row.get("url", "")), output_text(row.get("model", "")), output_text(row.get("price", ""))])
 
     return path
-
-
-__all__ = ['make_state', 'make_project', 'public_project', 'project_model_to_dict', 'upsert_project_model', 'save_projects', 'load_projects', 'get_project', 'update_project_state', 'reset_project_state', 'project_worker_alive', 'reset_project_state_after_form_save', 'add_project_log', 'project_csv_prefix', 'project_csv_filename', 'delete_project_csv_for_project', 'parse_thread_count', 'project_runtime_thread_count', 'get_project_row', 'create_export_file']
