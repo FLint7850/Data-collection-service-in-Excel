@@ -17,7 +17,9 @@ function addSite() {
         <p>Используются в мониторинге новинок, импорте файлов и сравнении поставщиков.</p>
       </div>
       <UButton color="neutral" variant="soft" icon="i-lucide-plus" @click="addSite">
-        Добавить фид
+        <div class="whitespace-nowrap">
+          Добавить фид
+        </div>
       </UButton>
     </div>
 
