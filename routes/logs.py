@@ -7,8 +7,7 @@ from flask import Blueprint, jsonify, request
 from services.application import ensure_storage
 from services.log_service import (
     clear_logs,
-    get_log_auto_cleanup,
-    logs_signature,
+    logs_metadata,
     prune_old_logs,
     query_logs,
     set_log_auto_cleanup,
@@ -29,12 +28,14 @@ def _positive_int(name: str, default: int, maximum: int) -> int:
 def api_logs():
     ensure_storage()
     global _last_cleanup_at
-    auto_cleanup = get_log_auto_cleanup()
+    metadata = logs_metadata()
+    auto_cleanup = bool(metadata["auto_cleanup"])
     if auto_cleanup and time.time() - _last_cleanup_at >= 60:
         prune_old_logs()
         _last_cleanup_at = time.time()
+        metadata = logs_metadata()
 
-    signature = logs_signature()
+    signature = str(metadata["signature"])
     requested_signature = str(request.args.get("signature") or "")
     if requested_signature and requested_signature == signature:
         return jsonify(
@@ -69,6 +70,8 @@ def api_logs():
         page=_positive_int("page", 1, 100_000),
         limit=_positive_int("limit", 200, 1000),
         after_id=after_id,
+        total=int(metadata["total"]),
+        last_id=int(metadata["last_id"]),
     )
     payload["auto_cleanup"] = auto_cleanup
     return jsonify(payload)

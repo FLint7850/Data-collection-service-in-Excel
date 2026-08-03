@@ -16,6 +16,7 @@ from models import FeedComparison, OwnSite, SupplierFeed
 from pathlib import Path
 from runtime.state import feed_comparison_lock, feed_comparison_stop_event, feed_comparison_worker_thread, news_lock, news_settings
 from services.normalization import normalize_feed_url, normalize_file_import_exclusions, normalize_file_import_rules_text
+from services.domain_revisions import bump_domain_revision, domain_revision
 from sqlalchemy import select
 from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
@@ -150,6 +151,7 @@ def public_feed_comparison_state(db_session=None) -> Dict[str, object]:
     own_sites = db.scalars(select(OwnSite).order_by(OwnSite.id)).all()
     suppliers = db.scalars(select(SupplierFeed).order_by(SupplierFeed.id)).all()
     return {
+        "revision": domain_revision("feed_comparison"),
         "own_sites": [public_own_site(row) for row in own_sites],
         "suppliers": [public_supplier_feed(row) for row in suppliers],
         "state": state,
@@ -164,6 +166,7 @@ def public_feed_comparison_progress(db_session=None) -> Dict[str, object]:
     state = normalize_feed_comparison_state(comparison.state)
     result_path = resolve_feed_comparison_export_path(str(comparison.export_path or ""))
     return {
+        "revision": domain_revision("feed_comparison"),
         "state": state,
         "result_ready": bool(
             result_path and not is_feed_comparison_active_state(state)
@@ -178,6 +181,7 @@ def sync_own_sites_runtime(db_session) -> None:
     with news_lock:
         news_settings["own_sites"] = [
             {
+                "id": site.get("id"),
                 "name": str(site.get("name") or ""),
                 "feed_url": str(site.get("feed_url") or ""),
                 "feed_generate_url": str(site.get("feed_generate_url") or ""),
@@ -191,6 +195,8 @@ def sync_own_sites_runtime(db_session) -> None:
         if payload:
             news_settings["feed_url"] = str(payload[0]["feed_url"])
             news_settings["feed_generate_url"] = str(payload[0].get("feed_generate_url") or "")
+    bump_domain_revision("feed_comparison")
+    bump_domain_revision("settings")
 
 
 def normalize_supplier_model_field(value: object) -> str:
@@ -982,4 +988,3 @@ def start_feed_comparison() -> Dict[str, object]:
 
 def feed_comparison_worker_alive() -> bool:
     return bool(feed_comparison_worker_thread and feed_comparison_worker_thread.is_alive())
-

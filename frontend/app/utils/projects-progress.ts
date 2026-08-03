@@ -31,7 +31,6 @@ export function mergeProjectsProgress(
     else projects[index] = mergeProject(projects[index], incoming);
   };
   for (const project of payload.upsert_projects || []) upsert(project);
-  if (payload.project_detail) upsert(payload.project_detail);
 
   for (const incoming of payload.projects || []) {
     const project = projects.find((item) => item.id === incoming.id);

@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 from database.repositories.projects import delete_project, update_project
 from config import MSK_TZ
-from models import Base, Brand, Project
+from models import Base, Brand, FileImport, Project
 from runtime.state import news_lock, news_settings
 from services.file_validation import validate_xlsx_archive
 
@@ -152,6 +152,37 @@ class SupplierFeedConfigurationTests(unittest.TestCase):
         self.assertTrue(
             {"name_field", "price_field", "brand_field", "url_field"}.issubset(columns)
         )
+
+
+class CompactPayloadTests(IsolatedDatabaseTestCase):
+    def test_file_import_progress_skips_large_form_settings(self) -> None:
+        import services.file_import_service as file_import_service
+
+        with self.Session.begin() as session:
+            session.add(
+                FileImport(
+                    id=1,
+                    exclusions=["value"] * 100,
+                    model_field="model",
+                    price_field="price",
+                    replace_rules="rule",
+                    file={},
+                    state={"status": "idle", "percent": 0},
+                )
+            )
+
+        with (
+            self.Session() as session,
+            patch.object(
+                file_import_service,
+                "normalize_file_import_exclusions",
+                side_effect=AssertionError("Compact polling touched form settings"),
+            ),
+        ):
+            payload = file_import_service.public_file_import_progress(session)
+
+        self.assertEqual(payload["state"]["status"], "idle")
+        self.assertNotIn("exclusions", payload)
 
 
 class LogStorageTests(IsolatedDatabaseTestCase):
@@ -295,6 +326,24 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         self.assertNotIn("password", payload["smtp"])
         self.assertTrue(payload["smtp"]["password_set"])
+
+    def test_public_own_sites_keep_stable_database_ids(self) -> None:
+        from services.news import own_sites_from_settings
+
+        sites = own_sites_from_settings(
+            {
+                "own_sites": [
+                    {
+                        "id": 17,
+                        "name": "Основной сайт",
+                        "feed_url": "https://example.test/feed.xml",
+                        "feed_generate_url": "",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(sites[0]["id"], 17)
 
     def test_suspicious_xlsx_compression_is_rejected(self) -> None:
         archive = io.BytesIO()

@@ -19,13 +19,8 @@ function cloneFeed<T extends OwnSite | SupplierFeed>(value: T): T {
 
 const open = ref(!("id" in props.item) || !props.item.id);
 const draft = ref<OwnSite | SupplierFeed>(cloneFeed(props.item));
-
-watch(
-  () => props.item,
-  (value) => {
-    draft.value = cloneFeed(value);
-  },
-  { deep: true },
+const summary = computed(() =>
+  "id" in props.item && props.item.id ? props.item : draft.value,
 );
 
 const isSupplier = computed(() => props.kind === "supplier");
@@ -56,8 +51,8 @@ function submit() {
             <UIcon :name="isSupplier ? 'i-lucide-truck' : 'i-lucide-store'" />
           </span>
           <span>
-            <strong>{{ draft.name || (isSupplier ? "Новый поставщик" : "Новый фид") }}</strong>
-            <small>{{ draft.feed_url || "Ссылка не указана" }}</small>
+            <strong>{{ summary.name || (isSupplier ? "Новый поставщик" : "Новый фид") }}</strong>
+            <small>{{ summary.feed_url || "Ссылка не указана" }}</small>
           </span>
           <UIcon
             name="i-lucide-chevron-down"

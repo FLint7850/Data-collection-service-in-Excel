@@ -61,10 +61,9 @@ describe("mergeNewsProgress", () => {
     expect(result[0]?.brand).toBe("Beko");
   });
 
-  it("applies full details for an open cross-user modal", () => {
+  it("updates news card fields while retaining already loaded details", () => {
     const detailed = {
       ...monitor,
-      brand: "Bora Updated",
       schedule_type: "weekly",
       scan_time: "03:30",
       weekday: 2,
@@ -78,17 +77,23 @@ describe("mergeNewsProgress", () => {
       extraction_rules: {},
       selector_settings: {},
     } as NewsMonitor;
+    const summary = {
+      ...monitor,
+      brand: "Bora Updated",
+      state: { ...monitor.state, percent: 50 },
+    };
     const payload: ProgressPayload = {
       cursor: "r1:4",
-      news_details: [detailed],
+      upsert_news: [summary],
     };
 
-    const result = mergeNewsProgress([monitor], payload);
+    const result = mergeNewsProgress([detailed], payload);
     const updated = result[0] as NewsMonitor;
 
     expect(updated.brand).toBe("Bora Updated");
     expect(updated.schedule_type).toBe("weekly");
     expect(updated.thread_count).toBe(8);
     expect(updated.exclusions).toEqual(["sale"]);
+    expect(updated.state.percent).toBe(50);
   });
 });

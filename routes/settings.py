@@ -7,7 +7,8 @@ from config import DEFAULT_FEED_GENERATE_URL, DEFAULT_FEED_URL
 from flask import request
 from runtime.state import news_lock, news_settings
 from services.application import ensure_storage
-from services.normalization import jsonify, normalize_emails, normalize_feed_url, normalize_feed_urls
+from services.domain_revisions import bump_domain_revision
+from services.normalization import jsonify, normalize_emails, normalize_feed_url, normalize_feed_urls, parse_db_int
 from typing import List
 from services.scraping import clean_text
 from services.news import public_news_configuration, save_news_configuration
@@ -28,13 +29,15 @@ def api_update_news_settings():
                 if not feed_url:
                     continue
                 feed_generate_url = normalize_feed_url(str(item.get("feed_generate_url") or "").strip())
-                own_sites.append(
-                    {
-                        "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
-                        "feed_url": feed_url,
-                        "feed_generate_url": feed_generate_url,
-                    }
-                )
+                site = {
+                    "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
+                    "feed_url": feed_url,
+                    "feed_generate_url": feed_generate_url,
+                }
+                site_id = parse_db_int(item.get("id"))
+                if site_id:
+                    site["id"] = site_id
+                own_sites.append(site)
             feed_urls = [
                 item["feed_url"]
                 for item in own_sites
@@ -83,6 +86,8 @@ def api_update_news_settings():
                 smtp["recipients"] = normalize_emails(smtp_payload.get("recipients"))
             news_settings["smtp"] = smtp
         save_news_configuration()
+        if "own_sites" in payload:
+            bump_domain_revision("feed_comparison")
     return jsonify(public_news_configuration())
 
 
@@ -93,4 +98,3 @@ def api_test_news_email():
     if not send_news_email(None, 0, test=True, error_holder=errors):
         return jsonify({"error": errors[-1] if errors else "Email не отправлен. Проверьте SMTP-настройки и логи мониторинга."}), 500
     return jsonify({"ok": True})
-

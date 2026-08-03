@@ -129,8 +129,6 @@ export interface ProgressPayload {
   cursor: string;
   projects?: ProgressEntity[];
   news?: ProgressEntity[];
-  project_detail?: Project | null;
-  news_details?: NewsMonitor[];
   upsert_projects?: Project[];
   upsert_news?: NewsMonitorSummary[];
   removed_projects_ids?: string[];
@@ -209,10 +207,6 @@ export interface NewsBrandSearchResult {
   name: string;
 }
 
-export interface NewsBrandSearchResponse {
-  brands: NewsBrandSearchResult[];
-}
-
 export interface StoredFeed {
   source?: string;
   filename?: string;
@@ -242,6 +236,7 @@ export interface NewsWorkspaceData {
 }
 
 export interface NewsConfiguration {
+  revision: string;
   own_sites: OwnSite[];
   auto_cleanup: boolean;
   smtp: SmtpSettings;
@@ -274,6 +269,7 @@ export interface UploadedFile {
 }
 
 export interface FileImportData {
+  revision: string;
   file: UploadedFile | null;
   exclusions: string;
   model_field: string;
@@ -285,6 +281,7 @@ export interface FileImportData {
 }
 
 export interface FileImportSettings {
+  revision?: string;
   exclusions: string;
   model_field: string;
   price_field: string;
@@ -292,6 +289,7 @@ export interface FileImportSettings {
 }
 
 export interface FileImportProgress {
+  revision: string;
   state: FileImportState;
   result_filename: string;
   result_ready: boolean;
@@ -331,6 +329,7 @@ export interface FeedComparisonState {
 }
 
 export interface FeedComparisonData {
+  revision: string;
   own_sites: OwnSite[];
   suppliers: SupplierFeed[];
   state: FeedComparisonState;
@@ -339,6 +338,7 @@ export interface FeedComparisonData {
 }
 
 export interface FeedComparisonProgress {
+  revision: string;
   state: FeedComparisonState;
   result_ready: boolean;
   result_filename: string;

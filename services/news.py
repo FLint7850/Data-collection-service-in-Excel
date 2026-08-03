@@ -13,6 +13,7 @@ from services.application import ensure_storage
 from services.connections import connection_method_id_for, get_donor_row, normalize_connection_method, public_connection_methods
 from services.normalization import datetime_to_input_value, normalize_emails, normalize_extraction_rules, normalize_feed_url, normalize_feed_urls, normalize_model_key, normalize_patterns, normalize_selector_settings, normalize_start_urls, parse_datetime_value, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
 from sqlalchemy import delete, select
+from sqlalchemy.orm import joinedload
 from typing import Dict, Iterable, List, Optional
 from services.scraping import clean_text
 
@@ -263,7 +264,15 @@ def recover_interrupted_news_scans(monitors: Iterable[Dict[str, object]]) -> Non
 def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
     name = clean_text(str(monitor.get("brand") or "Донор"))
     group_name = clean_text(str(monitor.get("group") or "Маржа"))
-    row = session.scalar(select(Brand).where(Brand.name == name, Brand.group_name == group_name))
+    brand_id = parse_db_int(monitor.get("brand_id"))
+    row = session.get(Brand, brand_id) if brand_id else None
+    if row is None:
+        row = session.scalar(
+            select(Brand).where(
+                Brand.name == name,
+                Brand.group_name == group_name,
+            )
+        )
     if row is None:
         row = Brand(
             name=name,
@@ -279,6 +288,7 @@ def get_or_create_brand(session, monitor: Dict[str, object]) -> Brand:
         session.add(row)
         session.flush()
     else:
+        row.name = name
         row.search_name = normalize_search_text(name)
         row.group_name = group_name
         row.state = normalize_news_state(monitor.get("brand_state") or monitor.get("state") or row.state)
@@ -319,7 +329,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.seen_models = [normalize_model_key(str(value)) for value in normalized.get("seen_models", []) if str(value).strip()]
     row.known_new_products = normalized.get("known_new_products", {}) if isinstance(normalized.get("known_new_products"), dict) else {}
     session.flush()
-    if not brand.primary_donor_id or not any(donor.id == brand.primary_donor_id for donor in brand.donors):
+    if not brand.primary_donor_id:
         brand.primary_donor_id = row.id
     session.flush()
     monitor["brand_id"] = brand.id
@@ -371,7 +381,7 @@ def ensure_brand_primary_flags(monitors: List[Dict[str, object]]) -> None:
             item["primary_donor_id"] = primary_id
 
 
-def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]:
+def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, object]]:
     from runtime.news_tasks import feed_source_label
     if isinstance(settings.get("own_sites"), list):
         sites = []
@@ -381,13 +391,15 @@ def own_sites_from_settings(settings: Dict[str, object]) -> List[Dict[str, str]]
             feed_url = normalize_feed_url(str(item.get("feed_url") or "").strip())
             if not feed_url:
                 continue
-            sites.append(
-                {
-                    "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
-                    "feed_url": feed_url,
-                    "feed_generate_url": normalize_feed_url(str(item.get("feed_generate_url") or "").strip()),
-                }
-            )
+            site = {
+                "name": clean_text(str(item.get("name") or "")) or f"Фид {index}",
+                "feed_url": feed_url,
+                "feed_generate_url": normalize_feed_url(str(item.get("feed_generate_url") or "").strip()),
+            }
+            site_id = parse_db_int(item.get("id"))
+            if site_id:
+                site["id"] = site_id
+            sites.append(site)
         if sites:
             return sites
     feed_urls = normalize_feed_urls(settings.get("feed_urls") or settings.get("feed_url") or DEFAULT_FEED_URL, DEFAULT_FEED_URL)
@@ -461,7 +473,9 @@ def synchronize_news_settings() -> None:
 
 def save_news_configuration() -> None:
     """Persist global news configuration without touching brands or donors."""
+    from services.domain_revisions import bump_domain_revision
     with news_lock:
+        persisted_sites: List[Dict[str, object]] = []
         with session_scope() as session:
             smtp = dict(news_settings.get("smtp", {}))
             smtp.pop("sender", None)
@@ -476,23 +490,50 @@ def save_news_configuration() -> None:
                 if isinstance(news_settings.get("feed_storage"), list)
                 else []
             )
-            current_feed_urls = set()
+            existing_sites = {
+                int(row.id): row for row in session.scalars(select(OwnSite)).all()
+            }
+            persisted_rows: List[OwnSite] = []
             for site in own_sites_from_settings(news_settings):
-                current_feed_urls.add(site["feed_url"])
-                row = session.scalar(select(OwnSite).where(OwnSite.feed_url == site["feed_url"]))
+                site_id = parse_db_int(site.get("id"))
+                row = existing_sites.pop(site_id, None) if site_id else None
                 if row is None:
-                    session.add(
-                        OwnSite(
-                            name=site["name"],
-                            feed_url=site["feed_url"],
-                            feed_generate_url=site["feed_generate_url"],
-                        )
+                    matching_id = next(
+                        (
+                            row_id
+                            for row_id, candidate in existing_sites.items()
+                            if candidate.feed_url == site["feed_url"]
+                        ),
+                        None,
                     )
+                    if matching_id is not None:
+                        row = existing_sites.pop(matching_id)
+                if row is None:
+                    row = OwnSite(
+                        name=str(site["name"]),
+                        feed_url=str(site["feed_url"]),
+                        feed_generate_url=str(site["feed_generate_url"]),
+                    )
+                    session.add(row)
                 else:
-                    row.name = site["name"]
-                    row.feed_generate_url = site["feed_generate_url"]
-            if current_feed_urls:
-                session.execute(delete(OwnSite).where(OwnSite.feed_url.not_in(current_feed_urls)))
+                    row.name = str(site["name"])
+                    row.feed_url = str(site["feed_url"])
+                    row.feed_generate_url = str(site["feed_generate_url"])
+                persisted_rows.append(row)
+            for obsolete in existing_sites.values():
+                session.delete(obsolete)
+            session.flush()
+            persisted_sites = [
+                {
+                    "id": int(row.id),
+                    "name": row.name,
+                    "feed_url": row.feed_url,
+                    "feed_generate_url": row.feed_generate_url,
+                }
+                for row in persisted_rows
+            ]
+        news_settings["own_sites"] = persisted_sites
+        bump_domain_revision("settings")
 
 
 def save_news_monitor(monitor: Dict[str, object]) -> None:
@@ -513,7 +554,11 @@ def save_news_monitor(monitor: Dict[str, object]) -> None:
                 ]
                 brand.state = aggregate_brand_state(brand_monitors or [monitor])
                 requested_primary = parse_db_int(monitor.get("primary_donor_id"))
-                donor_ids = {donor.id for donor in brand.donors}
+                donor_ids = set(
+                    session.scalars(
+                        select(Donor.id).where(Donor.brand_id == brand.id)
+                    )
+                )
                 if requested_primary in donor_ids:
                     brand.primary_donor_id = requested_primary
                 elif brand.primary_donor_id not in donor_ids:
@@ -555,6 +600,7 @@ def delete_news_records(monitor_ids: Iterable[object], *, remove_brand: bool = F
 
 def load_news_settings() -> None:
     from runtime.news_tasks import feed_source_label
+    from services.progress_service import publish_news_progress_snapshot
     with news_lock:
         if news_settings:
             return
@@ -562,9 +608,13 @@ def load_news_settings() -> None:
         with session_scope() as session:
             donor_rows = session.scalars(
                 select(Donor)
+                .options(
+                    joinedload(Donor.brand),
+                    joinedload(Donor.connection_method_row),
+                )
                 .join(Brand, Donor.brand_id == Brand.id)
                 .order_by(Brand.group_name, Brand.name, Donor.id)
-            ).all()
+            ).unique().all()
             for donor_row in donor_rows:
                 if donor_row.brand:
                     donor_row.brand.search_name = normalize_search_text(
@@ -581,6 +631,7 @@ def load_news_settings() -> None:
             if own_sites:
                 settings["own_sites"] = [
                     {
+                        "id": int(site.id),
                         "name": site.name or feed_source_label(site.feed_url),
                         "feed_url": site.feed_url,
                         "feed_generate_url": site.feed_generate_url,
@@ -596,8 +647,26 @@ def load_news_settings() -> None:
             settings["monitors"] = [donor_model_to_monitor(row) for row in donor_rows]
             recover_interrupted_news_scans(settings["monitors"])
             ensure_brand_primary_flags(settings["monitors"])
+
+            monitors_by_brand: Dict[int, List[Dict[str, object]]] = {}
+            donor_ids_by_brand: Dict[int, List[int]] = {}
+            brands_by_id: Dict[int, Brand] = {}
+            for donor_row, monitor in zip(donor_rows, settings["monitors"]):
+                if donor_row.brand is None:
+                    continue
+                brand_id = int(donor_row.brand.id)
+                brands_by_id[brand_id] = donor_row.brand
+                monitors_by_brand.setdefault(brand_id, []).append(monitor)
+                donor_ids_by_brand.setdefault(brand_id, []).append(int(donor_row.id))
+            for brand_id, brand in brands_by_id.items():
+                donor_ids = donor_ids_by_brand.get(brand_id, [])
+                if brand.primary_donor_id not in donor_ids:
+                    brand.primary_donor_id = donor_ids[0] if donor_ids else None
+                state = aggregate_brand_state(monitors_by_brand.get(brand_id, []))
+                if brand.state != state:
+                    brand.state = state
         news_settings.update(settings)
-        synchronize_news_settings()
+        publish_news_progress_snapshot(initialize=True)
 
 
 def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str = "info") -> None:
@@ -690,7 +759,9 @@ def runtime_news_monitors_for_brand(brand_id: object) -> List[Dict[str, object]]
 
 
 def public_news_monitor(monitor: Dict[str, object], include_details: bool = True) -> Dict[str, object]:
-    source = repair_mojibake(dict(monitor))
+    source = repair_mojibake(
+        news_monitor_dto(monitor, include_details=include_details)
+    )
     state = normalize_news_state(source.get("state"))
     original_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
     original_data = original_state.get("data", {}) if isinstance(original_state.get("data"), dict) else {}
@@ -711,7 +782,7 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
         state,
         include_details=include_details,
     )
-    public_monitor = news_monitor_dto(source, include_details=include_details)
+    public_monitor = source
     if not include_details:
         start_urls = (
             public_monitor.get("start_urls", [])
@@ -763,6 +834,7 @@ def public_news_workspace() -> Dict[str, object]:
 
 def public_news_configuration() -> Dict[str, object]:
     from runtime.news_tasks import cleanup_stale_news_transitions
+    from services.domain_revisions import domain_revision
     cleanup_stale_news_transitions()
     with news_lock:
         smtp = dict(news_settings.get("smtp", {}))
@@ -770,6 +842,7 @@ def public_news_configuration() -> Dict[str, object]:
         smtp.pop("password", None)
         smtp["password_set"] = bool(news_settings.get("smtp", {}).get("password"))
         return {
+            "revision": domain_revision("settings"),
             "own_sites": own_sites_from_settings(news_settings),
             "auto_cleanup": bool(news_settings.get("auto_cleanup", False)),
             "smtp": smtp,

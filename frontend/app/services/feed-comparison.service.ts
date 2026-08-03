@@ -14,7 +14,7 @@ export const feedComparisonService = {
 
   saveOwnSite: (site: OwnSite) => {
     const { id, ...body } = site;
-    return $fetch<{ own_site: OwnSite }>(
+    return $fetch<{ own_site: OwnSite; revision: string }>(
       site.id
         ? `/api/feed-comparison/own-sites/${site.id}`
         : "/api/feed-comparison/own-sites",
@@ -23,13 +23,13 @@ export const feedComparisonService = {
   },
 
   removeOwnSite: (id: number) =>
-    $fetch<{ ok: boolean; id: number }>(`/api/feed-comparison/own-sites/${id}`, {
+    $fetch<{ ok: boolean; id: number; revision: string }>(`/api/feed-comparison/own-sites/${id}`, {
       method: "DELETE",
     }),
 
   saveSupplier: (supplier: SupplierFeed) => {
     const { id, ...body } = supplier;
-    return $fetch<{ supplier: SupplierFeed }>(
+    return $fetch<{ supplier: SupplierFeed; revision: string }>(
       supplier.id
         ? `/api/feed-comparison/suppliers/${supplier.id}`
         : "/api/feed-comparison/suppliers",
@@ -38,7 +38,7 @@ export const feedComparisonService = {
   },
 
   removeSupplier: (id: number) =>
-    $fetch<{ ok: boolean; id: number }>(`/api/feed-comparison/suppliers/${id}`, {
+    $fetch<{ ok: boolean; id: number; revision: string }>(`/api/feed-comparison/suppliers/${id}`, {
       method: "DELETE",
     }),
 

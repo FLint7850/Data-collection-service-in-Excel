@@ -28,24 +28,26 @@ const project: Project = {
 };
 
 describe("mergeProjectsProgress", () => {
-  it("applies full details for the active cross-user form", () => {
-    const detail: Project = {
-      ...project,
+  it("updates card fields without replacing stored form details", () => {
+    const summary = {
+      id: project.id,
       name: "New name",
-      start_urls: ["https://new.example.test"],
       thread_count: 9,
-      exclusions: ["sale"],
-    };
+      start_urls_count: 3,
+      connection_method: "requests",
+      state: { status: "running", percent: 25 },
+    } as Project;
     const payload: ProgressPayload = {
       cursor: "r1:2",
-      project_detail: detail,
+      upsert_projects: [summary],
     };
 
     const result = mergeProjectsProgress([project], payload);
 
     expect(result[0]?.name).toBe("New name");
-    expect(result[0]?.start_urls).toEqual(["https://new.example.test"]);
+    expect(result[0]?.start_urls).toEqual(["https://old.example.test"]);
     expect(result[0]?.thread_count).toBe(9);
-    expect(result[0]?.exclusions).toEqual(["sale"]);
+    expect(result[0]?.exclusions).toEqual([]);
+    expect(result[0]?.state.status).toBe("running");
   });
 });

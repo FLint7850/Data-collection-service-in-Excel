@@ -1,6 +1,5 @@
 import type {
   NewsConfiguration,
-  NewsBrandSearchResponse,
   NewsMonitor,
   NewsWorkspaceData,
   OwnSite,
@@ -39,16 +38,15 @@ export const newsService = {
       query: { scope: "settings" },
     }),
 
+  getSettingsRevision: () =>
+    $fetch<{ revision: string }>("/api/news", {
+      query: { scope: "settings-revision" },
+    }),
+
   getMonitor: (monitorId: string) =>
     $fetch<{ monitors: NewsMonitor[] }>(
       `/api/news/monitors/${encodeURIComponent(monitorId)}`,
     ),
-
-  searchBrands: (query: string, signal?: AbortSignal) =>
-    $fetch<NewsBrandSearchResponse>("/api/news/brands", {
-      query: { q: query },
-      signal,
-    }),
 
   updateSettings: (body: { own_sites?: OwnSite[]; smtp?: Partial<SmtpSettings> }) =>
     $fetch<NewsConfiguration>("/api/news/settings", { method: "PATCH", body }),

@@ -44,22 +44,52 @@ function currentSettings(): FileImportSettings {
   };
 }
 
-function applySettings(value: FileImportSettings) {
-  form.model_field = value.model_field || "";
-  form.price_field = value.price_field || "";
-  form.exclusions = value.exclusions || "";
-  form.replace_rules = value.replace_rules || "";
-  if (data.value) Object.assign(data.value, value);
-  lastSavedSettings = currentSettings();
+function settingsFrom(value: FileImportSettings): FileImportSettings {
+  return {
+    model_field: value.model_field || "",
+    price_field: value.price_field || "",
+    exclusions: value.exclusions || "",
+    replace_rules: value.replace_rules || "",
+  };
 }
 
-function applyData(value: FileImportData) {
+function setForm(value: FileImportSettings) {
+  form.model_field = value.model_field;
+  form.price_field = value.price_field;
+  form.exclusions = value.exclusions;
+  form.replace_rules = value.replace_rules;
+}
+
+function applySettings(value: FileImportSettings) {
+  const settings = settingsFrom(value);
+  setForm(settings);
+  if (data.value) {
+    Object.assign(data.value, settings);
+    if (value.revision) data.value.revision = value.revision;
+  }
+  lastSavedSettings = { ...settings };
+}
+
+function replaceData(value: FileImportData) {
+  const settings = settingsFrom(value);
+  data.value = value;
+  setForm(settings);
+  lastSavedSettings = { ...settings };
+}
+
+function applyRuntimeData(value: FileImportData) {
+  if (!data.value) {
+    replaceData(value);
+    return;
+  }
   data.value = {
-    ...(data.value || value),
-    ...value,
-    state: mergeProgressState(data.value?.state, value.state),
+    ...data.value,
+    revision: value.revision,
+    file: value.file,
+    result_filename: value.result_filename,
+    result_ready: value.result_ready,
+    state: mergeProgressState(data.value.state, value.state),
   };
-  applySettings(value);
 }
 
 function applyProgress(value: FileImportProgress) {
@@ -83,7 +113,7 @@ function changedSettings(
 
 async function load() {
   try {
-    applyData(await fileImportService.get());
+    replaceData(await fileImportService.get());
   } catch (caught) {
     error.value = errorMessage(caught, "Не удалось загрузить настройки импорта");
   } finally {
@@ -118,7 +148,7 @@ async function upload(file?: File) {
   uploading.value = true;
   error.value = "";
   try {
-    applyData(await fileImportService.upload(file));
+    applyRuntimeData(await fileImportService.upload(file));
     toast.add({ title: `Файл «${file.name}» загружен`, color: "success" });
   } catch (caught) {
     error.value = errorMessage(caught);
@@ -145,7 +175,7 @@ function onDrop(event: DragEvent) {
 async function removeFile() {
   actionLoading.value = "remove";
   try {
-    applyData(await fileImportService.remove());
+    applyRuntimeData(await fileImportService.remove());
   } catch (caught) {
     error.value = errorMessage(caught);
   } finally {
@@ -179,9 +209,15 @@ async function stop() {
 
 const { refresh: refreshProgress } = useProgressPolling(
   async () => {
-    if (isActive.value) applyProgress(await fileImportService.getProgress());
+    if (!data.value) return;
+    const currentRevision = data.value.revision;
+    const progress = await fileImportService.getProgress();
+    applyProgress(progress);
+    if (progress.revision !== currentRevision) {
+      applyRuntimeData(await fileImportService.get());
+    }
   },
-  computed(() => isActive.value),
+  computed(() => Boolean(data.value)),
 );
 
 onMounted(load);

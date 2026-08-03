@@ -130,7 +130,10 @@ def get_donor_row(session, public_id: object) -> Optional[Donor]:
     return session.scalar(select(Donor).where(Donor.legacy_id == legacy_id))
 
 
-def connection_method_id_for(session, code: object) -> Optional[int]:
+def connection_method_id_for(_session, code: object) -> Optional[int]:
     method = normalize_connection_method(code)
-    row = session.scalar(select(ConnectionMethod).where(ConnectionMethod.code == method))
-    return row.id if row else None
+    for row in load_connection_methods():
+        if row.get("code") == method:
+            method_id = parse_db_int(row.get("id"))
+            return method_id if method_id and method_id > 0 else None
+    return None

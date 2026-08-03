@@ -10,7 +10,6 @@ import type {
 } from "~/types/api";
 import { errorMessage } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
-import { mergeRemoteDraft } from "~/utils/remote-draft";
 
 const props = defineProps<{
   monitorId: string;
@@ -36,6 +35,7 @@ const confirmDelete = ref(false);
 const error = ref("");
 let lastSavedPayload: MonitorPayload | null = null;
 let liveSyncPending = false;
+let membershipSyncing = false;
 
 const connectionOptions = computed(() =>
   props.connectionMethods.map((method) => ({ label: method.name, value: method.code })),
@@ -53,14 +53,6 @@ const canResume = computed(() => draft.value?.state.status === "partial");
 
 function cloneMonitor(monitor: NewsMonitor): NewsMonitor {
   return JSON.parse(JSON.stringify(monitor)) as NewsMonitor;
-}
-
-function isDetailedMonitor(monitor: NewsMonitorSummary): monitor is NewsMonitor {
-  return (
-    "schedule_type" in monitor &&
-    "extraction_rules" in monitor &&
-    "selector_settings" in monitor
-  );
 }
 
 function prepareMonitor(monitor: NewsMonitor): NewsMonitor {
@@ -129,7 +121,7 @@ function setDraft(monitor: NewsMonitor) {
   ) as MonitorPayload;
 }
 
-function mergeLiveMonitors(incoming: NewsMonitorSummary[]) {
+async function mergeLiveMonitors(incoming: NewsMonitorSummary[]) {
   const currentBrandId = draft.value?.brand_id ?? monitors.value[0]?.brand_id;
   const currentGroup = draft.value?.group ?? monitors.value[0]?.group;
   const currentBrand = draft.value?.brand ?? monitors.value[0]?.brand;
@@ -138,56 +130,81 @@ function mergeLiveMonitors(incoming: NewsMonitorSummary[]) {
       ? String(monitor.brand_id ?? "") === String(currentBrandId)
       : monitor.group === currentGroup && monitor.brand === currentBrand,
   );
+  if (!brandIncoming.length) {
+    monitors.value = [];
+    draft.value = null;
+    lastSavedPayload = null;
+    emit("close");
+    return;
+  }
+
   const incomingIds = new Set(brandIncoming.map((monitor) => String(monitor.id)));
-  const mergedMonitors = monitors.value
+  monitors.value = monitors.value
     .filter((monitor) => incomingIds.has(String(monitor.id)))
     .map((monitor) => {
       const live = brandIncoming.find(
         (item) => String(item.id) === String(monitor.id),
       );
       if (!live) return monitor;
-      if (isDetailedMonitor(live)) return prepareMonitor(live);
       return {
         ...monitor,
+        brand_id: live.brand_id,
+        primary_donor_id: live.primary_donor_id,
+        group: live.group,
+        brand: live.brand,
+        site_url: live.site_url,
+        enabled: live.enabled,
         state: mergeProgressState(monitor.state, live.state),
       };
     });
-  for (const live of brandIncoming) {
-    if (
-      isDetailedMonitor(live) &&
-      !mergedMonitors.some((monitor) => String(monitor.id) === String(live.id))
-    ) {
-      mergedMonitors.push(prepareMonitor(live));
+
+  const missingIds = brandIncoming
+    .map((monitor) => String(monitor.id))
+    .filter((id) => !monitors.value.some((monitor) => String(monitor.id) === id));
+  if (missingIds.length && !membershipSyncing) {
+    membershipSyncing = true;
+    try {
+      const response = await newsService.getMonitor(missingIds[0]!);
+      const latestIds = new Set(
+        props.liveMonitors
+          .filter((monitor) =>
+            currentBrandId != null
+              ? String(monitor.brand_id ?? "") === String(currentBrandId)
+              : monitor.group === currentGroup && monitor.brand === currentBrand,
+          )
+          .map((monitor) => String(monitor.id)),
+      );
+      for (const monitor of response.monitors) {
+        if (
+          latestIds.has(String(monitor.id)) &&
+          !monitors.value.some((current) => String(current.id) === String(monitor.id))
+        ) {
+          monitors.value.push(prepareMonitor(monitor));
+        }
+      }
+    } catch (caught) {
+      error.value = errorMessage(caught, "Не удалось обновить список доноров");
+    } finally {
+      membershipSyncing = false;
     }
   }
-  monitors.value = mergedMonitors;
 
   const live = brandIncoming.find(
     (item) => String(item.id) === String(selectedId.value),
   );
-  if (!live || !draft.value || String(draft.value.id) !== String(live.id)) {
-    if (!live) {
+  if (!live) {
+    const next = monitors.value[0];
+    if (next) setDraft(next);
+    else {
       draft.value = null;
       lastSavedPayload = null;
+      emit("close");
     }
     return;
   }
-  if (!isDetailedMonitor(live)) {
+  if (draft.value && String(draft.value.id) === String(live.id)) {
     draft.value.state = mergeProgressState(draft.value.state, live.state);
-    return;
   }
-
-  const currentPayload = monitorPayload(draft.value);
-  const remotePayload = monitorPayload(live);
-  draft.value = prepareMonitor(
-    mergeRemoteDraft(
-      draft.value,
-      live,
-      lastSavedPayload,
-      currentPayload,
-    ),
-  );
-  lastSavedPayload = JSON.parse(JSON.stringify(remotePayload)) as MonitorPayload;
 }
 
 function handleModalOpen(open: boolean) {
@@ -207,12 +224,21 @@ async function load() {
     if (!monitor) throw new Error("Донор не найден");
     setDraft(monitor);
   } catch (caught) {
-    error.value = errorMessage(caught, "Не удалось открыть настройки донора");
+    const failure = caught as {
+      status?: number;
+      statusCode?: number;
+      response?: { status?: number };
+    };
+    const status = Number(
+      failure.statusCode || failure.status || failure.response?.status || 0,
+    );
+    if (status === 404) emit("close");
+    else error.value = errorMessage(caught, "Не удалось открыть настройки донора");
   } finally {
     loading.value = false;
     if (liveSyncPending && draft.value) {
       liveSyncPending = false;
-      mergeLiveMonitors(props.liveMonitors);
+      void mergeLiveMonitors(props.liveMonitors);
     }
   }
 }
@@ -230,7 +256,7 @@ watch(
       liveSyncPending = true;
       return;
     }
-    mergeLiveMonitors(incoming);
+    void mergeLiveMonitors(incoming);
   },
 );
 

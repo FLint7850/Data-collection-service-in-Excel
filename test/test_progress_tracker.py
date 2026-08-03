@@ -108,6 +108,32 @@ class ApiDtoTests(unittest.TestCase):
             self.assertNotIn("known_new_products", payload)
             self.assertNotIn("worker_thread", payload)
 
+    def test_public_news_payload_does_not_walk_internal_model_collections(self) -> None:
+        from services.news import public_news_monitor
+
+        class InternalOnlyList(list):
+            def __iter__(self):
+                raise AssertionError("Internal model history must not be serialized")
+
+        payload = public_news_monitor(
+            {
+                "id": "1",
+                "brand": "Bora",
+                "group": "Маржа",
+                "site_url": "https://example.test",
+                "start_urls": [],
+                "enabled": True,
+                "state": {"status": "idle"},
+                "seen_models": InternalOnlyList(["A"]),
+                "known_new_products": {"A": True},
+            },
+            include_details=False,
+        )
+
+        self.assertEqual(payload["id"], "1")
+        self.assertNotIn("seen_models", payload)
+        self.assertNotIn("known_new_products", payload)
+
     def test_search_normalization_is_case_insensitive(self) -> None:
         self.assertEqual(normalize_search_text("  BEKO  "), "beko")
         self.assertEqual(normalize_search_text("БОРК"), "борк")

@@ -112,6 +112,13 @@ const totals = computed(() => ({
   news: brands.value.reduce((total, brand) => total + Number(brand.state.new_count || 0), 0),
 }));
 
+const brandSearchItems = computed<NewsBrandSearchResult[]>(() =>
+  brands.value
+    .filter((brand) => brand.brandId != null)
+    .map((brand) => ({ id: Number(brand.brandId), name: brand.brand }))
+    .sort((left, right) => left.name.localeCompare(right.name, "ru")),
+);
+
 async function openBrand(brand: BrandGroup) {
   const selected =
     brand.monitors.find((item) => String(item.id) === String(item.primary_donor_id)) ||
@@ -234,33 +241,22 @@ function handleModalChanged(incoming: NewsMonitor[]) {
 }
 
 async function pollProgress() {
-  const selectedBefore = data.value?.monitors.find(
-    (monitor) => monitor.id === selectedMonitorId.value,
-  );
   const payload = await $fetch<ProgressPayload>("/progress", {
     query: {
       once: 1,
       projects: 0,
       news: 1,
       cursor: progressCursor.value || undefined,
-      news_detail: modalOpen.value ? selectedMonitorId.value : undefined,
     },
   });
   mergeProgress(payload);
-  if (
-    modalOpen.value &&
-    selectedBefore &&
-    !data.value?.monitors.some((monitor) => monitor.id === selectedBefore.id)
-  ) {
-    await closeModal();
-  }
 }
 
 useProgressPolling(pollProgress, computed(() => Boolean(data.value)));
 
 onMounted(async () => {
   try {
-    await load(true);
+    if (!loaded.value) await load(true);
     if (props.brandId) {
       await openRequestedBrand(props.brandId);
     }
@@ -280,6 +276,7 @@ onMounted(async () => {
     >
       <template #actions>
         <NewsBrandToolbar
+          :brands="brandSearchItems"
           @select="openSearchedBrand"
           @create="createOpen = true"
         />

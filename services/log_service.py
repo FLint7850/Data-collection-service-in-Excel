@@ -87,9 +87,7 @@ def log_fetch_exception(method: str, url: str, error: BaseException) -> None:
 
 
 def get_log_auto_cleanup() -> bool:
-    with session_scope() as db_session:
-        app_setting = db_session.get(AppSetting, 1)
-        return bool(app_setting.auto_cleanup) if app_setting else False
+    return bool(logs_metadata()["auto_cleanup"])
 
 
 def set_log_auto_cleanup(value: bool) -> bool:
@@ -116,10 +114,31 @@ def clear_logs() -> None:
 
 
 def logs_signature() -> str:
+    return str(logs_metadata()["signature"])
+
+
+def logs_metadata() -> Dict[str, object]:
     with session_scope() as db_session:
-        last_id = db_session.scalar(select(func.max(ApplicationLog.id))) or 0
-        total = db_session.scalar(select(func.count(ApplicationLog.id))) or 0
-        return f"{int(last_id)}:{int(total)}"
+        auto_cleanup = (
+            select(AppSetting.auto_cleanup)
+            .where(AppSetting.id == 1)
+            .scalar_subquery()
+        )
+        last_id, total, cleanup_enabled = db_session.execute(
+            select(
+                func.max(ApplicationLog.id),
+                func.count(ApplicationLog.id),
+                auto_cleanup,
+            )
+        ).one()
+        normalized_last_id = int(last_id or 0)
+        normalized_total = int(total or 0)
+        return {
+            "last_id": normalized_last_id,
+            "total": normalized_total,
+            "signature": f"{normalized_last_id}:{normalized_total}",
+            "auto_cleanup": bool(cleanup_enabled),
+        }
 
 
 def query_logs(
@@ -127,12 +146,24 @@ def query_logs(
     page: int = 1,
     limit: int = 200,
     after_id: int = 0,
+    total: Optional[int] = None,
+    last_id: Optional[int] = None,
 ) -> Dict[str, object]:
     page = max(1, page)
     limit = max(1, min(limit, 1000))
     with session_scope() as db_session:
-        total = int(db_session.scalar(select(func.count(ApplicationLog.id))) or 0)
-        last_id = int(db_session.scalar(select(func.max(ApplicationLog.id))) or 0)
+        if total is None or last_id is None:
+            loaded_last_id, loaded_total = db_session.execute(
+                select(
+                    func.max(ApplicationLog.id),
+                    func.count(ApplicationLog.id),
+                )
+            ).one()
+            total = int(loaded_total or 0)
+            last_id = int(loaded_last_id or 0)
+        else:
+            total = max(0, int(total))
+            last_id = max(0, int(last_id))
         counts = {
             str(level): int(count)
             for level, count in db_session.execute(

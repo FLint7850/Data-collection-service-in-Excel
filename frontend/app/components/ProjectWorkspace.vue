@@ -5,7 +5,6 @@ import {
 } from "~/services/project.service";
 import type { ProgressPayload, Project } from "~/types/api";
 import { errorMessage } from "~/utils/format";
-import { mergeRemoteDraft } from "~/utils/remote-draft";
 import { normalizeProjectRouteId } from "~/utils/route-id";
 
 const props = withDefaults(defineProps<{ projectId?: string }>(), { projectId: "" });
@@ -99,21 +98,6 @@ function projectPayload(project: Project): ProjectSavePayload {
 
 function savePayload(): ProjectSavePayload | null {
   return draft.value ? projectPayload(draft.value) : null;
-}
-
-function syncRemoteProject(remote: Project) {
-  if (!draft.value || draft.value.id !== remote.id) return;
-  const currentPayload = projectPayload(draft.value);
-  const remotePayload = projectPayload(remote);
-  draft.value = mergeRemoteDraft(
-    draft.value,
-    cloneProject(remote),
-    lastSavedPayload,
-    currentPayload,
-  );
-  lastSavedPayload = JSON.parse(
-    JSON.stringify(remotePayload),
-  ) as ProjectSavePayload;
 }
 
 function changedSavePayload(
@@ -244,7 +228,6 @@ async function pollProgress() {
       projects: 1,
       news: 0,
       cursor: progressCursor.value || undefined,
-      project_detail: activeProjectId.value || undefined,
     },
   });
   mergeProgress(payload);
@@ -253,12 +236,8 @@ async function pollProgress() {
     lastSavedPayload = null;
     const next = projects.value[0];
     if (next) await selectProject(next.id);
+    else activeProjectId.value = "";
     return;
-  }
-  if (payload.project_detail) {
-    syncRemoteProject(payload.project_detail);
-  } else if (draft.value && activeProject.value) {
-    draft.value.state = { ...draft.value.state, ...activeProject.value.state };
   }
 }
 
@@ -269,7 +248,7 @@ useProgressPolling(
 
 onMounted(async () => {
   try {
-    await load(true);
+    if (!loaded.value) await load(true);
     workspaceReady.value = true;
     const requested = normalizeProjectRouteId(props.projectId);
     if (requested) {

@@ -27,7 +27,6 @@ const isActive = computed(() =>
 
 function applyData(value: FeedComparisonData) {
   data.value = {
-    ...(data.value || value),
     ...value,
     state: mergeProgressState(data.value?.state, value.state),
   };
@@ -60,6 +59,7 @@ async function saveSupplier(supplier: SupplierFeed, pendingIndex?: number) {
     if (data.value) {
       if (index >= 0) data.value.suppliers[index] = response.supplier;
       else data.value.suppliers.push(response.supplier);
+      data.value.revision = response.revision;
     }
     if (pendingIndex != null) pendingSuppliers.value.splice(pendingIndex, 1);
     toast.add({ title: "Фид поставщика сохранён", color: "success" });
@@ -78,6 +78,7 @@ async function removeSupplier(supplier: SupplierFeed) {
       data.value.suppliers = data.value.suppliers.filter(
         (item) => item.id !== response.id,
       );
+      data.value.revision = response.revision;
     }
   } catch (caught) {
     error.value = errorMessage(caught);
@@ -108,9 +109,15 @@ async function stop() {
 
 useProgressPolling(
   async () => {
-    if (isActive.value) applyProgress(await feedComparisonService.getProgress());
+    if (!data.value) return;
+    const currentRevision = data.value.revision;
+    const progress = await feedComparisonService.getProgress();
+    applyProgress(progress);
+    if (progress.revision !== currentRevision) {
+      applyData(await feedComparisonService.get());
+    }
   },
-  computed(() => isActive.value),
+  computed(() => Boolean(data.value)),
 );
 
 onMounted(load);

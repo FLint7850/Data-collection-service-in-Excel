@@ -5,7 +5,7 @@ from flask import Blueprint
 import uuid
 from config import FILE_IMPORT_ALLOWED_SUFFIXES, FILE_IMPORT_DIR, MSK_TZ
 from datetime import datetime
-from flask import request, send_file
+from flask import g, request, send_file
 from pathlib import Path
 from runtime.state import file_import_lock, file_import_stop_event
 from services.application import ensure_storage
@@ -17,6 +17,7 @@ from services.normalization import (
     safe_filename,
 )
 from services.scraping import clean_text
+from services.domain_revisions import bump_domain_revision
 from services.file_import_service import (
     clear_file_import_storage,
     file_import_worker_alive,
@@ -67,6 +68,8 @@ def api_update_file_import():
                         or datetime.fromtimestamp(path.stat().st_mtime, MSK_TZ).isoformat(timespec="seconds")
                     ),
                 }
+    g.db.commit()
+    bump_domain_revision("file_import")
     return jsonify(public_file_import_settings())
 
 
@@ -116,6 +119,8 @@ def api_upload_file_import():
     }
     row.export_path = ""
     row.state = make_file_import_state()
+    g.db.commit()
+    bump_domain_revision("file_import")
     return jsonify(public_file_import_state())
 
 
@@ -130,6 +135,8 @@ def api_delete_file_import():
     row.export_path = ""
     row.file = {}
     row.state = make_file_import_state()
+    g.db.commit()
+    bump_domain_revision("file_import")
     return jsonify(public_file_import_state())
 
 
@@ -176,4 +183,3 @@ def api_download_file_import_result():
     if not path:
         return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(path.name))
-

@@ -10,16 +10,14 @@ from runtime.news_tasks import (
 )
 import threading
 from config import MSK_TZ
-from database.session import session_scope
 from datetime import datetime
 from flask import request, send_file
-from models import Brand
 from query_utils import normalize_search_text
 from runtime.state import news_lock, news_settings, news_stop_events
 from services.application import ensure_storage
+from services.domain_revisions import domain_revision
 from services.connections import normalize_connection_method
 from services.normalization import jsonify, normalize_extraction_rules, normalize_patterns, normalize_selector_settings, normalize_start_urls, output_text, parse_db_int
-from sqlalchemy import select
 from services.scraping import clean_text
 from services.news import (
     add_news_log,
@@ -51,6 +49,8 @@ def api_news():
         return jsonify(public_news_workspace())
     if scope == "settings":
         return jsonify(public_news_configuration())
+    if scope == "settings-revision":
+        return jsonify({"revision": domain_revision("settings")})
     return jsonify({"error": "Укажите scope=workspace или scope=settings"}), 400
 
 
@@ -62,13 +62,19 @@ def api_search_news_brands():
     if len(normalized_query) < 2:
         return jsonify({"brands": []})
 
-    with session_scope() as session:
-        rows = session.execute(
-            select(Brand.id, Brand.name)
-            .where(Brand.search_name.contains(normalized_query, autoescape=True))
-            .order_by(Brand.name, Brand.id)
-            .limit(20)
-        ).all()
+    brands_by_id = {}
+    with news_lock:
+        for monitor in news_settings.get("monitors", []):
+            if not isinstance(monitor, dict):
+                continue
+            brand_id = parse_db_int(monitor.get("brand_id"))
+            brand_name = clean_text(str(monitor.get("brand") or ""))
+            if brand_id and normalized_query in normalize_search_text(brand_name):
+                brands_by_id[brand_id] = brand_name
+    rows = sorted(
+        brands_by_id.items(),
+        key=lambda item: (normalize_search_text(item[1]), item[0]),
+    )[:20]
 
     return jsonify({
         "brands": [
@@ -144,12 +150,7 @@ def api_update_news_monitor(monitor_id: str):
             monitor["selector_settings"] = normalize_selector_settings(payload.get("selector_settings"))
         if "primary_donor_id" in payload:
             primary_donor_id = str(payload.get("primary_donor_id") or "").strip()
-            primary_donor_pk = parse_db_int(primary_donor_id)
-            if primary_donor_pk:
-                with session_scope() as session:
-                    brand = session.get(Brand, parse_db_int(monitor.get("brand_id")))
-                    if brand and any(donor.id == primary_donor_pk for donor in brand.donors):
-                        brand.primary_donor_id = primary_donor_pk
+            monitor["primary_donor_id"] = primary_donor_id
         sync_brand_runtime_fields(monitor)
         save_news_monitor(monitor)
     response_monitor = public_news_monitor(monitor)

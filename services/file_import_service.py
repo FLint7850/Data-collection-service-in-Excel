@@ -16,6 +16,7 @@ from models import Brand, FileImport
 from pathlib import Path
 from runtime.state import file_import_lock, file_import_stop_event, file_import_worker_thread, news_lock, news_settings
 from services.normalization import normalize_file_import_exclusions, normalize_file_import_rules_text, normalize_model_key, output_text, safe_filename
+from services.domain_revisions import domain_revision
 from sqlalchemy import select
 from typing import Dict, Iterable, List, Optional, Set
 from services.scraping import clean_text, prepare_rule_model
@@ -205,36 +206,38 @@ def remove_file_import_export(row: FileImport) -> None:
                         pass
 
 
+def file_import_settings_payload(row: FileImport) -> Dict[str, object]:
+    exclusions = row.exclusions if isinstance(row.exclusions, list) else []
+    return {
+        "model_field": str(row.model_field or ""),
+        "price_field": str(getattr(row, "price_field", "") or ""),
+        "exclusions": "\n".join(str(value) for value in exclusions),
+        "replace_rules": str(row.replace_rules or ""),
+    }
+
+
 def public_file_import_state() -> Dict[str, object]:
     row = get_file_import_row()
     path = file_import_path_for_row(row)
     file_meta = row.file if isinstance(row.file, dict) else {}
-    exclusions = normalize_file_import_exclusions(row.exclusions)
-    exclusions_text = "\n".join(exclusions)
-    model_field = clean_text(str(row.model_field or ""))
-    price_field = clean_text(str(getattr(row, "price_field", "") or ""))
-    replace_rules = normalize_file_import_rules_text(row.replace_rules)
-    state = normalize_file_import_state(getattr(row, "state", {}) or {})
+    settings = file_import_settings_payload(row)
+    state = dict(row.state) if isinstance(row.state, dict) else make_file_import_state()
     active = is_file_import_active_state(state)
     result_filename = Path(str(row.export_path or file_meta.get("result_filename") or state.get("result_filename") or "")).name
     result_ready = bool(result_filename and not active and resolve_file_import_export_path(result_filename))
     if not path:
         return {
+            "revision": domain_revision("file_import"),
             "file": None,
-            "exclusions": exclusions_text,
-            "model_field": model_field,
-            "price_field": price_field,
-            "replace_rules": replace_rules,
+            **settings,
             "result_filename": result_filename,
             "result_ready": result_ready,
             "state": state,
         }
     stat = path.stat()
     return {
-        "exclusions": exclusions_text,
-        "model_field": model_field,
-        "price_field": price_field,
-        "replace_rules": replace_rules,
+        "revision": domain_revision("file_import"),
+        **settings,
         "result_filename": result_filename,
         "result_ready": result_ready,
         "state": state,
@@ -247,18 +250,42 @@ def public_file_import_state() -> Dict[str, object]:
     }
 
 
-def public_file_import_progress() -> Dict[str, object]:
-    payload = public_file_import_state()
+def public_file_import_progress(db_session=None) -> Dict[str, object]:
+    db = db_session or g.db
+    row = db.get(FileImport, 1)
+    if row is None:
+        return {
+            "revision": domain_revision("file_import"),
+            "state": make_file_import_state(),
+            "result_filename": "",
+            "result_ready": False,
+        }
+
+    state = normalize_file_import_state(getattr(row, "state", {}) or {})
+    file_meta = row.file if isinstance(row.file, dict) else {}
+    result_filename = Path(
+        str(
+            row.export_path
+            or file_meta.get("result_filename")
+            or state.get("result_filename")
+            or ""
+        )
+    ).name
+    result_path = resolve_file_import_export_path(result_filename)
     return {
-        "state": payload["state"],
-        "result_filename": payload["result_filename"],
-        "result_ready": payload["result_ready"],
+        "revision": domain_revision("file_import"),
+        "state": state,
+        "result_filename": result_filename,
+        "result_ready": bool(
+            result_path and not is_file_import_active_state(state)
+        ),
     }
 
 
 def public_file_import_settings() -> Dict[str, object]:
-    payload = public_file_import_state()
+    payload = file_import_settings_payload(get_file_import_row())
     return {
+        "revision": domain_revision("file_import"),
         "model_field": payload["model_field"],
         "price_field": payload["price_field"],
         "exclusions": payload["exclusions"],

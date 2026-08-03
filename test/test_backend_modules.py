@@ -60,30 +60,27 @@ class BackendModuleTests(unittest.TestCase):
             }.intersection(routes)
         )
 
-    def test_progress_endpoint_includes_requested_form_details(self) -> None:
+    def test_progress_endpoint_returns_only_the_compact_sync_payload(self) -> None:
         from app import app
         from routes.progress import progress_poll
 
-        project = {"id": "1", "name": "Project", "state": {"status": "idle"}}
-        monitor = {"id": "2", "brand_id": 3, "brand": "Bora", "group": "Маржа"}
+        compact_payload = {
+            "cursor": "r1:1",
+            "upsert_projects": [
+                {"id": "1", "name": "Project", "state": {"status": "idle"}}
+            ],
+        }
         with (
-            app.test_request_context(
-                "/progress?projects=1&news=1&project_detail=1&news_detail=2"
-            ),
+            app.test_request_context("/progress?projects=1&news=1"),
             patch("routes.progress.ensure_storage"),
-            patch("routes.progress.progress_payload", return_value={"cursor": "r1:1"}),
-            patch("routes.progress.get_project", return_value=project),
-            patch("routes.progress.public_project", return_value={**project, "start_urls": []}),
-            patch("routes.progress.get_news_monitor", return_value=monitor),
             patch(
-                "routes.progress.public_news_brand_monitors",
-                return_value=[{**monitor, "start_urls": []}],
+                "routes.progress.progress_payload",
+                return_value=compact_payload,
             ),
         ):
             payload = progress_poll().get_json()
 
-        self.assertEqual(payload["project_detail"]["id"], "1")
-        self.assertEqual(payload["news_details"][0]["id"], "2")
+        self.assertEqual(payload, compact_payload)
 
     def test_news_deletion_publishes_progress_removals(self) -> None:
         from app import app
@@ -114,6 +111,30 @@ class BackendModuleTests(unittest.TestCase):
 
         self.assertTrue(response.get_json()["ok"])
         publish_snapshot.assert_called_once_with()
+
+    def test_domain_revisions_change_only_for_the_requested_domain(self) -> None:
+        from services.domain_revisions import bump_domain_revision, domain_revision
+
+        previous_file_import = domain_revision("file_import")
+        previous_settings = domain_revision("settings")
+
+        current_file_import = bump_domain_revision("file_import")
+
+        self.assertNotEqual(current_file_import, previous_file_import)
+        self.assertEqual(domain_revision("settings"), previous_settings)
+
+    def test_settings_revision_endpoint_is_lightweight(self) -> None:
+        from app import app
+        from routes.news import api_news
+
+        with (
+            app.test_request_context("/api/news?scope=settings-revision"),
+            patch("routes.news.ensure_storage"),
+            patch("routes.news.domain_revision", return_value="settings-r2"),
+        ):
+            payload = api_news().get_json()
+
+        self.assertEqual(payload, {"revision": "settings-r2"})
 
 
 if __name__ == "__main__":

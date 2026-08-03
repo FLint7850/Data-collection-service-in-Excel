@@ -8,6 +8,7 @@ from flask import Response, g, request, send_file
 from models import OwnSite, SupplierFeed
 from runtime.state import feed_comparison_lock, feed_comparison_stop_event
 from services.application import ensure_storage
+from services.domain_revisions import bump_domain_revision, domain_revision
 from services.normalization import jsonify, output_text
 from sqlalchemy import select
 from typing import Optional
@@ -60,8 +61,12 @@ def api_create_feed_comparison_own_site():
     row = OwnSite(**data)
     g.db.add(row)
     g.db.flush()
+    g.db.commit()
     sync_own_sites_runtime(g.db)
-    return jsonify({"own_site": public_own_site(row)}), 201
+    return jsonify({
+        "own_site": public_own_site(row),
+        "revision": domain_revision("feed_comparison"),
+    }), 201
 
 
 @bp.patch("/api/feed-comparison/own-sites/<int:site_id>")
@@ -86,8 +91,12 @@ def api_update_feed_comparison_own_site(site_id: int):
     row.feed_url = data["feed_url"]
     row.feed_generate_url = data["feed_generate_url"]
     g.db.flush()
+    g.db.commit()
     sync_own_sites_runtime(g.db)
-    return jsonify({"own_site": public_own_site(row)})
+    return jsonify({
+        "own_site": public_own_site(row),
+        "revision": domain_revision("feed_comparison"),
+    })
 
 
 @bp.delete("/api/feed-comparison/own-sites/<int:site_id>")
@@ -101,8 +110,13 @@ def api_delete_feed_comparison_own_site(site_id: int):
         return jsonify({"error": "Фид вашего сайта не найден"}), 404
     g.db.delete(row)
     g.db.flush()
+    g.db.commit()
     sync_own_sites_runtime(g.db)
-    return jsonify({"ok": True, "id": site_id})
+    return jsonify({
+        "ok": True,
+        "id": site_id,
+        "revision": domain_revision("feed_comparison"),
+    })
 
 
 @bp.post("/api/feed-comparison/suppliers")
@@ -121,7 +135,9 @@ def api_create_supplier_feed():
     row = SupplierFeed(**data)
     g.db.add(row)
     g.db.flush()
-    return jsonify({"supplier": public_supplier_feed(row)}), 201
+    g.db.commit()
+    revision = bump_domain_revision("feed_comparison")
+    return jsonify({"supplier": public_supplier_feed(row), "revision": revision}), 201
 
 
 @bp.patch("/api/feed-comparison/suppliers/<int:supplier_id>")
@@ -155,7 +171,9 @@ def api_update_supplier_feed(supplier_id: int):
     row.exclusions = data["exclusions"]
     row.replace_rules = data["replace_rules"]
     g.db.flush()
-    return jsonify({"supplier": public_supplier_feed(row)})
+    g.db.commit()
+    revision = bump_domain_revision("feed_comparison")
+    return jsonify({"supplier": public_supplier_feed(row), "revision": revision})
 
 
 @bp.delete("/api/feed-comparison/suppliers/<int:supplier_id>")
@@ -169,7 +187,9 @@ def api_delete_supplier_feed(supplier_id: int):
         return jsonify({"error": "Фид поставщика не найден"}), 404
     g.db.delete(row)
     g.db.flush()
-    return jsonify({"ok": True, "id": supplier_id})
+    g.db.commit()
+    revision = bump_domain_revision("feed_comparison")
+    return jsonify({"ok": True, "id": supplier_id, "revision": revision})
 
 
 @bp.post("/api/feed-comparison/start")
@@ -211,4 +231,3 @@ def api_download_feed_comparison():
     if not path:
         return jsonify({"error": "Файл еще не готов"}), 404
     return send_file(path, as_attachment=True, download_name=output_text(path.name))
-
