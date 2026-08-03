@@ -3,8 +3,9 @@
 from flask import Blueprint, jsonify, request
 
 from services.application import ensure_storage
-from services.news import get_news_monitor
-from services.progress_service import progress_payload, public_news_monitor_progress
+from services.news import get_news_monitor, public_news_brand_monitors
+from services.progress_service import progress_payload
+from services.projects import get_project, public_project
 
 bp = Blueprint("routes_progress", __name__)
 
@@ -19,16 +20,16 @@ def progress_poll():
         include_news,
         str(request.args.get("cursor") or ""),
     )
+    detail_project_id = str(request.args.get("project_detail") or "")
+    if include_projects and detail_project_id:
+        detail_project = get_project(detail_project_id)
+        payload["project_detail"] = (
+            public_project(detail_project) if detail_project else None
+        )
     detail_monitor_id = str(request.args.get("news_detail") or "")
     if include_news and detail_monitor_id:
         detail_monitor = get_news_monitor(detail_monitor_id)
-        if detail_monitor:
-            detail_progress = public_news_monitor_progress(detail_monitor)
-            state_changes = [
-                item
-                for item in payload.get("news", [])
-                if str(item.get("id")) != detail_monitor_id
-            ]
-            state_changes.append(detail_progress)
-            payload["news"] = state_changes
+        payload["news_details"] = (
+            public_news_brand_monitors(detail_monitor) if detail_monitor else []
+        )
     return jsonify(payload)

@@ -29,6 +29,7 @@ from services.news import (
     make_news_monitor,
     make_news_state,
     public_news_configuration,
+    public_news_brand_monitors,
     public_news_monitor,
     public_news_workspace,
     resolve_export_file,
@@ -36,7 +37,7 @@ from services.news import (
     sync_brand_runtime_fields,
     unique_news_brand_name,
 )
-from services.progress_service import public_news_monitor_progress
+from services.progress_service import public_news_monitor_progress, publish_news_progress_snapshot
 from services.projects import parse_thread_count
 
 bp = Blueprint("routes_news", __name__)
@@ -82,17 +83,7 @@ def api_get_news_monitor(monitor_id: str):
     monitor = get_news_monitor(monitor_id)
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
-    group = clean_text(str(monitor.get("group") or ""))
-    brand = clean_text(str(monitor.get("brand") or ""))
-    with news_lock:
-        brand_monitors = [
-            public_news_monitor(item)
-            for item in news_settings.get("monitors", [])
-            if isinstance(item, dict)
-            and clean_text(str(item.get("group") or "")) == group
-            and clean_text(str(item.get("brand") or "")) == brand
-        ]
-    return jsonify({"monitors": brand_monitors})
+    return jsonify({"monitors": public_news_brand_monitors(monitor)})
 
 
 @bp.patch("/api/news/monitors/<monitor_id>")
@@ -368,6 +359,7 @@ def api_delete_news_monitor(monitor_id: str):
             and clean_text(str(item.get("group") or "")) == group
             and clean_text(str(item.get("brand") or "")) == brand
         ]
+    publish_news_progress_snapshot()
     add_news_log(monitor, "Монитор новинок удален", "warning")
     return jsonify(
         {

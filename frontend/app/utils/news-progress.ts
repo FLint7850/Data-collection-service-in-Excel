@@ -31,6 +31,7 @@ export function mergeNewsProgress(
   const hasChanges = Boolean(
     payload.replace_news ||
       payload.upsert_news?.length ||
+      payload.news_details?.length ||
       payload.news?.length ||
       payload.removed_news_ids?.length,
   );
@@ -48,6 +49,13 @@ export function mergeNewsProgress(
   }
 
   for (const incoming of payload.upsert_news || []) {
+    monitors.set(
+      incoming.id,
+      mergeNewsMonitor(monitors.get(incoming.id), incoming),
+    );
+  }
+
+  for (const incoming of payload.news_details || []) {
     monitors.set(
       incoming.id,
       mergeNewsMonitor(monitors.get(incoming.id), incoming),

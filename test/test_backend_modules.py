@@ -2,6 +2,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class BackendModuleTests(unittest.TestCase):
@@ -58,6 +59,61 @@ class BackendModuleTests(unittest.TestCase):
                 ("GET", "/api/news/brands/<brand_id>"),
             }.intersection(routes)
         )
+
+    def test_progress_endpoint_includes_requested_form_details(self) -> None:
+        from app import app
+        from routes.progress import progress_poll
+
+        project = {"id": "1", "name": "Project", "state": {"status": "idle"}}
+        monitor = {"id": "2", "brand_id": 3, "brand": "Bora", "group": "Маржа"}
+        with (
+            app.test_request_context(
+                "/progress?projects=1&news=1&project_detail=1&news_detail=2"
+            ),
+            patch("routes.progress.ensure_storage"),
+            patch("routes.progress.progress_payload", return_value={"cursor": "r1:1"}),
+            patch("routes.progress.get_project", return_value=project),
+            patch("routes.progress.public_project", return_value={**project, "start_urls": []}),
+            patch("routes.progress.get_news_monitor", return_value=monitor),
+            patch(
+                "routes.progress.public_news_brand_monitors",
+                return_value=[{**monitor, "start_urls": []}],
+            ),
+        ):
+            payload = progress_poll().get_json()
+
+        self.assertEqual(payload["project_detail"]["id"], "1")
+        self.assertEqual(payload["news_details"][0]["id"], "2")
+
+    def test_news_deletion_publishes_progress_removals(self) -> None:
+        from app import app
+        from routes.news import api_delete_news_monitor
+
+        monitor = {
+            "id": "2",
+            "brand_id": 3,
+            "brand": "Bora",
+            "group": "Маржа",
+            "state": {"status": "idle"},
+        }
+        with (
+            app.test_request_context(
+                "/api/news/monitors/2?mode=brand",
+                method="DELETE",
+            ),
+            patch("routes.news.get_news_monitor", return_value=monitor),
+            patch("routes.news.news_settings", {"monitors": [monitor]}),
+            patch("routes.news.news_stop_events", {}),
+            patch("routes.news.request_news_stop"),
+            patch("routes.news.delete_news_csv_for_monitor"),
+            patch("routes.news.delete_news_records"),
+            patch("routes.news.add_news_log"),
+            patch("routes.news.publish_news_progress_snapshot") as publish_snapshot,
+        ):
+            response = api_delete_news_monitor("2")
+
+        self.assertTrue(response.get_json()["ok"])
+        publish_snapshot.assert_called_once_with()
 
 
 if __name__ == "__main__":

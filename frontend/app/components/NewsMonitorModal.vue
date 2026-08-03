@@ -10,6 +10,7 @@ import type {
 } from "~/types/api";
 import { errorMessage } from "~/utils/format";
 import { mergeProgressState } from "~/utils/progress-state";
+import { mergeRemoteDraft } from "~/utils/remote-draft";
 
 const props = defineProps<{
   monitorId: string;
@@ -54,6 +55,28 @@ function cloneMonitor(monitor: NewsMonitor): NewsMonitor {
   return JSON.parse(JSON.stringify(monitor)) as NewsMonitor;
 }
 
+function isDetailedMonitor(monitor: NewsMonitorSummary): monitor is NewsMonitor {
+  return (
+    "schedule_type" in monitor &&
+    "extraction_rules" in monitor &&
+    "selector_settings" in monitor
+  );
+}
+
+function prepareMonitor(monitor: NewsMonitor): NewsMonitor {
+  const next = cloneMonitor(monitor);
+  next.extraction_rules = {
+    ...next.extraction_rules,
+    model_start_marker: next.extraction_rules.model_start_marker || "",
+    model_end_marker: next.extraction_rules.model_end_marker || "",
+  };
+  next.selector_settings = {
+    ...next.selector_settings,
+    availability_exclusions: [...(next.selector_settings.availability_exclusions || [])],
+  };
+  return next;
+}
+
 function monitorPayload(monitor: NewsMonitor): MonitorPayload {
   return {
     brand: monitor.brand,
@@ -92,16 +115,7 @@ function emitChanged() {
 }
 
 function setDraft(monitor: NewsMonitor) {
-  const next = cloneMonitor(monitor);
-  next.extraction_rules = {
-    ...next.extraction_rules,
-    model_start_marker: next.extraction_rules.model_start_marker || "",
-    model_end_marker: next.extraction_rules.model_end_marker || "",
-  };
-  next.selector_settings = {
-    ...next.selector_settings,
-    availability_exclusions: [...(next.selector_settings.availability_exclusions || [])],
-  };
+  const next = prepareMonitor(monitor);
   selectedId.value = monitor.id;
   draft.value = next;
   lastSavedPayload = JSON.parse(
@@ -115,18 +129,65 @@ function setDraft(monitor: NewsMonitor) {
   ) as MonitorPayload;
 }
 
-function mergeLiveState(incoming: NewsMonitorSummary[]) {
-  if (!incoming.length) return;
-  monitors.value = monitors.value.map((monitor) => {
-    const live = incoming.find((item) => String(item.id) === String(monitor.id));
-    return live
-      ? { ...monitor, state: mergeProgressState(monitor.state, live.state) }
-      : monitor;
-  });
-  const live = incoming.find((item) => String(item.id) === String(selectedId.value));
-  if (live && draft.value && String(draft.value.id) === String(live.id)) {
-    draft.value.state = mergeProgressState(draft.value.state, live.state);
+function mergeLiveMonitors(incoming: NewsMonitorSummary[]) {
+  const currentBrandId = draft.value?.brand_id ?? monitors.value[0]?.brand_id;
+  const currentGroup = draft.value?.group ?? monitors.value[0]?.group;
+  const currentBrand = draft.value?.brand ?? monitors.value[0]?.brand;
+  const brandIncoming = incoming.filter((monitor) =>
+    currentBrandId != null
+      ? String(monitor.brand_id ?? "") === String(currentBrandId)
+      : monitor.group === currentGroup && monitor.brand === currentBrand,
+  );
+  const incomingIds = new Set(brandIncoming.map((monitor) => String(monitor.id)));
+  const mergedMonitors = monitors.value
+    .filter((monitor) => incomingIds.has(String(monitor.id)))
+    .map((monitor) => {
+      const live = brandIncoming.find(
+        (item) => String(item.id) === String(monitor.id),
+      );
+      if (!live) return monitor;
+      if (isDetailedMonitor(live)) return prepareMonitor(live);
+      return {
+        ...monitor,
+        state: mergeProgressState(monitor.state, live.state),
+      };
+    });
+  for (const live of brandIncoming) {
+    if (
+      isDetailedMonitor(live) &&
+      !mergedMonitors.some((monitor) => String(monitor.id) === String(live.id))
+    ) {
+      mergedMonitors.push(prepareMonitor(live));
+    }
   }
+  monitors.value = mergedMonitors;
+
+  const live = brandIncoming.find(
+    (item) => String(item.id) === String(selectedId.value),
+  );
+  if (!live || !draft.value || String(draft.value.id) !== String(live.id)) {
+    if (!live) {
+      draft.value = null;
+      lastSavedPayload = null;
+    }
+    return;
+  }
+  if (!isDetailedMonitor(live)) {
+    draft.value.state = mergeProgressState(draft.value.state, live.state);
+    return;
+  }
+
+  const currentPayload = monitorPayload(draft.value);
+  const remotePayload = monitorPayload(live);
+  draft.value = prepareMonitor(
+    mergeRemoteDraft(
+      draft.value,
+      live,
+      lastSavedPayload,
+      currentPayload,
+    ),
+  );
+  lastSavedPayload = JSON.parse(JSON.stringify(remotePayload)) as MonitorPayload;
 }
 
 function handleModalOpen(open: boolean) {
@@ -151,7 +212,7 @@ async function load() {
     loading.value = false;
     if (liveSyncPending && draft.value) {
       liveSyncPending = false;
-      mergeLiveState(props.liveMonitors);
+      mergeLiveMonitors(props.liveMonitors);
     }
   }
 }
@@ -169,7 +230,7 @@ watch(
       liveSyncPending = true;
       return;
     }
-    mergeLiveState(incoming);
+    mergeLiveMonitors(incoming);
   },
 );
 

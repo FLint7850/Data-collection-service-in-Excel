@@ -129,6 +129,8 @@ export interface ProgressPayload {
   cursor: string;
   projects?: ProgressEntity[];
   news?: ProgressEntity[];
+  project_detail?: Project | null;
+  news_details?: NewsMonitor[];
   upsert_projects?: Project[];
   upsert_news?: NewsMonitorSummary[];
   removed_projects_ids?: string[];

@@ -5,6 +5,7 @@ import {
 } from "~/services/project.service";
 import type { ProgressPayload, Project } from "~/types/api";
 import { errorMessage } from "~/utils/format";
+import { mergeRemoteDraft } from "~/utils/remote-draft";
 import { normalizeProjectRouteId } from "~/utils/route-id";
 
 const props = withDefaults(defineProps<{ projectId?: string }>(), { projectId: "" });
@@ -81,20 +82,38 @@ async function selectProject(projectId: string, updateRoute = true) {
   }
 }
 
-function savePayload(): ProjectSavePayload | null {
-  if (!draft.value) return null;
+function projectPayload(project: Project): ProjectSavePayload {
   return {
-    name: draft.value.name.trim(),
-    start_urls: draft.value.start_urls,
-    thread_count: Number(draft.value.thread_count || 4),
-    connection_method: draft.value.connection_method,
-    auto_connection_fallback: draft.value.auto_connection_fallback,
-    persist_profile: draft.value.persist_profile,
-    exclusions: draft.value.exclusions,
-    product_url_filters: draft.value.product_url_filters,
-    product_url_exclusions: draft.value.product_url_exclusions,
-    extraction_rules: draft.value.extraction_rules,
+    name: project.name.trim(),
+    start_urls: project.start_urls,
+    thread_count: Number(project.thread_count || 4),
+    connection_method: project.connection_method,
+    auto_connection_fallback: project.auto_connection_fallback,
+    persist_profile: project.persist_profile,
+    exclusions: project.exclusions,
+    product_url_filters: project.product_url_filters,
+    product_url_exclusions: project.product_url_exclusions,
+    extraction_rules: project.extraction_rules,
   };
+}
+
+function savePayload(): ProjectSavePayload | null {
+  return draft.value ? projectPayload(draft.value) : null;
+}
+
+function syncRemoteProject(remote: Project) {
+  if (!draft.value || draft.value.id !== remote.id) return;
+  const currentPayload = projectPayload(draft.value);
+  const remotePayload = projectPayload(remote);
+  draft.value = mergeRemoteDraft(
+    draft.value,
+    cloneProject(remote),
+    lastSavedPayload,
+    currentPayload,
+  );
+  lastSavedPayload = JSON.parse(
+    JSON.stringify(remotePayload),
+  ) as ProjectSavePayload;
 }
 
 function changedSavePayload(
@@ -225,6 +244,7 @@ async function pollProgress() {
       projects: 1,
       news: 0,
       cursor: progressCursor.value || undefined,
+      project_detail: activeProjectId.value || undefined,
     },
   });
   mergeProgress(payload);
@@ -235,7 +255,9 @@ async function pollProgress() {
     if (next) await selectProject(next.id);
     return;
   }
-  if (draft.value && activeProject.value) {
+  if (payload.project_detail) {
+    syncRemoteProject(payload.project_detail);
+  } else if (draft.value && activeProject.value) {
     draft.value.state = { ...draft.value.state, ...activeProject.value.state };
   }
 }

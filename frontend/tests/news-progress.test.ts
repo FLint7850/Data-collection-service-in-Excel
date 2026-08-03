@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { NewsMonitorSummary, ProgressPayload } from "../app/types/api";
+import type {
+  NewsMonitor,
+  NewsMonitorSummary,
+  ProgressPayload,
+} from "../app/types/api";
 import { mergeNewsProgress } from "../app/utils/news-progress";
 
 const monitor: NewsMonitorSummary = {
@@ -55,5 +59,36 @@ describe("mergeNewsProgress", () => {
 
     expect(result.map((item) => item.id)).toEqual(["2"]);
     expect(result[0]?.brand).toBe("Beko");
+  });
+
+  it("applies full details for an open cross-user modal", () => {
+    const detailed = {
+      ...monitor,
+      brand: "Bora Updated",
+      schedule_type: "weekly",
+      scan_time: "03:30",
+      weekday: 2,
+      next_run_at: "",
+      thread_count: 8,
+      connection_method: "requests",
+      auto_connection_fallback: true,
+      exclusions: ["sale"],
+      product_url_filters: ["/catalog/"],
+      product_url_exclusions: [],
+      extraction_rules: {},
+      selector_settings: {},
+    } as NewsMonitor;
+    const payload: ProgressPayload = {
+      cursor: "r1:4",
+      news_details: [detailed],
+    };
+
+    const result = mergeNewsProgress([monitor], payload);
+    const updated = result[0] as NewsMonitor;
+
+    expect(updated.brand).toBe("Bora Updated");
+    expect(updated.schedule_type).toBe("weekly");
+    expect(updated.thread_count).toBe(8);
+    expect(updated.exclusions).toEqual(["sale"]);
   });
 });

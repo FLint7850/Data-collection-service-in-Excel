@@ -723,6 +723,26 @@ def public_news_monitor(monitor: Dict[str, object], include_details: bool = True
     return public_monitor
 
 
+def public_news_brand_monitors(monitor: Dict[str, object]) -> List[Dict[str, object]]:
+    brand_id = parse_db_int(monitor.get("brand_id"))
+    group = clean_text(str(monitor.get("group") or ""))
+    brand = clean_text(str(monitor.get("brand") or ""))
+    with news_lock:
+        return [
+            public_news_monitor(item)
+            for item in news_settings.get("monitors", [])
+            if isinstance(item, dict)
+            and (
+                parse_db_int(item.get("brand_id")) == brand_id
+                if brand_id
+                else (
+                    clean_text(str(item.get("group") or "")) == group
+                    and clean_text(str(item.get("brand") or "")) == brand
+                )
+            )
+        ]
+
+
 def public_news_workspace() -> Dict[str, object]:
     from runtime.news_tasks import cleanup_stale_news_transitions
     from services.progress_service import register_progress_items
@@ -759,4 +779,3 @@ def public_news_configuration() -> Dict[str, object]:
                 else []
             ),
         }
-

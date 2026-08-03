@@ -10,7 +10,7 @@ from runtime.state import projects, projects_lock
 from services.application import ensure_storage
 from services.connections import normalize_connection_method, public_connection_methods
 from services.normalization import jsonify, normalize_extraction_rules, normalize_patterns, normalize_start_urls, now_iso, output_text
-from services.progress_service import register_progress_items
+from services.progress_service import publish_projects_progress_snapshot, register_progress_items
 from services.projects import (
     add_project_log,
     delete_project_record,
@@ -120,6 +120,7 @@ def api_delete_project(project_id: str):
             stop_event.set()
         projects.pop(project_id, None)
         delete_project_record(project_id)
+    publish_projects_progress_snapshot()
     return jsonify({"ok": True})
 
 
