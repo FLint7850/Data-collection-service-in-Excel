@@ -1035,11 +1035,11 @@ def start_file_import_compare() -> Dict[str, object]:
     global file_import_worker_thread
     with file_import_lock:
         if file_import_worker_thread and file_import_worker_thread.is_alive():
-            return public_file_import_state()
+            return public_file_import_progress()
         row = get_file_import_row()
         state = normalize_file_import_state(getattr(row, "state", {}) or {})
         if is_file_import_active_state(state):
-            return public_file_import_state()
+            return public_file_import_progress()
         path = file_import_path_for_row(row)
         if not path:
             raise ValueError("Файл не загружен")
@@ -1066,7 +1066,7 @@ def start_file_import_compare() -> Dict[str, object]:
             daemon=True,
         )
         file_import_worker_thread.start()
-        return public_file_import_state()
+        return public_file_import_progress()
 
 
 def file_import_worker_alive() -> bool:

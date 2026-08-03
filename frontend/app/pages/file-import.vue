@@ -157,8 +157,8 @@ async function compare() {
   if (!(await saveSettings(false))) return;
   actionLoading.value = "compare";
   try {
-    const state = await fileImportService.compare();
-    if (data.value) data.value.state = state;
+    applyProgress(await fileImportService.compare());
+    void refreshProgress();
   } catch (caught) {
     error.value = errorMessage(caught);
   } finally {
@@ -177,7 +177,7 @@ async function stop() {
   }
 }
 
-useProgressPolling(
+const { refresh: refreshProgress } = useProgressPolling(
   async () => {
     if (isActive.value) applyProgress(await fileImportService.getProgress());
   },

@@ -2,7 +2,6 @@ import type {
   FileImportData,
   FileImportProgress,
   FileImportSettings,
-  FileImportState,
 } from "~/types/api";
 
 export const fileImportService = {
@@ -33,7 +32,7 @@ export const fileImportService = {
     }),
 
   compare: () =>
-    $fetch<FileImportState>("/api/file-import/compare", {
+    $fetch<FileImportProgress>("/api/file-import/compare", {
       method: "POST",
     }),
 
