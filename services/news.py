@@ -680,7 +680,6 @@ def add_news_log(monitor: Optional[Dict[str, object]], message: str, level: str 
     from services.log_service import append_log
     append_log(
         {
-            "time": datetime.now().isoformat(timespec="seconds"),
             "project_id": f"news:{monitor.get('id')}" if monitor else "news",
             "project_name": repair_mojibake_text(f"Новинки: {monitor.get('brand')}") if monitor else "Новинки",
             "brand": repair_mojibake_text(monitor.get("brand") or "") if monitor else "",

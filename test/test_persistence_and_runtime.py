@@ -202,7 +202,13 @@ class LogStorageTests(IsolatedDatabaseTestCase):
                 session.close()
 
         with patch.object(log_service, "session_scope", isolated_session_scope):
-            first_id = log_service.append_log({"level": "info", "message": "Первое"})
+            first_id = log_service.append_log(
+                {
+                    "time": "2026-08-04T05:30:00+00:00",
+                    "level": "info",
+                    "message": "Первое",
+                }
+            )
             initial = log_service.query_logs(limit=10)
             second_id = log_service.append_log({"level": "error", "message": "Второе"})
             delta = log_service.query_logs(after_id=first_id, limit=10)
@@ -211,6 +217,7 @@ class LogStorageTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(initial["logs_total"], 1)
         self.assertEqual(initial["logs"][0]["message"], "Первое")
+        self.assertEqual(initial["logs"][0]["time"], "2026-08-04T08:30:00+03:00")
         self.assertEqual([item["id"] for item in delta["logs"]], [second_id])
         self.assertEqual(delta["logs_counts"], {"error": 1, "info": 1})
         self.assertFalse(after_clear["delta"])

@@ -264,7 +264,6 @@ def add_project_log(project: Dict[str, object], message: str, level: str = "info
     from services.log_service import append_log
     append_log(
         {
-            "time": datetime.now().isoformat(timespec="seconds"),
             "project_id": project["id"],
             "project_name": repair_mojibake_text(project["name"]),
             "level": level,

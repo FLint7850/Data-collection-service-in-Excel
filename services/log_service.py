@@ -1,11 +1,12 @@
 """Indexed SQLite-backed application log storage."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Dict, Optional
 
 from sqlalchemy import delete, func, select
 
 from database.session import session_scope
+from config import MSK_TZ
 from models import AppSetting, ApplicationLog
 from services.normalization import repair_mojibake, repair_mojibake_text
 
@@ -19,10 +20,14 @@ def _normalized_level(value: object) -> str:
 
 
 def _public_log(row: ApplicationLog) -> Dict[str, object]:
+    created_at = row.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    project_time = created_at.astimezone(MSK_TZ)
     return repair_mojibake(
         {
             "id": row.id,
-            "time": row.created_at.isoformat(timespec="seconds"),
+            "time": project_time.isoformat(timespec="seconds"),
             "level": row.level,
             "message": row.message,
             "project_id": row.project_id or "",
@@ -52,9 +57,12 @@ def append_log(item: Dict[str, object]) -> int:
 
 def _parse_log_time(value: object) -> datetime:
     try:
-        return datetime.fromisoformat(str(value or ""))
+        parsed = datetime.fromisoformat(str(value or ""))
     except (TypeError, ValueError):
-        return datetime.now()
+        return datetime.now(UTC).replace(tzinfo=None)
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(UTC).replace(tzinfo=None)
 
 
 def append_unified_log(item: Dict[str, object]) -> None:
@@ -102,7 +110,7 @@ def set_log_auto_cleanup(value: bool) -> bool:
 
 
 def prune_old_logs(days: int = 7) -> int:
-    cutoff = datetime.now() - timedelta(days=max(1, days))
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=max(1, days))
     with session_scope() as db_session:
         result = db_session.execute(delete(ApplicationLog).where(ApplicationLog.created_at < cutoff))
         return int(result.rowcount or 0)
