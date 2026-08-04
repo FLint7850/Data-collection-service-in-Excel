@@ -699,6 +699,7 @@ def collect_products_for_monitor(
     monitor: Dict[str, object],
     stop_signal: threading.Event,
     browser_session: BotasaurusBrowserSession,
+    connection_method_state: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, str]]:
     from services.projects import parse_thread_count
     finish_signal = threading.Event()
@@ -755,6 +756,7 @@ def collect_products_for_monitor(
         extraction_rules=normalize_extraction_rules(monitor.get("extraction_rules", {})),
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
+        connection_method_state=connection_method_state,
         allow_empty_price=True,
         browser_session=browser_session,
         owns_browser_session=False,
@@ -809,7 +811,12 @@ def enrich_news_product(
         browser_session=browser_session,
         owns_browser_session=False,
     )
-    html = fetcher.fetch(url) if url else ""
+    try:
+        html = fetcher.fetch(url) if url else ""
+    finally:
+        # The hidden session is shared and remains alive, while the visible
+        # debug wrapper belongs to this one enrichment worker.
+        fetcher.close_browser_sessions()
     if not html:
         return details
     soup = BeautifulSoup(html, "html.parser")
@@ -973,6 +980,7 @@ def enrich_news_candidates(
     stop_signal: threading.Event,
     browser_session: BotasaurusBrowserSession,
     progress_callback,
+    connection_method_state: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, str]]:
     from services.projects import parse_thread_count
     candidates: List[tuple[int, Dict[str, str]]] = []
@@ -1002,10 +1010,15 @@ def enrich_news_candidates(
 
     if candidates and not stop_signal.is_set():
         max_workers = min(parse_thread_count(monitor.get("thread_count", 4)), len(candidates))
-        connection_method_state = {
-            "active_method": normalize_connection_method(monitor.get("connection_method")),
-            "lock": threading.Lock(),
-        }
+        if connection_method_state is None:
+            initial_method = normalize_connection_method(monitor.get("connection_method"))
+            connection_method_state = {
+                "active_method": initial_method,
+                "resource_method": initial_method,
+                "resource_generation": 0,
+                "lock": threading.Lock(),
+                "transition_lock": threading.Lock(),
+            }
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {
                 executor.submit(
@@ -1126,6 +1139,14 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         profile_dir=profile_dir,
         prefer_headless_shell=normalize_connection_method(monitor.get("connection_method")) != "protected-site",
     )
+    initial_connection_method = normalize_connection_method(monitor.get("connection_method"))
+    connection_method_state = {
+        "active_method": initial_connection_method,
+        "resource_method": initial_connection_method,
+        "resource_generation": 0,
+        "lock": threading.Lock(),
+        "transition_lock": threading.Lock(),
+    }
 
     def check_stop_requested() -> None:
         if stop_event.is_set():
@@ -1152,7 +1173,12 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             "info",
         )
         update_news_monitor_state(monitor, stage="Сканирование сайта-донора", percent=5)
-        products = collect_products_for_monitor(monitor, stop_event, browser_session)
+        products = collect_products_for_monitor(
+            monitor,
+            stop_event,
+            browser_session,
+            connection_method_state,
+        )
         check_stop_requested()
         add_news_log(monitor, "Сбор закончил", "info")
         add_news_log(monitor, f"Сканирование сайта завершено. Найдено товаров: {len(products)}", "info")
@@ -1194,6 +1220,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             stop_event,
             browser_session,
             update_compare_progress,
+            connection_method_state,
         )
         availability_exclusions = normalize_patterns((monitor.get("selector_settings") or {}).get("availability_exclusions", []))
         for details, product in zip(enriched_products, products):

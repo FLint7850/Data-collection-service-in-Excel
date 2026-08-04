@@ -195,6 +195,123 @@ class ScrapingBoundaryTests(unittest.TestCase):
 
         browser_fetch.assert_not_called()
 
+    def test_fallback_restarts_previous_session_before_trying_next_method(self) -> None:
+        events = []
+
+        class SharedBrowserSession:
+            def restart(self, prefer_headless_shell=True):
+                events.append(("restart", prefer_headless_shell))
+                return True
+
+        normalize = lambda value: str(value or "requests")
+        with (
+            patch("services.scraping.fallback.normalize_connection_method", side_effect=normalize),
+            patch(
+                "services.scraping.fallback.is_browser_render_method",
+                side_effect=lambda method: method == "protected-site",
+            ),
+            patch("services.scraping.fallback.is_debug_visible_method", return_value=False),
+        ):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                connection_method="botasaurus-browser",
+                auto_connection_fallback=True,
+                browser_session=SharedBrowserSession(),
+                owns_browser_session=False,
+            )
+
+            def fetch_method(_url, method):
+                events.append(("fetch", method))
+                if method == "protected-site":
+                    return "<html><body>Product</body></html>"
+                return None
+
+            with (
+                patch.object(
+                    crawler,
+                    "fallback_method_sequence",
+                    return_value=["botasaurus-browser", "requests", "protected-site"],
+                ),
+                patch.object(crawler, "fetch_with_connection_method", side_effect=fetch_method),
+            ):
+                result = crawler.fetch("https://example.test/catalog/")
+
+        self.assertEqual(result, "<html><body>Product</body></html>")
+        self.assertEqual(
+            events,
+            [
+                ("fetch", "botasaurus-browser"),
+                ("restart", True),
+                ("fetch", "requests"),
+                ("restart", False),
+                ("fetch", "protected-site"),
+                ("restart", True),
+            ],
+        )
+        self.assertEqual(crawler.connection_method_state["active_method"], "botasaurus-browser")
+
+    def test_non_browser_fallback_becomes_active_after_previous_browser_stops(self) -> None:
+        events = []
+
+        class SharedBrowserSession:
+            def restart(self, prefer_headless_shell=True):
+                events.append(("restart", prefer_headless_shell))
+                return True
+
+        normalize = lambda value: str(value or "requests")
+        with (
+            patch("services.scraping.fallback.normalize_connection_method", side_effect=normalize),
+            patch("services.scraping.fallback.is_browser_render_method", return_value=False),
+            patch("services.scraping.fallback.is_debug_visible_method", return_value=False),
+        ):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                connection_method="botasaurus-browser",
+                auto_connection_fallback=True,
+                browser_session=SharedBrowserSession(),
+                owns_browser_session=False,
+            )
+
+            def fetch_method(_url, method):
+                events.append(("fetch", method))
+                return "<html><body>Catalog</body></html>" if method == "requests" else None
+
+            with (
+                patch.object(crawler, "fallback_method_sequence", return_value=["botasaurus-browser", "requests"]),
+                patch.object(crawler, "fetch_with_connection_method", side_effect=fetch_method),
+            ):
+                result = crawler.fetch("https://example.test/catalog/")
+
+        self.assertEqual(result, "<html><body>Catalog</body></html>")
+        self.assertEqual(
+            events,
+            [
+                ("fetch", "botasaurus-browser"),
+                ("restart", True),
+                ("fetch", "requests"),
+            ],
+        )
+        self.assertEqual(crawler.connection_method_state["active_method"], "requests")
+
+    def test_browser_session_can_restart_after_full_shutdown(self) -> None:
+        session = BotasaurusBrowserSession(threading.Event(), 1, prefer_headless_shell=True)
+        previous_token = session._process_token
+
+        restarted = session.restart(prefer_headless_shell=False)
+
+        self.assertTrue(restarted)
+        self.assertFalse(session._closed)
+        self.assertFalse(session.prefer_headless_shell)
+        self.assertNotEqual(session._process_token, previous_token)
+
     def test_thread_count_limits_parallel_browser_pages(self) -> None:
         with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
             crawler = ProductSiteCrawler(

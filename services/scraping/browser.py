@@ -102,6 +102,7 @@ class BotasaurusBrowserSession:
             prefer_headless_shell=self.prefer_headless_shell,
         )
         self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._loop = None
@@ -540,27 +541,60 @@ class BotasaurusBrowserSession:
         import asyncio
         from services.log_service import fetch_debug_log
 
-        thread = None
-        loop = None
-        with self._state_lock:
-            self._closed = True
+        with self._lifecycle_lock:
+            thread = None
+            loop = None
+            with self._state_lock:
+                self._closed = True
+                thread = self._thread
+                loop = self._loop
+            if loop is not None and loop.is_running():
+                try:
+                    shutdown = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
+                    shutdown.result(timeout=20)
+                except BaseException as error:  # noqa: BLE001
+                    fetch_debug_log(f"browser-session close failed: {type(error).__name__}: {error}", "warning")
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except BaseException as error:  # noqa: BLE001
+                    fetch_debug_log(f"browser-session loop stop failed: {type(error).__name__}: {error}", "warning")
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=20)
+                if thread.is_alive():
+                    fetch_debug_log("browser-session thread did not stop in 20 seconds", "warning")
+            self._force_terminate_owned_processes()
+            if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+                thread.join(timeout=5)
+
+    def restart(self, prefer_headless_shell: Optional[bool] = None) -> bool:
+        """Fully stops the owned browser process and makes this shared object reusable."""
+        from services.log_service import fetch_debug_log
+
+        with self._lifecycle_lock:
+            self.close()
             thread = self._thread
-            loop = self._loop
-        if loop is not None and loop.is_running():
-            try:
-                shutdown = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
-                shutdown.result(timeout=20)
-            except BaseException as error:  # noqa: BLE001
-                fetch_debug_log(f"browser-session close failed: {type(error).__name__}: {error}", "warning")
-            try:
-                loop.call_soon_threadsafe(loop.stop)
-            except BaseException as error:  # noqa: BLE001
-                fetch_debug_log(f"browser-session loop stop failed: {type(error).__name__}: {error}", "warning")
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=20)
-            if thread.is_alive():
-                fetch_debug_log("browser-session thread did not stop in 20 seconds", "warning")
-        self._force_terminate_owned_processes()
+            if thread is not None and thread.is_alive():
+                fetch_debug_log("browser-session restart aborted: previous thread is still alive", "warning")
+                return False
+
+            if prefer_headless_shell is not None:
+                self.prefer_headless_shell = bool(prefer_headless_shell)
+            self.executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(
+                prefer_headless_shell=self.prefer_headless_shell,
+            )
+            with self._state_lock:
+                self._ready = threading.Event()
+                self._thread = None
+                self._loop = None
+                self._playwright = None
+                self._browser = None
+                self._context = None
+                self._semaphore = None
+                self._closed = False
+                self._start_error = None
+                self._process_token = f"parser-browser-session-{uuid.uuid4().hex}"
+                self._shutdown_complete = threading.Event()
+            return True
 
 
 class BotasaurusDebugVisibleSession:
@@ -1014,25 +1048,56 @@ playwright_headless_renderer = PlaywrightHeadlessRenderer()
 
 
 def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine_name: str = "engine") -> Optional[str]:
+    command = [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if os.name == "nt":
+        creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     try:
-        completed = subprocess.run(
-            [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER],
+        process = subprocess.Popen(
+            command,
             cwd=str(BASE_DIR),
-            capture_output=True,
-            timeout=timeout_seconds + 10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+            creationflags=creationflags,
         )
+        try:
+            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout_seconds + 10)
+        except subprocess.TimeoutExpired as error:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.terminate()
+            try:
+                stdout_bytes, stderr_bytes = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                stdout_bytes, stderr_bytes = process.communicate()
+            raise RuntimeError(
+                f"{engine_name}: процесс превысил таймаут {timeout_seconds + 10} сек."
+            ) from error
     except Exception as error:
+        if isinstance(error, RuntimeError) and str(error).startswith(f"{engine_name}:"):
+            raise
         raise RuntimeError(f"{engine_name}: не удалось запустить процесс: {error}") from error
 
-    stdout = completed.stdout.decode("utf-8", "replace")
-    stderr = completed.stderr.decode("utf-8", "replace")
+    stdout = stdout_bytes.decode("utf-8", "replace")
+    stderr = stderr_bytes.decode("utf-8", "replace")
 
-    if completed.returncode != 0:
+    if process.returncode != 0:
         details = (stderr or stdout or "").strip()
         if len(details) > 1200:
             details = details[-1200:]
-        raise RuntimeError(f"{engine_name}: процесс завершился с кодом {completed.returncode}: {details}")
+        raise RuntimeError(f"{engine_name}: процесс завершился с кодом {process.returncode}: {details}")
 
     for line in reversed(stdout.splitlines()):
         if ENGINE_OUTPUT_MARKER not in line:

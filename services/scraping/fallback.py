@@ -85,10 +85,19 @@ class ProductSiteCrawler:
             connection_method_state = {
                 "active_method": self.connection_method,
                 "lock": threading.Lock(),
+                "transition_lock": threading.Lock(),
+                "resource_method": self.connection_method,
+                "resource_generation": 0,
             }
         else:
             connection_method_state.setdefault("active_method", self.connection_method)
             connection_method_state.setdefault("lock", threading.Lock())
+            connection_method_state.setdefault("transition_lock", threading.Lock())
+            connection_method_state.setdefault(
+                "resource_method",
+                str(connection_method_state.get("active_method") or self.connection_method),
+            )
+            connection_method_state.setdefault("resource_generation", 0)
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
         debug_profile = str(profile_dir) if profile_dir is not None else "protected_sites_debug_visible"
@@ -180,8 +189,10 @@ class ProductSiteCrawler:
         if self.owns_browser_session:
             if self.browser_session not in sessions:
                 sessions.append(self.browser_session)
-            if self.debug_visible_session not in sessions:
-                sessions.append(self.debug_visible_session)
+        # The debug-visible wrapper is always created by this crawler, even
+        # when the regular hidden browser session is shared by news workers.
+        if self.debug_visible_session not in sessions:
+            sessions.append(self.debug_visible_session)
         for session in sessions:
             session.close()
 
@@ -307,25 +318,42 @@ class ProductSiteCrawler:
             self.active_connection_method = current
             return current
 
-    def set_active_connection_method(self, method: str) -> None:
-        previous = self.active_connection_method
+    def prepare_connection_method(self, method: str, activate: bool = True) -> str:
+        """Stops resources from the previous method before enabling the next one."""
+        current = normalize_connection_method(method)
         lock = self.connection_method_state["lock"]
         with lock:
-            current = normalize_connection_method(method)
-            self.connection_method_state["active_method"] = current
-            self.active_connection_method = current
-        if current != previous and self.owns_browser_session:
-            self.close_browser_sessions()
-            self.browser_session = BotasaurusBrowserSession(
-                self.stop_signal,
-                self.thread_count,
-                profile_dir=self.profile_dir,
-                prefer_headless_shell=current != "protected-site",
+            previous_resource = normalize_connection_method(
+                self.connection_method_state.get("resource_method")
             )
-            self.debug_visible_session = BotasaurusDebugVisibleSession(
-                self.stop_signal,
-                str(self.profile_dir) if self.profile_dir is not None else "protected_sites_debug_visible",
-            )
+            if activate:
+                self.connection_method_state["active_method"] = current
+                self.active_connection_method = current
+            self.connection_method_state["resource_method"] = current
+            if current != previous_resource:
+                self.connection_method_state["resource_generation"] = (
+                    int(self.connection_method_state.get("resource_generation", 0)) + 1
+                )
+
+        if current == previous_resource:
+            return current
+
+        # The shared session object is also used by news enrichment workers.
+        # Restart it in place so every owner sees the replacement session and
+        # the old Chromium/Playwright process is gone before the next method.
+        self.browser_session.restart(
+            prefer_headless_shell=current != "protected-site",
+        )
+
+        self.debug_visible_session.close()
+        self.debug_visible_session = BotasaurusDebugVisibleSession(
+            self.stop_signal,
+            str(self.profile_dir) if self.profile_dir is not None else "protected_sites_debug_visible",
+        )
+        return current
+
+    def set_active_connection_method(self, method: str) -> None:
+        self.prepare_connection_method(method)
 
     def fetch_with_connection_method(self, url: str, method: str) -> Optional[str]:
         from services.log_service import log_fetch_result
@@ -342,7 +370,13 @@ class ProductSiteCrawler:
         return None
 
     def fetch(self, url: str) -> Optional[str]:
-        current_method = self.current_connection_method()
+        transition_lock = self.connection_method_state["transition_lock"]
+        # Do not start a new URL while another worker is replacing the shared
+        # browser process. Existing requests may finish or be cancelled by the
+        # session shutdown, but no new work enters the previous method.
+        with transition_lock:
+            current_method = self.current_connection_method()
+            resource_generation = int(self.connection_method_state.get("resource_generation", 0))
         last_method = current_method
 
         if self.stop_signal.is_set():
@@ -366,21 +400,42 @@ class ProductSiteCrawler:
             self.log(f"Не удалось загрузить {url}. Последний метод: {last_method}", "error")
             return None
 
-        for method in self.fallback_method_sequence():
-            if self.stop_signal.is_set():
-                return None
-            if method == current_method:
-                continue
-            last_method = method
-            html = self.fetch_with_connection_method(url, method)
-            if html:
-                if method != current_method:
-                    self.set_active_connection_method(method)
-                    self.log(f"Автопереключение подключения: {method} для {url}", "warning")
-                return html
-            with self.data_lock:
-                if url in self.permanent_failures:
-                    break
+        with transition_lock:
+            # Another worker may have completed the transition while this URL
+            # was failing on the old method. Reuse that method instead of
+            # starting a second, competing fallback chain.
+            latest_method = self.current_connection_method()
+            latest_generation = int(self.connection_method_state.get("resource_generation", 0))
+            if latest_method != current_method or latest_generation != resource_generation:
+                return self.fetch_with_connection_method(url, latest_method)
+
+            for method in self.fallback_method_sequence():
+                if self.stop_signal.is_set():
+                    return None
+                if method == current_method:
+                    continue
+                last_method = method
+                self.prepare_connection_method(method, activate=False)
+                html = self.fetch_with_connection_method(url, method)
+                if html:
+                    if is_browser_render_method(method) or is_debug_visible_method(method):
+                        # Preserve the old pre-refactor behaviour: a browser
+                        # fallback serves only this URL and is then fully
+                        # stopped. The configured method remains active for the
+                        # rest of the scan.
+                        self.prepare_connection_method(current_method, activate=False)
+                        self.log(f"Браузерный fallback сработал: {method} для {url}", "warning")
+                    else:
+                        self.set_active_connection_method(method)
+                        self.log(f"Автопереключение подключения: {method} для {url}", "warning")
+                    return html
+                with self.data_lock:
+                    if url in self.permanent_failures:
+                        break
+
+            # Every candidate failed. Stop the final candidate process and
+            # leave the original method ready for the next retry/URL.
+            self.prepare_connection_method(current_method, activate=False)
 
         self.update_state(
             error=(
