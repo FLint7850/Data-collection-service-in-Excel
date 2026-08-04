@@ -8,7 +8,6 @@ from services.connections import normalize_connection_method
 from services.normalization import normalize_extraction_rules, normalize_patterns, safe_filename
 from typing import Dict, Optional
 from services.scraping import (
-    BotasaurusDebugVisibleSession,
     BrowserMethodSession,
     ProductSiteCrawler,
     product_url_filter_patterns,
@@ -92,13 +91,13 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             profile_dir=crawler.profile_dir,
             initial_method=crawler.connection_method,
         )
-        crawler.debug_visible_session = BotasaurusDebugVisibleSession(
-            project["stop_event"],
-            str(crawler.profile_dir) if crawler.profile_dir is not None else "protected_sites_debug_visible",
-            max_pages=crawler.thread_count,
-        )
         crawler.active_connection_method = crawler.connection_method
-        crawler.connection_method_state["active_method"] = crawler.connection_method
+        with crawler.connection_method_state["lock"]:
+            crawler.connection_method_state["active_method"] = crawler.connection_method
+            crawler.connection_method_state["resource_method"] = crawler.connection_method
+            crawler.connection_method_state["resource_generation"] = (
+                int(crawler.connection_method_state.get("resource_generation", 0)) + 1
+            )
         crawler.excel_finalized = False
     else:
         cleanup_project_profile_if_disabled(project)

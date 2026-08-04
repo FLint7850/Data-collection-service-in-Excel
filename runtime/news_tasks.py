@@ -22,7 +22,7 @@ from email.message import EmailMessage
 from models import Brand, utc_now
 from pathlib import Path
 from runtime import state as runtime_state
-from runtime.state import FEED_STORAGE_LOCK, NEWS_PROGRESS_FIELDS, feed_snapshot_cache, news_lock, news_scan_threads, news_settings, news_state_persisted_at, news_stop_events, news_stop_modes
+from runtime.state import FEED_STORAGE_LOCK, NEWS_PROGRESS_FIELDS, feed_snapshot_cache, news_browser_sessions, news_lock, news_scan_threads, news_settings, news_state_persisted_at, news_stop_events, news_stop_modes
 from services.connections import get_donor_row, normalize_connection_method
 from services.normalization import datetime_to_input_value, normalize_emails, normalize_extraction_rules, normalize_model_key, normalize_patterns, normalize_start_urls, output_text, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
 from sqlalchemy import select
@@ -690,6 +690,10 @@ def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
             stop_requested_at=datetime.now(MSK_TZ).isoformat(timespec="seconds"),
         )
     event.set()
+    with news_lock:
+        browser_session = news_browser_sessions.get(monitor_id)
+    if isinstance(browser_session, BrowserMethodSession):
+        browser_session.close()
     if monitor:
         threading.Thread(target=persist_news_monitor_state, args=(monitor, True), daemon=True).start()
     return event
@@ -814,8 +818,8 @@ def enrich_news_product(
     try:
         html = fetcher.fetch(url) if url else ""
     finally:
-        # The hidden session is shared and remains alive, while the visible
-        # debug wrapper belongs to this one enrichment worker.
+        # The browser manager belongs to the whole news scan. This worker does
+        # not close any of the shared Botasaurus/Playwright sessions.
         fetcher.close_browser_sessions()
     if not html:
         return details
@@ -1140,6 +1144,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         profile_dir=profile_dir,
         initial_method=initial_connection_method,
     )
+    with news_lock:
+        news_browser_sessions[monitor_id] = browser_session
     connection_method_state = {
         "active_method": initial_connection_method,
         "resource_method": initial_connection_method,
@@ -1378,6 +1384,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     finally:
         browser_session.close()
         with news_lock:
+            if news_browser_sessions.get(monitor_id) is browser_session:
+                news_browser_sessions.pop(monitor_id, None)
             news_stop_modes.pop(monitor_id, None)
             thread = news_scan_threads.get(monitor_id)
             if thread is threading.current_thread():

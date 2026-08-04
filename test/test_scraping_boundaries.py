@@ -15,6 +15,8 @@ from services.scraping.browser import (
     BotasaurusDebugVisibleSession,
     BrowserMethodSession,
     PlaywrightBrowserSession,
+    ScrapeGraphAISession,
+    _ensure_botasaurus_debugging_address_compatibility,
 )
 from services.scraping.extraction import extract_listing_products
 from services.scraping.fallback import ProductSiteCrawler
@@ -222,7 +224,7 @@ class ScrapingBoundaryTests(unittest.TestCase):
 
         browser_fetch.assert_not_called()
 
-    def test_fallback_restarts_previous_session_before_trying_next_method(self) -> None:
+    def test_successful_browser_fallback_stays_active_for_next_urls(self) -> None:
         events = []
 
         class SharedBrowserSession:
@@ -276,10 +278,9 @@ class ScrapingBoundaryTests(unittest.TestCase):
                 ("fetch", "requests"),
                 ("restart", False, "protected-site"),
                 ("fetch", "protected-site"),
-                ("restart", True, "botasaurus-browser"),
             ],
         )
-        self.assertEqual(crawler.connection_method_state["active_method"], "botasaurus-browser")
+        self.assertEqual(crawler.connection_method_state["active_method"], "protected-site")
 
     def test_non_browser_fallback_becomes_active_after_previous_browser_stops(self) -> None:
         events = []
@@ -352,8 +353,59 @@ class ScrapingBoundaryTests(unittest.TestCase):
         self.assertEqual(crawler.thread_count, 6)
         self.assertEqual(crawler.browser_session.max_pages, 6)
         self.assertEqual(crawler.browser_session.botasaurus_session.max_pages, 6)
+        self.assertEqual(crawler.browser_session.debug_visible_session.max_pages, 6)
+        self.assertEqual(crawler.browser_session.crawl4ai_session.max_pages, 6)
         self.assertEqual(crawler.browser_session.playwright_session.max_pages, 6)
         self.assertTrue(crawler.browser_session.prefer_headless_shell)
+
+    def test_shared_news_worker_does_not_close_browser_manager(self) -> None:
+        manager = BrowserMethodSession(
+            threading.Event(),
+            4,
+            initial_method="botasaurus-browser-direct",
+        )
+        with patch(
+            "services.scraping.fallback.normalize_connection_method",
+            return_value="botasaurus-browser-direct",
+        ):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                1,
+                browser_session=manager,
+                owns_browser_session=False,
+            )
+
+        crawler.close_browser_sessions()
+
+        self.assertFalse(manager._closed)
+        manager.close()
+
+    def test_profiles_and_debug_mode_keep_configured_thread_count(self) -> None:
+        from services.projects import project_runtime_thread_count
+
+        self.assertEqual(
+            project_runtime_thread_count(
+                {
+                    "thread_count": 10,
+                    "persist_profile": True,
+                    "connection_method": "protected-site",
+                }
+            ),
+            10,
+        )
+        self.assertEqual(
+            project_runtime_thread_count(
+                {
+                    "thread_count": 10,
+                    "persist_profile": False,
+                    "connection_method": "botasaurus-debug-visible",
+                }
+            ),
+            10,
+        )
 
     def test_protected_site_keeps_full_chromium(self) -> None:
         with patch("services.scraping.fallback.normalize_connection_method", return_value="protected-site"):
@@ -458,17 +510,23 @@ class ScrapingBoundaryTests(unittest.TestCase):
         asyncio.run(run_shutdown())
         self.assertEqual(events, ["browser-closed", "task-cancelled"])
 
-    def test_browser_method_session_uses_native_botasaurus_only_for_botasaurus_codes(self) -> None:
+    def test_browser_method_session_routes_each_browser_code_to_its_native_engine(self) -> None:
         session = BrowserMethodSession(threading.Event(), 3, initial_method="botasaurus-browser")
         try:
             with (
                 patch.object(session.botasaurus_session, "fetch", return_value="<html>botasaurus</html>") as botasaurus_fetch,
+                patch.object(session.debug_visible_session, "fetch", return_value="<html>debug</html>") as debug_fetch,
+                patch.object(session.crawl4ai_session, "fetch", return_value="<html>crawl4ai</html>") as crawl4ai_fetch,
+                patch.object(session.scrapegraphai_session, "fetch", return_value="<html>scrapegraphai</html>") as scrapegraphai_fetch,
                 patch.object(session.playwright_session, "fetch", return_value="<html>playwright</html>") as playwright_fetch,
             ):
                 for method in ("botasaurus-browser", "botasaurus-browser-direct", "botasaurus-visible"):
                     self.assertEqual(session.fetch("https://example.test", method), "<html>botasaurus</html>")
                 self.assertEqual(session.fetch("https://example.test", "playwright"), "<html>playwright</html>")
                 self.assertEqual(session.fetch("https://example.test", "protected-site"), "<html>playwright</html>")
+                self.assertEqual(session.fetch("https://example.test", "botasaurus-debug-visible"), "<html>debug</html>")
+                self.assertEqual(session.fetch("https://example.test", "crawl4ai"), "<html>crawl4ai</html>")
+                self.assertEqual(session.fetch("https://example.test", "scrapegraphai"), "<html>scrapegraphai</html>")
 
             self.assertEqual(
                 [call.args[1] for call in botasaurus_fetch.call_args_list],
@@ -478,6 +536,9 @@ class ScrapingBoundaryTests(unittest.TestCase):
                 [call.args[1] for call in playwright_fetch.call_args_list],
                 ["playwright", "protected-site"],
             )
+            debug_fetch.assert_called_once()
+            crawl4ai_fetch.assert_called_once_with("https://example.test")
+            scrapegraphai_fetch.assert_called_once_with("https://example.test")
         finally:
             session.close()
 
@@ -485,6 +546,21 @@ class ScrapingBoundaryTests(unittest.TestCase):
         with patch.object(BotasaurusBrowserSession, "_create_renderer", return_value=None):
             session = BotasaurusBrowserSession(threading.Event(), 2)
         self.assertIsNone(session.fetch("https://example.test", "playwright"))
+
+    def test_botasaurus_omits_remote_debugging_host_for_headless_shell(self) -> None:
+        from botasaurus_driver.core.config import Config
+
+        _ensure_botasaurus_debugging_address_compatibility()
+        config = Config(
+            headless=True,
+            port=59123,
+            chrome_executable_path=botasaurus_browser_executable(prefer_headless_shell=True),
+        )
+
+        arguments = config()
+
+        self.assertNotIn("--remote-debugging-host=127.0.0.1", arguments)
+        self.assertIn("--remote-debugging-port=59123", arguments)
 
     def test_debug_visible_botasaurus_uses_full_chrome_with_thread_tabs(self) -> None:
         with (
@@ -564,6 +640,30 @@ class ScrapingBoundaryTests(unittest.TestCase):
         self.assertTrue(all(result and result.startswith("<html>") for result in results))
         self.assertTrue(session._shutdown_complete.is_set())
 
+    def test_scrapegraphai_serializes_its_internal_full_browser_per_scan(self) -> None:
+        session = ScrapeGraphAISession(threading.Event())
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def fake_fetch(*_args, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            threading.Event().wait(0.03)
+            with lock:
+                active -= 1
+            return "<html>scrapegraphai</html>"
+
+        with patch("services.scraping.browser.fetch_with_python_engine", side_effect=fake_fetch):
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(session.fetch, [f"https://example.test/{i}" for i in range(4)]))
+        session.close()
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(results, ["<html>scrapegraphai</html>"] * 4)
+
     def test_every_connection_code_routes_to_its_named_engine(self) -> None:
         with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
             crawler = ProductSiteCrawler(
@@ -579,11 +679,9 @@ class ScrapingBoundaryTests(unittest.TestCase):
             patch.object(crawler, "fetch_with_requests", return_value="requests"),
             patch("services.scraping.fallback.fetch_with_botasaurus_request", return_value="botasaurus-request"),
             patch.object(crawler.browser_session, "fetch", side_effect=lambda _url, method, *_args: method),
-            patch.object(crawler.debug_visible_session, "fetch", return_value="botasaurus-debug-visible"),
-            patch("services.scraping.fallback.fetch_with_crawl4ai", return_value="crawl4ai"),
+            patch.object(crawler.browser_session.debug_visible_session, "fetch", return_value="botasaurus-debug-visible"),
             patch("services.scraping.fallback.fetch_with_scrapy", return_value="scrapy"),
             patch("services.scraping.fallback.fetch_with_crawlee", return_value="crawlee"),
-            patch("services.scraping.fallback.fetch_with_scrapegraphai", return_value="scrapegraphai"),
         ):
             expected = {
                 "requests": "requests",

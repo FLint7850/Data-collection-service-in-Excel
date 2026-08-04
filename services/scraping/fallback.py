@@ -24,11 +24,8 @@ from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
 from services.scraping.browser import (
-    BotasaurusDebugVisibleSession,
     BrowserMethodSession,
-    fetch_with_crawl4ai,
     fetch_with_crawlee,
-    fetch_with_scrapegraphai,
     fetch_with_scrapy,
 )
 from services.scraping.extraction import (
@@ -108,17 +105,11 @@ class ProductSiteCrawler:
             connection_method_state.setdefault("resource_generation", 0)
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
-        debug_profile = str(profile_dir) if profile_dir is not None else "protected_sites_debug_visible"
         self.browser_session = browser_session or BrowserMethodSession(
             self.stop_signal,
             self.thread_count,
             profile_dir=self.profile_dir,
             initial_method=self.connection_method,
-        )
-        self.debug_visible_session = BotasaurusDebugVisibleSession(
-            self.stop_signal,
-            debug_profile,
-            max_pages=self.thread_count,
         )
         self.owns_browser_session = owns_browser_session
         self.browser_sessions_lock = threading.Lock()
@@ -188,9 +179,6 @@ class ProductSiteCrawler:
     def browser_session_for_worker(self) -> BrowserMethodSession:
         return self.browser_session
 
-    def debug_visible_session_for_worker(self) -> BotasaurusDebugVisibleSession:
-        return self.debug_visible_session
-
     def close_browser_sessions(self) -> None:
         sessions: List[object] = []
         with self.browser_sessions_lock:
@@ -201,10 +189,6 @@ class ProductSiteCrawler:
         if self.owns_browser_session:
             if self.browser_session not in sessions:
                 sessions.append(self.browser_session)
-        # The debug-visible wrapper is always created by this crawler, even
-        # when the regular hidden browser session is shared by news workers.
-        if self.debug_visible_session not in sessions:
-            sessions.append(self.debug_visible_session)
         for session in sessions:
             session.close()
 
@@ -261,7 +245,7 @@ class ProductSiteCrawler:
                 self.allow_empty_price,
             )
         if method == "botasaurus-debug-visible":
-            return self.debug_visible_session_for_worker().fetch(target_url, method)
+            return self.browser_session_for_worker().fetch(target_url, method)
         if method in SESSION_BROWSER_METHODS:
             return self.browser_session_for_worker().fetch(
                 target_url,
@@ -271,9 +255,9 @@ class ProductSiteCrawler:
                 self.allow_empty_price,
             )
         if method == "crawl4ai":
-            return fetch_with_crawl4ai(target_url)
+            return self.browser_session_for_worker().fetch(target_url, method)
         if method == "scrapegraphai":
-            return fetch_with_scrapegraphai(target_url)
+            return self.browser_session_for_worker().fetch(target_url, method)
         if method == "scrapy":
             return fetch_with_scrapy(target_url)
         if method == "crawlee":
@@ -358,12 +342,6 @@ class ProductSiteCrawler:
             method=current,
         )
 
-        self.debug_visible_session.close()
-        self.debug_visible_session = BotasaurusDebugVisibleSession(
-            self.stop_signal,
-            str(self.profile_dir) if self.profile_dir is not None else "protected_sites_debug_visible",
-            max_pages=self.thread_count,
-        )
         return current
 
     def set_active_connection_method(self, method: str) -> None:
@@ -432,16 +410,11 @@ class ProductSiteCrawler:
                 self.prepare_connection_method(method, activate=False)
                 html = self.fetch_with_connection_method(url, method)
                 if html:
-                    if is_browser_render_method(method) or is_debug_visible_method(method):
-                        # Preserve the old pre-refactor behaviour: a browser
-                        # fallback serves only this URL and is then fully
-                        # stopped. The configured method remains active for the
-                        # rest of the scan.
-                        self.prepare_connection_method(current_method, activate=False)
-                        self.log(f"Браузерный fallback сработал: {method} для {url}", "warning")
-                    else:
-                        self.set_active_connection_method(method)
-                        self.log(f"Автопереключение подключения: {method} для {url}", "warning")
+                    # Keep the successful engine for the remaining URLs.
+                    # Recreating a browser after every URL causes process/CPU
+                    # churn and races the other workers sharing this manager.
+                    self.set_active_connection_method(method)
+                    self.log(f"Автопереключение подключения: {method} для {url}", "warning")
                     return html
                 with self.data_lock:
                     if url in self.permanent_failures:
@@ -747,7 +720,7 @@ class ProductSiteCrawler:
             paused_with_result=partial,
         )
         self.log(f"CSV сформирован: {filename.name}. Товаров: {counts['results']}", "success")
-        if self.project is not None:
+        if self.project is not None and self.run_id == int(self.project.get("run_id", self.run_id)):
             save_project(self.project)
 
     def run(self, resume: bool = False) -> None:

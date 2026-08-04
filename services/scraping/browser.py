@@ -11,7 +11,6 @@ import time
 import uuid
 from config import (
     BASE_DIR,
-    BLOCKED_BROWSER_RESOURCE_TYPES,
     BLOCKED_BROWSER_URL_PARTS,
     BOTASAURUS_HEADLESS_METHODS,
     REQUEST_TIMEOUT,
@@ -21,13 +20,109 @@ from config import (
 )
 from pathlib import Path
 from queue import Empty, Queue
-from runtime.state import STANDALONE_BROWSER_SEMAPHORE
 from typing import Dict, Iterable, List, Optional, Set
 
 from services.scraping.extraction import extract_listing_products, extract_product_data
 from services.scraping.http import is_product_url_for_filters
 
 from services.scraping.http import looks_blocked_or_empty
+
+
+_BOTASAURUS_CONFIG_PATCH_LOCK = threading.Lock()
+
+
+def _ensure_botasaurus_debugging_address_compatibility() -> None:
+    """Removes Botasaurus' host flag, which crashes current Headless Shell."""
+    from botasaurus_driver.core.config import Config
+
+    with _BOTASAURUS_CONFIG_PATCH_LOCK:
+        if getattr(Config, "_parser_debugging_address_compat", False):
+            return
+        original_call = Config.__call__
+
+        def compatible_call(config):
+            arguments = original_call(config)
+            return [
+                argument
+                for argument in arguments
+                if not argument.startswith("--remote-debugging-host=")
+            ]
+
+        Config.__call__ = compatible_call
+        Config._parser_debugging_address_compat = True
+
+
+def _force_terminate_token_processes(process_token: str, known_root_pid: Optional[int] = None) -> None:
+    """Terminates only the browser tree carrying this session's unique token."""
+    try:
+        import psutil
+    except ImportError:
+        return
+
+    marker = f"--{process_token}"
+    roots = []
+    for process in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if marker in (process.info.get("cmdline") or []):
+                roots.append(process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if known_root_pid and not roots:
+        try:
+            candidate = psutil.Process(int(known_root_pid))
+            if marker in (candidate.cmdline() or []):
+                roots.append(candidate)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            pass
+    if not roots:
+        return
+
+    owned = {}
+    for root in roots:
+        try:
+            owned[root.pid] = root
+            for child in root.children(recursive=True):
+                owned[child.pid] = child
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    owned.pop(os.getpid(), None)
+    processes = list(owned.values())
+    for process in reversed(processes):
+        try:
+            process.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    _gone, alive = psutil.wait_procs(processes, timeout=1.5)
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=1.5)
+
+
+def _terminate_subprocess_tree(process: subprocess.Popen) -> None:
+    """Stops an isolated parser subprocess together with browser descendants."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            process.kill()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
 
 
 def _ensure_botasaurus_initial_tab(driver) -> None:
@@ -39,66 +134,6 @@ def _ensure_botasaurus_initial_tab(driver) -> None:
         tabs = []
     if not tabs and hasattr(driver, "open_link_in_new_tab"):
         driver.open_link_in_new_tab("about:blank")
-
-def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optional[str]:
-    """Fallback через Botasaurus Browser для страниц, которым нужен настоящий рендеринг."""
-    from services.log_service import log_fetch_exception, log_fetch_result
-    try:
-        from botasaurus.browser import Driver
-        from botasaurus.browser import browser
-    except ImportError:
-        return None
-
-    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
-
-    @browser(
-        headless=True,
-        chrome_executable_path=chrome_executable_path,
-        add_arguments=[
-            "--headless=new",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--disable-background-networking",
-            "--disable-sync",
-            "--blink-settings=imagesEnabled=false",
-        ],
-        window_size=[1280, 720],
-        block_images_and_css=True,
-        wait_for_complete_page_load=False,
-        max_retry=1,
-        output=None,
-        close_on_crash=True,
-        create_error_logs=False,
-    )
-    def _render_html(driver: Driver, target_url: str):
-        _ensure_botasaurus_initial_tab(driver)
-        if navigation == "direct" and hasattr(driver, "get"):
-            driver.get(target_url)
-        else:
-            driver.google_get(target_url)
-        time.sleep(2)
-        for _ in range(4):
-            try:
-                driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception:
-                break
-            time.sleep(0.8)
-        return driver.page_html
-
-    try:
-        started = time.time()
-        with STANDALONE_BROWSER_SEMAPHORE:
-            result = _render_html(url)
-    except Exception as error:
-        log_fetch_exception(f"botasaurus-browser:{navigation}", url, error)
-        return None
-
-    if isinstance(result, list):
-        result = result[0] if result else None
-    if result:
-        log_fetch_result(f"botasaurus-browser:{navigation}", url, result, time.time() - started)
-    return result if isinstance(result, str) and result.strip() else None
-
 
 class PlaywrightBrowserSession:
     """One Playwright Chromium session owned by one project/news scan.
@@ -278,55 +313,7 @@ class PlaywrightBrowserSession:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _force_terminate_owned_processes(self) -> None:
-        """Добивает только Chromium-процессы этой сессии после graceful shutdown."""
-        if os.name != "posix" or not Path("/proc").is_dir():
-            return
-        token = f"--{self._process_token}".encode()
-        parent_by_pid: Dict[int, int] = {}
-        roots: Set[int] = set()
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            try:
-                cmdline = (entry / "cmdline").read_bytes()
-                stat = (entry / "stat").read_text(encoding="utf-8")
-                parent_by_pid[pid] = int(stat.rsplit(")", 1)[1].split()[1])
-                if token in cmdline:
-                    roots.add(pid)
-            except (OSError, ValueError, IndexError):
-                continue
-        if not roots:
-            return
-
-        owned = set(roots)
-        current_pid = os.getpid()
-        for root_pid in roots:
-            parent_pid = parent_by_pid.get(root_pid, 0)
-            while parent_pid not in {0, 1, current_pid} and parent_pid not in owned:
-                owned.add(parent_pid)
-                parent_pid = parent_by_pid.get(parent_pid, 0)
-        changed = True
-        while changed:
-            changed = False
-            for pid, parent_pid in parent_by_pid.items():
-                if parent_pid in owned and pid not in owned:
-                    owned.add(pid)
-                    changed = True
-
-        owned.discard(current_pid)
-        if not owned:
-            return
-        from services.log_service import fetch_debug_log
-        fetch_debug_log(f"browser-session force cleanup: processes={len(owned)}", "warning")
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            for pid in sorted(owned, reverse=True):
-                try:
-                    os.kill(pid, sig)
-                except (ProcessLookupError, PermissionError):
-                    continue
-            if sig == signal.SIGTERM:
-                time.sleep(0.25)
+        _force_terminate_token_processes(self._process_token)
 
     @staticmethod
     def _profiles_for_method(method: str) -> List[Dict[str, object]]:
@@ -661,6 +648,7 @@ class BotasaurusBrowserSession:
         self._renderer = self._create_renderer()
 
     def _create_renderer(self):
+        _ensure_botasaurus_debugging_address_compatibility()
         try:
             from botasaurus.browser import Driver
             from botasaurus.browser import browser
@@ -670,6 +658,7 @@ class BotasaurusBrowserSession:
         process_argument = f"--{self._process_token}"
 
         browser_arguments = [
+            "--no-sandbox",
             "--disable-gpu",
             "--disable-dev-shm-usage",
             "--disable-background-networking",
@@ -690,7 +679,9 @@ class BotasaurusBrowserSession:
             window_size=[1280, 720],
             block_images_and_css=self.block_images_and_css,
             wait_for_complete_page_load=self.wait_for_complete_page_load,
-            max_retry=1,
+            # Page retries are controlled by ProductSiteCrawler. Retrying the
+            # whole Driver here would launch another browser behind its back.
+            max_retry=0,
             output=None,
             close_on_crash=True,
             create_error_logs=False,
@@ -868,55 +859,7 @@ class BotasaurusBrowserSession:
                 self._tabs.put(reusable_tab)
 
     def _force_terminate_owned_processes(self) -> None:
-        if os.name == "nt":
-            thread = self._thread
-            if not self._browser_pid or thread is None or not thread.is_alive():
-                return
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(self._browser_pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=10,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            return
-        if os.name != "posix" or not Path("/proc").is_dir():
-            return
-        token = f"--{self._process_token}".encode()
-        parent_by_pid: Dict[int, int] = {}
-        roots: Set[int] = set()
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            try:
-                cmdline = (entry / "cmdline").read_bytes()
-                stat = (entry / "stat").read_text(encoding="utf-8")
-                parent_by_pid[pid] = int(stat.rsplit(")", 1)[1].split()[1])
-                if token in cmdline:
-                    roots.add(pid)
-            except (OSError, ValueError, IndexError):
-                continue
-        owned = set(roots)
-        changed = True
-        while changed:
-            changed = False
-            for pid, parent_pid in parent_by_pid.items():
-                if parent_pid in owned and pid not in owned:
-                    owned.add(pid)
-                    changed = True
-        owned.discard(os.getpid())
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            for pid in sorted(owned, reverse=True):
-                try:
-                    os.kill(pid, sig)
-                except (ProcessLookupError, PermissionError):
-                    continue
-            if sig == signal.SIGTERM and owned:
-                time.sleep(0.25)
+        _force_terminate_token_processes(self._process_token, self._browser_pid)
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -929,6 +872,263 @@ class BotasaurusBrowserSession:
             self._force_terminate_owned_processes()
             if thread is not None and thread is not threading.current_thread() and thread.is_alive():
                 thread.join(timeout=5)
+
+
+class Crawl4AIBrowserSession:
+    """One native Crawl4AI crawler with thread_count bounded concurrent pages."""
+
+    def __init__(
+        self,
+        stop_signal: Optional[threading.Event] = None,
+        max_pages: int = 1,
+    ) -> None:
+        from services.projects import parse_thread_count
+
+        self.stop_signal = stop_signal
+        self.max_pages = max(1, parse_thread_count(max_pages))
+        self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._ready = threading.Event()
+        self._close_requested = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._loop = None
+        self._crawler = None
+        self._semaphore = None
+        self._closed = False
+        self._start_error: Optional[BaseException] = None
+        self._process_token = f"parser-crawl4ai-session-{uuid.uuid4().hex}"
+
+    def _ensure_started(self) -> bool:
+        with self._state_lock:
+            if self._closed:
+                return False
+            if self._thread is None or not self._thread.is_alive():
+                self._start_error = None
+                self._ready.clear()
+                self._close_requested.clear()
+                self._thread = threading.Thread(
+                    target=self._run_loop,
+                    name="crawl4ai-browser-session",
+                    daemon=True,
+                )
+                self._thread.start()
+        if not self._ready.wait(timeout=40):
+            return False
+        return self._start_error is None and self._loop is not None and self._crawler is not None
+
+    def _run_loop(self) -> None:
+        import asyncio
+        from services.log_service import fetch_debug_log
+
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._start_crawler())
+            self._ready.set()
+            with self._state_lock:
+                closed = self._closed
+            if not closed:
+                self._loop.run_forever()
+        except BaseException as error:  # noqa: BLE001
+            self._start_error = error
+            fetch_debug_log(f"crawl4ai-session start failed: {type(error).__name__}: {error}", "warning")
+            self._ready.set()
+        finally:
+            try:
+                if not self._loop.is_closed():
+                    self._loop.run_until_complete(self._shutdown_async())
+            except BaseException as error:  # noqa: BLE001
+                fetch_debug_log(f"crawl4ai-session shutdown failed: {type(error).__name__}: {error}", "warning")
+            finally:
+                if not self._loop.is_closed():
+                    self._loop.close()
+                self._loop = None
+
+    async def _start_crawler(self) -> None:
+        import asyncio
+
+        crawl4ai_storage = BASE_DIR / "runtime" / "crawl4ai"
+        crawl4ai_storage.mkdir(parents=True, exist_ok=True)
+        # Crawl4AI creates its global cache manager during import, so the
+        # writable base must be configured before importing the package.
+        os.environ["CRAWL4_AI_BASE_DIRECTORY"] = str(crawl4ai_storage)
+        from crawl4ai import AsyncWebCrawler, BrowserConfig
+
+        browser_config = BrowserConfig(
+            browser_type="chromium",
+            headless=True,
+            channel="chromium",
+            text_mode=True,
+            light_mode=True,
+            avoid_ads=True,
+            avoid_css=True,
+            viewport_width=1366,
+            viewport_height=900,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            extra_args=[
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--blink-settings=imagesEnabled=false",
+                f"--{self._process_token}",
+            ],
+            verbose=False,
+        )
+        self._crawler = AsyncWebCrawler(
+            config=browser_config,
+            base_directory=str(crawl4ai_storage),
+            thread_safe=False,
+        )
+        await self._crawler.start()
+        self._semaphore = asyncio.Semaphore(self.max_pages)
+
+    @staticmethod
+    def _run_config():
+        from crawl4ai import CacheMode, CrawlerRunConfig
+
+        return CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            wait_until="domcontentloaded",
+            page_timeout=REQUEST_TIMEOUT * 1000,
+            wait_for_images=False,
+            delay_before_return_html=0.2,
+            exclude_all_images=True,
+            excluded_tags=["img", "picture", "source", "video", "audio", "svg", "style"],
+            exclude_domains=list(BLOCKED_BROWSER_URL_PARTS),
+            log_console=False,
+            capture_network_requests=False,
+            max_retries=0,
+            verbose=False,
+        )
+
+    async def _fetch_async(self, url: str) -> Optional[str]:
+        import asyncio
+
+        if self._crawler is None or self._semaphore is None:
+            return None
+        async with self._semaphore:
+            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                return None
+            result = await asyncio.wait_for(
+                self._crawler.arun(url=url, config=self._run_config()),
+                timeout=REQUEST_TIMEOUT + 10,
+            )
+            html = getattr(result, "html", "") or getattr(result, "cleaned_html", "")
+            return html if isinstance(html, str) and html.strip() else None
+
+    def fetch(self, url: str) -> Optional[str]:
+        from services.log_service import log_fetch_exception
+
+        if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+            return None
+        if not self._ensure_started():
+            return None
+        future = None
+        try:
+            import asyncio
+
+            future = asyncio.run_coroutine_threadsafe(self._fetch_async(url), self._loop)
+            return future.result(timeout=REQUEST_TIMEOUT + 20)
+        except Exception as error:
+            if future is not None:
+                future.cancel()
+            log_fetch_exception("crawl4ai", url, error)
+            return None
+
+    async def _shutdown_async(self) -> None:
+        import asyncio
+
+        if self._crawler is not None:
+            try:
+                await asyncio.wait_for(self._crawler.close(), timeout=10)
+            except BaseException:  # noqa: BLE001
+                pass
+        self._crawler = None
+        self._semaphore = None
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not current_task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            with self._state_lock:
+                self._closed = True
+                thread = self._thread
+                loop = self._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=15)
+            _force_terminate_token_processes(self._process_token)
+            if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+                thread.join(timeout=5)
+
+
+class ScrapeGraphAISession:
+    """Per-scan ScrapeGraphAI Chromium lifecycle without a server-wide lock."""
+
+    def __init__(self, stop_signal: Optional[threading.Event] = None) -> None:
+        self.stop_signal = stop_signal
+        # FetchNode creates and owns its Chromium internally and cannot accept
+        # a shared context. Serialize only this scan so thread_count does not
+        # turn into thread_count independent full browsers.
+        self._slot = threading.BoundedSemaphore(1)
+        self._state_lock = threading.Lock()
+        self._active_processes: Set[subprocess.Popen] = set()
+        self._closed = False
+
+    def _register_process(self, process: subprocess.Popen) -> None:
+        with self._state_lock:
+            if self._closed:
+                _terminate_subprocess_tree(process)
+                return
+            self._active_processes.add(process)
+
+    def _unregister_process(self, process: subprocess.Popen) -> None:
+        with self._state_lock:
+            self._active_processes.discard(process)
+
+    def fetch(self, url: str) -> Optional[str]:
+        while True:
+            with self._state_lock:
+                if self._closed:
+                    return None
+            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                return None
+            if self._slot.acquire(timeout=0.25):
+                break
+        try:
+            with self._state_lock:
+                if self._closed:
+                    return None
+            return fetch_with_python_engine(
+                SCRAPEGRAPHAI_FETCH_SCRIPT,
+                url,
+                REQUEST_TIMEOUT,
+                "ScrapeGraphAI",
+                process_started=self._register_process,
+                process_finished=self._unregister_process,
+            )
+        finally:
+            self._slot.release()
+
+    def close(self) -> None:
+        with self._state_lock:
+            self._closed = True
+            processes = list(self._active_processes)
+        for process in processes:
+            _terminate_subprocess_tree(process)
 
 
 class BrowserMethodSession:
@@ -952,6 +1152,9 @@ class BrowserMethodSession:
         self._closed = False
         self.playwright_session = self._new_playwright_session()
         self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
+        self.debug_visible_session = self._new_debug_visible_session()
+        self.crawl4ai_session = Crawl4AIBrowserSession(self.stop_signal, self.max_pages)
+        self.scrapegraphai_session = ScrapeGraphAISession(self.stop_signal)
 
     def _new_playwright_session(self) -> PlaywrightBrowserSession:
         return PlaywrightBrowserSession(
@@ -959,6 +1162,17 @@ class BrowserMethodSession:
             self.max_pages,
             profile_dir=self.profile_dir,
             prefer_headless_shell=self.prefer_headless_shell,
+        )
+
+    def _new_debug_visible_session(self) -> "BotasaurusDebugVisibleSession":
+        return BotasaurusDebugVisibleSession(
+            self.stop_signal,
+            profile=(
+                str(self.profile_dir)
+                if self.profile_dir is not None
+                else "protected_sites_debug_visible"
+            ),
+            max_pages=self.max_pages,
         )
 
     def fetch(
@@ -974,16 +1188,27 @@ class BrowserMethodSession:
                 return None
             if method in BOTASAURUS_HEADLESS_METHODS:
                 session = self.botasaurus_session
+            elif method == "botasaurus-debug-visible":
+                session = self.debug_visible_session
+            elif method == "crawl4ai":
+                session = self.crawl4ai_session
+            elif method == "scrapegraphai":
+                session = self.scrapegraphai_session
             elif method == "playwright" or method in SESSION_BROWSER_METHODS:
                 session = self.playwright_session
             else:
                 return None
+        if method in {"crawl4ai", "scrapegraphai"}:
+            return session.fetch(url)
         return session.fetch(url, method, rules, product_url_filters, allow_empty_price)
 
     def close(self) -> None:
         with self._lifecycle_lock:
             self._closed = True
             self.botasaurus_session.close()
+            self.debug_visible_session.close()
+            self.crawl4ai_session.close()
+            self.scrapegraphai_session.close()
             self.playwright_session.close()
 
     def restart(
@@ -993,6 +1218,9 @@ class BrowserMethodSession:
     ) -> bool:
         with self._lifecycle_lock:
             self.botasaurus_session.close()
+            self.debug_visible_session.close()
+            self.crawl4ai_session.close()
+            self.scrapegraphai_session.close()
             self.playwright_session.close()
             if method:
                 self.initial_method = str(method)
@@ -1002,6 +1230,9 @@ class BrowserMethodSession:
                 self.prefer_headless_shell = self.initial_method != "protected-site"
             self.playwright_session = self._new_playwright_session()
             self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
+            self.debug_visible_session = self._new_debug_visible_session()
+            self.crawl4ai_session = Crawl4AIBrowserSession(self.stop_signal, self.max_pages)
+            self.scrapegraphai_session = ScrapeGraphAISession(self.stop_signal)
             self._closed = False
             return True
 
@@ -1029,65 +1260,6 @@ class BotasaurusDebugVisibleSession(BotasaurusBrowserSession):
             max_pages=max_pages,
             profile=profile or "protected_sites_debug_visible",
         )
-
-
-def fetch_with_crawl4ai(url: str) -> Optional[str]:
-    try:
-        import asyncio
-        from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-    except ImportError:
-        return None
-
-    async def _fetch() -> Optional[str]:
-        browser_config = BrowserConfig(
-            browser_type="chromium",
-            headless=True,
-            channel="chromium",
-            text_mode=True,
-            light_mode=True,
-            avoid_ads=True,
-            avoid_css=True,
-            viewport_width=1366,
-            viewport_height=900,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            extra_args=[
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--blink-settings=imagesEnabled=false",
-            ],
-            verbose=False,
-        )
-        run_config = CrawlerRunConfig(
-            wait_until="domcontentloaded",
-            page_timeout=REQUEST_TIMEOUT * 1000,
-            wait_for_images=False,
-            delay_before_return_html=0.2,
-            exclude_all_images=True,
-            excluded_tags=["img", "picture", "source", "video", "audio", "svg", "style"],
-            exclude_domains=list(BLOCKED_BROWSER_URL_PARTS),
-            log_console=False,
-            capture_network_requests=False,
-            max_retries=0,
-            verbose=False,
-        )
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await asyncio.wait_for(
-                crawler.arun(url=url, config=run_config),
-                timeout=REQUEST_TIMEOUT + 10,
-            )
-            html = getattr(result, "html", "") or getattr(result, "cleaned_html", "")
-            return html if isinstance(html, str) else None
-
-    try:
-        with STANDALONE_BROWSER_SEMAPHORE:
-            return asyncio.run(_fetch())
-    except Exception:
-        return None
 
 
 ENGINE_OUTPUT_MARKER = "__PARSER_ENGINE_HTML_BASE64__:"
@@ -1301,114 +1473,14 @@ print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("as
 """
 
 
-class PlaywrightHeadlessRenderer:
-    """Small pool of isolated Chromium workers for fallback rendering."""
-
-    def __init__(self) -> None:
-        self.jobs: Queue = Queue()
-        self.threads: List[threading.Thread] = []
-        self.lock = threading.Lock()
-
-    def ensure_started(self) -> None:
-        with self.lock:
-            self.threads = [thread for thread in self.threads if thread.is_alive()]
-            while len(self.threads) < 1:
-                worker_number = len(self.threads) + 1
-                thread = threading.Thread(
-                    target=self._worker,
-                    name=f"playwright-headless-renderer-{worker_number}",
-                    daemon=True,
-                )
-                self.threads.append(thread)
-                thread.start()
-
-    def fetch(self, url: str, timeout_seconds: int) -> Optional[str]:
-        self.ensure_started()
-        result_queue: Queue = Queue(maxsize=1)
-        self.jobs.put((url, timeout_seconds, result_queue))
-        try:
-            status, value = result_queue.get(timeout=timeout_seconds + 35)
-        except Empty as error:
-            raise RuntimeError("Playwright: внутренний headless browser не ответил вовремя") from error
-        if status == "error":
-            raise RuntimeError(f"Playwright: {value}")
-        return value if isinstance(value, str) and value.strip() else None
-
-    def _worker(self) -> None:
-        from playwright.sync_api import sync_playwright
-
-        def should_block_resource(request) -> bool:
-            resource_type = getattr(request, "resource_type", "")
-            if resource_type in BLOCKED_BROWSER_RESOURCE_TYPES:
-                return True
-            request_url = str(getattr(request, "url", "") or "").lower()
-            return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
-
-        executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
-        with sync_playwright() as playwright:
-            launch_options = {
-                "headless": True,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--disable-background-networking",
-                    "--disable-sync",
-                    "--no-sandbox",
-                    "--blink-settings=imagesEnabled=false",
-                ],
-            }
-            if executable_path:
-                launch_options["executable_path"] = executable_path
-            browser = playwright.chromium.launch(**launch_options)
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                locale="ru-RU",
-                viewport={"width": 1366, "height": 900},
-            )
-            try:
-                while True:
-                    url, timeout_seconds, result_queue = self.jobs.get()
-                    page = None
-                    try:
-                        page = context.new_page()
-                        page.route(
-                            "**/*",
-                            lambda route, request: route.abort()
-                            if should_block_resource(request)
-                            else route.continue_(),
-                        )
-                        timeout_ms = int(float(timeout_seconds)) * 1000
-                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                        try:
-                            page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
-                        except Exception:
-                            pass
-                        for _ in range(3):
-                            page.mouse.wheel(0, 1600)
-                            page.wait_for_timeout(350)
-                        html = page.content()
-                        result_queue.put(("ok", html), block=False)
-                    except Exception as error:
-                        result_queue.put(("error", error), block=False)
-                    finally:
-                        if page is not None:
-                            try:
-                                page.close()
-                            except Exception:
-                                pass
-            finally:
-                context.close()
-                browser.close()
-
-
-playwright_headless_renderer = PlaywrightHeadlessRenderer()
-
-
-def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine_name: str = "engine") -> Optional[str]:
+def fetch_with_python_engine(
+    script: str,
+    url: str,
+    timeout_seconds: int,
+    engine_name: str = "engine",
+    process_started=None,
+    process_finished=None,
+) -> Optional[str]:
     command = [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if os.name == "nt":
@@ -1422,16 +1494,12 @@ def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine
             start_new_session=os.name == "posix",
             creationflags=creationflags,
         )
+        if process_started is not None:
+            process_started(process)
         try:
             stdout_bytes, stderr_bytes = process.communicate(timeout=timeout_seconds + 10)
         except subprocess.TimeoutExpired as error:
-            if os.name == "posix":
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.terminate()
+            _terminate_subprocess_tree(process)
             try:
                 stdout_bytes, stderr_bytes = process.communicate(timeout=3)
             except subprocess.TimeoutExpired:
@@ -1440,7 +1508,7 @@ def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                else:
+                elif process.poll() is None:
                     process.kill()
                 stdout_bytes, stderr_bytes = process.communicate()
             raise RuntimeError(
@@ -1450,6 +1518,9 @@ def fetch_with_python_engine(script: str, url: str, timeout_seconds: int, engine
         if isinstance(error, RuntimeError) and str(error).startswith(f"{engine_name}:"):
             raise
         raise RuntimeError(f"{engine_name}: не удалось запустить процесс: {error}") from error
+    finally:
+        if "process" in locals() and process_finished is not None:
+            process_finished(process)
 
     stdout = stdout_bytes.decode("utf-8", "replace")
     stderr = stderr_bytes.decode("utf-8", "replace")
@@ -1493,17 +1564,3 @@ def fetch_with_crawlee(url: str) -> Optional[str]:
     if find_spec("crawlee") is None:
         return None
     return fetch_with_python_engine(CRAWLEE_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Crawlee")
-
-
-def fetch_with_playwright(url: str) -> Optional[str]:
-    if find_spec("playwright") is None:
-        return None
-    with STANDALONE_BROWSER_SEMAPHORE:
-        return playwright_headless_renderer.fetch(url, REQUEST_TIMEOUT)
-
-
-def fetch_with_scrapegraphai(url: str) -> Optional[str]:
-    if find_spec("scrapegraphai") is None:
-        return None
-    with STANDALONE_BROWSER_SEMAPHORE:
-        return fetch_with_python_engine(SCRAPEGRAPHAI_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "ScrapeGraphAI")

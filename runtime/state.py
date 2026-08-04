@@ -28,8 +28,6 @@ active_crawler = None
 projects: Dict[str, Dict[str, object]] = {}
 news_settings: Dict[str, object] = {}
 
-VISIBLE_BROWSER_LOCK = threading.Lock()
-STANDALONE_BROWSER_SEMAPHORE = threading.BoundedSemaphore(1)
 FEED_STORAGE_LOCK = threading.RLock()
 feed_snapshot_cache: Dict[str, object] = {"signature": (), "created_at": 0.0, "feeds": []}
 connection_method_cache_lock = threading.Lock()
@@ -38,6 +36,7 @@ connection_method_cache: Dict[str, object] = {"loaded_at": 0.0, "methods": []}
 news_stop_events: Dict[str, threading.Event] = {}
 news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
+news_browser_sessions: Dict[str, object] = {}
 news_state_persisted_at: Dict[str, float] = {}
 
 progress_tracker = ProgressTracker(
@@ -98,5 +97,3 @@ def update_state(run_id: Optional[int] = None, **kwargs: object) -> None:
         if run_id is not None and run_id != active_run_id:
             return
         scan_state.update(kwargs)
-
-

@@ -118,8 +118,14 @@ def api_delete_project(project_id: str):
         stop_event = project.get("stop_event")
         if isinstance(stop_event, threading.Event):
             stop_event.set()
+        project["stop_mode"] = "stop"
+        project["run_id"] = int(project.get("run_id", 0)) + 1
         projects.pop(project_id, None)
-        delete_project_record(project_id)
+    close_project_browser_session(project)
+    worker = project.get("worker_thread")
+    if isinstance(worker, threading.Thread) and worker.is_alive():
+        worker.join(timeout=5)
+    delete_project_record(project_id)
     publish_projects_progress_snapshot()
     return jsonify({"ok": True})
 

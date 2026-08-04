@@ -10,7 +10,7 @@ from models import Project
 from pathlib import Path
 from runtime.state import PROJECT_PROGRESS_FIELDS, projects, projects_lock
 from services.application import ensure_storage
-from services.connections import is_debug_visible_method, normalize_connection_method
+from services.connections import normalize_connection_method
 from services.normalization import normalize_extraction_rules, normalize_patterns, normalize_start_urls, output_text, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
 from sqlalchemy import delete, select
 from typing import Dict, List, Optional
@@ -316,9 +316,6 @@ def parse_thread_count(value: object) -> int:
 
 
 def project_runtime_thread_count(project: Dict[str, object]) -> int:
-    method = normalize_connection_method(project.get("connection_method"))
-    if bool(project.get("persist_profile", False)) or is_debug_visible_method(method):
-        return 1
     return parse_thread_count(project.get("thread_count", 4))
 
 

@@ -13,7 +13,7 @@ from config import MSK_TZ
 from datetime import datetime
 from flask import request, send_file
 from query_utils import normalize_search_text
-from runtime.state import news_lock, news_settings, news_stop_events
+from runtime.state import news_browser_sessions, news_lock, news_settings, news_stop_events
 from services.application import ensure_storage
 from services.domain_revisions import domain_revision
 from services.connections import normalize_connection_method
@@ -352,6 +352,7 @@ def api_delete_news_monitor(monitor_id: str):
         ]
         for item_id in removed_ids:
             news_stop_events.pop(item_id, None)
+            news_browser_sessions.pop(item_id, None)
         delete_news_records(removed_ids, remove_brand=remove_brand)
         remaining_brand_monitors = [
             public_news_monitor(item)
