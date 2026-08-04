@@ -76,37 +76,40 @@ class ScrapingBoundaryTests(unittest.TestCase):
         self.assertEqual(products, [])
 
     def test_crawler_keeps_url_less_products_and_deduplicates_by_model(self) -> None:
-        crawler = ProductSiteCrawler(
-            ["https://example.test/catalog/"],
-            1,
-            threading.Event(),
-            threading.Event(),
-            2,
-            extraction_rules={
-                "product_card_selector": ".card",
-                "model_selector": ".model",
-                "price_selector": ".price",
-            },
-        )
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                extraction_rules={
+                    "product_card_selector": ".card",
+                    "model_selector": ".model",
+                    "price_selector": ".price",
+                },
+            )
         html = """
         <div class="card"><span class="model">ABC-123</span><span class="price">12 990 руб.</span></div>
         <div class="card"><span class="model">XYZ-456</span><span class="price">19 990 руб.</span></div>
         """
 
-        crawler.process_page("https://example.test/catalog/", html)
-        crawler.process_page("https://example.test/catalog/page-2/", html)
+        with patch.object(crawler, "current_connection_method", return_value="requests"):
+            crawler.process_page("https://example.test/catalog/", html)
+            crawler.process_page("https://example.test/catalog/page-2/", html)
 
         self.assertEqual(len(crawler.snapshot_results()), 2)
         self.assertEqual({item["url"] for item in crawler.snapshot_results()}, {""})
 
     def test_thread_count_limits_parallel_browser_pages(self) -> None:
-        crawler = ProductSiteCrawler(
-            ["https://example.test/catalog/"],
-            1,
-            threading.Event(),
-            threading.Event(),
-            6,
-        )
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                6,
+            )
 
         self.assertEqual(crawler.thread_count, 6)
         self.assertEqual(crawler.browser_session.max_pages, 6)
