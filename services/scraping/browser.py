@@ -29,7 +29,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
     except ImportError:
         return None
 
-    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=False)
+    chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
 
     @browser(
         headless=True,
@@ -91,11 +91,16 @@ class BotasaurusBrowserSession:
         stop_signal: Optional[threading.Event] = None,
         max_pages: int = 1,
         profile_dir: Optional[Path] = None,
+        prefer_headless_shell: bool = True,
     ) -> None:
         from services.projects import parse_thread_count
         self.stop_signal = stop_signal
         self.max_pages = max(1, parse_thread_count(max_pages))
         self.profile_dir = profile_dir
+        self.prefer_headless_shell = bool(prefer_headless_shell)
+        self.executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(
+            prefer_headless_shell=self.prefer_headless_shell,
+        )
         self._state_lock = threading.Lock()
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -156,9 +161,6 @@ class BotasaurusBrowserSession:
         from playwright.async_api import async_playwright
 
         self._playwright = await async_playwright().start()
-        # Используем полноценный Chromium, а нагрузку снижаем ранней остановкой
-        # страницы после появления нужных селекторов.
-        executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(prefer_headless_shell=False)
         launch_options = {
             "headless": True,
             "args": [
@@ -174,8 +176,8 @@ class BotasaurusBrowserSession:
                 f"--{self._process_token}",
             ],
         }
-        if executable_path:
-            launch_options["executable_path"] = executable_path
+        if self.executable_path:
+            launch_options["executable_path"] = self.executable_path
         context_options = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -947,8 +949,8 @@ class PlaywrightHeadlessRenderer:
             request_url = str(getattr(request, "url", "") or "").lower()
             return any(part in request_url for part in BLOCKED_BROWSER_URL_PARTS)
 
+        executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
         with sync_playwright() as playwright:
-            executable_path = botasaurus_browser_executable(prefer_headless_shell=True)
             launch_options = {
                 "headless": True,
                 "args": [

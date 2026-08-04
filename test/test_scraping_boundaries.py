@@ -1,8 +1,13 @@
 import unittest
 import asyncio
+import os
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from config import botasaurus_browser_executable
 from services.scraping import extract_product_data, normalize_url
 from services.scraping.browser import BotasaurusBrowserSession
 from services.scraping.extraction import extract_listing_products
@@ -113,6 +118,68 @@ class ScrapingBoundaryTests(unittest.TestCase):
 
         self.assertEqual(crawler.thread_count, 6)
         self.assertEqual(crawler.browser_session.max_pages, 6)
+        self.assertTrue(crawler.browser_session.prefer_headless_shell)
+
+    def test_protected_site_keeps_full_chromium(self) -> None:
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="protected-site"):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                connection_method="protected-site",
+            )
+
+        self.assertFalse(crawler.browser_session.prefer_headless_shell)
+
+    def test_browser_session_resolves_executable_before_async_loop(self) -> None:
+        with (
+            patch("services.scraping.browser.env_str", return_value=""),
+            patch(
+                "services.scraping.browser.botasaurus_browser_executable",
+                return_value="/ms-playwright/chromium_headless_shell/chrome-headless-shell",
+            ) as executable_resolver,
+        ):
+            session = BotasaurusBrowserSession(prefer_headless_shell=True)
+
+        executable_resolver.assert_called_once_with(prefer_headless_shell=True)
+        self.assertEqual(
+            session.executable_path,
+            "/ms-playwright/chromium_headless_shell/chrome-headless-shell",
+        )
+
+    def test_playwright_headless_shell_executable_is_detected(self) -> None:
+        with TemporaryDirectory() as directory:
+            browser_root = Path(directory)
+            chrome = browser_root / "chromium-123" / "chrome-linux64" / "chrome"
+            shell = (
+                browser_root
+                / "chromium_headless_shell-123"
+                / "chrome-headless-shell-linux64"
+                / "chrome-headless-shell"
+            )
+            chrome.parent.mkdir(parents=True)
+            shell.parent.mkdir(parents=True)
+            chrome.write_bytes(b"")
+            shell.write_bytes(b"")
+            playwright = SimpleNamespace(
+                chromium=SimpleNamespace(executable_path=str(chrome)),
+                stop=lambda: None,
+            )
+            manager = SimpleNamespace(start=lambda: playwright)
+
+            botasaurus_browser_executable.cache_clear()
+            try:
+                with (
+                    patch.dict(os.environ, {"PLAYWRIGHT_BROWSER_EXECUTABLE": ""}),
+                    patch("playwright.sync_api.sync_playwright", return_value=manager),
+                ):
+                    executable = botasaurus_browser_executable(prefer_headless_shell=True)
+            finally:
+                botasaurus_browser_executable.cache_clear()
+
+        self.assertEqual(executable, str(shell))
 
     def test_browser_accepts_listing_html_without_product_url(self) -> None:
         session = BotasaurusBrowserSession(max_pages=3)

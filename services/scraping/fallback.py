@@ -96,6 +96,7 @@ class ProductSiteCrawler:
             self.stop_signal,
             self.thread_count,
             profile_dir=self.profile_dir,
+            prefer_headless_shell=self.connection_method != "protected-site",
         )
         self.debug_visible_session = BotasaurusDebugVisibleSession(self.stop_signal, debug_profile)
         self.owns_browser_session = owns_browser_session
@@ -319,6 +320,7 @@ class ProductSiteCrawler:
                 self.stop_signal,
                 self.thread_count,
                 profile_dir=self.profile_dir,
+                prefer_headless_shell=current != "protected-site",
             )
             self.debug_visible_session = BotasaurusDebugVisibleSession(
                 self.stop_signal,

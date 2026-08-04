@@ -1124,6 +1124,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         stop_event,
         parse_thread_count(monitor.get("thread_count", 4)),
         profile_dir=profile_dir,
+        prefer_headless_shell=normalize_connection_method(monitor.get("connection_method")) != "protected-site",
     )
 
     def check_stop_requested() -> None:

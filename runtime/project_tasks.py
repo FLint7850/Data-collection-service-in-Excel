@@ -90,6 +90,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             project["stop_event"],
             crawler.thread_count,
             profile_dir=crawler.profile_dir,
+            prefer_headless_shell=crawler.connection_method != "protected-site",
         )
         crawler.debug_visible_session = BotasaurusDebugVisibleSession(
             project["stop_event"],

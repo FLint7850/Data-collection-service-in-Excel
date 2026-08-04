@@ -92,7 +92,12 @@ def botasaurus_browser_executable(prefer_headless_shell: bool = True) -> Optiona
                     browser_root = parent.parent
                     break
             for shell_dir in sorted(browser_root.glob("chromium_headless_shell-*"), reverse=True):
-                for shell_name in ("headless_shell.exe", "headless_shell"):
+                for shell_name in (
+                    "chrome-headless-shell.exe",
+                    "chrome-headless-shell",
+                    "headless_shell.exe",
+                    "headless_shell",
+                ):
                     matches = list(shell_dir.rglob(shell_name))
                     if matches:
                         return str(matches[0])
