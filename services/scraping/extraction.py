@@ -367,7 +367,7 @@ def extract_listing_products_by_rules(
                 normalize_url(link_node.get("href", "") if link_node else "", current_url),
                 filters,
             )
-            if not product_url or product_url in seen_urls or not product_url_matches_filters(product_url, filters):
+            if product_url and (product_url in seen_urls or not product_url_matches_filters(product_url, filters)):
                 continue
 
         model = extract_model_by_markers(str(card), rules)

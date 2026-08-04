@@ -66,7 +66,7 @@ class ScrapingBoundaryTests(unittest.TestCase):
         self.assertEqual([product["url"] for product in products], ["", ""])
         self.assertEqual([product["model"] for product in products], ["ABC-123", "XYZ-456"])
 
-    def test_configured_url_selector_still_requires_card_link(self) -> None:
+    def test_missing_card_link_does_not_drop_product(self) -> None:
         products = extract_listing_products(
             "https://example.test/catalog/",
             '<div class="card"><span class="model">ABC-123</span><span class="price">12 990 руб.</span></div>',
@@ -78,7 +78,10 @@ class ScrapingBoundaryTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(products, [])
+        self.assertEqual(
+            products,
+            [{"url": "", "model": "ABC-123", "price": "12 990 руб."}],
+        )
 
     def test_crawler_keeps_url_less_products_and_deduplicates_by_model(self) -> None:
         with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
@@ -105,6 +108,92 @@ class ScrapingBoundaryTests(unittest.TestCase):
 
         self.assertEqual(len(crawler.snapshot_results()), 2)
         self.assertEqual({item["url"] for item in crawler.snapshot_results()}, {""})
+
+    def test_requests_collects_detail_when_catalog_cards_yield_nothing(self) -> None:
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                product_url_filters=["/goods_"],
+                extraction_rules={
+                    "product_card_selector": ".missing-card",
+                    "model_selector": ".model",
+                    "price_selector": ".price",
+                },
+                connection_method="requests",
+            )
+
+        with patch.object(crawler, "current_connection_method", return_value="requests"):
+            crawler.process_page(
+                "https://example.test/catalog/",
+                '<a href="/goods_123/product.html">Product</a>',
+            )
+
+            product_url = crawler.queue.get_nowait()
+            crawler.process_page(
+                product_url,
+                '<h1>Product</h1><span class="model">BDW 4026</span><span class="price">17 240 руб.</span>',
+            )
+
+        self.assertEqual(product_url, "https://example.test/goods_123/product.html")
+        self.assertEqual(
+            crawler.snapshot_results(),
+            [{"url": product_url, "model": "BDW 4026", "price": "17 240 руб."}],
+        )
+
+    def test_url_less_listing_products_do_not_enqueue_their_detail_links(self) -> None:
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                product_url_filters=["/goods_"],
+                extraction_rules={
+                    "product_card_selector": ".card",
+                    "model_selector": ".model",
+                    "price_selector": ".price",
+                },
+                connection_method="requests",
+            )
+        html = """
+        <div class="card">
+          <a href="/goods_123/product.html">Product</a>
+          <span class="model">ABC-123</span>
+          <span class="price">12 990 руб.</span>
+        </div>
+        """
+
+        with patch.object(crawler, "current_connection_method", return_value="requests"):
+            crawler.process_page("https://example.test/catalog/", html)
+
+        self.assertTrue(crawler.queue.empty())
+        self.assertEqual(crawler.snapshot_results()[0]["url"], "")
+
+    def test_disabled_auto_fallback_does_not_start_protected_browser(self) -> None:
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="botasaurus-browser"):
+            crawler = ProductSiteCrawler(
+                ["https://example.test/catalog/"],
+                1,
+                threading.Event(),
+                threading.Event(),
+                2,
+                extraction_rules={"product_card_selector": ".missing-card"},
+                connection_method="botasaurus-browser",
+                auto_connection_fallback=False,
+            )
+
+        with (
+            patch.object(crawler, "current_connection_method", return_value="botasaurus-browser"),
+            patch.object(crawler.browser_session, "fetch") as browser_fetch,
+        ):
+            crawler.process_page("https://example.test/catalog/", "<html><body>Catalog</body></html>")
+
+        browser_fetch.assert_not_called()
 
     def test_thread_count_limits_parallel_browser_pages(self) -> None:
         with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):

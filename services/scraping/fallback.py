@@ -608,6 +608,7 @@ class ProductSiteCrawler:
 
         if (
             self.current_connection_method() != "requests"
+            and self.auto_connection_fallback
             and not current_is_product
             and not listing_products
             and (is_catalog_url(url) or not self.is_product_url(url))
@@ -636,8 +637,11 @@ class ProductSiteCrawler:
             if product_url:
                 self.remember_listing_price(product_url, product.get("price", ""))
                 self.enqueue(product_url, force=True)
-        collect_without_product_urls = not str(self.extraction_rules.get("product_url_selector", "") or "").strip()
-        if collect_without_product_urls or (not self.product_url_filters and not has_explicit_model_rules(self.extraction_rules)):
+        url_less_listing_products = [product for product in listing_products if not product.get("url")]
+        collected_only_url_less_listing_products = bool(listing_products) and len(url_less_listing_products) == len(listing_products)
+        if url_less_listing_products:
+            self.add_products(url_less_listing_products)
+        if not self.product_url_filters and not has_explicit_model_rules(self.extraction_rules):
             self.add_products(listing_products)
 
         should_extract_current_product = (
@@ -656,7 +660,7 @@ class ProductSiteCrawler:
             self.add_products([product])
 
         if not current_is_product:
-            self.extract_links(html, url, include_product_urls=not collect_without_product_urls)
+            self.extract_links(html, url, include_product_urls=not collected_only_url_less_listing_products)
 
     def finish_with_excel(self, partial: bool = False) -> None:
         from services.projects import create_export_file, delete_project_csv_for_project, save_project
