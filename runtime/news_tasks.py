@@ -30,7 +30,7 @@ from sqlalchemy.exc import OperationalError
 from typing import Dict, List, Optional, Set
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from services.scraping import (
-    BotasaurusBrowserSession,
+    BrowserMethodSession,
     ProductSiteCrawler,
     clean_text,
     extract_model_by_markers,
@@ -698,7 +698,7 @@ def request_news_stop(monitor_id: str, mode: str) -> threading.Event:
 def collect_products_for_monitor(
     monitor: Dict[str, object],
     stop_signal: threading.Event,
-    browser_session: BotasaurusBrowserSession,
+    browser_session: BrowserMethodSession,
     connection_method_state: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, str]]:
     from services.projects import parse_thread_count
@@ -782,7 +782,7 @@ def enrich_news_product(
     product: Dict[str, str],
     monitor: Dict[str, object],
     stop_signal: threading.Event,
-    browser_session: BotasaurusBrowserSession,
+    browser_session: BrowserMethodSession,
     connection_method_state: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     url = product.get("url", "")
@@ -978,7 +978,7 @@ def enrich_news_candidates(
     monitor: Dict[str, object],
     feed_code_sets: List[Dict[str, object]],
     stop_signal: threading.Event,
-    browser_session: BotasaurusBrowserSession,
+    browser_session: BrowserMethodSession,
     progress_callback,
     connection_method_state: Optional[Dict[str, object]] = None,
 ) -> List[Dict[str, str]]:
@@ -1133,13 +1133,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
     missing_summary: List[Dict[str, object]] = []
     availability_skipped = 0
     profile_dir = news_monitor_profile_storage_dir(monitor) if news_monitor_should_keep_browser_profile(monitor) else None
-    browser_session = BotasaurusBrowserSession(
+    initial_connection_method = normalize_connection_method(monitor.get("connection_method"))
+    browser_session = BrowserMethodSession(
         stop_event,
         parse_thread_count(monitor.get("thread_count", 4)),
         profile_dir=profile_dir,
-        prefer_headless_shell=normalize_connection_method(monitor.get("connection_method")) != "protected-site",
+        initial_method=initial_connection_method,
     )
-    initial_connection_method = normalize_connection_method(monitor.get("connection_method"))
     connection_method_state = {
         "active_method": initial_connection_method,
         "resource_method": initial_connection_method,

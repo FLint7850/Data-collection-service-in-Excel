@@ -8,8 +8,8 @@ from services.connections import normalize_connection_method
 from services.normalization import normalize_extraction_rules, normalize_patterns, safe_filename
 from typing import Dict, Optional
 from services.scraping import (
-    BotasaurusBrowserSession,
     BotasaurusDebugVisibleSession,
+    BrowserMethodSession,
     ProductSiteCrawler,
     product_url_filter_patterns,
 )
@@ -86,15 +86,16 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.connection_method = normalize_connection_method(project.get("connection_method"))
         crawler.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
         crawler.profile_dir = profile_dir
-        crawler.browser_session = BotasaurusBrowserSession(
+        crawler.browser_session = BrowserMethodSession(
             project["stop_event"],
             crawler.thread_count,
             profile_dir=crawler.profile_dir,
-            prefer_headless_shell=crawler.connection_method != "protected-site",
+            initial_method=crawler.connection_method,
         )
         crawler.debug_visible_session = BotasaurusDebugVisibleSession(
             project["stop_event"],
             str(crawler.profile_dir) if crawler.profile_dir is not None else "protected_sites_debug_visible",
+            max_pages=crawler.thread_count,
         )
         crawler.active_connection_method = crawler.connection_method
         crawler.connection_method_state["active_method"] = crawler.connection_method

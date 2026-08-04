@@ -5,7 +5,16 @@ import threading
 import time
 from bs4 import BeautifulSoup
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from config import CONNECTION_METHOD_TIMEOUT_SECONDS, DEFAULT_EXCLUSIONS, MAX_RETRIES, NEWS_SCAN_STALL_TIMEOUT, REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT, SESSION_BROWSER_METHODS
+from config import (
+    BOTASAURUS_HEADLESS_METHODS,
+    CONNECTION_METHOD_TIMEOUT_SECONDS,
+    DEFAULT_EXCLUSIONS,
+    MAX_RETRIES,
+    NEWS_SCAN_STALL_TIMEOUT,
+    REQUEST_DELAY_SECONDS,
+    REQUEST_TIMEOUT,
+    SESSION_BROWSER_METHODS,
+)
 from pathlib import Path
 from queue import Empty, Queue
 from runtime.state import reset_state, update_state
@@ -15,8 +24,8 @@ from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
 from services.scraping.browser import (
-    BotasaurusBrowserSession,
     BotasaurusDebugVisibleSession,
+    BrowserMethodSession,
     fetch_with_crawl4ai,
     fetch_with_crawlee,
     fetch_with_scrapegraphai,
@@ -32,7 +41,6 @@ from services.scraping.http import (
     exclusion_matches,
     fetch_with_botasaurus_request,
     has_static_extension,
-    is_catalog_url,
     is_product_url_for_filters,
     looks_blocked_or_empty,
     normalize_url,
@@ -60,7 +68,7 @@ class ProductSiteCrawler:
         auto_connection_fallback: bool = True,
         connection_method_state: Optional[Dict[str, object]] = None,
         allow_empty_price: bool = False,
-        browser_session: Optional[BotasaurusBrowserSession] = None,
+        browser_session: Optional[BrowserMethodSession] = None,
         owns_browser_session: bool = True,
         profile_dir: Optional[Path] = None,
     ):
@@ -101,13 +109,17 @@ class ProductSiteCrawler:
         self.connection_method_state = connection_method_state
         self.active_connection_method = str(connection_method_state.get("active_method") or self.connection_method)
         debug_profile = str(profile_dir) if profile_dir is not None else "protected_sites_debug_visible"
-        self.browser_session = browser_session or BotasaurusBrowserSession(
+        self.browser_session = browser_session or BrowserMethodSession(
             self.stop_signal,
             self.thread_count,
             profile_dir=self.profile_dir,
-            prefer_headless_shell=self.connection_method != "protected-site",
+            initial_method=self.connection_method,
         )
-        self.debug_visible_session = BotasaurusDebugVisibleSession(self.stop_signal, debug_profile)
+        self.debug_visible_session = BotasaurusDebugVisibleSession(
+            self.stop_signal,
+            debug_profile,
+            max_pages=self.thread_count,
+        )
         self.owns_browser_session = owns_browser_session
         self.browser_sessions_lock = threading.Lock()
         self.browser_sessions: List[object] = []
@@ -173,7 +185,7 @@ class ProductSiteCrawler:
             self.thread_local.session = session
         return session
 
-    def browser_session_for_worker(self) -> BotasaurusBrowserSession:
+    def browser_session_for_worker(self) -> BrowserMethodSession:
         return self.browser_session
 
     def debug_visible_session_for_worker(self) -> BotasaurusDebugVisibleSession:
@@ -240,7 +252,7 @@ class ProductSiteCrawler:
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
             return fetch_with_botasaurus_request(target_url)
-        if method in {"botasaurus-browser", "botasaurus-browser-direct", "botasaurus-visible", "playwright"}:
+        if method in BOTASAURUS_HEADLESS_METHODS or method == "playwright":
             return self.browser_session_for_worker().fetch(
                 target_url,
                 method,
@@ -343,12 +355,14 @@ class ProductSiteCrawler:
         # the old Chromium/Playwright process is gone before the next method.
         self.browser_session.restart(
             prefer_headless_shell=current != "protected-site",
+            method=current,
         )
 
         self.debug_visible_session.close()
         self.debug_visible_session = BotasaurusDebugVisibleSession(
             self.stop_signal,
             str(self.profile_dir) if self.profile_dir is not None else "protected_sites_debug_visible",
+            max_pages=self.thread_count,
         )
         return current
 
@@ -660,29 +674,6 @@ class ProductSiteCrawler:
             current_is_product = False
 
         listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
-
-        if (
-            self.current_connection_method() != "requests"
-            and self.auto_connection_fallback
-            and not current_is_product
-            and not listing_products
-            and (is_catalog_url(url) or not self.is_product_url(url))
-        ):
-            self.update_state(
-                error=f"На странице каталога не извлечены товары. Рендерю через браузер: {url}",
-            )
-            self.log(f"Рендеринг каталога через браузер: {url}", "warning")
-            rendered_html = self.browser_session.fetch(
-                url,
-                "protected-site",
-                self.extraction_rules,
-                self.product_url_filters,
-                self.allow_empty_price,
-            )
-            if rendered_html and not looks_blocked_or_empty(rendered_html):
-                html = rendered_html
-                listing_products = extract_listing_products(url, html, self.extraction_rules, self.product_url_filters)
-                self.update_state(error="")
 
         for product in listing_products:
             product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)

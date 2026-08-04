@@ -9,7 +9,16 @@ import sys
 import threading
 import time
 import uuid
-from config import BASE_DIR, BLOCKED_BROWSER_RESOURCE_TYPES, BLOCKED_BROWSER_URL_PARTS, REQUEST_TIMEOUT, botasaurus_browser_executable, env_str
+from config import (
+    BASE_DIR,
+    BLOCKED_BROWSER_RESOURCE_TYPES,
+    BLOCKED_BROWSER_URL_PARTS,
+    BOTASAURUS_HEADLESS_METHODS,
+    REQUEST_TIMEOUT,
+    SESSION_BROWSER_METHODS,
+    botasaurus_browser_executable,
+    env_str,
+)
 from pathlib import Path
 from queue import Empty, Queue
 from runtime.state import STANDALONE_BROWSER_SEMAPHORE
@@ -19,6 +28,17 @@ from services.scraping.extraction import extract_listing_products, extract_produ
 from services.scraping.http import is_product_url_for_filters
 
 from services.scraping.http import looks_blocked_or_empty
+
+
+def _ensure_botasaurus_initial_tab(driver) -> None:
+    """Chrome Headless Shell starts without a page; Botasaurus expects one."""
+    try:
+        browser = getattr(driver, "_browser", None)
+        tabs = list(getattr(browser, "tabs", []) or [])
+    except Exception:
+        tabs = []
+    if not tabs and hasattr(driver, "open_link_in_new_tab"):
+        driver.open_link_in_new_tab("about:blank")
 
 def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optional[str]:
     """Fallback через Botasaurus Browser для страниц, которым нужен настоящий рендеринг."""
@@ -51,6 +71,7 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
         create_error_logs=False,
     )
     def _render_html(driver: Driver, target_url: str):
+        _ensure_botasaurus_initial_tab(driver)
         if navigation == "direct" and hasattr(driver, "get"):
             driver.get(target_url)
         else:
@@ -79,8 +100,8 @@ def fetch_with_botasaurus_browser(url: str, navigation: str = "direct") -> Optio
     return result if isinstance(result, str) and result.strip() else None
 
 
-class BotasaurusBrowserSession:
-    """One hidden full Chromium session owned by one project/news scan.
+class PlaywrightBrowserSession:
+    """One Playwright Chromium session owned by one project/news scan.
 
     thread_count still controls parallel open pages, but every page now uses a
     selector-driven fast path and closes as soon as the needed DOM appears.
@@ -315,15 +336,9 @@ class BotasaurusBrowserSession:
                 {"name": "protected_direct", "block_stylesheet": False, "selector_timeout": 9000, "referer": ""},
                 {"name": "protected_google_referrer", "block_stylesheet": False, "selector_timeout": 9000, "referer": "https://www.google.com/"},
             ]
-        if method == "botasaurus-browser-direct":
-            referer = ""
-        elif method == "botasaurus-browser":
-            referer = "https://www.google.com/"
-        else:
-            referer = ""
         return [
-            {"name": "fast_full_browser", "block_stylesheet": True, "selector_timeout": 2500, "referer": referer},
-            {"name": "compatible_full_browser", "block_stylesheet": False, "selector_timeout": 5500, "referer": referer},
+            {"name": "fast_playwright", "block_stylesheet": True, "selector_timeout": 2500, "referer": ""},
+            {"name": "compatible_playwright", "block_stylesheet": False, "selector_timeout": 5500, "referer": ""},
         ]
 
     @staticmethod
@@ -597,14 +612,52 @@ class BotasaurusBrowserSession:
             return True
 
 
-class BotasaurusDebugVisibleSession:
-    """One visible Botasaurus browser with a persistent project profile."""
+class BotasaurusBrowserSession:
+    """One native Botasaurus browser with a bounded pool of tabs.
 
-    def __init__(self, stop_signal: Optional[threading.Event] = None, profile: str = "protected_sites_debug_visible") -> None:
+    ``max_pages`` is the number of tabs inside one Chrome process, not the
+    number of independent browser instances. The Botasaurus decorator owns the
+    single Driver for the whole scan and closes it when the session stops or
+    switches to another connection method.
+    """
+
+    prefer_headless_shell = True
+    headless = True
+    block_images_and_css = True
+    wait_for_complete_page_load = False
+    initial_wait_seconds = 1.0
+    scroll_count = 4
+    scroll_wait_seconds = 0.5
+    allowed_methods = frozenset(BOTASAURUS_HEADLESS_METHODS)
+
+    def __init__(
+        self,
+        stop_signal: Optional[threading.Event] = None,
+        max_pages: int = 1,
+        profile: Optional[str] = None,
+    ) -> None:
+        from services.projects import parse_thread_count
+
         self.stop_signal = stop_signal
-        self.profile = profile or "protected_sites_debug_visible"
-        self._lock = threading.Lock()
+        self.max_pages = max(1, parse_thread_count(max_pages))
+        self.profile = profile
+        self.executable_path = botasaurus_browser_executable(
+            prefer_headless_shell=self.prefer_headless_shell
+        )
+        self._tabs: Queue = Queue(maxsize=self.max_pages)
+        self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._tab_admin_lock = threading.Lock()
         self._closed = False
+        self._active_calls = 0
+        self._process_token = f"parser-botasaurus-session-{uuid.uuid4().hex}"
+        self._browser_pid: Optional[int] = None
+        self._driver = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready = threading.Event()
+        self._close_requested = threading.Event()
+        self._shutdown_complete = threading.Event()
+        self._start_error: Optional[BaseException] = None
         self._renderer = self._create_renderer()
 
     def _create_renderer(self):
@@ -614,60 +667,368 @@ class BotasaurusDebugVisibleSession:
         except ImportError:
             return None
 
-        chrome_executable_path = botasaurus_browser_executable(prefer_headless_shell=False)
+        process_argument = f"--{self._process_token}"
+
+        browser_arguments = [
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--blink-settings=imagesEnabled=false",
+            process_argument,
+        ]
+        if self.headless:
+            browser_arguments.insert(0, "--headless=new")
+        else:
+            browser_arguments.insert(0, "--window-position=40,40")
 
         @browser(
-            headless=False,
-            chrome_executable_path=chrome_executable_path,
+            headless=self.headless,
+            chrome_executable_path=self.executable_path,
             profile=self.profile,
+            add_arguments=browser_arguments,
             window_size=[1280, 720],
-            add_arguments=["--window-position=40,40"],
-            block_images_and_css=False,
-            wait_for_complete_page_load=True,
-            reuse_driver=True,
+            block_images_and_css=self.block_images_and_css,
+            wait_for_complete_page_load=self.wait_for_complete_page_load,
+            max_retry=1,
             output=None,
             close_on_crash=True,
             create_error_logs=False,
-            max_retry=1,
+            raise_exception=True,
         )
-        def _render_html(driver: Driver, target_url: str):
-            driver.get(target_url)
-            time.sleep(8)
-            for _ in range(3):
+        def _serve_tabs(driver: Driver, _session: "BotasaurusBrowserSession"):
+            self._serve_driver(driver)
+
+        return _serve_tabs
+
+    @staticmethod
+    def _make_browser_tab(driver, raw_tab):
+        from botasaurus_driver.driver import BrowserTab
+
+        return BrowserTab(driver.config, raw_tab, driver, driver, driver._browser)
+
+    def _new_browser_tab(self, driver):
+        with self._tab_admin_lock:
+            raw_tab = driver._browser.get("about:blank", new_tab=True)
+        return self._make_browser_tab(driver, raw_tab)
+
+    def _serve_driver(self, driver) -> None:
+        try:
+            _ensure_botasaurus_initial_tab(driver)
+            raw_tabs = list(driver._browser.tabs)
+            while len(raw_tabs) < self.max_pages:
+                self._new_browser_tab(driver)
+                raw_tabs = list(driver._browser.tabs)
+
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._driver = driver
+                self._browser_pid = int(getattr(driver._browser, "_process_pid", 0) or 0) or None
+                for raw_tab in raw_tabs[: self.max_pages]:
+                    self._tabs.put_nowait(self._make_browser_tab(driver, raw_tab))
+            self._ready.set()
+
+            while not self._close_requested.wait(0.25):
+                if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                    break
+
+            # Give active tab calls a short chance to finish normally. The
+            # decorator closes the single Driver immediately afterwards.
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                with self._state_lock:
+                    if self._active_calls == 0:
+                        break
+                time.sleep(0.05)
+        finally:
+            self._ready.set()
+
+    def _run_renderer(self) -> None:
+        try:
+            renderer = self._renderer
+            if renderer is not None:
+                renderer(self)
+        except BaseException as error:  # noqa: BLE001
+            self._start_error = error
+        finally:
+            with self._state_lock:
+                self._driver = None
+            self._ready.set()
+            self._shutdown_complete.set()
+
+    def _ensure_started(self) -> bool:
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._closed or self._renderer is None:
+                    return False
+                thread = self._thread
+                if thread is None:
+                    self._thread = threading.Thread(
+                        target=self._run_renderer,
+                        name=f"botasaurus-tab-session-{self._process_token[-8:]}",
+                        daemon=True,
+                    )
+                    self._thread.start()
+        if not self._ready.wait(timeout=REQUEST_TIMEOUT + 10):
+            return False
+        with self._state_lock:
+            return not self._closed and self._driver is not None and self._start_error is None
+
+    def _acquire_tab(self):
+        while True:
+            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                return None
+            with self._state_lock:
+                if self._closed:
+                    return None
+            try:
+                tab = self._tabs.get(timeout=0.25)
+            except Empty:
+                continue
+            with self._state_lock:
+                if self._closed:
+                    return None
+                self._active_calls += 1
+            return tab
+
+    def _navigate_tab(self, tab, url: str, navigation: str) -> None:
+        from botasaurus_driver import cdp
+        from botasaurus_driver.solve_cloudflare_captcha import wait_till_document_is_ready
+
+        referer = "https://www.google.com/" if navigation == "google" else None
+        frame_id, *_ = tab._tab.send(cdp.page.navigate(url, referrer=referer))
+        tab._tab.frame_id = frame_id
+        time.sleep(0.25)
+        wait_till_document_is_ready(
+            tab._tab,
+            self.wait_for_complete_page_load,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+    def _replace_failed_tab(self, tab):
+        try:
+            tab._tab.close()
+        except Exception:
+            pass
+        with self._state_lock:
+            driver = self._driver
+            closed = self._closed
+        if driver is None or closed:
+            return None
+        try:
+            return self._new_browser_tab(driver)
+        except Exception:
+            return None
+
+    def fetch(
+        self,
+        url: str,
+        method: str,
+        rules: Optional[Dict[str, str]] = None,
+        product_url_filters: Optional[Iterable[str]] = None,
+        allow_empty_price: bool = False,
+    ) -> Optional[str]:
+        del rules, product_url_filters, allow_empty_price
+        from services.log_service import log_fetch_exception, log_fetch_result
+
+        if method not in self.allowed_methods or not self._ensure_started():
+            return None
+        tab = self._acquire_tab()
+        if tab is None:
+            return None
+
+        started = time.time()
+        reusable_tab = tab
+        try:
+            navigation = "google" if method == "botasaurus-browser" else "direct"
+            self._navigate_tab(tab, url, navigation)
+            time.sleep(self.initial_wait_seconds)
+            for _ in range(self.scroll_count):
+                if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                    return None
                 try:
-                    driver.run_js("window.scrollTo(0, document.body.scrollHeight)")
+                    tab.run_js("window.scrollTo(0, document.body.scrollHeight)")
                 except Exception:
                     break
-                time.sleep(0.8)
-            return driver.page_html
-
-        return _render_html
-
-    def fetch(self, url: str, method: str) -> Optional[str]:
-        if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+                time.sleep(self.scroll_wait_seconds)
+            result = tab.page_html
+            if result:
+                log_fetch_result(method, url, result, time.time() - started, extra="engine=botasaurus")
+            return result if isinstance(result, str) and result.strip() else None
+        except Exception as error:
+            log_fetch_exception(method, url, error)
+            reusable_tab = self._replace_failed_tab(tab)
             return None
-        if self._renderer is None:
-            return None
-        with self._lock:
-            if self._closed:
-                return None
+        finally:
+            with self._state_lock:
+                self._active_calls = max(0, self._active_calls - 1)
+                closed = self._closed
+            if reusable_tab is not None and not closed:
+                self._tabs.put(reusable_tab)
+
+    def _force_terminate_owned_processes(self) -> None:
+        if os.name == "nt":
+            thread = self._thread
+            if not self._browser_pid or thread is None or not thread.is_alive():
+                return
             try:
-                result = self._renderer(url)
-            except Exception:
-                return None
-        if isinstance(result, list):
-            result = result[0] if result else None
-        return result if isinstance(result, str) and result.strip() else None
+                subprocess.run(
+                    ["taskkill", "/PID", str(self._browser_pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return
+        if os.name != "posix" or not Path("/proc").is_dir():
+            return
+        token = f"--{self._process_token}".encode()
+        parent_by_pid: Dict[int, int] = {}
+        roots: Set[int] = set()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                cmdline = (entry / "cmdline").read_bytes()
+                stat = (entry / "stat").read_text(encoding="utf-8")
+                parent_by_pid[pid] = int(stat.rsplit(")", 1)[1].split()[1])
+                if token in cmdline:
+                    roots.add(pid)
+            except (OSError, ValueError, IndexError):
+                continue
+        owned = set(roots)
+        changed = True
+        while changed:
+            changed = False
+            for pid, parent_pid in parent_by_pid.items():
+                if parent_pid in owned and pid not in owned:
+                    owned.add(pid)
+                    changed = True
+        owned.discard(os.getpid())
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in sorted(owned, reverse=True):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    continue
+            if sig == signal.SIGTERM and owned:
+                time.sleep(0.25)
 
     def close(self) -> None:
-        with self._lock:
+        with self._lifecycle_lock:
+            with self._state_lock:
+                self._closed = True
+                thread = self._thread
+            self._close_requested.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=15)
+            self._force_terminate_owned_processes()
+            if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+                thread.join(timeout=5)
+
+
+class BrowserMethodSession:
+    """Routes browser method codes to their matching native engine."""
+
+    def __init__(
+        self,
+        stop_signal: Optional[threading.Event] = None,
+        max_pages: int = 1,
+        profile_dir: Optional[Path] = None,
+        initial_method: str = "playwright",
+    ) -> None:
+        from services.projects import parse_thread_count
+
+        self.stop_signal = stop_signal
+        self.max_pages = max(1, parse_thread_count(max_pages))
+        self.profile_dir = profile_dir
+        self.initial_method = str(initial_method or "playwright")
+        self.prefer_headless_shell = self.initial_method != "protected-site"
+        self._lifecycle_lock = threading.RLock()
+        self._closed = False
+        self.playwright_session = self._new_playwright_session()
+        self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
+
+    def _new_playwright_session(self) -> PlaywrightBrowserSession:
+        return PlaywrightBrowserSession(
+            self.stop_signal,
+            self.max_pages,
+            profile_dir=self.profile_dir,
+            prefer_headless_shell=self.prefer_headless_shell,
+        )
+
+    def fetch(
+        self,
+        url: str,
+        method: str,
+        rules: Optional[Dict[str, str]] = None,
+        product_url_filters: Optional[Iterable[str]] = None,
+        allow_empty_price: bool = False,
+    ) -> Optional[str]:
+        with self._lifecycle_lock:
+            if self._closed:
+                return None
+            if method in BOTASAURUS_HEADLESS_METHODS:
+                session = self.botasaurus_session
+            elif method == "playwright" or method in SESSION_BROWSER_METHODS:
+                session = self.playwright_session
+            else:
+                return None
+        return session.fetch(url, method, rules, product_url_filters, allow_empty_price)
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
             self._closed = True
-            renderer = self._renderer
-            if renderer is not None and hasattr(renderer, "close"):
-                try:
-                    renderer.close()
-                except Exception:
-                    pass
+            self.botasaurus_session.close()
+            self.playwright_session.close()
+
+    def restart(
+        self,
+        prefer_headless_shell: Optional[bool] = None,
+        method: Optional[str] = None,
+    ) -> bool:
+        with self._lifecycle_lock:
+            self.botasaurus_session.close()
+            self.playwright_session.close()
+            if method:
+                self.initial_method = str(method)
+            if prefer_headless_shell is not None:
+                self.prefer_headless_shell = bool(prefer_headless_shell)
+            else:
+                self.prefer_headless_shell = self.initial_method != "protected-site"
+            self.playwright_session = self._new_playwright_session()
+            self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
+            self._closed = False
+            return True
+
+
+class BotasaurusDebugVisibleSession(BotasaurusBrowserSession):
+    """One visible Botasaurus Chrome for Testing with a bounded tab pool."""
+
+    prefer_headless_shell = False
+    headless = False
+    block_images_and_css = False
+    wait_for_complete_page_load = True
+    initial_wait_seconds = 8.0
+    scroll_count = 3
+    scroll_wait_seconds = 0.8
+    allowed_methods = frozenset({"botasaurus-debug-visible"})
+
+    def __init__(
+        self,
+        stop_signal: Optional[threading.Event] = None,
+        profile: str = "protected_sites_debug_visible",
+        max_pages: int = 1,
+    ) -> None:
+        super().__init__(
+            stop_signal,
+            max_pages=max_pages,
+            profile=profile or "protected_sites_debug_visible",
+        )
 
 
 def fetch_with_crawl4ai(url: str) -> Optional[str]:
