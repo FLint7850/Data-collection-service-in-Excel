@@ -130,6 +130,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
             add_project_log(project, f"Критическая ошибка: {exc}", "error")
         finally:
+            crawler.close_browser_sessions()
             if project.get("worker_thread") is threading.current_thread():
                 project["worker_thread"] = None
 

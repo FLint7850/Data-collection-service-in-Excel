@@ -348,11 +348,12 @@ def extract_listing_products_by_rules(
         return []
     filters = list(product_url_filters or [])
     products: List[Dict[str, str]] = []
+    seen_models: Set[str] = set()
     try:
         cards = soup.select(card_selector)
     except Exception:
         return []
-    url_selector = rules.get("product_url_selector", "")
+    url_selector = str(rules.get("product_url_selector", "") or "").strip()
     for card in cards:
         link_node = None
         if url_selector and not product_url_filter_patterns([], {"product_url_selector": url_selector}):
@@ -360,9 +361,14 @@ def extract_listing_products_by_rules(
                 link_node = card.select_one(url_selector)
             except Exception:
                 link_node = None
-        product_url = canonicalize_product_url_by_filters(normalize_url(link_node.get("href", "") if link_node else "", current_url), filters)
-        if not product_url or product_url in seen_urls or not product_url_matches_filters(product_url, filters):
-            continue
+        product_url = ""
+        if url_selector:
+            product_url = canonicalize_product_url_by_filters(
+                normalize_url(link_node.get("href", "") if link_node else "", current_url),
+                filters,
+            )
+            if not product_url or product_url in seen_urls or not product_url_matches_filters(product_url, filters):
+                continue
 
         model = extract_model_by_markers(str(card), rules)
         model_from_config = bool(model)
@@ -372,12 +378,18 @@ def extract_listing_products_by_rules(
         if has_configured_model_source(rules) and not model_from_config:
             continue
         model = finalize_scraped_model(model, product_url, rules, model_from_config)
+        model_key = clean_text(model).casefold()
+        if not model_key or (not product_url and model_key in seen_models):
+            continue
 
         price = extract_price_from_container(card, rules.get("price_selector", ""))
         if not model or not price:
             continue
 
-        seen_urls.add(product_url)
+        if product_url:
+            seen_urls.add(product_url)
+        else:
+            seen_models.add(model_key)
         products.append({"url": product_url, "model": model, "price": price})
     return products
 

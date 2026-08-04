@@ -2,15 +2,18 @@
 
 import base64
 from importlib.util import find_spec
+import os
+import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from config import BASE_DIR, BLOCKED_BROWSER_RESOURCE_TYPES, BLOCKED_BROWSER_URL_PARTS, REQUEST_TIMEOUT, botasaurus_browser_executable, env_str
 from pathlib import Path
 from queue import Empty, Queue
 from runtime.state import STANDALONE_BROWSER_SEMAPHORE
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from services.scraping.extraction import extract_listing_products, extract_product_data
 from services.scraping.http import is_product_url_for_filters
@@ -103,6 +106,8 @@ class BotasaurusBrowserSession:
         self._semaphore = None
         self._closed = False
         self._start_error: Optional[BaseException] = None
+        self._process_token = f"parser-browser-session-{uuid.uuid4().hex}"
+        self._shutdown_complete = threading.Event()
 
     def _ensure_started(self) -> bool:
         with self._state_lock:
@@ -125,18 +130,26 @@ class BotasaurusBrowserSession:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._start_browser())
+            self._ready.set()
+            with self._state_lock:
+                closed = self._closed
+            if not closed:
+                self._loop.run_forever()
         except BaseException as error:  # noqa: BLE001
             self._start_error = error
             fetch_debug_log(f"browser-session start failed: {type(error).__name__}: {error}", "warning")
             self._ready.set()
-            return
-        self._ready.set()
-        try:
-            self._loop.run_forever()
         finally:
-            if not self._loop.is_closed():
-                self._loop.run_until_complete(self._shutdown_async())
-                self._loop.close()
+            try:
+                if not self._loop.is_closed():
+                    self._loop.run_until_complete(self._shutdown_async())
+            except BaseException as error:  # noqa: BLE001
+                fetch_debug_log(f"browser-session shutdown failed: {type(error).__name__}: {error}", "warning")
+            finally:
+                if not self._loop.is_closed():
+                    self._loop.close()
+                self._loop = None
+                self._shutdown_complete.set()
 
     async def _start_browser(self) -> None:
         import asyncio
@@ -158,6 +171,7 @@ class BotasaurusBrowserSession:
                 "--blink-settings=imagesEnabled=false",
                 "--disable-renderer-backgrounding",
                 "--disable-background-timer-throttling",
+                f"--{self._process_token}",
             ],
         }
         if executable_path:
@@ -198,21 +212,24 @@ class BotasaurusBrowserSession:
         self._semaphore = asyncio.Semaphore(self.max_pages)
 
     async def _close_browser(self) -> None:
+        import asyncio
+        from services.log_service import fetch_debug_log
+
+        async def close_component(name: str, awaitable) -> None:
+            try:
+                await asyncio.wait_for(awaitable, timeout=8)
+            except BaseException as error:  # noqa: BLE001
+                fetch_debug_log(
+                    f"browser-session {name} close failed: {type(error).__name__}: {error}",
+                    "warning",
+                )
+
         if self._context is not None:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-        if self.profile_dir is None and self._browser is not None:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
+            await close_component("context", self._context.close())
+        if self._browser is not None:
+            await close_component("browser", self._browser.close())
         if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
+            await close_component("playwright", self._playwright.stop())
         self._context = None
         self._browser = None
         self._playwright = None
@@ -221,6 +238,10 @@ class BotasaurusBrowserSession:
     async def _shutdown_async(self) -> None:
         import asyncio
 
+        # Сначала корректно закрываем страницы, контекст, браузер и Playwright.
+        # Если отменить все задачи раньше, отменяется и внутренний transport
+        # Playwright, после чего context.close() уже не способен завершить Chromium.
+        await self._close_browser()
         current_task = asyncio.current_task()
         tasks = [
             task
@@ -231,7 +252,57 @@ class BotasaurusBrowserSession:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self._close_browser()
+
+    def _force_terminate_owned_processes(self) -> None:
+        """Добивает только Chromium-процессы этой сессии после graceful shutdown."""
+        if os.name != "posix" or not Path("/proc").is_dir():
+            return
+        token = f"--{self._process_token}".encode()
+        parent_by_pid: Dict[int, int] = {}
+        roots: Set[int] = set()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                cmdline = (entry / "cmdline").read_bytes()
+                stat = (entry / "stat").read_text(encoding="utf-8")
+                parent_by_pid[pid] = int(stat.rsplit(")", 1)[1].split()[1])
+                if token in cmdline:
+                    roots.add(pid)
+            except (OSError, ValueError, IndexError):
+                continue
+        if not roots:
+            return
+
+        owned = set(roots)
+        current_pid = os.getpid()
+        for root_pid in roots:
+            parent_pid = parent_by_pid.get(root_pid, 0)
+            while parent_pid not in {0, 1, current_pid} and parent_pid not in owned:
+                owned.add(parent_pid)
+                parent_pid = parent_by_pid.get(parent_pid, 0)
+        changed = True
+        while changed:
+            changed = False
+            for pid, parent_pid in parent_by_pid.items():
+                if parent_pid in owned and pid not in owned:
+                    owned.add(pid)
+                    changed = True
+
+        owned.discard(current_pid)
+        if not owned:
+            return
+        from services.log_service import fetch_debug_log
+        fetch_debug_log(f"browser-session force cleanup: processes={len(owned)}", "warning")
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in sorted(owned, reverse=True):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    continue
+            if sig == signal.SIGTERM:
+                time.sleep(0.25)
 
     @staticmethod
     def _profiles_for_method(method: str) -> List[Dict[str, object]]:
@@ -465,27 +536,29 @@ class BotasaurusBrowserSession:
 
     def close(self) -> None:
         import asyncio
+        from services.log_service import fetch_debug_log
 
         thread = None
         loop = None
         with self._state_lock:
-            if self._closed:
-                return
             self._closed = True
             thread = self._thread
             loop = self._loop
-        if loop is not None:
+        if loop is not None and loop.is_running():
             try:
                 shutdown = asyncio.run_coroutine_threadsafe(self._shutdown_async(), loop)
-                shutdown.result(timeout=10)
-            except Exception:
-                pass
+                shutdown.result(timeout=20)
+            except BaseException as error:  # noqa: BLE001
+                fetch_debug_log(f"browser-session close failed: {type(error).__name__}: {error}", "warning")
             try:
                 loop.call_soon_threadsafe(loop.stop)
-            except Exception:
-                pass
+            except BaseException as error:  # noqa: BLE001
+                fetch_debug_log(f"browser-session loop stop failed: {type(error).__name__}: {error}", "warning")
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=10)
+            thread.join(timeout=20)
+            if thread.is_alive():
+                fetch_debug_log("browser-session thread did not stop in 20 seconds", "warning")
+        self._force_terminate_owned_processes()
 
 
 class BotasaurusDebugVisibleSession:

@@ -117,6 +117,7 @@ class ProductSiteCrawler:
         self.visited: Set[str] = set()
         self.skipped_urls: Set[str] = set()
         self.result_urls: Set[str] = set()
+        self.result_models: Set[str] = set()
         self.pending_prices: Dict[str, str] = {}
         self.results: List[Dict[str, str]] = []
         self.failed_attempts: Dict[str, int] = {}
@@ -464,10 +465,12 @@ class ProductSiteCrawler:
         for url in pending_urls:
             self.enqueue(url, force=True)
 
-    def extract_links(self, html: str, current_url: str) -> None:
+    def extract_links(self, html: str, current_url: str, include_product_urls: bool = True) -> None:
         soup = BeautifulSoup(html, "html.parser")
         for link in soup.select("a[href]"):
             normalized = normalize_url(link.get("href", ""), current_url)
+            if not include_product_urls and self.is_product_url(normalized):
+                continue
             self.enqueue(normalized)
 
     def add_products(self, products: Iterable[Dict[str, str]]) -> int:
@@ -475,14 +478,23 @@ class ProductSiteCrawler:
         with self.data_lock:
             for product in products:
                 product_url = canonicalize_product_url_by_filters(product.get("url", ""), self.product_url_filters)
-                model = product.get("model", "")
+                model = str(product.get("model", "") or "").strip()
+                model_key = model.casefold()
                 price = product.get("price", "")
                 if product_url and not self.is_product_allowed(product_url):
                     continue
-                if not product_url or not model or (not price and not self.allow_empty_price) or product_url in self.result_urls:
+                if (
+                    not model
+                    or (not price and not self.allow_empty_price)
+                    or (product_url and product_url in self.result_urls)
+                    or model_key in self.result_models
+                ):
                     continue
                 product["url"] = product_url
-                self.result_urls.add(product_url)
+                if product_url:
+                    self.result_urls.add(product_url)
+                else:
+                    self.result_models.add(model_key)
                 self.results.append(product)
                 added += 1
         return added
@@ -619,9 +631,11 @@ class ProductSiteCrawler:
             if product_url and not self.is_product_allowed(product_url):
                 continue
             product["url"] = product_url
-            self.remember_listing_price(product_url, product.get("price", ""))
-            self.enqueue(product_url, force=True)
-        if not self.product_url_filters and not has_explicit_model_rules(self.extraction_rules):
+            if product_url:
+                self.remember_listing_price(product_url, product.get("price", ""))
+                self.enqueue(product_url, force=True)
+        collect_without_product_urls = not str(self.extraction_rules.get("product_url_selector", "") or "").strip()
+        if collect_without_product_urls or (not self.product_url_filters and not has_explicit_model_rules(self.extraction_rules)):
             self.add_products(listing_products)
 
         should_extract_current_product = (
@@ -640,7 +654,7 @@ class ProductSiteCrawler:
             self.add_products([product])
 
         if not current_is_product:
-            self.extract_links(html, url)
+            self.extract_links(html, url, include_product_urls=not collect_without_product_urls)
 
     def finish_with_excel(self, partial: bool = False) -> None:
         from services.projects import create_export_file, delete_project_csv_for_project, save_project
