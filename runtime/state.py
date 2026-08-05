@@ -37,6 +37,7 @@ news_stop_events: Dict[str, threading.Event] = {}
 news_stop_modes: Dict[str, str] = {}
 news_scan_threads: Dict[str, threading.Thread] = {}
 news_browser_sessions: Dict[str, object] = {}
+news_crawlers: Dict[str, object] = {}
 news_state_persisted_at: Dict[str, float] = {}
 
 progress_tracker = ProgressTracker(

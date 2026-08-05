@@ -134,6 +134,7 @@ class ProductSiteCrawler:
         self.pending_prices: Dict[str, str] = {}
         self.results: List[Dict[str, str]] = []
         self.failed_attempts: Dict[str, int] = {}
+        self.deferred_urls: Set[str] = set()
         self.permanent_failures: Set[str] = set()
         self.data_lock = threading.Lock()
         self.excel_finalized = False
@@ -142,6 +143,7 @@ class ProductSiteCrawler:
         self.last_progress_at = time.time()
         self.last_progress_signature: tuple = ()
         self.fatal_error = ""
+        self.recovery_pause_reason = ""
 
     def update_state(self, **kwargs: object) -> None:
         from services.projects import update_project_state
@@ -191,6 +193,142 @@ class ProductSiteCrawler:
                 sessions.append(self.browser_session)
         for session in sessions:
             session.close()
+
+    def checkpoint_payload(self) -> Dict[str, object]:
+        """Return the durable state needed to resume without rescanning successful URLs."""
+        with self.data_lock:
+            with self.queue.mutex:
+                queued_urls = list(self.queue.queue)
+            return {
+                "start_urls": list(self.start_urls),
+                "queued_urls": queued_urls,
+                "deferred_urls": sorted(self.deferred_urls),
+                "visited_urls": sorted(self.visited),
+                "skipped_urls": sorted(self.skipped_urls),
+                "permanent_failures": sorted(self.permanent_failures),
+                "failed_attempts": dict(self.failed_attempts),
+                "pending_prices": dict(self.pending_prices),
+                "results": [dict(item) for item in self.results],
+                "result_urls": sorted(self.result_urls),
+                "result_models": sorted(self.result_models),
+                "elapsed_seconds": float(self.elapsed_seconds()),
+            }
+
+    def restore_checkpoint(self, payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        def strings(key: str) -> List[str]:
+            value = payload.get(key, [])
+            if not isinstance(value, list):
+                return []
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        checkpoint_start_urls = strings("start_urls")
+        if checkpoint_start_urls and checkpoint_start_urls != self.start_urls:
+            return False
+
+        raw_results = payload.get("results", [])
+        results = [
+            {str(key): str(value or "") for key, value in item.items()}
+            for item in raw_results
+            if isinstance(item, dict)
+        ] if isinstance(raw_results, list) else []
+        raw_attempts = payload.get("failed_attempts", {})
+        failed_attempts: Dict[str, int] = {}
+        if isinstance(raw_attempts, dict):
+            for url, count in raw_attempts.items():
+                if not str(url).strip():
+                    continue
+                try:
+                    failed_attempts[str(url)] = max(0, int(count or 0))
+                except (TypeError, ValueError):
+                    continue
+        raw_prices = payload.get("pending_prices", {})
+        pending_prices = {
+            str(url): str(price or "")
+            for url, price in raw_prices.items()
+            if str(url).strip()
+        } if isinstance(raw_prices, dict) else {}
+
+        with self.data_lock:
+            self.queue = Queue()
+            self.queued = set()
+            self.in_progress = set()
+            self.visited = set(strings("visited_urls"))
+            self.skipped_urls = set(strings("skipped_urls"))
+            self.deferred_urls = set(strings("deferred_urls"))
+            self.permanent_failures = set(strings("permanent_failures"))
+            self.failed_attempts = failed_attempts
+            self.pending_prices = pending_prices
+            self.results = results
+            self.result_urls = set(strings("result_urls"))
+            self.result_models = set(strings("result_models"))
+            if not self.result_urls:
+                self.result_urls = {
+                    str(item.get("url") or "")
+                    for item in results
+                    if str(item.get("url") or "").strip()
+                }
+            if not self.result_models:
+                self.result_models = {
+                    str(item.get("model") or "").strip().casefold()
+                    for item in results
+                    if not str(item.get("url") or "").strip()
+                    and str(item.get("model") or "").strip()
+                }
+            for url in strings("queued_urls"):
+                if url not in self.permanent_failures and url not in self.queued:
+                    self.queue.put(url)
+                    self.queued.add(url)
+        try:
+            self.elapsed_before_resume = max(0.0, float(payload.get("elapsed_seconds", 0) or 0))
+        except (TypeError, ValueError):
+            self.elapsed_before_resume = 0.0
+        self.started_at = 0.0
+        self.excel_finalized = False
+        self.fatal_error = ""
+        self.recovery_pause_reason = ""
+        return True
+
+    def save_project_checkpoint(self) -> None:
+        if self.project is None:
+            return
+        from services.scraping.checkpoints import save_scrape_checkpoint
+        save_scrape_checkpoint("projects", self.project.get("id"), self.checkpoint_payload())
+
+    def delete_project_checkpoint(self) -> None:
+        if self.project is None:
+            return
+        from services.scraping.checkpoints import delete_scrape_checkpoint
+        delete_scrape_checkpoint("projects", self.project.get("id"))
+
+    def prepare_resume_queue(self) -> None:
+        with self.data_lock:
+            retry_urls = sorted(self.deferred_urls)
+            for url in retry_urls:
+                self.visited.discard(url)
+                self.failed_attempts.pop(url, None)
+            self.deferred_urls.clear()
+        for url in retry_urls:
+            self.enqueue(url, force=True)
+
+    def request_recovery_pause(self, message: str, active_urls: Optional[Iterable[str]] = None) -> None:
+        if self.recovery_pause_reason:
+            return
+        urls = [str(url) for url in (active_urls or []) if str(url)]
+        self.recovery_pause_reason = message
+        self.update_state(
+            status="pausing",
+            error="",
+            last_warning=message,
+            currenturl=urls[0] if urls else "",
+            active_urls=urls[:8],
+            active_tasks=len(urls),
+            queue_size=self.queue.qsize() + len(self.deferred_urls),
+        )
+        self.log(message, "warning")
+        self.stop_signal.set()
 
     def fetch_with_requests(self, url: str) -> Optional[str]:
         last_error = ""
@@ -607,19 +745,11 @@ class ProductSiteCrawler:
             f"товаров в памяти: {counts['results']}. "
             f"Активные URL: {', '.join(active_urls[:5])}"
         )
-        self.fatal_error = message
         self.update_state(
-            status="error",
-            error=message,
-            currenturl=active_urls[0] if active_urls else "",
-            active_urls=active_urls[:8],
-            active_tasks=len(active_urls),
-            queue_size=self.queue.qsize(),
             in_memory_products=counts["results"],
             stall_seconds=NEWS_SCAN_STALL_TIMEOUT,
         )
-        self.log(message, "error")
-        self.stop_signal.set()
+        self.request_recovery_pause(message, active_urls)
 
     def elapsed_seconds(self) -> float:
         if self.started_at:
@@ -695,7 +825,7 @@ class ProductSiteCrawler:
             delete_project_csv_for_project(self.project, keep_filename=filename.name)
         final_error = ""
         if partial:
-            final_error = "Сбор приостановлен. CSV сформирован по уже найденным товарам."
+            final_error = "" if self.recovery_pause_reason else "Сбор приостановлен. CSV сформирован по уже найденным товарам."
         elif not self.results:
             final_error = (
                 "Сбор завершен, но товары не найдены. Проверьте стартовый URL и исключения; "
@@ -706,6 +836,9 @@ class ProductSiteCrawler:
             status="partial" if partial else "completed",
             percent=100 if not partial else int((self.project or {}).get("state", {}).get("percent", 0) or 0),
             currenturl="",
+            active_urls=[],
+            active_tasks=0,
+            queue_size=self.queue.qsize() + len(self.deferred_urls),
             totalprocessed=counts["visited"],
             processed_products=counts["results"],
             found_products=counts["results"],
@@ -714,6 +847,7 @@ class ProductSiteCrawler:
             download_url="/download",
             filename=filename.name,
             error=final_error,
+            last_warning=self.recovery_pause_reason,
             thread_count=self.thread_count,
             elapsed_seconds=int(self.elapsed_seconds()),
             finished_at=now_iso() if not partial else "",
@@ -726,6 +860,10 @@ class ProductSiteCrawler:
     def run(self, resume: bool = False) -> None:
         if not self.started_at:
             self.started_at = time.time()
+        self.fatal_error = ""
+        self.recovery_pause_reason = ""
+        if resume:
+            self.prepare_resume_queue()
         self.update_state(
             status="running",
             thread_count=self.thread_count,
@@ -769,6 +907,12 @@ class ProductSiteCrawler:
 
                 if not pending:
                     if self.queue.empty():
+                        if self.deferred_urls:
+                            self.request_recovery_pause(
+                                f"Не удалось загрузить URL после повторных попыток: {len(self.deferred_urls)}. "
+                                "Сбор приостановлен; нажмите «Продолжить», чтобы повторить эти ссылки.",
+                                sorted(self.deferred_urls)[:8],
+                            )
                         break
                     continue
 
@@ -794,6 +938,9 @@ class ProductSiteCrawler:
                         self.log(f"Ошибка обработки {url}: {exc}", "error")
 
                     if html and not self.stop_signal.is_set():
+                        with self.data_lock:
+                            self.failed_attempts.pop(url, None)
+                            self.deferred_urls.discard(url)
                         self.process_page(url, html)
                     elif not self.stop_signal.is_set():
                         with self.data_lock:
@@ -810,7 +957,9 @@ class ProductSiteCrawler:
                             self.enqueue(url, force=True)
                             self.log(f"Повторная попытка загрузки {retry_count}/2: {url}", "warning")
                         else:
-                            self.log(f"URL пропущен после повторных попыток загрузки: {url}", "error")
+                            with self.data_lock:
+                                self.deferred_urls.add(url)
+                            self.log(f"URL отложен до продолжения после повторных попыток загрузки: {url}", "warning")
 
                     self.refresh_progress(url)
         finally:
@@ -824,6 +973,7 @@ class ProductSiteCrawler:
             self.elapsed_before_resume = self.elapsed_seconds()
             self.started_at = 0.0
             if self.fatal_error:
+                self.delete_project_checkpoint()
                 self.update_state(
                     status="error",
                     currenturl="",
@@ -834,10 +984,16 @@ class ProductSiteCrawler:
                     error=self.fatal_error,
                 )
                 return
+            if self.recovery_pause_reason:
+                self.save_project_checkpoint()
+                self.finish_with_excel(partial=True)
+                return
             stop_mode = str((self.project or {}).get("stop_mode") or "")
             if self.finish_signal.is_set():
+                self.save_project_checkpoint()
                 self.finish_with_excel(partial=True)
             elif stop_mode == "pause":
+                self.save_project_checkpoint()
                 self.update_state(
                     status="paused",
                     currenturl="",
@@ -846,7 +1002,11 @@ class ProductSiteCrawler:
                 )
                 if (self.project or {}).get("state", {}).get("status") == "paused":
                     self.log("Сбор поставлен на паузу", "warning")
+                if self.project is not None:
+                    from services.projects import save_project
+                    save_project(self.project)
             else:
+                self.delete_project_checkpoint()
                 self.update_state(
                     status="idle",
                     currenturl="",
@@ -863,4 +1023,5 @@ class ProductSiteCrawler:
 
         self.elapsed_before_resume = self.elapsed_seconds()
         self.started_at = 0.0
+        self.delete_project_checkpoint()
         self.finish_with_excel()

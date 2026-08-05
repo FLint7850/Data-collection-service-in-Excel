@@ -13,12 +13,13 @@ from config import MSK_TZ
 from datetime import datetime
 from flask import request, send_file
 from query_utils import normalize_search_text
-from runtime.state import news_browser_sessions, news_lock, news_settings, news_stop_events
+from runtime.state import news_browser_sessions, news_crawlers, news_lock, news_settings, news_stop_events
 from services.application import ensure_storage
 from services.domain_revisions import domain_revision
 from services.connections import normalize_connection_method
 from services.normalization import jsonify, normalize_extraction_rules, normalize_patterns, normalize_selector_settings, normalize_start_urls, output_text, parse_db_int
 from services.scraping import clean_text
+from services.scraping.checkpoints import delete_scrape_checkpoint
 from services.news import (
     add_news_log,
     delete_news_records,
@@ -169,6 +170,9 @@ def api_scan_news_monitor(monitor_id: str):
     if monitor.get("state", {}).get("status") in {"running", "queued"}:
         return jsonify({"error": "Сканирование уже выполняется"}), 409
     with news_lock:
+        news_crawlers.pop(str(monitor_id), None)
+    delete_scrape_checkpoint("news", monitor_id)
+    with news_lock:
         monitor["state"] = {
             **make_news_state("queued"),
             "stage": "Запуск",
@@ -190,6 +194,7 @@ def api_stop_news_monitor(monitor_id: str):
     if not monitor:
         return jsonify({"error": "Монитор не найден"}), 404
     request_news_stop(monitor_id, "stop")
+    delete_scrape_checkpoint("news", monitor_id)
     with news_lock:
         response_monitor = public_news_monitor_progress(monitor)
     threading.Thread(
@@ -228,7 +233,7 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = public_news_monitor_progress(monitor)
-    if not start_news_scan(monitor_id, manual=True):
+    if not start_news_scan(monitor_id, manual=True, resume=True):
         return jsonify({"error": "Сканирование уже выполняется"}), 409
     add_news_log(monitor, "Продолжение сканирования новинок запущено", "info")
     return jsonify({"monitor": response_monitor})
@@ -252,6 +257,8 @@ def api_reset_news_monitor_visual(monitor_id: str):
         ]
         if any(str((item.get("state") or {}).get("status") or "") in active_statuses for item in brand_monitors):
             return jsonify({"error": "Нельзя сбрасывать статус, пока сканирование выполняется."}), 409
+        news_crawlers.pop(str(monitor_id), None)
+        delete_scrape_checkpoint("news", monitor_id)
         previous_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
         reset_state = make_news_state("idle")
         last_csv = str(previous_state.get("last_csv") or "")
@@ -353,6 +360,8 @@ def api_delete_news_monitor(monitor_id: str):
         for item_id in removed_ids:
             news_stop_events.pop(item_id, None)
             news_browser_sessions.pop(item_id, None)
+            news_crawlers.pop(item_id, None)
+            delete_scrape_checkpoint("news", item_id)
         delete_news_records(removed_ids, remove_brand=remove_brand)
         remaining_brand_monitors = [
             public_news_monitor(item)

@@ -188,7 +188,11 @@ async function createMonitor() {
 }
 
 async function runBrandAction(brand: BrandGroup, action: "pause" | "resume" | "stop" | "reset-visual") {
+  const runMonitorId = brand.monitors
+    .map((item) => String(item.state.run_monitor_id || ""))
+    .find(Boolean);
   const monitor =
+    brand.monitors.find((item) => String(item.id) === runMonitorId) ||
     brand.monitors.find((item) =>
       action === "resume"
         ? item.state.status === "partial"

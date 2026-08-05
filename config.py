@@ -109,6 +109,7 @@ def botasaurus_browser_executable(prefer_headless_shell: bool = True) -> Optiona
 FEED_DIR = env_path("FEED_DIR", "feeds")
 EXPORT_DIR = env_path("EXPORT_DIR", "exports")
 FILE_IMPORT_DIR = env_path("FILE_IMPORT_DIR", "storage/file-import")
+SCRAPE_CHECKPOINT_DIR = env_path("SCRAPE_CHECKPOINT_DIR", "storage/checkpoints")
 PROJECT_PROFILE_DIR = BASE_DIR / "profiles" / "projects"
 
 DEFAULT_START_URL = env_str("DEFAULT_START_URL", "")

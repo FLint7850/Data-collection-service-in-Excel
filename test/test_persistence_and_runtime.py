@@ -284,8 +284,10 @@ class RuntimeSafetyTests(unittest.TestCase):
 
         started = {"first": threading.Event(), "second": threading.Event()}
         release = threading.Event()
+        resume_flags = []
 
-        def run_scan(monitor_id: str, _manual: bool) -> None:
+        def run_scan(monitor_id: str, _manual: bool, resume: bool = False) -> None:
+            resume_flags.append((monitor_id, resume))
             started[monitor_id].set()
             release.wait(2)
 
@@ -306,6 +308,15 @@ class RuntimeSafetyTests(unittest.TestCase):
             release.set()
             for thread in threads:
                 thread.join(2)
+            started["first"].clear()
+            self.assertTrue(news_tasks.start_news_scan("first", manual=True, resume=True))
+            self.assertTrue(started["first"].wait(1))
+            with news_lock:
+                resumed_thread = news_tasks.news_scan_threads.get("first")
+            if resumed_thread:
+                resumed_thread.join(2)
+
+        self.assertIn(("first", True), resume_flags)
 
     def test_public_smtp_configuration_never_contains_password(self) -> None:
         from services.news import public_news_configuration

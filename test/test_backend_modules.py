@@ -6,6 +6,28 @@ from unittest.mock import patch
 
 
 class BackendModuleTests(unittest.TestCase):
+    def test_partial_news_result_uses_collected_products_without_more_page_requests(self) -> None:
+        from runtime.news_tasks import build_partial_news_items
+
+        rows = build_partial_news_items(
+            [
+                {
+                    "model": "ABC-1",
+                    "price": "100",
+                    "url": "https://example.test/product/abc-1",
+                }
+            ],
+            {"group": "Маржа", "brand": "Demo"},
+            [
+                {"source_label": "Есть", "codes": {"ABC-1"}},
+                {"source_label": "Нет", "codes": set()},
+            ],
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["model"], "ABC-1")
+        self.assertEqual(rows[0]["missing_on"], "Нет")
+
     def test_core_paths_still_resolve_from_the_repository_root(self) -> None:
         from config import BASE_DIR
 

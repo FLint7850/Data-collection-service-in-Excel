@@ -9,7 +9,7 @@ from sqlalchemy import select
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash
 
-from config import EXPORT_DIR, FEED_DIR, FILE_IMPORT_DIR, PROJECT_PROFILE_DIR, env_str
+from config import EXPORT_DIR, FEED_DIR, FILE_IMPORT_DIR, PROJECT_PROFILE_DIR, SCRAPE_CHECKPOINT_DIR, env_str
 from database.session import SessionLocal, init_db, session_scope
 from models import User
 
@@ -91,6 +91,7 @@ def ensure_storage() -> None:
         EXPORT_DIR.mkdir(exist_ok=True)
         FEED_DIR.mkdir(exist_ok=True)
         FILE_IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+        SCRAPE_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         PROJECT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         init_db()
         ensure_default_user()

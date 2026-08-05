@@ -11,6 +11,7 @@ from services.application import ensure_storage
 from services.connections import normalize_connection_method, public_connection_methods
 from services.normalization import jsonify, normalize_extraction_rules, normalize_patterns, normalize_start_urls, now_iso, output_text
 from services.progress_service import publish_projects_progress_snapshot, register_progress_items
+from services.scraping.checkpoints import delete_scrape_checkpoint
 from services.projects import (
     add_project_log,
     delete_project_record,
@@ -126,6 +127,7 @@ def api_delete_project(project_id: str):
     if isinstance(worker, threading.Thread) and worker.is_alive():
         worker.join(timeout=5)
     delete_project_record(project_id)
+    delete_scrape_checkpoint("projects", project_id)
     publish_projects_progress_snapshot()
     return jsonify({"ok": True})
 
@@ -229,6 +231,7 @@ def api_project_stop(project_id: str):
         )
         project["state"] = state
         save_project(project)
+    delete_scrape_checkpoint("projects", project_id)
     add_project_log(project, "Сбор остановлен", "warning")
     return jsonify(project["state"])
 
@@ -242,6 +245,7 @@ def api_project_restart(project_id: str):
     if isinstance(stop_event, threading.Event):
         stop_event.set()
     close_project_browser_session(project)
+    delete_scrape_checkpoint("projects", project_id)
     worker = project.get("worker_thread")
     if isinstance(worker, threading.Thread) and worker.is_alive():
         with projects_lock:

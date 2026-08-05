@@ -59,6 +59,7 @@ NEWS_MONITOR_SUMMARY_STATE_FIELDS = frozenset(
         "error",
         "started_at",
         "elapsed_seconds",
+        "run_monitor_id",
     }
 )
 

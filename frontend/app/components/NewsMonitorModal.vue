@@ -291,7 +291,11 @@ async function runAction(action: "scan" | "pause" | "resume" | "stop" | "reset-v
       const saved = await save(false);
       if (!saved) return;
     }
-    const response = await newsService.action(draft.value.id, action);
+    const runMonitorId = String(draft.value.state.run_monitor_id || "");
+    const actionMonitorId = action === "scan" || action === "reset-visual"
+      ? draft.value.id
+      : monitors.value.find((item) => String(item.id) === runMonitorId)?.id || draft.value.id;
+    const response = await newsService.action(actionMonitorId, action);
     const index = monitors.value.findIndex((item) => item.id === response.monitor.id);
     const currentMonitor = monitors.value[index];
     if (currentMonitor) {

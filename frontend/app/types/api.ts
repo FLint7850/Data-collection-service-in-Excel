@@ -84,6 +84,7 @@ export interface ScanState {
   started_at?: string;
   finished_at?: string;
   elapsed_seconds: number;
+  run_monitor_id?: string;
   paused_with_result?: boolean;
 }
 

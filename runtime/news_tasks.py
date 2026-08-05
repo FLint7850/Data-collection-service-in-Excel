@@ -22,7 +22,7 @@ from email.message import EmailMessage
 from models import Brand, utc_now
 from pathlib import Path
 from runtime import state as runtime_state
-from runtime.state import FEED_STORAGE_LOCK, NEWS_PROGRESS_FIELDS, feed_snapshot_cache, news_browser_sessions, news_lock, news_scan_threads, news_settings, news_state_persisted_at, news_stop_events, news_stop_modes
+from runtime.state import FEED_STORAGE_LOCK, NEWS_PROGRESS_FIELDS, feed_snapshot_cache, news_browser_sessions, news_crawlers, news_lock, news_scan_threads, news_settings, news_state_persisted_at, news_stop_events, news_stop_modes
 from services.connections import get_donor_row, normalize_connection_method
 from services.normalization import datetime_to_input_value, normalize_emails, normalize_extraction_rules, normalize_model_key, normalize_patterns, normalize_start_urls, output_text, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
 from sqlalchemy import select
@@ -38,7 +38,9 @@ from services.scraping import (
     finalize_scraped_model,
     first_by_selector,
     first_text,
+    product_url_filter_patterns,
 )
+from services.scraping.checkpoints import delete_scrape_checkpoint, load_scrape_checkpoint, save_scrape_checkpoint
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import selectinload
 
@@ -515,7 +517,7 @@ def news_monitor_thread_alive(monitor_id: object) -> bool:
     return isinstance(thread, threading.Thread) and thread.is_alive()
 
 
-def start_news_scan(monitor_id: str, manual: bool) -> bool:
+def start_news_scan(monitor_id: str, manual: bool, resume: bool = False) -> bool:
     monitor_id = str(monitor_id)
 
     def run() -> None:
@@ -524,7 +526,10 @@ def start_news_scan(monitor_id: str, manual: bool) -> bool:
             monitor = get_news_monitor(monitor_id)
             state = monitor.get("state", {}) if monitor else {}
             if monitor and state.get("status") == "queued":
-                scan_news_monitor(monitor_id, manual)
+                if resume:
+                    scan_news_monitor(monitor_id, manual, resume=True)
+                else:
+                    scan_news_monitor(monitor_id, manual)
         finally:
             with news_lock:
                 if news_scan_threads.get(monitor_id) is threading.current_thread():
@@ -704,6 +709,7 @@ def collect_products_for_monitor(
     stop_signal: threading.Event,
     browser_session: BrowserMethodSession,
     connection_method_state: Optional[Dict[str, object]] = None,
+    resume: bool = False,
 ) -> List[Dict[str, str]]:
     from services.projects import parse_thread_count
     finish_signal = threading.Event()
@@ -731,7 +737,7 @@ def collect_products_for_monitor(
             return
         update_news_monitor_state(
             monitor,
-            status="running",
+            status=str(payload.get("status") or "running"),
             stage="Сканирование сайта-донора",
             percent=min(85, int(payload.get("percent", 0) or 0)),
             currenturl=str(payload.get("currenturl", "")),
@@ -745,40 +751,77 @@ def collect_products_for_monitor(
             stall_seconds=int(payload.get("stall_seconds", 0) or 0),
             skipped=int(payload.get("skipped", 0) or 0),
             error=str(payload.get("error", "") or ""),
+            last_warning=str(payload.get("last_warning", "") or ""),
         )
 
-    crawler = CollectOnlyCrawler(
-        start_urls,
-        int(time.time()),
-        stop_signal,
-        finish_signal,
-        parse_thread_count(monitor.get("thread_count", 4)),
-        project=None,
-        exclusions=list(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
-        product_url_filters=list(monitor.get("product_url_filters", [])),
-        product_url_exclusions=list(monitor.get("product_url_exclusions", [])),
-        extraction_rules=normalize_extraction_rules(monitor.get("extraction_rules", {})),
-        connection_method=normalize_connection_method(monitor.get("connection_method")),
-        auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
-        connection_method_state=connection_method_state,
-        allow_empty_price=True,
-        browser_session=browser_session,
-        owns_browser_session=False,
-        progress_callback=progress_callback,
-    )
-    crawler.run()
+    monitor_id = str(monitor.get("id") or "")
+    with news_lock:
+        existing = news_crawlers.get(monitor_id) if resume else None
+    crawler = existing if isinstance(existing, CollectOnlyCrawler) else None
+    resume_with_state = crawler is not None
+    checkpoint = load_scrape_checkpoint("news", monitor_id) if resume and crawler is None else None
+
+    if crawler is None:
+        crawler = CollectOnlyCrawler(
+            start_urls,
+            int(time.time()),
+            stop_signal,
+            finish_signal,
+            parse_thread_count(monitor.get("thread_count", 4)),
+            project=None,
+            exclusions=list(monitor.get("exclusions", DEFAULT_EXCLUSIONS)),
+            product_url_filters=list(monitor.get("product_url_filters", [])),
+            product_url_exclusions=list(monitor.get("product_url_exclusions", [])),
+            extraction_rules=normalize_extraction_rules(monitor.get("extraction_rules", {})),
+            connection_method=normalize_connection_method(monitor.get("connection_method")),
+            auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
+            connection_method_state=connection_method_state,
+            allow_empty_price=True,
+            browser_session=browser_session,
+            owns_browser_session=False,
+            progress_callback=progress_callback,
+        )
+        if checkpoint:
+            resume_with_state = crawler.restore_checkpoint(checkpoint)
+    else:
+        crawler.stop_signal = stop_signal
+        crawler.finish_signal = finish_signal
+        crawler.thread_count = parse_thread_count(monitor.get("thread_count", 4))
+        crawler.exclusions = list(monitor.get("exclusions", DEFAULT_EXCLUSIONS))
+        crawler.extraction_rules = normalize_extraction_rules(monitor.get("extraction_rules", {}))
+        crawler.product_url_filters = product_url_filter_patterns(
+            list(monitor.get("product_url_filters", [])),
+            crawler.extraction_rules,
+        )
+        crawler.product_url_exclusions = normalize_patterns(monitor.get("product_url_exclusions", []))
+        crawler.connection_method = normalize_connection_method(monitor.get("connection_method"))
+        crawler.auto_connection_fallback = bool(monitor.get("auto_connection_fallback", True))
+        crawler.connection_method_state = connection_method_state or crawler.connection_method_state
+        crawler.active_connection_method = crawler.connection_method
+        crawler.browser_session = browser_session
+        crawler.owns_browser_session = False
+        crawler.progress_callback = progress_callback
+        crawler.excel_finalized = False
+
+    with news_lock:
+        news_crawlers[monitor_id] = crawler
+    if resume and not resume_with_state:
+        from services.news import add_news_log
+        add_news_log(monitor, "Checkpoint продолжения не найден; сканирование будет запущено заново", "warning")
+    crawler.run(resume=resume_with_state)
     products = crawler.snapshot_results()
-    if crawler.fatal_error:
-        message = f"{crawler.fatal_error}. Промежуточно хранится в памяти товаров: {len(products)}."
+    if crawler.recovery_pause_reason:
+        with news_lock:
+            news_stop_modes[monitor_id] = "pause"
         update_news_monitor_state(
             monitor,
-            status="error",
-            error=message,
+            status="pausing",
+            error="",
+            last_warning=crawler.recovery_pause_reason,
             found_products=len(products),
             in_memory_products=len(products),
             currenturl="",
         )
-        raise RuntimeError(message)
     return products
 
 
@@ -967,6 +1010,43 @@ def feed_missing_labels(keys: Set[str], feed_code_sets: List[Dict[str, object]])
     return missing_feeds
 
 
+def build_partial_news_items(
+    products: List[Dict[str, str]],
+    monitor: Dict[str, object],
+    feed_code_sets: List[Dict[str, object]],
+) -> List[Dict[str, str]]:
+    """Build a valid best-effort news result without making more page requests."""
+    rows: List[Dict[str, str]] = []
+    seen_models: Set[str] = set()
+    for product in products:
+        keys = product_compare_keys(product)
+        if not keys:
+            continue
+        missing_feeds = feed_missing_labels(keys, feed_code_sets)
+        if not missing_feeds:
+            continue
+        model = str(product.get("model") or "").strip()
+        dedupe_key = model.casefold() or str(product.get("url") or "").strip()
+        if not dedupe_key or dedupe_key in seen_models:
+            continue
+        seen_models.add(dedupe_key)
+        rows.append(
+            {
+                "date_found": datetime.now(MSK_TZ).strftime("%d.%m.%Y %H:%M:%S"),
+                "group": str(monitor.get("group") or ""),
+                "brand": str(monitor.get("brand") or ""),
+                "name": str(product.get("name") or model),
+                "model": model,
+                "price": str(product.get("price") or ""),
+                "availability": str(product.get("availability") or ""),
+                "missing_on": ", ".join(missing_feeds),
+                "missing_on_count": str(len(missing_feeds)),
+                "url": str(product.get("url") or ""),
+            }
+        )
+    return rows
+
+
 def news_monitor_profile_storage_dir(monitor: Dict[str, object]) -> Path:
     monitor_id = safe_filename(str(monitor.get("id") or monitor.get("brand") or "monitor"))
     return PROJECT_PROFILE_DIR / "news" / monitor_id
@@ -1118,7 +1198,7 @@ def send_news_email(
     return True
 
 
-def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
+def scan_news_monitor(monitor_id: str, manual: bool = False, resume: bool = False) -> None:
     from services.news import add_news_log, delete_news_csv_for_monitor, get_news_monitor, make_news_state, save_news_monitor
     from services.projects import parse_thread_count
     monitor = get_news_monitor(monitor_id)
@@ -1126,6 +1206,12 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         return
     refresh_monitor_schedule_from_brand(monitor)
     started = time.time()
+    previous_state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+    resume_elapsed = int(previous_state.get("elapsed_seconds", 0) or 0) if resume else 0
+    if not resume:
+        with news_lock:
+            news_crawlers.pop(str(monitor_id), None)
+        delete_scrape_checkpoint("news", monitor_id)
     stop_event = get_news_stop_event(monitor_id)
     stop_event.clear()
     with news_lock:
@@ -1163,6 +1249,8 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             **make_news_state("running"),
             "stage": "Подготовка",
             "started_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+            "elapsed_seconds": resume_elapsed,
+            "run_monitor_id": str(monitor_id),
         }
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
@@ -1184,6 +1272,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             stop_event,
             browser_session,
             connection_method_state,
+            resume=resume,
         )
         check_stop_requested()
         add_news_log(monitor, "Сбор закончил", "info")
@@ -1260,7 +1349,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         update_news_monitor_state(monitor, stage="Формирование CSV", percent=99, currenturl="")
         csv_path = create_news_csv(new_items, monitor)
         delete_news_csv_for_monitor(monitor, keep_filename=csv_path.name)
-        elapsed = int(time.time() - started)
+        elapsed = resume_elapsed + int(time.time() - started)
         with news_lock:
             monitor["known_new_products"] = known
             monitor["state"] = {
@@ -1290,6 +1379,9 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             if normalize_schedule_type(monitor.get("schedule_type")) != "once":
                 monitor["next_run_at"] = update_brand_next_run_at(monitor.get("brand_id"))
             save_news_monitor(monitor)
+        delete_scrape_checkpoint("news", monitor_id)
+        with news_lock:
+            news_crawlers.pop(str(monitor_id), None)
         add_news_log(monitor, f"Сканирование завершено. Найдено новинок: {len(new_items)}. CSV: {csv_path.name}", "success")
         update_brand_scan_state(
             "donor",
@@ -1308,21 +1400,44 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
         if new_items:
             send_news_email(monitor, len(new_items), missing_summary=missing_summary)
     except NewsScanStopped:
-        elapsed = int(time.time() - started)
+        elapsed = resume_elapsed + int(time.time() - started)
         with news_lock:
             stop_mode = news_stop_modes.get(monitor_id, "stop")
+            crawler = news_crawlers.get(str(monitor_id))
         partial_csv = ""
-        if stop_mode == "pause" and new_items:
+        recovery_reason = (
+            crawler.recovery_pause_reason
+            if isinstance(crawler, CollectOnlyCrawler) and crawler.recovery_pause_reason
+            else "Сканирование приостановлено с сохранением промежуточного результата."
+        )
+        if stop_mode == "pause" and isinstance(crawler, CollectOnlyCrawler):
+            save_scrape_checkpoint("news", monitor_id, crawler.checkpoint_payload())
+        if stop_mode == "pause" and products:
+            try:
+                if not feed_code_sets:
+                    _all_codes, local_feeds, feed_code_sets = fetch_existing_vendor_code_sets()
+                new_items = build_partial_news_items(products, monitor, feed_code_sets)
+            except Exception as partial_error:
+                add_news_log(monitor, f"Не удалось полностью сравнить промежуточный результат: {partial_error}", "warning")
+        if stop_mode == "pause":
             partial_path = create_news_csv(new_items, monitor)
             partial_csv = partial_path.name
             delete_news_csv_for_monitor(monitor, keep_filename=partial_csv)
+        else:
+            delete_scrape_checkpoint("news", monitor_id)
+            with news_lock:
+                news_crawlers.pop(str(monitor_id), None)
         missing_summary = build_missing_summary(new_items, feed_code_sets) if feed_code_sets else []
+        outstanding = 0
+        if isinstance(crawler, CollectOnlyCrawler):
+            outstanding = crawler.queue.qsize() + len(crawler.deferred_urls)
         with news_lock:
             monitor["state"] = {
                 **monitor.get("state", {}),
                 "status": "partial" if stop_mode == "pause" else "idle",
                 "stage": "Приостановлено" if stop_mode == "pause" else "Ожидание",
                 "error": "",
+                "last_warning": recovery_reason if stop_mode == "pause" else "",
                 "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
                 "elapsed_seconds": elapsed,
                 "currenturl": "",
@@ -1333,7 +1448,7 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
                 "found_products": len(products),
                 "in_memory_products": len(products),
                 "availability_skipped": availability_skipped,
-                "queue_size": int(monitor.get("state", {}).get("queue_size", 0) or 0),
+                "queue_size": outstanding if stop_mode == "pause" else 0,
                 "active_tasks": 0,
                 "active_urls": [],
             }
@@ -1354,7 +1469,10 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             data={"csv": partial_csv, "availability_skipped": availability_skipped},
         )
     except Exception as exc:
-        elapsed = int(time.time() - started)
+        elapsed = resume_elapsed + int(time.time() - started)
+        delete_scrape_checkpoint("news", monitor_id)
+        with news_lock:
+            news_crawlers.pop(str(monitor_id), None)
         with news_lock:
             monitor["state"] = {
                 **monitor.get("state", {}),
@@ -1390,6 +1508,9 @@ def scan_news_monitor(monitor_id: str, manual: bool = False) -> None:
             thread = news_scan_threads.get(monitor_id)
             if thread is threading.current_thread():
                 news_scan_threads.pop(monitor_id, None)
+            state = monitor.get("state", {}) if isinstance(monitor.get("state"), dict) else {}
+            if state.get("status") != "partial":
+                news_crawlers.pop(str(monitor_id), None)
         stop_event.clear()
 
 

@@ -12,6 +12,7 @@ from services.scraping import (
     ProductSiteCrawler,
     product_url_filter_patterns,
 )
+from services.scraping.checkpoints import delete_scrape_checkpoint, load_scrape_checkpoint
 
 
 def close_project_browser_session(project: Dict[str, object]) -> None:
@@ -69,6 +70,12 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
     project["run_id"] = int(project.get("run_id", 0)) + 1
 
     crawler = project.get("crawler") if resume else None
+    resume_with_state = bool(crawler)
+    checkpoint = None
+    if resume and not crawler:
+        checkpoint = load_scrape_checkpoint("projects", project.get("id"))
+    elif not resume:
+        delete_scrape_checkpoint("projects", project.get("id"))
     profile_dir = project_browser_profile_dir(project)
     runtime_thread_count = project_runtime_thread_count(project)
     if crawler:
@@ -118,15 +125,19 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             profile_dir=profile_dir,
         )
         project["crawler"] = crawler
+        if checkpoint:
+            resume_with_state = crawler.restore_checkpoint(checkpoint)
+        if resume and not resume_with_state:
+            add_project_log(project, "Checkpoint продолжения не найден; сбор будет запущен заново", "warning")
 
     def target() -> None:
         from services.projects import add_project_log, reset_project_state, update_project_state
         try:
-            if resume:
+            if resume_with_state:
                 update_project_state(project, status="running", error="")
             else:
                 reset_project_state(project, "running")
-            crawler.run(resume=resume)
+            crawler.run(resume=resume_with_state)
         except Exception as exc:  # noqa: BLE001
             update_project_state(project, status="error", error=str(exc), currenturl="", download_ready=False)
             add_project_log(project, f"Критическая ошибка: {exc}", "error")
@@ -142,5 +153,5 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
     )
     project["worker_thread"] = thread
     thread.start()
-    add_project_log(project, "Продолжение запущено" if resume else "Сбор запущен", "info")
+    add_project_log(project, "Продолжение запущено" if resume_with_state else "Сбор запущен", "info")
     return project["state"]

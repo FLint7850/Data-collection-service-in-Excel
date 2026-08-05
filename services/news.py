@@ -116,6 +116,7 @@ def make_news_state(status: str = "idle") -> Dict[str, object]:
         "started_at": "",
         "finished_at": "",
         "elapsed_seconds": 0,
+        "run_monitor_id": "",
         "next_run_at": "",
     }
 

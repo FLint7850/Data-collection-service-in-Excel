@@ -257,6 +257,8 @@ def reset_project_state_after_form_save(project: Dict[str, object]) -> None:
         return
     project["crawler"] = None
     project["stop_mode"] = ""
+    from services.scraping.checkpoints import delete_scrape_checkpoint
+    delete_scrape_checkpoint("projects", project.get("id"))
     reset_project_state(project, "idle")
 
 

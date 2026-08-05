@@ -21,9 +21,127 @@ from services.scraping.browser import (
 from services.scraping.extraction import extract_listing_products
 from services.scraping.fallback import ProductSiteCrawler
 from services.scraping.http import looks_blocked_or_empty
+from services.scraping.checkpoints import delete_scrape_checkpoint, load_scrape_checkpoint, save_scrape_checkpoint
 
 
 class ScrapingBoundaryTests(unittest.TestCase):
+    def make_recording_crawler(self):
+        class FakeBrowserSession:
+            def close(self):
+                return None
+
+        class RecordingCrawler(ProductSiteCrawler):
+            def __init__(self):
+                super().__init__(
+                    ["https://example.test/catalog/"],
+                    1,
+                    threading.Event(),
+                    threading.Event(),
+                    1,
+                    browser_session=FakeBrowserSession(),
+                )
+                self.state_updates = []
+                self.finished_partials = []
+
+            def update_state(self, **kwargs):
+                self.state_updates.append(kwargs)
+
+            def log(self, _message, _level="info"):
+                return None
+
+            def finish_with_excel(self, partial=False):
+                self.finished_partials.append(partial)
+
+        return RecordingCrawler()
+
+    def test_failed_url_is_deferred_and_auto_pauses_with_partial_result(self) -> None:
+        crawler = self.make_recording_crawler()
+
+        with (
+            patch.object(crawler, "fetch", return_value=None) as fetch,
+            patch("services.scraping.fallback.REQUEST_DELAY_SECONDS", 0),
+        ):
+            crawler.run()
+
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(crawler.deferred_urls, {"https://example.test/catalog/"})
+        self.assertTrue(crawler.stop_signal.is_set())
+        self.assertTrue(crawler.recovery_pause_reason)
+        self.assertEqual(crawler.finished_partials, [True])
+        self.assertTrue(any(state.get("status") == "pausing" for state in crawler.state_updates))
+
+    def test_resume_retries_deferred_url_without_rescanning_visited_urls(self) -> None:
+        crawler = self.make_recording_crawler()
+        crawler.deferred_urls.add("https://example.test/catalog/")
+        crawler.visited.update(
+            {
+                "https://example.test/catalog/",
+                "https://example.test/already-done/",
+            }
+        )
+        crawler.failed_attempts["https://example.test/catalog/"] = 3
+        crawler.stop_signal = threading.Event()
+        crawler.finish_signal = threading.Event()
+
+        with (
+            patch.object(crawler, "fetch", return_value="<html><body>ok</body></html>") as fetch,
+            patch.object(crawler, "process_page"),
+            patch("services.scraping.fallback.REQUEST_DELAY_SECONDS", 0),
+        ):
+            crawler.run(resume=True)
+
+        self.assertEqual(
+            [call.args[0] for call in fetch.call_args_list],
+            ["https://example.test/catalog/"],
+        )
+        self.assertNotIn("https://example.test/catalog/", crawler.deferred_urls)
+        self.assertIn("https://example.test/already-done/", crawler.visited)
+        self.assertEqual(crawler.finished_partials, [False])
+
+    def test_stall_requests_recoverable_pause_instead_of_fatal_error(self) -> None:
+        crawler = self.make_recording_crawler()
+
+        crawler.mark_stalled(["https://example.test/slow/"])
+
+        self.assertTrue(crawler.stop_signal.is_set())
+        self.assertTrue(crawler.recovery_pause_reason)
+        self.assertEqual(crawler.fatal_error, "")
+        self.assertTrue(any(state.get("status") == "pausing" for state in crawler.state_updates))
+
+    def test_crawler_checkpoint_round_trip_preserves_resume_queue_and_results(self) -> None:
+        crawler = self.make_recording_crawler()
+        crawler.enqueue("https://example.test/pending/", force=True)
+        crawler.deferred_urls.add("https://example.test/retry/")
+        crawler.visited.add("https://example.test/done/")
+        crawler.results.append(
+            {"url": "https://example.test/product/1", "model": "ABC-1", "price": "100"}
+        )
+        crawler.result_urls.add("https://example.test/product/1")
+        payload = crawler.checkpoint_payload()
+
+        restored = self.make_recording_crawler()
+
+        self.assertTrue(restored.restore_checkpoint(payload))
+        self.assertEqual(restored.deferred_urls, {"https://example.test/retry/"})
+        self.assertIn("https://example.test/done/", restored.visited)
+        self.assertEqual(restored.snapshot_results(), crawler.snapshot_results())
+        self.assertEqual(restored.queue.get_nowait(), "https://example.test/pending/")
+
+    def test_scrape_checkpoint_file_is_atomic_and_removable(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("services.scraping.checkpoints.SCRAPE_CHECKPOINT_DIR", root):
+                path = save_scrape_checkpoint(
+                    "news",
+                    "42",
+                    {"queued_urls": ["https://example.test/retry/"]},
+                )
+                loaded = load_scrape_checkpoint("news", "42")
+                delete_scrape_checkpoint("news", "42")
+
+        self.assertEqual(loaded["queued_urls"], ["https://example.test/retry/"])
+        self.assertFalse(path.exists())
+
     def test_url_normalization_drops_tracking_but_preserves_pagination(self) -> None:
         result = normalize_url(
             "/catalog/?page=2&utm_source=test",
