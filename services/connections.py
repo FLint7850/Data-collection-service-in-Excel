@@ -39,12 +39,19 @@ def load_connection_methods(force_refresh: bool = False) -> List[Dict[str, objec
                 "is_debug_visible": bool(row.is_debug_visible),
             })
     except Exception as error:
-        append_unified_log({
-            "project_id": "system",
-            "project_name": "system",
-            "level": "warning",
-            "message": f"Не удалось прочитать способы подключения из БД: {error}",
-        })
+        # This lookup can run before the database bootstrap (for example while
+        # importing isolated modules in a clean build environment).  Failure to
+        # persist the warning must not hide the original recoverable lookup
+        # failure or prevent the built-in Requests fallback below.
+        try:
+            append_unified_log({
+                "project_id": "system",
+                "project_name": "system",
+                "level": "warning",
+                "message": f"Не удалось прочитать способы подключения из БД: {error}",
+            })
+        except Exception:
+            pass
 
     if not methods:
         methods = [{

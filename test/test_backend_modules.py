@@ -6,6 +6,19 @@ from unittest.mock import patch
 
 
 class BackendModuleTests(unittest.TestCase):
+    def test_connection_catalog_fallback_survives_uninitialized_log_table(self) -> None:
+        from runtime.state import connection_method_cache
+        from services.connections import load_connection_methods
+
+        with (
+            patch.dict(connection_method_cache, {"methods": [], "loaded_at": 0.0}, clear=True),
+            patch("services.connections.session_scope", side_effect=RuntimeError("database is not initialized")),
+            patch("services.log_service.append_unified_log", side_effect=RuntimeError("log table is not initialized")),
+        ):
+            methods = load_connection_methods(force_refresh=True)
+
+        self.assertEqual([method["code"] for method in methods], ["requests"])
+
     def test_partial_news_result_uses_collected_products_without_more_page_requests(self) -> None:
         from runtime.news_tasks import build_partial_news_items
 

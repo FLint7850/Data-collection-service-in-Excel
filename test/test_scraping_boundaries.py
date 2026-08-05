@@ -52,7 +52,11 @@ class ScrapingBoundaryTests(unittest.TestCase):
             def finish_with_excel(self, partial=False):
                 self.finished_partials.append(partial)
 
-        return RecordingCrawler()
+        # These crawler-boundary tests do not exercise the database-backed
+        # connection-method catalog.  Keep them independent from application
+        # bootstrap so they also run in a clean Docker build without app.db.
+        with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):
+            return RecordingCrawler()
 
     def test_failed_url_is_deferred_and_auto_pauses_with_partial_result(self) -> None:
         crawler = self.make_recording_crawler()
