@@ -57,6 +57,8 @@ NEWS_MONITOR_SUMMARY_STATE_FIELDS = frozenset(
         "last_warning",
         "last_scan_at",
         "error",
+        "started_at",
+        "elapsed_seconds",
     }
 )
 

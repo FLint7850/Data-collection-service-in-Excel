@@ -15,19 +15,9 @@ const emit = defineEmits<{
   remove: [];
 }>();
 
-const comparisonTotal = computed(() =>
-  Number(props.state.candidate_products || props.state.found_products || 0),
+const progress = computed(() =>
+  Math.max(0, Math.min(100, Number(props.state.percent || 0))),
 );
-const comparisonDone = computed(() => Number(props.state.compared_products || 0));
-const progress = computed(() => {
-  if (comparisonTotal.value > 0) {
-    return Math.max(
-      0,
-      Math.min(100, Math.round((comparisonDone.value / comparisonTotal.value) * 100)),
-    );
-  }
-  return Math.max(0, Math.min(100, Number(props.state.percent || 0)));
-});
 const missingFeeds = computed(() => props.state.missing_by_feed || []);
 const isActive = computed(() =>
   ["running", "queued", "pausing", "stopping"].includes(props.state.status),
@@ -102,7 +92,7 @@ const hasDiagnostics = computed(() =>
 
     <div class="news-card-progress">
       <div>
-        <span>{{ comparisonTotal ? "Прогресс сравнения" : "Прогресс" }}</span>
+        <span>Прогресс</span>
         <strong>{{ progress }}%</strong>
       </div>
       <UProgress :model-value="progress" color="primary" size="xs" />

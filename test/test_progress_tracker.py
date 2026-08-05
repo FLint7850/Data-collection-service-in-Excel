@@ -148,6 +148,7 @@ class ApiDtoTests(unittest.TestCase):
             "active_urls": ["https://example.test/product"],
             "currenturl": "https://example.test/product",
             "started_at": "2026-07-31T12:00:00+03:00",
+            "elapsed_seconds": 15,
         }
 
         summary = news_monitor_state_dto(state, include_details=False)
@@ -156,7 +157,8 @@ class ApiDtoTests(unittest.TestCase):
         self.assertIn("missing_by_feed", summary)
         self.assertNotIn("active_urls", summary)
         self.assertNotIn("currenturl", summary)
-        self.assertNotIn("started_at", summary)
+        self.assertEqual(summary["started_at"], "2026-07-31T12:00:00+03:00")
+        self.assertEqual(summary["elapsed_seconds"], 15)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,73 @@ const props = withDefaults(
   { showNewsSummary: true },
 );
 
+const ACTIVE_ELAPSED_STATUSES = new Set([
+  "running",
+  "queued",
+  "pausing",
+  "stopping",
+]);
+
 const percent = computed(() => Math.max(0, Math.min(100, Number(props.state.percent || 0))));
+const elapsedClock = ref(Date.now());
+const elapsedAnchorSeconds = ref(Math.max(0, Number(props.state.elapsed_seconds || 0)));
+const elapsedAnchorAt = ref(Date.now());
+let elapsedRun = String(props.state.started_at || "");
+let elapsedWasActive = ACTIVE_ELAPSED_STATUSES.has(props.state.status);
+let elapsedTimer: ReturnType<typeof setInterval> | undefined;
+
+function activeElapsedStatus(status: string) {
+  return ACTIVE_ELAPSED_STATUSES.has(status);
+}
+
+function anchoredElapsed(now: number) {
+  if (!elapsedWasActive) return elapsedAnchorSeconds.value;
+  return elapsedAnchorSeconds.value + Math.max(
+    0,
+    Math.floor((now - elapsedAnchorAt.value) / 1000),
+  );
+}
+
+const displayedElapsedSeconds = computed(() => {
+  const incoming = Math.max(0, Number(props.state.elapsed_seconds || 0));
+  if (!activeElapsedStatus(props.state.status)) return incoming;
+  return Math.max(incoming, anchoredElapsed(elapsedClock.value));
+});
+
+watch(
+  [
+    () => props.state.elapsed_seconds,
+    () => props.state.started_at,
+    () => props.state.status,
+  ],
+  ([elapsedValue, startedAt, status]) => {
+    const now = Date.now();
+    const incoming = Math.max(0, Number(elapsedValue || 0));
+    const run = String(startedAt || "");
+    const active = activeElapsedStatus(String(status || ""));
+    const current = anchoredElapsed(now);
+
+    if (run !== elapsedRun || (!elapsedWasActive && active) || !active || incoming > current) {
+      elapsedAnchorSeconds.value = incoming;
+      elapsedAnchorAt.value = now;
+    }
+
+    elapsedRun = run;
+    elapsedWasActive = active;
+    elapsedClock.value = now;
+  },
+);
+
+onMounted(() => {
+  elapsedTimer = setInterval(() => {
+    if (activeElapsedStatus(props.state.status)) elapsedClock.value = Date.now();
+  }, 1000);
+});
+
+onBeforeUnmount(() => {
+  if (elapsedTimer) clearInterval(elapsedTimer);
+});
+
 const activeUrls = computed(() =>
   (props.state.active_urls || []).filter((url): url is string => Boolean(url?.trim())),
 );
@@ -97,7 +163,7 @@ const hasDiagnostics = computed(() =>
     <div class="progress-time-grid">
       <div>
         <span>Прошло</span>
-        <strong>{{ formatDuration(state.elapsed_seconds) }}</strong>
+        <strong>{{ formatDuration(displayedElapsedSeconds) }}</strong>
       </div>
       <div v-if="state.last_scan_at">
         <span class="flex gap-1 align-center items-center">
