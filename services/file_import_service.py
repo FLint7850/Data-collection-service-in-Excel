@@ -18,7 +18,7 @@ from runtime.state import file_import_lock, file_import_stop_event, file_import_
 from services.normalization import normalize_file_import_exclusions, normalize_file_import_rules_text, normalize_model_key, output_text, safe_filename
 from services.domain_revisions import domain_revision
 from sqlalchemy import select
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 from services.scraping import clean_text, prepare_rule_model
 
 
@@ -504,10 +504,15 @@ def brand_match_pattern(brand: str) -> str:
     return r"\s*&\s*".join(parts) if "&" in brand else r"\s+".join(parts)
 
 
-def find_brand_in_name(name: str, explicit_brand: str = "") -> str:
+def find_brand_in_name(
+    name: str,
+    explicit_brand: str = "",
+    known_brands: Optional[Sequence[str]] = None,
+) -> str:
     if explicit_brand:
         return explicit_brand
-    for brand in known_file_import_brands():
+    brands = known_brands if known_brands is not None else known_file_import_brands()
+    for brand in brands:
         pattern = brand_match_pattern(brand)
         if pattern and re.search(rf"(?<![A-Za-zА-Яа-яЁё0-9]){pattern}(?![A-Za-zА-Яа-яЁё0-9])", name, flags=re.IGNORECASE):
             return brand
@@ -637,9 +642,13 @@ def code_model_tokens(value: str) -> List[str]:
     return result
 
 
-def generate_model_candidates(name: str, brand: str = "") -> List[str]:
+def generate_model_candidates(
+    name: str,
+    brand: str = "",
+    known_brands: Optional[Sequence[str]] = None,
+) -> List[str]:
     cleaned = strip_file_import_non_model_phrases(technical_clean_model_text(name))
-    detected_brand = find_brand_in_name(cleaned, brand)
+    detected_brand = find_brand_in_name(cleaned, brand, known_brands)
     tail = tail_after_brand(cleaned, detected_brand)
     main_part = re.split(r"[,;|]", tail, maxsplit=1)[0]
     before_russian_description = candidate_until_russian_description(main_part)

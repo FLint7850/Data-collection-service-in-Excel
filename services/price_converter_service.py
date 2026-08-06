@@ -334,6 +334,22 @@ def normalize_price(value: object) -> str:
     return re.sub(r"\D+", "", cell_text(value))
 
 
+def extract_price_converter_model(
+    value: object,
+    known_brands: Sequence[str],
+) -> str:
+    source_model = cell_text(value)
+    if not source_model:
+        return ""
+    from services.file_import_service import generate_model_candidates
+
+    candidates = generate_model_candidates(
+        source_model,
+        known_brands=known_brands,
+    )
+    return candidates[0] if candidates else source_model
+
+
 def _header_indexes(
     row: Sequence[object],
     model_field: str,
@@ -371,6 +387,7 @@ def _write_sheet_rows(
     promo_field: str = "",
     promo_start_date: Optional[date] = None,
     promo_end_date: Optional[date] = None,
+    known_brands: Sequence[str] = (),
 ) -> Optional[int]:
     indexes = None
     for row in rows:
@@ -383,7 +400,10 @@ def _write_sheet_rows(
     model_index, price_index, promo_index = indexes
     written = 0
     for row in rows:
-        model = cell_text(row[model_index] if model_index < len(row) else None)
+        model = extract_price_converter_model(
+            row[model_index] if model_index < len(row) else None,
+            known_brands,
+        )
         if not model:
             continue
         price = normalize_price(row[price_index] if price_index < len(row) else None)
@@ -440,6 +460,7 @@ def _convert_sheet_sources(
     promo_field: str = "",
     promo_start_date: Optional[date] = None,
     promo_end_date: Optional[date] = None,
+    known_brands: Sequence[str] = (),
 ) -> Dict[str, int]:
     matched = 0
     skipped = 0
@@ -453,6 +474,7 @@ def _convert_sheet_sources(
             promo_field,
             promo_start_date,
             promo_end_date,
+            known_brands,
         )
         if sheet_written is None:
             skipped += 1
@@ -510,6 +532,9 @@ def convert_price_source(
     promo_start_date = (
         normalize_promo_date(conversion_date) or datetime.now(MSK_TZ).date()
     )
+    from services.file_import_service import known_file_import_brands
+
+    known_brands = known_file_import_brands()
     suffix = source_path.suffix.lower()
     if suffix not in PRICE_CONVERTER_ALLOWED_SUFFIXES:
         raise ValueError("Можно обработать только CSV, XLS или XLSX")
@@ -544,6 +569,7 @@ def convert_price_source(
                     promo_field=promo_field,
                     promo_start_date=promo_start_date,
                     promo_end_date=normalized_promo_date,
+                    known_brands=known_brands,
                 )
             elif suffix == ".xlsx":
                 from openpyxl import load_workbook
@@ -568,6 +594,7 @@ def convert_price_source(
                         promo_field=promo_field,
                         promo_start_date=promo_start_date,
                         promo_end_date=normalized_promo_date,
+                        known_brands=known_brands,
                     )
                 finally:
                     workbook.close()
@@ -594,6 +621,7 @@ def convert_price_source(
                         promo_field=promo_field,
                         promo_start_date=promo_start_date,
                         promo_end_date=normalized_promo_date,
+                        known_brands=known_brands,
                     )
                 finally:
                     workbook.release_resources()

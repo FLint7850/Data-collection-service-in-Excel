@@ -234,6 +234,38 @@ class PriceConverterTests(unittest.TestCase):
             ],
         )
 
+    def test_model_candidates_are_applied_without_removing_duplicate_rows(self) -> None:
+        from openpyxl import Workbook
+        from services.price_converter_service import convert_price_source
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "models.xlsx"
+            output = Path(directory) / "result.csv"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Модель", "Цена"])
+            sheet.append(["CS6T-23038\nчерное стекло", 100])
+            sheet.append(["CS6T-23038 платина", 200])
+            sheet.append(["OCM64BSH Компактный духовой шкаф ASKO", 300])
+            sheet.append(["12345", 400])
+            workbook.save(source)
+            workbook.close()
+
+            result = convert_price_source(source, output, "Модель", "Цена")
+            rows = output.read_text(encoding="utf-8-sig").splitlines()
+
+        self.assertEqual(result["rows_written"], 4)
+        self.assertEqual(
+            rows,
+            [
+                "_MODEL_;_PRICE_",
+                "CS6T-23038;100",
+                "CS6T-23038;200",
+                "OCM64BSH;300",
+                "12345;400",
+            ],
+        )
+
     def test_promo_field_and_date_must_be_configured_together(self) -> None:
         from services.price_converter_service import normalize_promo_settings
 
