@@ -109,6 +109,7 @@ def botasaurus_browser_executable(prefer_headless_shell: bool = True) -> Optiona
 FEED_DIR = env_path("FEED_DIR", "feeds")
 EXPORT_DIR = env_path("EXPORT_DIR", "exports")
 FILE_IMPORT_DIR = env_path("FILE_IMPORT_DIR", "storage/file-import")
+PRICE_CONVERTER_DIR = env_path("PRICE_CONVERTER_DIR", "storage/price-converter")
 SCRAPE_CHECKPOINT_DIR = env_path("SCRAPE_CHECKPOINT_DIR", "storage/checkpoints")
 PROJECT_PROFILE_DIR = BASE_DIR / "profiles" / "projects"
 
@@ -169,6 +170,7 @@ STATIC_BROWSER_RENDER_METHODS = {
 }
 
 FILE_IMPORT_ALLOWED_SUFFIXES = {".csv", ".xlsx", ".xls"}
+PRICE_CONVERTER_ALLOWED_SUFFIXES = set(FILE_IMPORT_ALLOWED_SUFFIXES)
 FILE_IMPORT_ACTIVE_STATUSES = {"queued", "running"}
 FILE_IMPORT_RESULT_FIELDS = ["row", "name", "price", "brand", "model_candidates", "selected_model", "missing_on"]
 FEED_COMPARISON_ACTIVE_STATUSES = {"queued", "running"}

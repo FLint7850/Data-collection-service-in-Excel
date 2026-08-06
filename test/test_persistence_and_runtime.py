@@ -4,7 +4,9 @@ import unittest
 import zipfile
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from sqlalchemy import create_engine, inspect, text
@@ -13,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from database.repositories.projects import delete_project, update_project
 from config import MSK_TZ
-from models import Base, Brand, FileImport, Project
+from models import Base, Brand, FileImport, PriceConverter, Project
 from runtime.state import news_lock, news_settings
 from services.file_validation import validate_xlsx_archive
 
@@ -154,6 +156,219 @@ class SupplierFeedConfigurationTests(unittest.TestCase):
         )
 
 
+class PriceConverterTests(unittest.TestCase):
+    def test_price_cleanup_keeps_only_digits_without_float_dot_zero(self) -> None:
+        from services.price_converter_service import normalize_price
+
+        self.assertEqual(normalize_price("49 490"), "49490")
+        self.assertEqual(normalize_price("49 490Р"), "49490")
+        self.assertEqual(normalize_price("49590руб"), "49590")
+        self.assertEqual(normalize_price(49490.0), "49490")
+        self.assertEqual(normalize_price(11674.16), "1167416")
+
+    def test_xlsx_finds_headers_on_each_matching_sheet_and_skips_service_sheets(self) -> None:
+        from openpyxl import Workbook
+        from services.price_converter_service import convert_price_source
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source.xlsx"
+            output = Path(directory) / "result.csv"
+            workbook = Workbook()
+            first = workbook.active
+            first.title = "Основной"
+            first.append(["Прайс поставщика"])
+            first.append([])
+            first.append(["Модель", "Цена"])
+            first.append(["Винные шкафы MEYVEL (Италия)", None])
+            first.append(["A-1", "49 490 руб."])
+            service = workbook.create_sheet("Пиктограммы")
+            service.append(["Описание", "Картинка"])
+            second = workbook.create_sheet("Дополнительный")
+            second.append(["Название", "Цена", "Модель"])
+            second.append(["Товар", 59990.0, "B-2"])
+            workbook.save(source)
+            workbook.close()
+
+            result = convert_price_source(source, output, "Модель", "Цена")
+            rows = output.read_text(encoding="utf-8-sig").splitlines()
+
+        self.assertEqual(result, {"rows_written": 2, "matched_sheets": 2, "skipped_sheets": 1})
+        self.assertEqual(rows, ["_MODEL_;_PRICE_", "A-1;49490", "B-2;59990"])
+
+    def test_optional_promo_adds_special_column_and_cleans_promo_price(self) -> None:
+        from openpyxl import Workbook
+        from services.price_converter_service import convert_price_source
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "promo.xlsx"
+            output = Path(directory) / "result.csv"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Прайс поставщика"])
+            sheet.append(["Модель", "Цена", "Промо цена"])
+            sheet.append(["A-1", "9 990 руб.", "7 999 руб."])
+            sheet.append(["B-2", 11990, "9 999 ₽"])
+            sheet.append(["C-3", 12990, None])
+            workbook.save(source)
+            workbook.close()
+
+            result = convert_price_source(
+                source,
+                output,
+                "Модель",
+                "Цена",
+                promo_field="Промо цена",
+                promo_date="2026-09-01",
+                conversion_date=date(2026, 8, 5),
+            )
+            rows = output.read_text(encoding="utf-8-sig").splitlines()
+
+        self.assertEqual(result["rows_written"], 3)
+        self.assertEqual(
+            rows,
+            [
+                "_MODEL_;_PRICE_;_SPECIAL_",
+                "A-1;9990;1,1,7999,2026-08-05,2026-09-01",
+                "B-2;11990;1,1,9999,2026-08-05,2026-09-01",
+                "C-3;12990;",
+            ],
+        )
+
+    def test_promo_field_and_date_must_be_configured_together(self) -> None:
+        from services.price_converter_service import normalize_promo_settings
+
+        with self.assertRaisesRegex(ValueError, "заполнены вместе"):
+            normalize_promo_settings("Промо", None)
+        with self.assertRaisesRegex(ValueError, "заполнены вместе"):
+            normalize_promo_settings("", "2026-09-01")
+        self.assertEqual(normalize_promo_settings("", ""), ("", None))
+
+    def test_specific_sheet_requires_both_headers_on_that_sheet(self) -> None:
+        from openpyxl import Workbook
+        from services.price_converter_service import convert_price_source
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source.xlsx"
+            output = Path(directory) / "result.csv"
+            workbook = Workbook()
+            workbook.active.append(["Модель", "Описание"])
+            second = workbook.create_sheet("Данные")
+            second.append(["Модель", "Цена"])
+            second.append(["B-2", 100])
+            workbook.save(source)
+            workbook.close()
+
+            with self.assertRaisesRegex(ValueError, "листе №1"):
+                convert_price_source(source, output, "Модель", "Цена", 1)
+            result = convert_price_source(source, output, "Модель", "Цена", 2)
+
+        self.assertEqual(result["rows_written"], 1)
+
+    def test_date_header_can_be_selected_by_displayed_date(self) -> None:
+        from openpyxl import Workbook
+        from services.price_converter_service import convert_price_source
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "dated.xlsx"
+            output = Path(directory) / "result.csv"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Model", datetime(2026, 8, 3)])
+            sheet.append(["DW-1", 74990])
+            workbook.save(source)
+            workbook.close()
+
+            result = convert_price_source(source, output, "Model", "03.08.2026")
+
+        self.assertEqual(result["rows_written"], 1)
+
+    def test_csv_supports_leading_rows_and_rejects_nonexistent_sheet(self) -> None:
+        from services.price_converter_service import convert_price_source
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source.csv"
+            output = Path(directory) / "result.csv"
+            source.write_text(
+                "Прайс поставщика\nКод;Стоимость\nA-1;49 490 руб.\n",
+                encoding="utf-8-sig",
+            )
+
+            result = convert_price_source(source, output, "Код", "Стоимость")
+            with self.assertRaisesRegex(ValueError, "только лист №1"):
+                convert_price_source(source, output, "Код", "Стоимость", 2)
+
+        self.assertEqual(result["rows_written"], 1)
+
+    def test_source_and_export_cleanup_remove_only_converter_files(self) -> None:
+        import services.price_converter_service as converter
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = root / "storage"
+            exports = root / "exports"
+            storage.mkdir()
+            exports.mkdir()
+            source = storage / "source.xlsx"
+            result = exports / "result.csv"
+            unrelated = exports / "unrelated.csv"
+            source.write_bytes(b"source")
+            result.write_bytes(b"result")
+            unrelated.write_bytes(b"keep")
+            row = PriceConverter(
+                id=1,
+                export_path=result.name,
+                file={"original_filename": "source.xlsx", "stored_filename": source.name},
+                state={"result_filename": result.name},
+            )
+
+            with (
+                patch.object(converter, "PRICE_CONVERTER_DIR", storage),
+                patch.object(converter, "EXPORT_DIR", exports),
+            ):
+                converter.remove_price_converter_export(row)
+                converter.clear_price_converter_storage()
+
+            self.assertFalse(source.exists())
+            self.assertFalse(result.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_runtime_migration_completes_price_converter_table(self) -> None:
+        from database.session import migrate_price_converter_table
+
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.execute(text("CREATE TABLE price_converter (id INTEGER PRIMARY KEY)"))
+                migrate_price_converter_table(connection)
+            columns = {column["name"] for column in inspect(engine).get_columns("price_converter")}
+        finally:
+            engine.dispose()
+
+        self.assertTrue(
+            {
+                "model_field",
+                "price_field",
+                "promo_field",
+                "promo_date",
+                "sheet_number",
+                "export_path",
+                "file",
+                "state",
+            }.issubset(columns)
+        )
+
+    def test_price_converter_model_is_present_in_fresh_schema(self) -> None:
+        engine = create_engine("sqlite://")
+        try:
+            Base.metadata.create_all(engine)
+            with sessionmaker(bind=engine)() as session:
+                session.add(PriceConverter(id=1))
+                session.commit()
+                self.assertIsNotNone(session.get(PriceConverter, 1))
+        finally:
+            engine.dispose()
+
+
 class CompactPayloadTests(IsolatedDatabaseTestCase):
     def test_file_import_progress_skips_large_form_settings(self) -> None:
         import services.file_import_service as file_import_service
@@ -183,6 +398,37 @@ class CompactPayloadTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(payload["state"]["status"], "idle")
         self.assertNotIn("exclusions", payload)
+
+    def test_price_converter_runtime_skips_form_settings(self) -> None:
+        import services.price_converter_service as converter
+
+        with self.Session.begin() as session:
+            session.add(
+                PriceConverter(
+                    id=1,
+                    model_field="model",
+                    price_field="price",
+                    promo_field="promo",
+                    promo_date=date(2026, 9, 1),
+                    sheet_number=2,
+                    file={},
+                    state={"status": "idle"},
+                )
+            )
+
+        with (
+            self.Session() as session,
+            patch.object(
+                converter,
+                "price_converter_settings",
+                side_effect=AssertionError("Compact polling touched form settings"),
+            ),
+        ):
+            payload = converter.public_price_converter_runtime(session)
+
+        self.assertEqual(payload["state"]["status"], "idle")
+        self.assertNotIn("model_field", payload)
+        self.assertNotIn("promo_field", payload)
 
 
 class LogStorageTests(IsolatedDatabaseTestCase):

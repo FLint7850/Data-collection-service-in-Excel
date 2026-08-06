@@ -1,3 +1,10 @@
+.file-import-layout {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 14px;
+}
+
 .settings-page-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -110,8 +117,20 @@
   color: var(--muted);
 }
 
+.converter-field-hint {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--muted);;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.converter-action-card .run-actions {
+  justify-content: space-between;
+  margin-top: auto;
+}
+
 
 .feed-column > .panel-header {
   margin-bottom: 17px;
 }
-

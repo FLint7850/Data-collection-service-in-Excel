@@ -2,6 +2,7 @@ export type ViewId =
   | "projects"
   | "news"
   | "file-import"
+  | "price-converter"
   | "feed-comparison"
   | "settings"
   | "logs";
@@ -294,6 +295,44 @@ export interface FileImportProgress {
   state: FileImportState;
   result_filename: string;
   result_ready: boolean;
+}
+
+export interface PriceConverterState {
+  status: string;
+  stage: string;
+  rows_written: number;
+  matched_sheets: number;
+  skipped_sheets: number;
+  error: string;
+  started_at: string;
+  finished_at: string;
+  elapsed_seconds: number;
+  result_filename: string;
+}
+
+export interface PriceConverterSettings {
+  revision?: string;
+  model_field: string;
+  price_field: string;
+  promo_field: string;
+  promo_date: string;
+  sheet_number: number | null;
+}
+
+export interface PriceConverterRuntime {
+  revision: string;
+  file: UploadedFile | null;
+  result_filename: string;
+  result_ready: boolean;
+  state: PriceConverterState;
+}
+
+export interface PriceConverterData extends PriceConverterRuntime {
+  model_field: string;
+  price_field: string;
+  promo_field: string;
+  promo_date: string;
+  sheet_number: number | null;
 }
 
 export interface SupplierFeed {

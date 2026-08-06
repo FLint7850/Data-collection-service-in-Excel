@@ -4,7 +4,7 @@ import threading
 import uuid
 
 
-_DOMAINS = ("file_import", "feed_comparison", "settings")
+_DOMAINS = ("file_import", "price_converter", "feed_comparison", "settings")
 _lock = threading.Lock()
 _revisions = {domain: uuid.uuid4().hex for domain in _DOMAINS}
 

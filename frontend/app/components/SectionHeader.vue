@@ -15,7 +15,7 @@ defineProps<{
     :ui="{
       root: 'border-0 py-0',
       headline: 'eyebrow mint',
-      description: 'max-w-3xl text-base sm:text-lg leading-7 text-muted',
+      description: 'text-base sm:text-lg leading-7 text-muted',
       links: 'heading-actions',
     }"
   >

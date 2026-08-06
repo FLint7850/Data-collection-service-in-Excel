@@ -11,6 +11,7 @@ state_lock = threading.RLock()
 projects_lock = threading.RLock()
 news_lock = threading.RLock()
 file_import_lock = threading.RLock()
+price_converter_lock = threading.Lock()
 feed_comparison_lock = threading.RLock()
 
 active_stop_event = threading.Event()

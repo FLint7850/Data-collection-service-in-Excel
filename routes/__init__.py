@@ -5,6 +5,7 @@ from routes.feeds import bp as routes_feeds_bp
 from routes.file_import import bp as routes_file_import_bp
 from routes.logs import bp as routes_logs_bp
 from routes.news import bp as routes_news_bp
+from routes.price_converter import bp as routes_price_converter_bp
 from routes.progress import bp as routes_progress_bp
 from routes.projects import bp as routes_projects_bp
 from routes.settings import bp as routes_settings_bp
@@ -15,6 +16,7 @@ BLUEPRINTS = [
     routes_file_import_bp,
     routes_logs_bp,
     routes_news_bp,
+    routes_price_converter_bp,
     routes_progress_bp,
     routes_projects_bp,
     routes_settings_bp,

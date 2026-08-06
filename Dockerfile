@@ -35,7 +35,7 @@ FROM base AS runtime
 COPY --from=test /app /app
 RUN addgroup --system --gid 10001 app \
     && adduser --system --uid 10001 --ingroup app --home /app app \
-    && mkdir -p data exports feeds storage/file-import profiles/projects \
+    && mkdir -p data exports feeds storage/file-import storage/price-converter profiles/projects \
     && chown -R app:app /app /ms-playwright /tmp/parser \
     && chmod +x deploy/docker-entrypoint.sh
 

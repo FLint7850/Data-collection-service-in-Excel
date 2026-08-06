@@ -4,6 +4,7 @@ set -eu
 mkdir -p "${FEED_DIR:-/app/feeds}" \
     "${EXPORT_DIR:-/app/exports}" \
     "${FILE_IMPORT_DIR:-/app/storage/file-import}" \
+    "${PRICE_CONVERTER_DIR:-/app/storage/price-converter}" \
     "${TMPDIR:-/tmp/parser}" \
     /app/data /app/profiles/projects
 

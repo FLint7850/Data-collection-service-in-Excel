@@ -36,6 +36,15 @@ const navItems: Array<{
     },
   },
   {
+    label: "Конвертер",
+    caption: "Прайсы поставщиков",
+    to: "/price-converter",
+    icon: "i-lucide-file-output",
+    onSelect: () => {
+      mobileOpen.value = false;
+    },
+  },
+  {
     label: "Сравнение",
     caption: "Фиды поставщиков",
     to: "/feed-comparison",

@@ -205,6 +205,7 @@ def migrate_schema(connection) -> None:
     migrate_donors_table(connection)
     migrate_projects_table(connection)
     migrate_file_import_table(connection)
+    migrate_price_converter_table(connection)
     migrate_supplier_feeds_table(connection)
     cleanup_brand_state_payloads(connection)
 
@@ -400,6 +401,29 @@ def migrate_file_import_table(connection) -> None:
         )
     connection.execute(text("DROP TABLE file_import"))
     connection.execute(text("ALTER TABLE file_import_migration_tmp RENAME TO file_import"))
+
+
+def migrate_price_converter_table(connection) -> None:
+    columns = table_columns(connection, "price_converter")
+    if not columns:
+        return
+    additions = {
+        "model_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "price_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "promo_field": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "promo_date": "DATE",
+        "sheet_number": "INTEGER",
+        "export_path": "VARCHAR(500) NOT NULL DEFAULT ''",
+        "file": "JSON NOT NULL DEFAULT '{}'",
+        "state": "JSON NOT NULL DEFAULT '{}'",
+        "created_at": "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'",
+        "updated_at": "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'",
+    }
+    for column_name, definition in additions.items():
+        if column_name not in columns:
+            connection.execute(
+                text(f"ALTER TABLE price_converter ADD COLUMN {column_name} {definition}")
+            )
 
 
 def migrate_supplier_feeds_table(connection) -> None:

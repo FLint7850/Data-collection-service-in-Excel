@@ -83,6 +83,8 @@ class BackendModuleTests(unittest.TestCase):
                 ("GET", "/api/news"),
                 ("PATCH", "/api/news/monitors/<monitor_id>"),
                 ("POST", "/api/file-import/compare"),
+                ("GET", "/api/price-converter"),
+                ("POST", "/api/price-converter/convert"),
                 ("POST", "/api/feed-comparison/start"),
                 ("GET", "/api/logs"),
                 ("GET", "/progress"),

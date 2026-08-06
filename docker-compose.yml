@@ -34,6 +34,7 @@ services:
       FEED_DIR: /app/feeds
       EXPORT_DIR: /app/exports
       FILE_IMPORT_DIR: /app/storage/file-import
+      PRICE_CONVERTER_DIR: /app/storage/price-converter
       TMPDIR: /tmp/parser
       FORCE_BROWSER_SETUP: 0
       SQLITE_JOURNAL_MODE: WAL
