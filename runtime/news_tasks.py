@@ -1672,7 +1672,11 @@ def scheduled_brand_candidates(now: Optional[datetime] = None) -> List[Brand]:
         rows = session.scalars(
             select(Brand)
             .options(selectinload(Brand.donors))
-            .where(Brand.enabled.is_(True), or_(*schedule_conditions))
+            .where(
+                Brand.enabled.is_(True),
+                Brand.donors.any(),
+                or_(*schedule_conditions),
+            )
             .order_by(Brand.id)
         ).all()
         return [brand for brand in rows if is_brand_due(brand, now)]
@@ -1690,8 +1694,10 @@ def start_news_scheduler() -> None:
         while True:
             try:
                 due_ids: List[str] = []
-                due_brands = scheduled_brand_candidates()
                 with news_lock:
+                    # Deletion uses this lock too, so the database candidates and
+                    # the process-local donor list belong to the same snapshot.
+                    due_brands = scheduled_brand_candidates()
                     monitor_by_id = {
                         str(monitor.get("id")): monitor
                         for monitor in news_settings.get("monitors", [])

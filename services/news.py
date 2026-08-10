@@ -576,28 +576,39 @@ def save_news_monitor(monitor: Dict[str, object]) -> None:
         publish_news_progress_snapshot()
 
 
-def delete_news_records(monitor_ids: Iterable[object], *, remove_brand: bool = False) -> None:
+def delete_news_records(
+    monitor_ids: Iterable[object],
+    *,
+    remove_brand: bool = False,
+    brand_id: object = None,
+) -> Dict[int, Optional[int]]:
     from database.repositories.news import delete_brand, delete_donor
     ids = [value for value in (parse_db_int(item) for item in monitor_ids) if value]
-    if not ids:
-        return
+    requested_brand_id = parse_db_int(brand_id)
+    if not ids and not (remove_brand and requested_brand_id):
+        return {}
     with session_scope() as session:
         donors = [row for row in (session.get(Donor, item) for item in ids) if row is not None]
         brand_ids = {row.brand_id for row in donors}
+        if requested_brand_id:
+            brand_ids.add(requested_brand_id)
         if remove_brand:
-            for brand_id in brand_ids:
-                delete_brand(brand_id, session)
-            return
+            for affected_brand_id in brand_ids:
+                delete_brand(affected_brand_id, session)
+            return {affected_brand_id: None for affected_brand_id in brand_ids}
         for donor in donors:
             delete_donor(donor.id, session)
         session.flush()
-        for brand_id in brand_ids:
-            brand = session.get(Brand, brand_id)
+        primary_by_brand: Dict[int, Optional[int]] = {}
+        for affected_brand_id in brand_ids:
+            brand = session.get(Brand, affected_brand_id)
             if not brand:
                 continue
             donor_ids = [row.id for row in brand.donors]
             if brand.primary_donor_id not in donor_ids:
                 brand.primary_donor_id = donor_ids[0] if donor_ids else None
+            primary_by_brand[affected_brand_id] = brand.primary_donor_id
+        return primary_by_brand
 
 
 def load_news_settings() -> None:
@@ -608,6 +619,10 @@ def load_news_settings() -> None:
             return
         settings = default_news_settings()
         with session_scope() as session:
+            # Remove schedule rows left by older deletion logic before the
+            # process-local donor list is built.
+            session.execute(delete(Brand).where(~Brand.donors.any()))
+            session.flush()
             donor_rows = session.scalars(
                 select(Donor)
                 .options(

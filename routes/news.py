@@ -328,14 +328,19 @@ def api_delete_news_monitor(monitor_id: str):
         return jsonify({"error": "Монитор не найден"}), 404
     group = clean_text(str(monitor.get("group") or ""))
     brand = clean_text(str(monitor.get("brand") or ""))
+    brand_id = parse_db_int(monitor.get("brand_id"))
     remove_brand = request.args.get("mode") == "brand"
     with news_lock:
         brand_monitors = [
             item
             for item in news_settings.get("monitors", [])
             if isinstance(item, dict)
-            and clean_text(str(item.get("group") or "")) == group
-            and clean_text(str(item.get("brand") or "")) == brand
+            and (
+                parse_db_int(item.get("brand_id")) == brand_id
+                if brand_id is not None
+                else clean_text(str(item.get("group") or "")) == group
+                and clean_text(str(item.get("brand") or "")) == brand
+            )
         ]
     if not remove_brand and len(brand_monitors) < 2:
         return jsonify({"error": "Нельзя удалить единственного донора бренда"}), 409
@@ -362,7 +367,19 @@ def api_delete_news_monitor(monitor_id: str):
             news_browser_sessions.pop(item_id, None)
             news_crawlers.pop(item_id, None)
             delete_scrape_checkpoint("news", item_id)
-        delete_news_records(removed_ids, remove_brand=remove_brand)
+        primary_by_brand = delete_news_records(
+            removed_ids,
+            remove_brand=remove_brand,
+            brand_id=brand_id,
+        )
+        if not remove_brand and brand_id in primary_by_brand:
+            primary_id = str(primary_by_brand[brand_id] or "")
+            for item in news_settings.get("monitors", []):
+                if (
+                    isinstance(item, dict)
+                    and parse_db_int(item.get("brand_id")) == brand_id
+                ):
+                    item["primary_donor_id"] = primary_id
         remaining_brand_monitors = [
             public_news_monitor(item)
             for item in news_settings.get("monitors", [])

@@ -140,14 +140,57 @@ class BackendModuleTests(unittest.TestCase):
             patch("routes.news.news_stop_events", {}),
             patch("routes.news.request_news_stop"),
             patch("routes.news.delete_news_csv_for_monitor"),
-            patch("routes.news.delete_news_records"),
+            patch("routes.news.delete_news_records") as delete_records,
             patch("routes.news.add_news_log"),
             patch("routes.news.publish_news_progress_snapshot") as publish_snapshot,
         ):
             response = api_delete_news_monitor("2")
 
         self.assertTrue(response.get_json()["ok"])
+        delete_records.assert_called_once_with(
+            {"2"},
+            remove_brand=True,
+            brand_id=3,
+        )
         publish_snapshot.assert_called_once_with()
+
+    def test_primary_donor_deletion_updates_remaining_runtime_donors(self) -> None:
+        from app import app
+        from routes.news import api_delete_news_monitor
+
+        first = {
+            "id": "1",
+            "brand_id": 3,
+            "primary_donor_id": "1",
+            "brand": "Bora",
+            "group": "Маржа",
+            "state": {"status": "idle"},
+        }
+        second = {
+            "id": "2",
+            "brand_id": 3,
+            "primary_donor_id": "1",
+            "brand": "Bora",
+            "group": "Маржа",
+            "state": {"status": "idle"},
+        }
+        settings = {"monitors": [first, second]}
+        with (
+            app.test_request_context("/api/news/monitors/1", method="DELETE"),
+            patch("routes.news.get_news_monitor", return_value=first),
+            patch("routes.news.news_settings", settings),
+            patch("routes.news.news_stop_events", {}),
+            patch("routes.news.request_news_stop"),
+            patch("routes.news.delete_news_csv_for_monitor"),
+            patch("routes.news.delete_news_records", return_value={3: 2}),
+            patch("routes.news.add_news_log"),
+            patch("routes.news.publish_news_progress_snapshot"),
+        ):
+            response = api_delete_news_monitor("1")
+
+        self.assertTrue(response.get_json()["ok"])
+        self.assertEqual(settings["monitors"], [second])
+        self.assertEqual(second["primary_donor_id"], "2")
 
     def test_domain_revisions_change_only_for_the_requested_domain(self) -> None:
         from services.domain_revisions import bump_domain_revision, domain_revision

@@ -15,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from database.repositories.projects import delete_project, update_project
 from config import MSK_TZ
-from models import Base, Brand, FileImport, PriceConverter, Project
+from models import Base, Brand, Donor, FileImport, PriceConverter, Project
 from runtime.state import news_lock, news_settings
 from services.file_validation import validate_xlsx_archive
 
@@ -49,6 +49,108 @@ class TargetedPersistenceTests(IsolatedDatabaseTestCase):
         with self.Session() as session:
             self.assertIsNone(session.get(Project, first_id))
             self.assertEqual(session.get(Project, second_id).name, "Second")
+
+    def test_brand_deletion_removes_all_nested_donors(self) -> None:
+        import services.news as news_service
+
+        with self.Session.begin() as session:
+            brand = Brand(
+                name="Deleted brand",
+                search_name="deleted brand",
+                group_name="Маржа",
+                state={"status": "idle"},
+            )
+            session.add(brand)
+            session.flush()
+            donors = [
+                Donor(
+                    legacy_id=f"deleted-{index}",
+                    brand_id=brand.id,
+                    site_url=f"https://example.test/{index}",
+                    start_urls=[],
+                )
+                for index in range(2)
+            ]
+            session.add_all(donors)
+            session.flush()
+            brand_id = brand.id
+            donor_ids = [donor.id for donor in donors]
+            brand.primary_donor_id = donor_ids[0]
+
+        @contextmanager
+        def isolated_session_scope():
+            session = self.Session()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        with patch.object(news_service, "session_scope", isolated_session_scope):
+            primary_by_brand = news_service.delete_news_records(
+                donor_ids,
+                remove_brand=True,
+                brand_id=brand_id,
+            )
+
+        self.assertEqual(primary_by_brand, {brand_id: None})
+        with self.Session() as session:
+            self.assertIsNone(session.get(Brand, brand_id))
+            self.assertTrue(all(session.get(Donor, donor_id) is None for donor_id in donor_ids))
+
+    def test_primary_donor_deletion_reassigns_brand_schedule_target(self) -> None:
+        import services.news as news_service
+
+        with self.Session.begin() as session:
+            brand = Brand(
+                name="Active brand",
+                search_name="active brand",
+                group_name="Маржа",
+                state={"status": "idle"},
+            )
+            session.add(brand)
+            session.flush()
+            first = Donor(
+                legacy_id="primary-first",
+                brand_id=brand.id,
+                site_url="https://first.example.test",
+                start_urls=[],
+            )
+            second = Donor(
+                legacy_id="primary-second",
+                brand_id=brand.id,
+                site_url="https://second.example.test",
+                start_urls=[],
+            )
+            session.add_all([first, second])
+            session.flush()
+            brand_id = brand.id
+            first_id = first.id
+            second_id = second.id
+            brand.primary_donor_id = first_id
+
+        @contextmanager
+        def isolated_session_scope():
+            session = self.Session()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        with patch.object(news_service, "session_scope", isolated_session_scope):
+            primary_by_brand = news_service.delete_news_records([first_id])
+
+        self.assertEqual(primary_by_brand, {brand_id: second_id})
+        with self.Session() as session:
+            self.assertIsNone(session.get(Donor, first_id))
+            self.assertEqual(session.get(Brand, brand_id).primary_donor_id, second_id)
 
 
 class SupplierFeedConfigurationTests(unittest.TestCase):
@@ -508,8 +610,7 @@ class SchedulerQueryTests(IsolatedDatabaseTestCase):
 
         now = datetime.now(MSK_TZ).replace(second=15, microsecond=0)
         with self.Session.begin() as session:
-            session.add_all(
-                [
+            brands = [
                     Brand(
                         name="Due",
                         search_name="due",
@@ -537,7 +638,26 @@ class SchedulerQueryTests(IsolatedDatabaseTestCase):
                         schedule_type="once",
                         next_run_at=(now + timedelta(hours=1)).replace(tzinfo=None),
                     ),
+                    Brand(
+                        name="Orphan",
+                        search_name="orphan",
+                        group_name="Маржа",
+                        state={"status": "idle"},
+                        enabled=True,
+                        schedule_type="daily",
+                        scan_time=now.strftime("%H:%M"),
+                    ),
                 ]
+            session.add_all(brands)
+            session.flush()
+            session.add_all(
+                Donor(
+                    legacy_id=f"scheduler-{brand.id}",
+                    brand_id=brand.id,
+                    site_url=f"https://example.test/{brand.id}",
+                    start_urls=[],
+                )
+                for brand in brands[:3]
             )
 
         @contextmanager
