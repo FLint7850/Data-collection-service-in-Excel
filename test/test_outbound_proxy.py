@@ -58,6 +58,19 @@ class OutboundProxyTests(unittest.TestCase):
 
         self.assertFalse(session.trust_env)
 
+    def test_feed_session_is_always_direct(self) -> None:
+        from runtime.news_tasks import make_feed_session
+
+        with self.proxy_environment():
+            session = make_feed_session()
+
+        try:
+            self.assertIs(type(session), requests.Session)
+            self.assertFalse(session.trust_env)
+            self.assertEqual(session.proxies, {})
+        finally:
+            session.close()
+
     def test_requests_session_routes_external_and_internal_per_request(self) -> None:
         session = outbound_requests_session()
         captured = []
