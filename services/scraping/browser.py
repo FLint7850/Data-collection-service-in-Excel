@@ -148,12 +148,14 @@ class PlaywrightBrowserSession:
         max_pages: int = 1,
         profile_dir: Optional[Path] = None,
         prefer_headless_shell: bool = True,
+        request_url_validator=None,
     ) -> None:
         from services.projects import parse_thread_count
         self.stop_signal = stop_signal
         self.max_pages = max(1, parse_thread_count(max_pages))
         self.profile_dir = profile_dir
         self.prefer_headless_shell = bool(prefer_headless_shell)
+        self.request_url_validator = request_url_validator
         self.executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(
             prefer_headless_shell=self.prefer_headless_shell,
         )
@@ -417,7 +419,15 @@ class PlaywrightBrowserSession:
                 await page.set_extra_http_headers({"Referer": referer})
 
             async def route_handler(route, request):
-                if self._should_block_resource(request, block_stylesheet=block_stylesheet):
+                request_url = str(getattr(request, "url", "") or "")
+                validator = self.request_url_validator
+                allowed = True
+                if validator is not None and request_url.lower().startswith(("http://", "https://")):
+                    try:
+                        allowed = bool(validator(request_url))
+                    except Exception:
+                        allowed = False
+                if not allowed or self._should_block_resource(request, block_stylesheet=block_stylesheet):
                     await route.abort()
                 else:
                     await route.continue_()

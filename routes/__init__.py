@@ -1,6 +1,7 @@
 """Flask blueprints."""
 
 from routes.auth import bp as routes_auth_bp
+from routes.attribute_assistant import bp as routes_attribute_assistant_bp
 from routes.feeds import bp as routes_feeds_bp
 from routes.file_import import bp as routes_file_import_bp
 from routes.logs import bp as routes_logs_bp
@@ -12,6 +13,7 @@ from routes.settings import bp as routes_settings_bp
 
 BLUEPRINTS = [
     routes_auth_bp,
+    routes_attribute_assistant_bp,
     routes_feeds_bp,
     routes_file_import_bp,
     routes_logs_bp,

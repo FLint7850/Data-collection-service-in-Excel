@@ -200,6 +200,9 @@ def migrate_schema(connection) -> None:
         connection.exec_driver_sql(f"ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'")
 
     migrate_app_settings_current_table(connection)
+    app_setting_columns = table_columns(connection, "app_settings")
+    if app_setting_columns and "attribute_ai" in app_setting_columns:
+        connection.execute(text("ALTER TABLE app_settings DROP COLUMN attribute_ai"))
     migrate_news_tables(connection)
     migrate_donor_start_urls(connection)
     migrate_donors_table(connection)
@@ -207,7 +210,55 @@ def migrate_schema(connection) -> None:
     migrate_file_import_table(connection)
     migrate_price_converter_table(connection)
     migrate_supplier_feeds_table(connection)
+    migrate_attribute_assistant_tables(connection)
     cleanup_brand_state_payloads(connection)
+
+
+def migrate_attribute_assistant_tables(connection) -> None:
+    """Keep existing SQLite installations compatible without a manual Alembic run."""
+    column_defaults = {
+        "attribute_categories": (
+            ("parent_name", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("external_key", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ),
+        "attribute_templates": (
+            ("product_type", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("is_default", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("version", "INTEGER NOT NULL DEFAULT 1"),
+        ),
+        "attribute_template_fields": (
+            ("is_active", "BOOLEAN NOT NULL DEFAULT 1"),
+        ),
+        "attribute_allowed_values": (
+            ("value_type", "VARCHAR(32) NOT NULL DEFAULT 'value'"),
+            ("is_global", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("is_recommended", "BOOLEAN NOT NULL DEFAULT 1"),
+            ("is_active", "BOOLEAN NOT NULL DEFAULT 1"),
+            ("source", "VARCHAR(64) NOT NULL DEFAULT 'import'"),
+        ),
+        "attribute_batches": (
+            ("report_filename", "VARCHAR(500) NOT NULL DEFAULT ''"),
+            ("input_mode", "VARCHAR(32) NOT NULL DEFAULT 'csv'"),
+            ("processing_mode", "VARCHAR(32) NOT NULL DEFAULT 'suggest'"),
+            ("source_urls", "JSON NOT NULL DEFAULT '[]'"),
+        ),
+        "attribute_products": (
+            ("source_url", "TEXT NOT NULL DEFAULT ''"),
+            ("category_name", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("brand", "VARCHAR(255) NOT NULL DEFAULT ''"),
+            ("donor_urls", "JSON NOT NULL DEFAULT '[]'"),
+        ),
+        "attribute_product_values": (
+            ("source_details", "JSON NOT NULL DEFAULT '{}'"),
+        ),
+    }
+    for table_name, columns in column_defaults.items():
+        existing = table_columns(connection, table_name)
+        if not existing:
+            continue
+        for column_name, ddl in columns:
+            if column_name not in existing:
+                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
 
 
 def reset_brand_states(connection) -> None:
