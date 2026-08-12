@@ -1809,22 +1809,25 @@ def _decode_html_content(
 def fetch_product_html(url: object, timeout: int = 25) -> Tuple[str, str]:
     safe_url = _validate_http_url(url)
     response = None
-    for _redirect in range(6):
-        response = requests.get(
-            safe_url,
-            headers=DEFAULT_HTTP_HEADERS,
-            timeout=timeout,
-            allow_redirects=False,
-        )
-        if response.is_redirect or response.is_permanent_redirect:
-            location = response.headers.get("Location")
-            if not location:
-                break
-            safe_url = _validate_http_url(urljoin(safe_url, location))
-            continue
-        break
-    else:
-        raise ValueError("Слишком много перенаправлений при загрузке страницы")
+    from services.outbound_proxy import outbound_requests_session
+
+    with outbound_requests_session() as session:
+        for _redirect in range(6):
+            response = session.get(
+                safe_url,
+                headers=DEFAULT_HTTP_HEADERS,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    break
+                safe_url = _validate_http_url(urljoin(safe_url, location))
+                continue
+            break
+        else:
+            raise ValueError("Слишком много перенаправлений при загрузке страницы")
     if response is None:
         raise ValueError("Не удалось загрузить страницу товара")
     response.raise_for_status()

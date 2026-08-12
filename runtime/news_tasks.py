@@ -25,6 +25,7 @@ from runtime import state as runtime_state
 from runtime.state import FEED_STORAGE_LOCK, NEWS_PROGRESS_FIELDS, feed_snapshot_cache, news_browser_sessions, news_crawlers, news_lock, news_scan_threads, news_settings, news_state_persisted_at, news_stop_events, news_stop_modes
 from services.connections import get_donor_row, normalize_connection_method
 from services.normalization import datetime_to_input_value, normalize_emails, normalize_extraction_rules, normalize_model_key, normalize_patterns, normalize_start_urls, output_text, parse_db_int, repair_mojibake, repair_mojibake_text, safe_filename
+from services.outbound_proxy import outbound_requests_session
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from typing import Dict, List, Optional, Set
@@ -180,7 +181,7 @@ def generation_file_url(url: str) -> str:
 
 
 def make_feed_session() -> requests.Session:
-    session = requests.Session()
+    session = outbound_requests_session()
     session.headers.update(
         {
             "User-Agent": (

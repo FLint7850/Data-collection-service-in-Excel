@@ -79,6 +79,46 @@ class FakeLoginClient(CodexAppServerClient):
 
 
 class CodexAppServerTests(unittest.TestCase):
+    def test_codex_child_receives_explicit_external_proxy(self) -> None:
+        client = CodexAppServerClient.__new__(CodexAppServerClient)
+        client._start_lock = __import__("threading").RLock()
+        client._process = None
+        client._initialized = False
+        client.command = ["codex", "app-server"]
+        client.home = Path("/tmp/codex-home")
+        client.workspace = Path("/tmp/codex-workspace")
+        client.user_id = 1
+        client.stop = lambda: None
+        client._is_running = lambda: False
+        client._reader_loop = lambda: None
+        client._stderr_loop = lambda: None
+        client._request_started = lambda *_args, **_kwargs: None
+        client._notify = lambda *_args, **_kwargs: None
+        fake_process = type("FakeProcess", (), {"stdin": None, "stdout": None, "stderr": None})()
+        captured = {}
+
+        def fake_popen(_command, **kwargs):
+            captured.update(kwargs)
+            return fake_process
+
+        proxy_url = "http://user:pass@198.51.100.10:6584"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "OUTBOUND_PROXY_URL": proxy_url,
+                    "OUTBOUND_PROXY_REQUIRED": "1",
+                },
+                clear=False,
+            ),
+            patch("services.codex_app_server.subprocess.Popen", side_effect=fake_popen),
+            patch("services.codex_app_server.threading.Thread") as thread,
+        ):
+            thread.return_value.start.return_value = None
+            client.start()
+
+        self.assertEqual(captured["env"]["HTTPS_PROXY"], proxy_url)
+
     def test_resolved_command_disables_unneeded_agent_tools(self) -> None:
         with patch("services.codex_app_server.shutil.which", return_value="C:/tools/codex.cmd"):
             command = _resolve_codex_command()

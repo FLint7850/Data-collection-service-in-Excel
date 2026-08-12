@@ -20,6 +20,7 @@ from queue import Empty, Queue
 from runtime.state import reset_state, update_state
 from services.connections import is_browser_render_method, is_debug_visible_method, normalize_connection_method, ordered_db_connection_methods
 from services.normalization import normalize_extraction_rules, normalize_patterns, normalize_start_urls, now_iso
+from services.outbound_proxy import outbound_requests_session
 from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
@@ -173,7 +174,7 @@ class ProductSiteCrawler:
     def get_session(self) -> requests.Session:
         session = getattr(self.thread_local, "session", None)
         if session is None:
-            session = requests.Session()
+            session = outbound_requests_session()
             session.headers.update(self.headers)
             self.thread_local.session = session
         return session
