@@ -110,7 +110,6 @@ FEED_DIR = env_path("FEED_DIR", "feeds")
 EXPORT_DIR = env_path("EXPORT_DIR", "exports")
 FILE_IMPORT_DIR = env_path("FILE_IMPORT_DIR", "storage/file-import")
 PRICE_CONVERTER_DIR = env_path("PRICE_CONVERTER_DIR", "storage/price-converter")
-ATTRIBUTE_ASSISTANT_DIR = env_path("ATTRIBUTE_ASSISTANT_DIR", "storage/attribute-assistant")
 SCRAPE_CHECKPOINT_DIR = env_path("SCRAPE_CHECKPOINT_DIR", "storage/checkpoints")
 PROJECT_PROFILE_DIR = BASE_DIR / "profiles" / "projects"
 

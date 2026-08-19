@@ -45,15 +45,6 @@ const navItems: Array<{
     },
   },
   {
-    label: "Атрибуты",
-    caption: "OpenCart / ocStore",
-    to: "/attribute-assistant",
-    icon: "i-lucide-list-checks",
-    onSelect: () => {
-      mobileOpen.value = false;
-    },
-  },
-  {
     label: "Сравнение",
     caption: "Фиды поставщиков",
     to: "/feed-comparison",

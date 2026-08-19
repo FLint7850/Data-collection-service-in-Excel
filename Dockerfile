@@ -1,9 +1,3 @@
-FROM node:24-bookworm-slim AS codex-cli
-
-ARG CODEX_CLI_VERSION=0.146.0
-RUN npm install --global "@openai/codex@${CODEX_CLI_VERSION}" \
-    && npm cache clean --force
-
 FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -17,10 +11,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
-COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
-COPY --from=codex-cli /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@openai/codex
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gosu \
     && rm -rf /var/lib/apt/lists/*
@@ -33,10 +23,6 @@ RUN pip install --upgrade pip \
     && chmod -R 1777 /tmp/parser \
     && chmod -R a+rwX /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
     && python -m playwright install --with-deps chromium chromium-headless-shell
-
-# Docker COPY dereferences the npm launcher symlink. Restore it so Node resolves
-# the platform-specific @openai/codex package next to the JS entry point.
-RUN ln -sf ../lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 
 FROM base AS test
 COPY . .

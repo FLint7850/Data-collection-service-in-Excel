@@ -11,7 +11,7 @@ export default defineNuxtConfig({
   compatibilityDate: "2026-07-29",
   devtools: { enabled: process.env.NODE_ENV !== "production" },
   modules: ["@nuxt/ui", "@nuxt/icon"],
-  css: ["~/assets/css/main.css", "~/assets/css/attribute-assistant.css"],
+  css: ["~/assets/css/main.css"],
   app: {
     head: {
       htmlAttrs: { lang: "ru", class: "dark" },
