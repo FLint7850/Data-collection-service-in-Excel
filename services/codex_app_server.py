@@ -20,7 +20,6 @@ import time
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from config import ATTRIBUTE_ASSISTANT_DIR, env_int, env_str
-from services.outbound_proxy import outbound_proxy_environment
 
 
 CODEX_CLIENT_NAME = "data_collection_attribute_assistant"
@@ -163,7 +162,7 @@ class CodexAppServerClient:
                 return
             self.stop()
             command = self.command or _resolve_codex_command()
-            environment = outbound_proxy_environment()
+            environment = os.environ.copy()
             environment.update(
                 {
                     "CODEX_HOME": str(self.home),

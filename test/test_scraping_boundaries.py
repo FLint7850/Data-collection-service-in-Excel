@@ -18,7 +18,6 @@ from services.scraping.browser import (
     ScrapeGraphAISession,
     _ensure_botasaurus_debugging_address_compatibility,
 )
-from services.outbound_proxy import OutboundProxy
 from services.scraping.extraction import extract_listing_products
 from services.scraping.fallback import ProductSiteCrawler
 from services.scraping.http import looks_blocked_or_empty
@@ -26,46 +25,6 @@ from services.scraping.checkpoints import delete_scrape_checkpoint, load_scrape_
 
 
 class ScrapingBoundaryTests(unittest.TestCase):
-    def test_playwright_uses_native_proxy_settings(self) -> None:
-        proxy = OutboundProxy(
-            "http://user:pass@198.51.100.10:6584",
-            "http",
-            "198.51.100.10",
-            6584,
-            "user",
-            "pass",
-        )
-        session = PlaywrightBrowserSession(max_pages=1)
-        async def add_init_script(_script):
-            return None
-
-        fake_context = SimpleNamespace(add_init_script=add_init_script)
-
-        launches = []
-        async def new_context(**_kwargs):
-            return fake_context
-
-        browser = SimpleNamespace(new_context=new_context)
-
-        async def launch(**kwargs):
-            launches.append(kwargs)
-            return browser
-
-        chromium = SimpleNamespace(launch=launch)
-        playwright = SimpleNamespace(chromium=chromium)
-
-        class FakePlaywrightManager:
-            async def start(self):
-                return playwright
-
-        with (
-            patch("services.scraping.browser.configured_outbound_proxy", return_value=proxy),
-            patch("playwright.async_api.async_playwright", return_value=FakePlaywrightManager()),
-        ):
-            asyncio.run(session._start_browser())
-
-        self.assertEqual(launches[0]["proxy"], proxy.playwright())
-
     def make_recording_crawler(self):
         class FakeBrowserSession:
             def close(self):

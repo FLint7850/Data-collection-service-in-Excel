@@ -207,16 +207,7 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
         log_fetch_exception("botasaurus-request:import", url, error)
         return None
 
-    from services.outbound_proxy import proxy_for_external_url
-
-    outbound_proxy = proxy_for_external_url(url)
-
-    @botasaurus_request(
-        max_retry=MAX_RETRIES,
-        output=None,
-        create_error_logs=False,
-        proxy=outbound_proxy.url if outbound_proxy is not None else None,
-    )
+    @botasaurus_request(max_retry=MAX_RETRIES, output=None, create_error_logs=False)
     def _fetch_html(request_client: Request, target_url: str):
         response = request_client.get(target_url)
         response.raise_for_status()

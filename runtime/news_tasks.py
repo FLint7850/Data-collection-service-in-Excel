@@ -180,10 +180,7 @@ def generation_file_url(url: str) -> str:
 
 
 def make_feed_session() -> requests.Session:
-    # Feeds are trusted public sources and must not consume the scraping proxy.
-    # Disable environment proxies as well so this direct route is deterministic.
     session = requests.Session()
-    session.trust_env = False
     session.headers.update(
         {
             "User-Agent": (

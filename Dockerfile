@@ -2,8 +2,6 @@ FROM node:24-bookworm-slim AS codex-cli
 
 ARG CODEX_CLI_VERSION=0.146.0
 RUN npm install --global "@openai/codex@${CODEX_CLI_VERSION}" \
-    && mkdir -p /opt/botasaurus-js \
-    && npm install --prefix /opt/botasaurus-js proxy-chain@3.0.0 botasaurus-controls@6.0.66 \
     && npm cache clean --force
 
 FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93 AS base
@@ -22,7 +20,6 @@ WORKDIR /app
 COPY --from=codex-cli /usr/local/bin/node /usr/local/bin/node
 COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=codex-cli /usr/local/lib/node_modules/@openai/codex /usr/local/lib/node_modules/@openai/codex
-COPY --from=codex-cli /opt/botasaurus-js /opt/botasaurus-js
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gosu \
@@ -31,14 +28,10 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt \
-    && mkdir -p /usr/local/lib/python3.11/site-packages/javascript_fixes/js/node_modules \
-    && ln -s /opt/botasaurus-js/node_modules/proxy-chain /usr/local/lib/python3.11/site-packages/javascript_fixes/js/node_modules/proxy-chain \
-    && ln -s /opt/botasaurus-js/node_modules/botasaurus-controls /usr/local/lib/python3.11/site-packages/javascript_fixes/js/node_modules/botasaurus-controls \
     && rm -rf /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin/temp \
     && mkdir -p /tmp/parser /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
     && chmod -R 1777 /tmp/parser \
     && chmod -R a+rwX /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
-    && python -c "import botasaurus_requests.cffi" \
     && python -m playwright install --with-deps chromium chromium-headless-shell
 
 # Docker COPY dereferences the npm launcher symlink. Restore it so Node resolves

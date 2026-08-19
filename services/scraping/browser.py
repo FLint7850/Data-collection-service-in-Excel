@@ -24,11 +24,6 @@ from typing import Dict, Iterable, List, Optional, Set
 
 from services.scraping.extraction import extract_listing_products, extract_product_data
 from services.scraping.http import is_product_url_for_filters
-from services.outbound_proxy import (
-    configured_outbound_proxy,
-    outbound_proxy_environment,
-    redact_proxy_secrets,
-)
 
 from services.scraping.http import looks_blocked_or_empty
 
@@ -242,9 +237,6 @@ class PlaywrightBrowserSession:
         }
         if self.executable_path:
             launch_options["executable_path"] = self.executable_path
-        outbound_proxy = configured_outbound_proxy()
-        if outbound_proxy is not None:
-            launch_options["proxy"] = outbound_proxy.playwright()
         context_options = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -674,7 +666,6 @@ class BotasaurusBrowserSession:
             return None
 
         process_argument = f"--{self._process_token}"
-        outbound_proxy = configured_outbound_proxy()
 
         browser_arguments = [
             "--no-sandbox",
@@ -694,7 +685,6 @@ class BotasaurusBrowserSession:
             headless=self.headless,
             chrome_executable_path=self.executable_path,
             profile=self.profile,
-            proxy=outbound_proxy.url if outbound_proxy is not None else None,
             add_arguments=browser_arguments,
             window_size=[1280, 720],
             block_images_and_css=self.block_images_and_css,
@@ -974,7 +964,6 @@ class Crawl4AIBrowserSession:
         os.environ["CRAWL4_AI_BASE_DIRECTORY"] = str(crawl4ai_storage)
         from crawl4ai import AsyncWebCrawler, BrowserConfig
 
-        outbound_proxy = configured_outbound_proxy()
         browser_config = BrowserConfig(
             browser_type="chromium",
             headless=True,
@@ -997,9 +986,6 @@ class Crawl4AIBrowserSession:
                 "--blink-settings=imagesEnabled=false",
                 f"--{self._process_token}",
             ],
-            proxy_config=(
-                outbound_proxy.crawl4ai() if outbound_proxy is not None else None
-            ),
             verbose=False,
         )
         self._crawler = AsyncWebCrawler(
@@ -1319,7 +1305,6 @@ class SinglePageSpider(scrapy.Spider):
         },
         "TELNETCONSOLE_ENABLED": False,
         "WARN_ON_GENERATOR_RETURN_VALUE": False,
-        "HTTPPROXY_ENABLED": True,
     }
 
     async def start(self):
@@ -1350,7 +1335,6 @@ storage_dir = os.path.join(tempfile.gettempdir(), "parser-crawlee", uuid.uuid4()
 os.environ["CRAWLEE_STORAGE_DIR"] = storage_dir
 
 from crawlee.crawlers._http import HttpCrawler
-from crawlee.proxy_configuration import ProxyConfiguration
 
 url = sys.argv[1]
 timeout = int(float(sys.argv[2]))
@@ -1359,16 +1343,12 @@ marker = sys.argv[3]
 
 async def main():
     result = {"body": b""}
-    proxy_url = os.environ.get("OUTBOUND_PROXY_URL", "").strip()
     crawler = HttpCrawler(
         max_requests_per_crawl=1,
         max_request_retries=0,
         request_handler_timeout=timedelta(seconds=timeout),
         configure_logging=False,
         ignore_http_error_status_codes=list(range(300, 600)),
-        proxy_configuration=(
-            ProxyConfiguration(proxy_urls=[proxy_url]) if proxy_url else None
-        ),
     )
 
     @crawler.router.default_handler
@@ -1388,9 +1368,7 @@ finally:
 
 PLAYWRIGHT_FETCH_SCRIPT = r"""
 import base64
-import os
 import sys
-from urllib.parse import unquote, urlsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -1416,23 +1394,6 @@ blocked_url_parts = (
 )
 
 
-def configured_proxy():
-    raw_url = os.environ.get("OUTBOUND_PROXY_URL", "").strip()
-    if not raw_url:
-        return None
-    parsed = urlsplit(raw_url)
-    hostname = parsed.hostname or ""
-    display_hostname = f"[{hostname}]" if ":" in hostname else hostname
-    settings = {
-        "server": f"{parsed.scheme}://{display_hostname}:{parsed.port}",
-        "bypass": os.environ.get("OUTBOUND_PROXY_NO_PROXY", ""),
-    }
-    if parsed.username is not None:
-        settings["username"] = unquote(parsed.username)
-        settings["password"] = unquote(parsed.password or "")
-    return settings
-
-
 def should_block(request):
     if request.resource_type in blocked_resource_types:
         return True
@@ -1442,7 +1403,6 @@ def should_block(request):
 with sync_playwright() as p:
     browser = p.chromium.launch(
         headless=True,
-        proxy=configured_proxy(),
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
@@ -1475,9 +1435,7 @@ with sync_playwright() as p:
 
 SCRAPEGRAPHAI_FETCH_SCRIPT = r"""
 import base64
-import os
 import sys
-from urllib.parse import unquote, urlsplit
 
 try:
     import langchain_community.chat_models as community_chat_models
@@ -1494,23 +1452,6 @@ url = sys.argv[1]
 timeout = int(float(sys.argv[2]))
 marker = sys.argv[3]
 
-
-def configured_proxy():
-    raw_url = os.environ.get("OUTBOUND_PROXY_URL", "").strip()
-    if not raw_url:
-        return None
-    parsed = urlsplit(raw_url)
-    hostname = parsed.hostname or ""
-    display_hostname = f"[{hostname}]" if ":" in hostname else hostname
-    settings = {
-        "server": f"{parsed.scheme}://{display_hostname}:{parsed.port}",
-        "bypass": os.environ.get("OUTBOUND_PROXY_NO_PROXY", ""),
-    }
-    if parsed.username is not None:
-        settings["username"] = unquote(parsed.username)
-        settings["password"] = unquote(parsed.password or "")
-    return settings
-
 node = FetchNode(
     input="url",
     output=["doc"],
@@ -1521,12 +1462,8 @@ node = FetchNode(
         "cut": False,
         "loader_kwargs": {
             "timeout": timeout,
-            # ChromiumLoader still renders JavaScript in its regular Playwright
-            # path.  Its separate JS-support path hard-codes ``networkidle`` and
-            # times out on pages with long-lived analytics/network requests.
-            "requires_js_support": False,
-            "load_state": "domcontentloaded",
-            "proxy": configured_proxy(),
+            "requires_js_support": True,
+            "load_state": "networkidle",
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
@@ -1566,7 +1503,6 @@ def fetch_with_python_engine(
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
             creationflags=creationflags,
-            env=outbound_proxy_environment(),
         )
         if process_started is not None:
             process_started(process)
@@ -1591,9 +1527,7 @@ def fetch_with_python_engine(
     except Exception as error:
         if isinstance(error, RuntimeError) and str(error).startswith(f"{engine_name}:"):
             raise
-        raise RuntimeError(
-            f"{engine_name}: не удалось запустить процесс: {redact_proxy_secrets(error)}"
-        ) from error
+        raise RuntimeError(f"{engine_name}: не удалось запустить процесс: {error}") from error
     finally:
         if "process" in locals() and process_finished is not None:
             process_finished(process)
@@ -1602,7 +1536,7 @@ def fetch_with_python_engine(
     stderr = stderr_bytes.decode("utf-8", "replace")
 
     if process.returncode != 0:
-        details = redact_proxy_secrets((stderr or stdout or "").strip())
+        details = (stderr or stdout or "").strip()
         if len(details) > 1200:
             details = details[-1200:]
         raise RuntimeError(f"{engine_name}: процесс завершился с кодом {process.returncode}: {details}")
