@@ -207,6 +207,7 @@ def migrate_schema(connection) -> None:
     migrate_file_import_table(connection)
     migrate_price_converter_table(connection)
     migrate_supplier_feeds_table(connection)
+    migrate_attribute_assistant_tables(connection)
     cleanup_brand_state_payloads(connection)
 
 
@@ -445,6 +446,115 @@ def migrate_supplier_feeds_table(connection) -> None:
         connection.execute(text("ALTER TABLE supplier_feeds ADD COLUMN exclusions JSON NOT NULL DEFAULT '[]'"))
     if "replace_rules" not in columns:
         connection.execute(text("ALTER TABLE supplier_feeds ADD COLUMN replace_rules TEXT NOT NULL DEFAULT ''"))
+
+
+def migrate_attribute_assistant_tables(connection) -> None:
+    """Keep Attribute Assistant data readable across its two persisted schemas."""
+    additions = {
+        "attribute_templates": {
+            "is_active": "BOOLEAN NOT NULL DEFAULT 1",
+            "version": "INTEGER NOT NULL DEFAULT 1",
+        },
+        "attribute_template_revisions": {
+            "version": "INTEGER NOT NULL DEFAULT 1",
+            "report": "JSON NOT NULL DEFAULT '{}'",
+        },
+        "attribute_batches": {
+            "name": "VARCHAR(255) NOT NULL DEFAULT ''",
+            "original_path": "VARCHAR(1000) NOT NULL DEFAULT ''",
+            "export_path": "VARCHAR(1000) NOT NULL DEFAULT ''",
+            "stored_filename": "VARCHAR(500) NOT NULL DEFAULT ''",
+            "export_filename": "VARCHAR(500) NOT NULL DEFAULT ''",
+            "report_filename": "VARCHAR(500) NOT NULL DEFAULT ''",
+            "products_count": "INTEGER NOT NULL DEFAULT 0",
+            "attributes_count": "INTEGER NOT NULL DEFAULT 0",
+            "source_urls": "JSON NOT NULL DEFAULT '[]'",
+        },
+        "attribute_products": {
+            "sort_order": "INTEGER NOT NULL DEFAULT 0",
+            "donor_urls": "JSON NOT NULL DEFAULT '[]'",
+        },
+    }
+    original_columns: dict[str, dict[str, str]] = {}
+    for table_name, table_additions in additions.items():
+        columns = table_columns(connection, table_name)
+        if not columns:
+            continue
+        original_columns[table_name] = columns
+        for column_name, definition in table_additions.items():
+            if column_name not in columns:
+                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+
+    batch_columns = original_columns.get("attribute_batches", {})
+    if batch_columns:
+        if "name" not in batch_columns and "source_filename" in batch_columns:
+            connection.execute(
+                text("UPDATE attribute_batches SET name = COALESCE(source_filename, '') WHERE name = ''")
+            )
+        configured_root = Path(os.environ.get("ATTRIBUTE_ASSISTANT_DIR", "storage/attribute-assistant"))
+        if not configured_root.is_absolute():
+            configured_root = BASE_DIR / configured_root
+        legacy_root = str((configured_root / "batches").resolve()) + os.sep
+        if "original_path" not in batch_columns and "stored_filename" in batch_columns:
+            connection.execute(
+                text(
+                    "UPDATE attribute_batches SET original_path = :root || stored_filename "
+                    "WHERE stored_filename != ''"
+                ),
+                {"root": legacy_root},
+            )
+        if "export_path" not in batch_columns and "export_filename" in batch_columns:
+            connection.execute(
+                text(
+                    "UPDATE attribute_batches SET export_path = :root || export_filename "
+                    "WHERE export_filename != ''"
+                ),
+                {"root": legacy_root},
+            )
+
+    mapping_columns = table_columns(connection, "attribute_mapping_rules")
+    if mapping_columns and "normalized_donor_name" in mapping_columns:
+        normalized_source = (
+            "normalized_donor_attribute"
+            if "normalized_donor_attribute" in mapping_columns
+            else "normalized_donor_name"
+        )
+        connection.execute(text("DROP TABLE IF EXISTS attribute_mapping_rules_migration_tmp"))
+        connection.execute(
+            text(
+                "CREATE TABLE attribute_mapping_rules_migration_tmp ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "donor_id INTEGER NOT NULL, "
+                "template_id INTEGER, "
+                "template_field_id INTEGER NOT NULL, "
+                "donor_attribute_name VARCHAR(500) NOT NULL, "
+                "normalized_donor_attribute VARCHAR(500) NOT NULL, "
+                "confidence INTEGER NOT NULL DEFAULT 100, "
+                "is_active BOOLEAN NOT NULL DEFAULT 1, "
+                "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                "CONSTRAINT uq_attribute_mapping_rules_source UNIQUE "
+                "(donor_id, template_id, normalized_donor_attribute), "
+                "FOREIGN KEY(donor_id) REFERENCES donors(id) ON DELETE CASCADE, "
+                "FOREIGN KEY(template_id) REFERENCES attribute_templates(id) ON DELETE CASCADE, "
+                "FOREIGN KEY(template_field_id) REFERENCES attribute_template_fields(id) ON DELETE CASCADE"
+                ")"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO attribute_mapping_rules_migration_tmp "
+                "(id, donor_id, template_id, template_field_id, donor_attribute_name, "
+                "normalized_donor_attribute, confidence, is_active, created_at, updated_at) "
+                "SELECT id, donor_id, template_id, template_field_id, donor_attribute_name, "
+                f"{normalized_source}, confidence, is_active, created_at, updated_at "
+                "FROM attribute_mapping_rules"
+            )
+        )
+        connection.execute(text("DROP TABLE attribute_mapping_rules"))
+        connection.execute(
+            text("ALTER TABLE attribute_mapping_rules_migration_tmp RENAME TO attribute_mapping_rules")
+        )
 
 
 def _bool_value(value, default=False) -> bool:

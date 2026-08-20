@@ -258,6 +258,95 @@ class SupplierFeedConfigurationTests(unittest.TestCase):
         )
 
 
+class AttributeAssistantMigrationTests(unittest.TestCase):
+    def test_runtime_migration_upgrades_legacy_attribute_tables_without_data_loss(self) -> None:
+        from database.session import migrate_attribute_assistant_tables
+        from models import AttributeBatch, AttributeMappingRule
+        from sqlalchemy import select
+
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE attribute_batches ("
+                        "id INTEGER PRIMARY KEY, template_id INTEGER, "
+                        "source_filename VARCHAR(500) NOT NULL, "
+                        "stored_filename VARCHAR(500) NOT NULL, "
+                        "export_filename VARCHAR(500) NOT NULL, "
+                        "status VARCHAR(32) NOT NULL, "
+                        "products_count INTEGER NOT NULL, "
+                        "attributes_count INTEGER NOT NULL, "
+                        "summary JSON NOT NULL, "
+                        "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+                        "report_filename VARCHAR(500) NOT NULL DEFAULT '', "
+                        "input_mode VARCHAR(32) NOT NULL DEFAULT 'csv', "
+                        "processing_mode VARCHAR(32) NOT NULL DEFAULT 'suggest', "
+                        "source_urls JSON NOT NULL DEFAULT '[]'"
+                        ")"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO attribute_batches "
+                        "(id, template_id, source_filename, stored_filename, export_filename, "
+                        "status, products_count, attributes_count, summary, created_at, updated_at) "
+                        "VALUES (2, 1, 'products.csv', 'stored.csv', 'result.csv', "
+                        "'ready', 14, 1013, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE TABLE attribute_mapping_rules ("
+                        "id INTEGER PRIMARY KEY, donor_id INTEGER NOT NULL, template_id INTEGER, "
+                        "template_field_id INTEGER NOT NULL, donor_attribute_name VARCHAR(255) NOT NULL, "
+                        "normalized_donor_name VARCHAR(255) NOT NULL, confidence INTEGER NOT NULL, "
+                        "is_active BOOLEAN NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL"
+                        ")"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO attribute_mapping_rules "
+                        "(id, donor_id, template_id, template_field_id, donor_attribute_name, "
+                        "normalized_donor_name, confidence, is_active, created_at, updated_at) "
+                        "VALUES (3, 4, 1, 5, 'Spin speed', 'spin speed', 100, 1, "
+                        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+                migrate_attribute_assistant_tables(connection)
+                migrate_attribute_assistant_tables(connection)
+
+            batch_columns = {column["name"] for column in inspect(engine).get_columns("attribute_batches")}
+            mapping_columns = {
+                column["name"] for column in inspect(engine).get_columns("attribute_mapping_rules")
+            }
+            Session = sessionmaker(bind=engine, expire_on_commit=False)
+            with Session() as session:
+                batch = session.scalar(select(AttributeBatch))
+                rule = session.scalar(select(AttributeMappingRule))
+
+            self.assertTrue(
+                {
+                    "name",
+                    "original_path",
+                    "export_path",
+                    "stored_filename",
+                    "products_count",
+                    "source_urls",
+                }.issubset(batch_columns)
+            )
+            self.assertIn("normalized_donor_attribute", mapping_columns)
+            self.assertNotIn("normalized_donor_name", mapping_columns)
+            self.assertEqual(batch.name, "products.csv")
+            self.assertTrue(batch.original_path.endswith("stored.csv"))
+            self.assertTrue(batch.export_path.endswith("result.csv"))
+            self.assertEqual(batch.products_count, 14)
+            self.assertEqual(rule.normalized_donor_attribute, "spin speed")
+        finally:
+            engine.dispose()
+
+
 class PriceConverterTests(unittest.TestCase):
     def test_price_cleanup_keeps_only_digits_without_float_dot_zero(self) -> None:
         from services.price_converter_service import normalize_price

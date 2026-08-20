@@ -1,4 +1,26 @@
 services:
+  attribute-ai:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.attribute-ai
+    container_name: data-collection-attribute-ai
+    restart: unless-stopped
+    environment:
+      ATTRIBUTE_AI_HOST: 0.0.0.0
+      ATTRIBUTE_AI_PORT: 4580
+      ATTRIBUTE_CODEX_HOME: /state/codex
+      ATTRIBUTE_CHATGPT_PROXY_URL: ${ATTRIBUTE_CHATGPT_PROXY_URL:-}
+      ATTRIBUTE_CODEX_PROXY_URL: ${ATTRIBUTE_CODEX_PROXY_URL:-}
+      ATTRIBUTE_CHATGPT_BRIDGE_TOKEN: ${ATTRIBUTE_CHATGPT_BRIDGE_TOKEN:-}
+    volumes:
+      - ./storage/attribute-codex:/state/codex
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+
   frontend:
     build:
       context: ./frontend
@@ -33,6 +55,9 @@ services:
       PORT: 5000
       FEED_DIR: /app/feeds
       EXPORT_DIR: /app/exports
+      ATTRIBUTE_ASSISTANT_DIR: /app/storage/attribute-assistant
+      ATTRIBUTE_CHATGPT_BRIDGE_URL: http://attribute-ai:4580
+      ATTRIBUTE_CHATGPT_BRIDGE_TOKEN: ${ATTRIBUTE_CHATGPT_BRIDGE_TOKEN:-}
       FILE_IMPORT_DIR: /app/storage/file-import
       PRICE_CONVERTER_DIR: ${PRICE_CONVERTER_DIR:-storage/price-converter}
       TMPDIR: /tmp/parser

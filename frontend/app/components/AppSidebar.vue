@@ -54,6 +54,15 @@ const navItems: Array<{
     },
   },
   {
+    label: "Атрибуты",
+    caption: "Заполнение товаров",
+    to: "/attribute-assistant",
+    icon: "i-lucide-list-checks",
+    onSelect: () => {
+      mobileOpen.value = false;
+    },
+  },
+  {
     label: "Настройки",
     caption: "Фиды и почта",
     to: "/settings",

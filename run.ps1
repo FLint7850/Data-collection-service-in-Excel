@@ -89,6 +89,64 @@ function Stop-StartedProcess {
     }
 }
 
+function Install-AttributeCodex {
+    param(
+        [string]$NpmPath,
+        [string]$ProjectRoot
+    )
+    $codexDir = Join-Path $ProjectRoot "storage\codex-cli"
+    $codexBin = Join-Path $codexDir "node_modules\.bin\codex.cmd"
+    if (-not (Test-Path -LiteralPath $codexBin)) {
+        Write-Host "Installing Codex CLI for Attribute Assistant..." -ForegroundColor Cyan
+        New-Item -ItemType Directory -Force -Path $codexDir | Out-Null
+        $installOutput = & $NpmPath install --prefix $codexDir --no-audit --no-fund "@openai/codex"
+        $installExitCode = $LASTEXITCODE
+        $installOutput | ForEach-Object { Write-Host $_ }
+        if ($installExitCode -ne 0) {
+            throw "Codex CLI installation failed."
+        }
+    }
+    return $codexBin
+}
+
+function Start-AttributeAi {
+    param(
+        [string]$NodePath,
+        [string]$ProjectRoot,
+        [string]$CodexBin,
+        [int]$Port,
+        [string]$LogPath
+    )
+    $env:CODEX_BIN = $CodexBin
+    $env:ATTRIBUTE_AI_HOST = "127.0.0.1"
+    $env:ATTRIBUTE_AI_PORT = [string]$Port
+    $env:ATTRIBUTE_CODEX_HOME = Join-Path $ProjectRoot "storage\attribute-codex"
+    $env:ATTRIBUTE_CHATGPT_BRIDGE_URL = "http://127.0.0.1:$Port"
+    $bridgePath = Join-Path $ProjectRoot "deploy\attribute-ai-bridge.mjs"
+    return Start-Process -FilePath $NodePath -ArgumentList $bridgePath -WorkingDirectory $ProjectRoot -PassThru -WindowStyle Hidden -RedirectStandardOutput "$LogPath.out" -RedirectStandardError "$LogPath.err"
+}
+
+function Test-AttributeAiHealth {
+    param([string]$Url)
+    try {
+        $response = Invoke-WebRequest -Uri "$Url/health" -UseBasicParsing -TimeoutSec 2
+        return $response.StatusCode -eq 200
+    }
+    catch {
+        return $false
+    }
+}
+
+
+function Stop-AttributeAiProcess {
+    param($Process)
+    if (-not $Process -or $Process.HasExited) {
+        return
+    }
+    & taskkill.exe /PID $Process.Id /T /F *> $null
+}
+
+
 Load-LocalEnv
 
 $python = Find-Python
@@ -104,6 +162,14 @@ if (-not $nodeCommand -or -not $npmCommand) {
     Write-Host "Node.js was not found in PATH." -ForegroundColor Red
     Write-Host "Install Node.js 20+ from https://nodejs.org/ and run this file again." -ForegroundColor Yellow
     exit 1
+}
+
+$attributeCodexBin = $null
+try {
+    $attributeCodexBin = Install-AttributeCodex -NpmPath $npmCommand.Source -ProjectRoot $PSScriptRoot
+}
+catch {
+    Write-Warning "Codex CLI was not installed: $($_.Exception.Message)"
 }
 
 $pythonArgs = if ($python -eq "py") { @("-3") } else { @() }
@@ -145,6 +211,7 @@ if (-not (Test-Path (Join-Path $FrontendDir "node_modules\.bin\nuxt.cmd"))) {
 $BackendPort = Find-FreePort -Preferred $BackendPort -Last 5065
 $FrontendPort = Find-FreePort -Preferred $FrontendPort -Last 3010
 $BackendUrl = "http://127.0.0.1:$BackendPort"
+$AttributeAiPort = Find-FreePort -Preferred 4580 -Last 4590
 $AppUrl = "http://127.0.0.1:$FrontendPort"
 
 $LogDir = Join-Path $PSScriptRoot "logs"
@@ -152,13 +219,34 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $BackendLog = Join-Path $LogDir "backend.log"
 $FrontendLog = Join-Path $LogDir "frontend.log"
 Add-Content -Path $BackendLog -Encoding UTF8 -Value ""
+$AttributeAiLog = Join-Path $LogDir "attribute-ai.log"
 Add-Content -Path $FrontendLog -Encoding UTF8 -Value ""
 
 $backendProcess = $null
 $frontendProcess = $null
 
+$attributeAiProcess = $null
 try {
     Write-Host "Starting API at $BackendUrl ..." -ForegroundColor Green
+    if ($attributeCodexBin) {
+        Write-Host "Starting isolated ChatGPT bridge..." -ForegroundColor Green
+        $attributeAiProcess = Start-AttributeAi -NodePath $nodeCommand.Source -ProjectRoot $PSScriptRoot -CodexBin $attributeCodexBin -Port $AttributeAiPort -LogPath $AttributeAiLog
+        $attributeAiReady = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            if (Test-AttributeAiHealth -Url "http://127.0.0.1:$AttributeAiPort") {
+                $attributeAiReady = $true
+                break
+            }
+            if ($attributeAiProcess.HasExited) {
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $attributeAiReady) {
+            Write-Warning "ChatGPT bridge did not start. The rest of the application will continue."
+        }
+    }
+
     $backendCommand = "set PORT=$BackendPort&& set PYTHONIOENCODING=utf-8&& `"$venvPython`" `"app.py`" >> `"$BackendLog`" 2>>&1"
     $backendProcess = Start-Process `
         -FilePath "cmd.exe" `
@@ -232,4 +320,5 @@ catch {
 finally {
     Stop-StartedProcess $frontendProcess
     Stop-StartedProcess $backendProcess
+    Stop-AttributeAiProcess $attributeAiProcess
 }
