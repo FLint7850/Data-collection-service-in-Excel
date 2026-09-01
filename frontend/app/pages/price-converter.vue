@@ -18,8 +18,6 @@ const loading = ref(true);
 const uploading = ref(false);
 const saving = ref(false);
 const actionLoading = ref("");
-const dragActive = ref(false);
-const fileInput = ref<HTMLInputElement | null>(null);
 const error = ref("");
 let lastSavedSettings: PriceConverterSettings | null = null;
 
@@ -203,22 +201,11 @@ async function upload(file?: File) {
     error.value = errorMessage(caught);
   } finally {
     uploading.value = false;
-    if (fileInput.value) fileInput.value.value = "";
   }
 }
 
-function handleFiles(files?: FileList | null) {
-  if (!files?.length) return;
-  if (files.length > 1) {
-    error.value = "Можно выбрать только один файл.";
-    return;
-  }
-  void upload(files[0]);
-}
-
-function onDrop(event: DragEvent) {
-  dragActive.value = false;
-  handleFiles(event.dataTransfer?.files);
+function handleFileSelection(file: File | null | undefined) {
+  if (file) void upload(file);
 }
 
 async function removeFile() {
@@ -364,33 +351,18 @@ onMounted(load);
             </UBadge>
           </div>
 
-          <input
-            ref="fileInput"
-            class="sr-only"
-            type="file"
-            accept=".csv,.xls,.xlsx"
-            @change="handleFiles(($event.target as HTMLInputElement).files)"
-          >
-
-          <button
+          <UFileUpload
             v-if="!data.file"
-            type="button"
             class="file-dropzone"
-            :class="{ active: dragActive }"
+            accept=".csv,.xls,.xlsx"
+            :icon="uploading ? 'i-lucide-loader-circle' : 'i-lucide-cloud-upload'"
+            :label="uploading ? 'Загружаем файл…' : 'Перетащите файл сюда'"
+            description="или нажмите, чтобы выбрать CSV, XLS или XLSX · При загрузке нового файла предыдущий будет удалён"
             :disabled="uploading || isRunning"
-            @click="fileInput?.click()"
-            @dragenter.prevent="dragActive = true"
-            @dragover.prevent="dragActive = true"
-            @dragleave.prevent="dragActive = false"
-            @drop.prevent="onDrop"
-          >
-            <span class="dropzone-icon">
-              <UIcon :name="uploading ? 'i-lucide-loader-circle' : 'i-lucide-cloud-upload'" :class="{ spin: uploading }" />
-            </span>
-            <strong>{{ uploading ? "Загружаем файл…" : "Перетащите файл сюда" }}</strong>
-            <span>или нажмите, чтобы выбрать CSV, XLS или XLSX</span>
-            <small>При загрузке нового файла предыдущий будет удалён</small>
-          </button>
+            :preview="false"
+            reset
+            @update:model-value="handleFileSelection"
+          />
 
           <UCard
             v-else

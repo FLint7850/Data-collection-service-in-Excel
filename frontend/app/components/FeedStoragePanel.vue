@@ -16,8 +16,11 @@ defineProps<{ feeds: StoredFeed[] }>();
     </div>
 
     <div v-if="feeds.length" class="stored-feed-list">
-      <a
+      <UButton
         v-for="feed in feeds"
+        as="a"
+        color="neutral"
+        variant="ghost"
         :key="`${feed.source}-${feed.filename}`"
         :href="`/api/news/feeds/${encodeURIComponent(feed.source || '')}/${encodeURIComponent(feed.filename || '')}`"
         class="stored-feed-item"
@@ -28,7 +31,7 @@ defineProps<{ feeds: StoredFeed[] }>();
           <small>{{ formatFileSize(feed.size) }} · {{ feed.created_at || "сохранённый снимок" }}</small>
         </div>
         <UIcon name="i-lucide-download" />
-      </a>
+      </UButton>
     </div>
     <p v-else class="inline-empty">Снимки фидов появятся после первого мониторинга.</p>
   </UCard>

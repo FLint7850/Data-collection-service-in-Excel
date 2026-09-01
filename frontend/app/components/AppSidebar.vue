@@ -119,8 +119,11 @@ const navItems: Array<{
     </UNavigationMenu>
   </aside>
 
-  <button
+  <UButton
     v-if="mobileOpen"
+    color="neutral"
+    variant="ghost"
+    square
     class="sidebar-backdrop"
     type="button"
     aria-label="Закрыть меню"

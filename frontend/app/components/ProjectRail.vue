@@ -21,10 +21,13 @@ const emit = defineEmits<{
       <UBadge color="neutral" variant="subtle">{{ projects.length }}</UBadge>
     </div>
     <div class="project-list">
-      <button
+      <UButton
         v-for="project in projects"
         :key="project.id"
         type="button"
+        color="neutral"
+        variant="ghost"
+        block
         class="project-list-item"
         :class="{ active: project.id === activeProjectId }"
         @click="emit('select', project.id)"
@@ -40,7 +43,7 @@ const emit = defineEmits<{
           </small>
         </span>
         <StatusBadge :status="project.state.status" />
-      </button>
+      </UButton>
     </div>
   </UCard>
 </template>

@@ -302,14 +302,19 @@ class PlaywrightBrowserSession:
         # Playwright, после чего context.close() уже не способен завершить Chromium.
         await self._close_browser()
         current_task = asyncio.current_task()
-        tasks = [
-            task
-            for task in asyncio.all_tasks()
-            if task is not current_task and not task.done()
-        ]
-        for task in tasks:
-            task.cancel()
-        if tasks:
+        # Playwright may schedule one final transport callback while stop() settles.
+        # Drain in a few event-loop turns so those late tasks are observed as well.
+        for _attempt in range(4):
+            await asyncio.sleep(0)
+            tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not current_task and not task.done()
+            ]
+            if not tasks:
+                break
+            for task in tasks:
+                task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def _force_terminate_owned_processes(self) -> None:
@@ -1076,14 +1081,22 @@ class Crawl4AIBrowserSession:
 
 
 class ScrapeGraphAISession:
-    """Per-scan ScrapeGraphAI Chromium lifecycle without a server-wide lock."""
+    """Process HTML with ScrapeGraphAI after loading it in the shared browser.
 
-    def __init__(self, stop_signal: Optional[threading.Event] = None) -> None:
+    ScrapeGraphAI's ChromiumLoader owns and closes a browser for every URL and
+    does not accept an existing Playwright context. The application therefore
+    loads pages through the scan-owned PlaywrightBrowserSession and gives
+    FetchNode local HTML only. Browser concurrency stays bounded by the shared
+    session's max_pages semaphore.
+    """
+
+    def __init__(
+        self,
+        browser_session: PlaywrightBrowserSession,
+        stop_signal: Optional[threading.Event] = None,
+    ) -> None:
+        self.browser_session = browser_session
         self.stop_signal = stop_signal
-        # FetchNode creates and owns its Chromium internally and cannot accept
-        # a shared context. Serialize only this scan so thread_count does not
-        # turn into thread_count independent full browsers.
-        self._slot = threading.BoundedSemaphore(1)
         self._state_lock = threading.Lock()
         self._active_processes: Set[subprocess.Popen] = set()
         self._closed = False
@@ -1099,29 +1112,41 @@ class ScrapeGraphAISession:
         with self._state_lock:
             self._active_processes.discard(process)
 
-    def fetch(self, url: str) -> Optional[str]:
-        while True:
-            with self._state_lock:
-                if self._closed:
-                    return None
-            if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+    def fetch(
+        self,
+        url: str,
+        rules: Optional[Dict[str, str]] = None,
+        product_url_filters: Optional[Iterable[str]] = None,
+        allow_empty_price: bool = False,
+    ) -> Optional[str]:
+        with self._state_lock:
+            if self._closed:
                 return None
-            if self._slot.acquire(timeout=0.25):
-                break
-        try:
-            with self._state_lock:
-                if self._closed:
-                    return None
-            return fetch_with_python_engine(
-                SCRAPEGRAPHAI_FETCH_SCRIPT,
-                url,
-                REQUEST_TIMEOUT,
-                "ScrapeGraphAI",
-                process_started=self._register_process,
-                process_finished=self._unregister_process,
-            )
-        finally:
-            self._slot.release()
+        if isinstance(self.stop_signal, threading.Event) and self.stop_signal.is_set():
+            return None
+
+        html = self.browser_session.fetch(
+            url,
+            "scrapegraphai",
+            rules,
+            product_url_filters,
+            allow_empty_price,
+        )
+        if not html:
+            return None
+
+        with self._state_lock:
+            if self._closed:
+                return None
+        return fetch_with_python_engine(
+            SCRAPEGRAPHAI_LOCAL_HTML_SCRIPT,
+            url,
+            REQUEST_TIMEOUT,
+            "ScrapeGraphAI",
+            process_started=self._register_process,
+            process_finished=self._unregister_process,
+            input_text=html,
+        )
 
     def close(self) -> None:
         with self._state_lock:
@@ -1154,7 +1179,10 @@ class BrowserMethodSession:
         self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
         self.debug_visible_session = self._new_debug_visible_session()
         self.crawl4ai_session = Crawl4AIBrowserSession(self.stop_signal, self.max_pages)
-        self.scrapegraphai_session = ScrapeGraphAISession(self.stop_signal)
+        self.scrapegraphai_session = ScrapeGraphAISession(
+            self.playwright_session,
+            self.stop_signal,
+        )
 
     def _new_playwright_session(self) -> PlaywrightBrowserSession:
         return PlaywrightBrowserSession(
@@ -1199,7 +1227,9 @@ class BrowserMethodSession:
             else:
                 return None
         if method in {"crawl4ai", "scrapegraphai"}:
-            return session.fetch(url)
+            if method == "crawl4ai":
+                return session.fetch(url)
+            return session.fetch(url, rules, product_url_filters, allow_empty_price)
         return session.fetch(url, method, rules, product_url_filters, allow_empty_price)
 
     def close(self) -> None:
@@ -1232,7 +1262,10 @@ class BrowserMethodSession:
             self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
             self.debug_visible_session = self._new_debug_visible_session()
             self.crawl4ai_session = Crawl4AIBrowserSession(self.stop_signal, self.max_pages)
-            self.scrapegraphai_session = ScrapeGraphAISession(self.stop_signal)
+            self.scrapegraphai_session = ScrapeGraphAISession(
+                self.playwright_session,
+                self.stop_signal,
+            )
             self._closed = False
             return True
 
@@ -1423,7 +1456,7 @@ with sync_playwright() as p:
 """
 
 
-SCRAPEGRAPHAI_FETCH_SCRIPT = r"""
+SCRAPEGRAPHAI_LOCAL_HTML_SCRIPT = r"""
 import base64
 import sys
 
@@ -1438,38 +1471,27 @@ except Exception:
 
 from scrapegraphai.nodes.fetch_node import FetchNode
 
-url = sys.argv[1]
 timeout = int(float(sys.argv[2]))
 marker = sys.argv[3]
+html = sys.stdin.buffer.read().decode("utf-8", "replace")
 
 node = FetchNode(
-    input="url",
+    input="local_dir",
     output=["doc"],
     node_config={
-        "headless": True,
         "timeout": timeout,
         "use_soup": False,
         "cut": False,
-        "loader_kwargs": {
-            "timeout": timeout,
-            "requires_js_support": True,
-            "load_state": "networkidle",
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ],
-        },
     },
 )
-state = node.execute({"url": url}) or {}
+state = node.execute({"local_dir": html}) or {}
 documents = state.get("doc") or state.get("document") or []
-html = ""
+processed_html = ""
 if isinstance(documents, list) and documents:
-    html = getattr(documents[0], "page_content", "") or str(documents[0] or "")
+    processed_html = getattr(documents[0], "page_content", "") or str(documents[0] or "")
 elif isinstance(documents, str):
-    html = documents
-print(marker + base64.b64encode(str(html).encode("utf-8", "replace")).decode("ascii"))
+    processed_html = documents
+print(marker + base64.b64encode(str(processed_html).encode("utf-8", "replace")).decode("ascii"))
 """
 
 
@@ -1480,6 +1502,7 @@ def fetch_with_python_engine(
     engine_name: str = "engine",
     process_started=None,
     process_finished=None,
+    input_text: Optional[str] = None,
 ) -> Optional[str]:
     command = [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1489,6 +1512,7 @@ def fetch_with_python_engine(
         process = subprocess.Popen(
             command,
             cwd=str(BASE_DIR),
+            stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
@@ -1497,7 +1521,11 @@ def fetch_with_python_engine(
         if process_started is not None:
             process_started(process)
         try:
-            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout_seconds + 10)
+            stdin_bytes = input_text.encode("utf-8") if input_text is not None else None
+            stdout_bytes, stderr_bytes = process.communicate(
+                input=stdin_bytes,
+                timeout=timeout_seconds + 10,
+            )
         except subprocess.TimeoutExpired as error:
             _terminate_subprocess_tree(process)
             try:

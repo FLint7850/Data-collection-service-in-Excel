@@ -11,6 +11,10 @@ withDefaults(
     contentClass: "",
   },
 );
+
+const emit = defineEmits<{
+  "update:open": [value: boolean];
+}>();
 </script>
 
 <template>
@@ -18,6 +22,7 @@ withDefaults(
     :default-open="defaultOpen"
     :disabled="disabled"
     class="settings-details"
+    @update:open="emit('update:open', $event)"
   >
     <template #default="{ open }">
       <UButton

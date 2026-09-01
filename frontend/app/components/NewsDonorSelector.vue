@@ -41,10 +41,13 @@ const addUrl = defineModel<string>("addUrl", { required: true });
       </UButton>
     </div>
     <div class="donor-mini-list">
-      <button
+      <UButton
         v-for="monitor in monitors"
         :key="monitor.id"
         type="button"
+        color="neutral"
+        variant="ghost"
+        block
         :class="{ active: monitor.id === selectedId }"
         @click="selectedId = monitor.id"
       >
@@ -55,7 +58,7 @@ const addUrl = defineModel<string>("addUrl", { required: true });
           </strong>
           <small>{{ monitor.start_urls.length }} стартовых URL</small>
         </span>
-      </button>
+      </UButton>
     </div>
   </UCard>
 </template>

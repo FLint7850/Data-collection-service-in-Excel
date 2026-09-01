@@ -259,6 +259,84 @@ class SupplierFeedConfigurationTests(unittest.TestCase):
 
 
 class AttributeAssistantMigrationTests(unittest.TestCase):
+    def test_runtime_migration_removes_only_obsolete_tables(self) -> None:
+        from database.session import cleanup_obsolete_tables
+
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.execute(text("CREATE TABLE attribute_donor_product_sources (id INTEGER PRIMARY KEY)"))
+                connection.execute(text("CREATE TABLE attribute_donors (id INTEGER PRIMARY KEY)"))
+                connection.execute(text("CREATE TABLE scan_runs (id INTEGER PRIMARY KEY)"))
+                connection.execute(text("CREATE TABLE attribute_templates (id INTEGER PRIMARY KEY)"))
+                cleanup_obsolete_tables(connection)
+                cleanup_obsolete_tables(connection)
+
+            tables = set(inspect(engine).get_table_names())
+        finally:
+            engine.dispose()
+
+        self.assertNotIn("attribute_donor_product_sources", tables)
+        self.assertNotIn("attribute_donors", tables)
+        self.assertNotIn("scan_runs", tables)
+        self.assertIn("attribute_templates", tables)
+
+    def test_runtime_migration_keeps_only_restorable_product_snapshots(self) -> None:
+        from database.session import migrate_attribute_product_revisions
+
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.execute(text("CREATE TABLE attribute_products (id INTEGER PRIMARY KEY)"))
+                connection.execute(text("INSERT INTO attribute_products (id) VALUES (12)"))
+                connection.execute(
+                    text(
+                        "CREATE TABLE attribute_processing_logs ("
+                        "id INTEGER PRIMARY KEY, batch_id INTEGER, product_id INTEGER, "
+                        "action VARCHAR(64) NOT NULL, details JSON NOT NULL, "
+                        "created_at DATETIME NOT NULL)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO attribute_processing_logs "
+                        "(id, batch_id, product_id, action, details, created_at) "
+                        "VALUES (:id, 3, 12, :action, :details, CURRENT_TIMESTAMP)"
+                    ),
+                    {
+                        "id": 7,
+                        "action": "product_snapshot",
+                        "details": '{"label":"До изменения","values":[{"id":4}]}',
+                    },
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO attribute_processing_logs "
+                        "(id, batch_id, product_id, action, details, created_at) "
+                        "VALUES (8, 3, 12, 'donor_processing', '{}', CURRENT_TIMESTAMP)"
+                    )
+                )
+                migrate_attribute_product_revisions(connection)
+                migrate_attribute_product_revisions(connection)
+
+                tables = set(inspect(connection).get_table_names())
+                rows = connection.execute(
+                    text(
+                        "SELECT id, product_id, label, "
+                        "json_extract(snapshot, '$.values[0].id') AS value_id "
+                        "FROM attribute_product_revisions"
+                    )
+                ).mappings().all()
+        finally:
+            engine.dispose()
+
+        self.assertNotIn("attribute_processing_logs", tables)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 7)
+        self.assertEqual(rows[0]["product_id"], 12)
+        self.assertEqual(rows[0]["label"], "До изменения")
+        self.assertEqual(rows[0]["value_id"], 4)
+
     def test_runtime_migration_upgrades_legacy_attribute_tables_without_data_loss(self) -> None:
         from database.session import migrate_attribute_assistant_tables
         from models import AttributeBatch, AttributeMappingRule
@@ -343,6 +421,48 @@ class AttributeAssistantMigrationTests(unittest.TestCase):
             self.assertTrue(batch.export_path.endswith("result.csv"))
             self.assertEqual(batch.products_count, 14)
             self.assertEqual(rule.normalized_donor_attribute, "spin speed")
+        finally:
+            engine.dispose()
+
+
+    def test_runtime_migration_removes_unused_allowed_value_flags_without_data_loss(self) -> None:
+        from database.session import migrate_attribute_assistant_tables
+
+        engine = create_engine("sqlite://")
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE attribute_allowed_values ("
+                        "id INTEGER PRIMARY KEY, value VARCHAR(1000) NOT NULL, "
+                        "is_global BOOLEAN NOT NULL DEFAULT 0, "
+                        "is_recommended BOOLEAN NOT NULL DEFAULT 1"
+                        ")"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO attribute_allowed_values "
+                        "(id, value, is_global, is_recommended) "
+                        "VALUES (1, 'Россия', 1, 1)"
+                    )
+                )
+                migrate_attribute_assistant_tables(connection)
+                migrate_attribute_assistant_tables(connection)
+
+            columns = {
+                column["name"]
+                for column in inspect(engine).get_columns("attribute_allowed_values")
+            }
+            with engine.connect() as connection:
+                value = connection.execute(
+                    text("SELECT value FROM attribute_allowed_values WHERE id = 1")
+                ).scalar_one()
+
+            self.assertNotIn("is_global", columns)
+            self.assertNotIn("is_recommended", columns)
+            self.assertIn("is_combination", columns)
+            self.assertEqual(value, "Россия")
         finally:
             engine.dispose()
 

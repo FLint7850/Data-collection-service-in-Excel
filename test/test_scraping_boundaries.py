@@ -582,7 +582,10 @@ class ScrapingBoundaryTests(unittest.TestCase):
             botasaurus_browser_executable.cache_clear()
             try:
                 with (
-                    patch.dict(os.environ, {"PLAYWRIGHT_BROWSER_EXECUTABLE": ""}),
+                    patch.dict(os.environ, {
+                        "PLAYWRIGHT_BROWSER_EXECUTABLE": "",
+                        "PLAYWRIGHT_BROWSERS_PATH": str(browser_root),
+                    }),
                     patch("playwright.sync_api.sync_playwright", return_value=manager),
                 ):
                     executable = botasaurus_browser_executable(prefer_headless_shell=True)
@@ -660,7 +663,12 @@ class ScrapingBoundaryTests(unittest.TestCase):
             )
             debug_fetch.assert_called_once()
             crawl4ai_fetch.assert_called_once_with("https://example.test")
-            scrapegraphai_fetch.assert_called_once_with("https://example.test")
+            scrapegraphai_fetch.assert_called_once_with(
+                "https://example.test",
+                None,
+                None,
+                False,
+            )
         finally:
             session.close()
 
@@ -762,29 +770,77 @@ class ScrapingBoundaryTests(unittest.TestCase):
         self.assertTrue(all(result and result.startswith("<html>") for result in results))
         self.assertTrue(session._shutdown_complete.is_set())
 
-    def test_scrapegraphai_serializes_its_internal_full_browser_per_scan(self) -> None:
-        session = ScrapeGraphAISession(threading.Event())
+    def test_scrapegraphai_uses_shared_browser_and_processes_local_html(self) -> None:
         active = 0
         max_active = 0
         lock = threading.Lock()
 
-        def fake_fetch(*_args, **_kwargs):
-            nonlocal active, max_active
-            with lock:
-                active += 1
-                max_active = max(max_active, active)
-            threading.Event().wait(0.03)
-            with lock:
-                active -= 1
-            return "<html>scrapegraphai</html>"
+        class SharedBrowser:
+            @staticmethod
+            def fetch(url, method, *_args):
+                nonlocal active, max_active
+                if method != "scrapegraphai":
+                    raise AssertionError(method)
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                threading.Event().wait(0.03)
+                with lock:
+                    active -= 1
+                return f"<html>{url}</html>"
 
-        with patch("services.scraping.browser.fetch_with_python_engine", side_effect=fake_fetch):
+        session = ScrapeGraphAISession(SharedBrowser(), threading.Event())
+
+        def fake_process(script, url, *_args, **kwargs):
+            self.assertIn('input="local_dir"', script)
+            self.assertNotIn('input="url"', script)
+            self.assertEqual(kwargs["input_text"], f"<html>{url}</html>")
+            return kwargs["input_text"]
+
+        with patch("services.scraping.browser.fetch_with_python_engine", side_effect=fake_process):
+            urls = [f"https://example.test/{i}" for i in range(4)]
             with ThreadPoolExecutor(max_workers=4) as executor:
-                results = list(executor.map(session.fetch, [f"https://example.test/{i}" for i in range(4)]))
+                results = list(executor.map(session.fetch, urls))
         session.close()
 
-        self.assertEqual(max_active, 1)
-        self.assertEqual(results, ["<html>scrapegraphai</html>"] * 4)
+        self.assertEqual(max_active, 4)
+        self.assertEqual(results, [f"<html>{url}</html>" for url in urls])
+
+    def test_scrapegraphai_does_not_start_local_processing_after_close(self) -> None:
+        browser_started = threading.Event()
+        release_browser = threading.Event()
+
+        class SharedBrowser:
+            @staticmethod
+            def fetch(url, method, *_args):
+                del url, method
+                browser_started.set()
+                release_browser.wait(timeout=2)
+                return "<html>scrapegraphai</html>"
+
+        session = ScrapeGraphAISession(SharedBrowser(), threading.Event())
+        with patch("services.scraping.browser.fetch_with_python_engine") as process_html:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(session.fetch, "https://example.test")
+                self.assertTrue(browser_started.wait(timeout=1))
+                session.close()
+                release_browser.set()
+                self.assertIsNone(future.result(timeout=2))
+
+        process_html.assert_not_called()
+
+    def test_scrapegraphai_local_processor_receives_html_through_stdin(self) -> None:
+        html = "<html><body>Пример</body></html>"
+        shared_browser = PlaywrightBrowserSession(threading.Event(), 2)
+        session = ScrapeGraphAISession(shared_browser, threading.Event())
+        try:
+            with patch.object(shared_browser, "fetch", return_value=html):
+                result = session.fetch("https://example.test")
+        finally:
+            session.close()
+            shared_browser.close()
+
+        self.assertEqual(result, html)
 
     def test_every_connection_code_routes_to_its_named_engine(self) -> None:
         with patch("services.scraping.fallback.normalize_connection_method", return_value="requests"):

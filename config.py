@@ -72,11 +72,47 @@ def env_path(name: str, default: str) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
+def _installed_playwright_executable(prefer_headless_shell: bool) -> Optional[str]:
+    roots: list[Path] = []
+    configured_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured_root:
+        roots.append(Path(configured_root))
+    roots.extend([Path("/ms-playwright"), Path.home() / ".cache" / "ms-playwright"])
+    families = (
+        ("chromium_headless_shell-*", ("chrome-headless-shell.exe", "chrome-headless-shell", "headless_shell.exe", "headless_shell")),
+        ("chromium-*", ("chrome.exe", "chrome")),
+    )
+    if not prefer_headless_shell:
+        families = tuple(reversed(families))
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        for directory_pattern, executable_names in families:
+            for browser_dir in sorted(resolved.glob(directory_pattern), reverse=True):
+                for executable_name in executable_names:
+                    match = next(
+                        (item for item in browser_dir.rglob(executable_name) if item.is_file()),
+                        None,
+                    )
+                    if match:
+                        return str(match)
+    return None
+
+
 @lru_cache(maxsize=2)
 def botasaurus_browser_executable(prefer_headless_shell: bool = True) -> Optional[str]:
     configured = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE")
     if configured and Path(configured).is_file():
         return configured
+    discovered = _installed_playwright_executable(prefer_headless_shell)
+    if discovered:
+        return discovered
     try:
         from playwright.sync_api import sync_playwright
 
@@ -111,6 +147,24 @@ EXPORT_DIR = env_path("EXPORT_DIR", "exports")
 FILE_IMPORT_DIR = env_path("FILE_IMPORT_DIR", "storage/file-import")
 PRICE_CONVERTER_DIR = env_path("PRICE_CONVERTER_DIR", "storage/price-converter")
 ATTRIBUTE_ASSISTANT_DIR = env_path("ATTRIBUTE_ASSISTANT_DIR", "storage/attribute-assistant")
+ATTRIBUTE_ASSISTANT_UPLOAD_MAX_BYTES = env_int(
+    "ATTRIBUTE_ASSISTANT_UPLOAD_MAX_BYTES",
+    20 * 1024 * 1024,
+    minimum=1024 * 1024,
+    maximum=100 * 1024 * 1024,
+)
+ATTRIBUTE_ASSISTANT_JSON_MAX_BYTES = env_int(
+    "ATTRIBUTE_ASSISTANT_JSON_MAX_BYTES",
+    2 * 1024 * 1024,
+    minimum=64 * 1024,
+    maximum=10 * 1024 * 1024,
+)
+ATTRIBUTE_ASSISTANT_MAX_URLS = env_int(
+    "ATTRIBUTE_ASSISTANT_MAX_URLS",
+    500,
+    minimum=1,
+    maximum=5000,
+)
 SCRAPE_CHECKPOINT_DIR = env_path("SCRAPE_CHECKPOINT_DIR", "storage/checkpoints")
 PROJECT_PROFILE_DIR = BASE_DIR / "profiles" / "projects"
 

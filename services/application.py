@@ -5,7 +5,7 @@ import traceback
 from typing import Optional
 
 from flask import Response, g, jsonify, request, session
-from sqlalchemy import select
+from sqlalchemy import select, text
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash
 
@@ -17,18 +17,24 @@ from models import User
 def log_unhandled_exception(error: Exception):
     if isinstance(error, HTTPException):
         return jsonify({"error": error.description}), error.code or 500
-    from services.log_service import append_log
-    append_log(
-        {
-            "project_id": "flask",
-            "project_name": "Flask",
-            "level": "error",
-            "message": (
-                f"{request.method} {request.path}\n"
-                + "".join(traceback.format_exception(type(error), error, error.__traceback__))
-            ),
-        }
+    message = (
+        f"{request.method} {request.path}\n"
+        + "".join(traceback.format_exception(type(error), error, error.__traceback__))
     )
+    try:
+        from services.log_service import append_log
+
+        append_log(
+            {
+                "project_id": "flask",
+                "project_name": "Flask",
+                "level": "error",
+                "message": message,
+            }
+        )
+    except Exception:
+        # Logging must never replace the original API error with Flask's HTML 500 page.
+        print(message, flush=True)
     return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
@@ -49,6 +55,32 @@ def ensure_default_user() -> None:
         )
 
 
+def run_data_migrations() -> None:
+    """Apply idempotent data migrations outside request handlers."""
+
+    migration_name = "20260901_attribute_url_current_values_v1"
+    with session_scope() as db_session:
+        applied = db_session.scalar(
+            text("SELECT name FROM app_data_migrations WHERE name = :name"),
+            {"name": migration_name},
+        )
+        if applied:
+            return
+        from services.attribute_assistant import backfill_cached_site_current_values
+
+        changed = backfill_cached_site_current_values(db_session)
+        db_session.execute(
+            text(
+                "INSERT INTO app_data_migrations (name, details, applied_at) "
+                "VALUES (:name, json(:details), CURRENT_TIMESTAMP)"
+            ),
+            {
+                "name": migration_name,
+                "details": f'{{"changed":{int(changed)}}}',
+            },
+        )
+
+
 def is_public_endpoint() -> bool:
     endpoint = (request.endpoint or "").rsplit(".", 1)[-1]
     return endpoint in {"healthcheck", "api_auth_session", "api_auth_login", "api_auth_logout"}
@@ -64,11 +96,18 @@ def close_request_db_session(error: Optional[BaseException] = None) -> None:
     db = g.pop("db", None)
     if db is None:
         return
-    if error is None:
-        db.commit()
-    else:
+    try:
+        # A registered Flask error handler turns an exception into a response,
+        # so teardown may receive error=None even after a failed SQL flush.
+        if error is None and db.is_active:
+            db.commit()
+        else:
+            db.rollback()
+    except Exception:
         db.rollback()
-    db.close()
+        raise
+    finally:
+        db.close()
 
 
 _storage_init_lock = threading.RLock()
@@ -98,6 +137,7 @@ def ensure_storage() -> None:
         PROJECT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         init_db()
         ensure_default_user()
+        run_data_migrations()
         recover_interrupted_file_import_scan()
         recover_interrupted_price_conversion()
         recover_interrupted_feed_comparison()

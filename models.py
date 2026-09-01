@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 
 from datetime import UTC, date
 
@@ -277,6 +277,7 @@ class AttributeTemplateField(Base):
     value_type: Mapped[str] = mapped_column(String(32), default="select", nullable=False)
     is_composite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     separator: Mapped[str] = mapped_column(String(8), default="/", nullable=False)
+    conversion_rules: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     use_dash_if_empty: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
@@ -301,9 +302,8 @@ class AttributeAllowedValue(Base):
     field_id: Mapped[int] = mapped_column(ForeignKey("attribute_template_fields.id", ondelete="CASCADE"), nullable=False)
     value: Mapped[str] = mapped_column(String(1000), nullable=False)
     normalized_value: Mapped[str] = mapped_column(String(1000), nullable=False)
-    is_global: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    is_recommended: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_combination: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     source: Mapped[str] = mapped_column(String(64), default="template_import", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
@@ -381,6 +381,7 @@ class AttributeProduct(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     batch_id: Mapped[int] = mapped_column(ForeignKey("attribute_batches.id", ondelete="CASCADE"), nullable=False)
+    template_id: Mapped[int | None] = mapped_column(ForeignKey("attribute_templates.id", ondelete="RESTRICT"), nullable=True)
     external_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
@@ -389,11 +390,15 @@ class AttributeProduct(Base):
     source_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     donor_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    selected_donor_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    donor_url_overrides: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    processing_state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="needs_review", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
     batch: Mapped[AttributeBatch] = relationship("AttributeBatch", back_populates="products")
+    template: Mapped[AttributeTemplate | None] = relationship("AttributeTemplate")
     values: Mapped[list["AttributeProductValue"]] = relationship(
         "AttributeProductValue", back_populates="product", cascade="all, delete-orphan",
         order_by="AttributeProductValue.sort_order",
@@ -454,6 +459,20 @@ class AttributeProductSource(Base):
     __table_args__ = (UniqueConstraint("product_id", "donor_id", "url", name="uq_attribute_product_sources_url"),)
 
 
+class AttributeProductRevision(Base):
+    __tablename__ = "attribute_product_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("attribute_products.id", ondelete="CASCADE"), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+    product: Mapped[AttributeProduct] = relationship("AttributeProduct")
+
+    __table_args__ = (Index("ix_attribute_product_revisions_product", "product_id", "created_at"),)
+
+
 class AttributeMappingRule(Base):
     __tablename__ = "attribute_mapping_rules"
 
@@ -475,14 +494,31 @@ class AttributeMappingRule(Base):
     __table_args__ = (UniqueConstraint("donor_id", "template_id", "normalized_donor_attribute", name="uq_attribute_mapping_rules_source"),)
 
 
-class AttributeProcessingLog(Base):
-    __tablename__ = "attribute_processing_logs"
+
+class AttributeValueMappingRule(Base):
+    __tablename__ = "attribute_value_mapping_rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    batch_id: Mapped[int | None] = mapped_column(ForeignKey("attribute_batches.id", ondelete="CASCADE"), nullable=True)
-    product_id: Mapped[int | None] = mapped_column(ForeignKey("attribute_products.id", ondelete="CASCADE"), nullable=True)
-    action: Mapped[str] = mapped_column(String(64), nullable=False)
-    details: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    donor_id: Mapped[int] = mapped_column(ForeignKey("donors.id", ondelete="CASCADE"), nullable=False)
+    template_field_id: Mapped[int] = mapped_column(ForeignKey("attribute_template_fields.id", ondelete="CASCADE"), nullable=False)
+    allowed_value_id: Mapped[int] = mapped_column(ForeignKey("attribute_allowed_values.id", ondelete="CASCADE"), nullable=False)
+    raw_value: Mapped[str] = mapped_column(String(1000), nullable=False)
+    normalized_raw_value: Mapped[str] = mapped_column(String(1000), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
-    __table_args__ = (Index("ix_attribute_processing_logs_product", "product_id", "created_at"),)
+    donor: Mapped[Donor] = relationship("Donor")
+    template_field: Mapped[AttributeTemplateField] = relationship("AttributeTemplateField")
+    allowed_value: Mapped[AttributeAllowedValue] = relationship("AttributeAllowedValue")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "donor_id", "template_field_id", "normalized_raw_value",
+            name="uq_attribute_value_mapping_rules_source",
+        ),
+        Index(
+            "ix_attribute_value_mapping_rules_lookup",
+            "donor_id", "template_field_id", "normalized_raw_value",
+        ),
+    )

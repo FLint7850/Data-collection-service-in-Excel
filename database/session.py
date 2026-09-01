@@ -1,4 +1,6 @@
-﻿import json
+import base64
+import gzip
+import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +45,11 @@ DEFAULT_BRAND_STATE = {
     "next_run_at": "",
 }
 DEFAULT_BRAND_STATE_JSON = json.dumps(DEFAULT_BRAND_STATE, ensure_ascii=False, separators=(",", ":"))
+OBSOLETE_TABLES = (
+    "attribute_donor_product_sources",
+    "attribute_donors",
+    "scan_runs",
+)
 
 engine = create_engine(
     DATABASE_URL,
@@ -190,6 +197,15 @@ def seed_connection_methods(connection) -> None:
 
 def migrate_schema(connection) -> None:
     seed_connection_methods(connection)
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS app_data_migrations ("
+            "name VARCHAR(255) NOT NULL PRIMARY KEY, "
+            "details JSON NOT NULL DEFAULT '{}', "
+            "applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+    )
 
     own_site_columns = table_columns(connection, "own_sites")
     if own_site_columns and "name" not in own_site_columns:
@@ -208,7 +224,154 @@ def migrate_schema(connection) -> None:
     migrate_price_converter_table(connection)
     migrate_supplier_feeds_table(connection)
     migrate_attribute_assistant_tables(connection)
+    migrate_attribute_product_revisions(connection)
+    compact_attribute_revision_payloads(connection)
+    cleanup_obsolete_tables(connection)
     cleanup_brand_state_payloads(connection)
+
+
+def cleanup_obsolete_tables(connection) -> None:
+    """Remove tables left by features that are no longer part of the application."""
+    for table_name in OBSOLETE_TABLES:
+        connection.execute(text(f'DROP TABLE IF EXISTS "{table_name}"'))
+
+
+def migrate_attribute_product_revisions(connection) -> None:
+    """Keep only restorable product snapshots from the former mixed event table."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS attribute_product_revisions ("
+            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+            "product_id INTEGER NOT NULL, "
+            "label VARCHAR(255) NOT NULL DEFAULT '', "
+            "snapshot JSON NOT NULL DEFAULT '{}', "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "FOREIGN KEY(product_id) REFERENCES attribute_products(id) ON DELETE CASCADE"
+            ")"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_attribute_product_revisions_product "
+            "ON attribute_product_revisions (product_id, created_at)"
+        )
+    )
+    if not table_columns(connection, "attribute_processing_logs"):
+        return
+
+    rows = connection.execute(
+        text(
+            "SELECT id, product_id, details, created_at FROM attribute_processing_logs "
+            "WHERE action = 'product_snapshot' AND product_id IS NOT NULL"
+        )
+    ).mappings().all()
+    for row in rows:
+        stored = row["details"]
+        try:
+            snapshot = json.loads(stored) if isinstance(stored, str) else dict(stored or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot = {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        connection.execute(
+            text(
+                "INSERT OR IGNORE INTO attribute_product_revisions "
+                "(id, product_id, label, snapshot, created_at) "
+                "VALUES (:id, :product_id, :label, json(:snapshot), :created_at)"
+            ),
+            {
+                "id": row["id"],
+                "product_id": row["product_id"],
+                "label": str(snapshot.get("label") or "")[:255],
+                "snapshot": json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+                "created_at": row["created_at"],
+            },
+        )
+    connection.execute(text("DROP TABLE attribute_processing_logs"))
+
+
+def _compressed_revision_payload(snapshot: object, schema: str) -> dict[str, object] | None:
+    if isinstance(snapshot, str):
+        try:
+            snapshot = json.loads(snapshot)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    if not isinstance(snapshot, dict) or snapshot.get("encoding") == "gzip+base64":
+        return None
+    payload = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return {
+        "schema": schema,
+        "format_version": 2,
+        "encoding": "gzip+base64",
+        "payload": base64.b64encode(gzip.compress(payload, compresslevel=6)).decode("ascii"),
+    }
+
+
+def _compact_revision_report(report: object) -> object:
+    if isinstance(report, str):
+        try:
+            report = json.loads(report)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    if not isinstance(report, dict):
+        return {}
+    serialized_size = len(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+    if serialized_size <= 32_000:
+        return report
+    fields = list(report.get("fields") or [])
+    return {
+        "mode": report.get("mode", ""),
+        "rows": int(report.get("rows") or 0),
+        "fields_count": len(fields),
+        "added_fields": sum(item.get("change") == "add" for item in fields if isinstance(item, dict)),
+        "updated_fields": sum(item.get("change") == "update" for item in fields if isinstance(item, dict)),
+        "removed_fields_count": len(report.get("removed_fields") or []),
+        "warnings": list(report.get("warnings") or [])[:20],
+        "compacted": True,
+    }
+
+
+def compact_attribute_revision_payloads(connection) -> None:
+    """Migrate historical JSON snapshots to the compact versioned format."""
+
+    targets = (
+        ("attribute_template_revisions", "attribute-template-snapshot", True),
+        ("attribute_product_revisions", "attribute-product-snapshot", False),
+    )
+    for table_name, schema, compact_report in targets:
+        if not table_columns(connection, table_name):
+            continue
+        columns = "id, snapshot" + (", report" if compact_report else "")
+        rows = connection.execute(text(f"SELECT {columns} FROM {table_name}")).mappings().all()
+        for row in rows:
+            packed = _compressed_revision_payload(row["snapshot"], schema)
+            raw_report = row.get("report")
+            parsed_report = raw_report
+            if compact_report and isinstance(raw_report, str):
+                try:
+                    parsed_report = json.loads(raw_report)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed_report = {}
+            report = _compact_revision_report(raw_report) if compact_report else None
+            report_changed = compact_report and report != parsed_report
+            if packed is None and not report_changed:
+                continue
+            assignments = ["snapshot = :snapshot"] if packed is not None else []
+            params: dict[str, object] = {"id": row["id"]}
+            if packed is not None:
+                params["snapshot"] = json.dumps(packed, ensure_ascii=False, separators=(",", ":"))
+            if report_changed:
+                assignments.append("report = :report")
+                params["report"] = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+            connection.execute(
+                text(f"UPDATE {table_name} SET {', '.join(assignments)} WHERE id = :id"),
+                params,
+            )
 
 
 def reset_brand_states(connection) -> None:
@@ -450,10 +613,43 @@ def migrate_supplier_feeds_table(connection) -> None:
 
 def migrate_attribute_assistant_tables(connection) -> None:
     """Keep Attribute Assistant data readable across its two persisted schemas."""
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS attribute_value_mapping_rules ("
+            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+            "donor_id INTEGER NOT NULL, "
+            "template_field_id INTEGER NOT NULL, "
+            "allowed_value_id INTEGER NOT NULL, "
+            "raw_value VARCHAR(1000) NOT NULL, "
+            "normalized_raw_value VARCHAR(1000) NOT NULL, "
+            "is_active BOOLEAN NOT NULL DEFAULT 1, "
+            "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "CONSTRAINT uq_attribute_value_mapping_rules_source UNIQUE "
+            "(donor_id, template_field_id, normalized_raw_value), "
+            "FOREIGN KEY(donor_id) REFERENCES donors(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(template_field_id) REFERENCES attribute_template_fields(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(allowed_value_id) REFERENCES attribute_allowed_values(id) ON DELETE CASCADE"
+            ")"
+        )
+    )
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_attribute_value_mapping_rules_lookup "
+            "ON attribute_value_mapping_rules "
+            "(donor_id, template_field_id, normalized_raw_value)"
+        )
+    )
     additions = {
         "attribute_templates": {
             "is_active": "BOOLEAN NOT NULL DEFAULT 1",
             "version": "INTEGER NOT NULL DEFAULT 1",
+        },
+        "attribute_template_fields": {
+            "conversion_rules": "JSON NOT NULL DEFAULT '[]'",
+        },
+        "attribute_allowed_values": {
+            "is_combination": "BOOLEAN NOT NULL DEFAULT 0",
         },
         "attribute_template_revisions": {
             "version": "INTEGER NOT NULL DEFAULT 1",
@@ -472,7 +668,11 @@ def migrate_attribute_assistant_tables(connection) -> None:
         },
         "attribute_products": {
             "sort_order": "INTEGER NOT NULL DEFAULT 0",
+            "template_id": "INTEGER",
             "donor_urls": "JSON NOT NULL DEFAULT '[]'",
+            "selected_donor_ids": "JSON NOT NULL DEFAULT '[]'",
+            "donor_url_overrides": "JSON NOT NULL DEFAULT '{}'",
+            "processing_state": "JSON NOT NULL DEFAULT '{}'",
         },
     }
     original_columns: dict[str, dict[str, str]] = {}
@@ -484,6 +684,22 @@ def migrate_attribute_assistant_tables(connection) -> None:
         for column_name, definition in table_additions.items():
             if column_name not in columns:
                 connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+
+    allowed_value_columns = table_columns(connection, "attribute_allowed_values")
+    for obsolete_column in ("is_global", "is_recommended"):
+        if obsolete_column in allowed_value_columns:
+            connection.execute(text(f"ALTER TABLE attribute_allowed_values DROP COLUMN {obsolete_column}"))
+            allowed_value_columns = table_columns(connection, "attribute_allowed_values")
+
+    product_columns = original_columns.get("attribute_products", {})
+    if product_columns and "template_id" not in product_columns:
+        connection.execute(
+            text(
+                "UPDATE attribute_products SET template_id = ("
+                "SELECT attribute_batches.template_id FROM attribute_batches "
+                "WHERE attribute_batches.id = attribute_products.batch_id)"
+            )
+        )
 
     batch_columns = original_columns.get("attribute_batches", {})
     if batch_columns:

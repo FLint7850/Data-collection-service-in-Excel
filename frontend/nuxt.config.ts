@@ -12,6 +12,9 @@ export default defineNuxtConfig({
   devtools: { enabled: process.env.NODE_ENV !== "production" },
   modules: ["@nuxt/ui", "@nuxt/icon"],
   css: ["~/assets/css/main.css"],
+  features: {
+    inlineStyles: false,
+  },
   app: {
     head: {
       htmlAttrs: { lang: "ru", class: "dark" },
