@@ -10,6 +10,7 @@ export interface AttributeTemplateField {
   id: number;
   group_name: string;
   name: string;
+  synonyms: string[];
   value_type: "select" | "number" | "dimensions" | "boolean" | string;
   is_composite: boolean;
   is_required: boolean;
@@ -189,6 +190,34 @@ export interface AttributeBatch {
   products?: AttributeProduct[];
 }
 
+export interface AttributeBatchOperationError {
+  product_id: number | null;
+  product: string;
+  error: string;
+}
+
+export interface AttributeBatchOperation {
+  id: string;
+  batch_id: number;
+  kind: "" | "donors" | "chatgpt";
+  status: "idle" | "queued" | "running" | "completed" | "failed";
+  stage: "" | "queued" | "preparing" | "donors" | "chatgpt" | "applying" | "completed" | "failed";
+  total: number;
+  prepared: number;
+  processed: number;
+  succeeded: number;
+  failed: number;
+  percent: number;
+  changed: number;
+  attributes_found: number;
+  current_product_id: number | null;
+  current_product: string;
+  errors: AttributeBatchOperationError[];
+  started_at: string;
+  finished_at: string;
+  error: string;
+}
+
 export interface AttributeWorkspace {
   templates: AttributeTemplate[];
   donors: AttributeDonor[];
@@ -268,7 +297,6 @@ export interface ChatGptLogin {
 
 
 export interface AttributeChatGptAnalysis {
-  product: { name: string; model: string; brand: string; category: string };
   observed_attributes: Array<{ name: string; value: string; evidence: string }>;
   suggestions: Array<{
     template_field_id: number;

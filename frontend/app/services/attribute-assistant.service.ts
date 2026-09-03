@@ -2,6 +2,7 @@ import type {
   AttributeAllowedValue,
   AttributeAllowedValueOptions,
   AttributeBatch,
+  AttributeBatchOperation,
   AttributeBatchReport,
   AttributeChatGptAnalyzeResult,
   AttributeDonor,
@@ -87,6 +88,26 @@ export const attributeAssistantService = {
     }),
 
   batch: (id: number) => $fetch<AttributeBatch>(`${base}/batches/${id}`),
+  batchOperation: (id: number) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation`),
+  processBatch: (
+    id: number,
+    donorIds: number[],
+    urlOverridesByProduct: Record<string, Record<string, string>> = {},
+  ) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/process-all`, {
+      method: "POST",
+      body: { donor_ids: donorIds, url_overrides_by_product: urlOverridesByProduct },
+    }),
+  analyzeBatchWithChatGpt: (
+    id: number,
+    donorIds: number[],
+    urlOverridesByProduct: Record<string, Record<string, string>> = {},
+  ) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/chatgpt/analyze-all`, {
+      method: "POST",
+      body: { donor_ids: donorIds, url_overrides_by_product: urlOverridesByProduct },
+    }),
   removeBatch: (id: number) =>
     $fetch<{ ok: boolean; deleted: { products: number; files: number } }>(
       `${base}/batches/${id}`,
@@ -108,10 +129,14 @@ export const attributeAssistantService = {
       { method: "POST" },
     ),
 
-  analyzeProductWithChatGpt: (id: number, donorIds: number[]) =>
+  analyzeProductWithChatGpt: (
+    id: number,
+    donorIds: number[],
+    urlOverrides: Record<string, string> = {},
+  ) =>
     $fetch<AttributeChatGptAnalyzeResult>(
       `${base}/products/${id}/chatgpt/analyze`,
-      { method: "POST", body: { donor_ids: donorIds } },
+      { method: "POST", body: { donor_ids: donorIds, url_overrides: urlOverrides } },
     ),
 
   updateValue: (
@@ -202,4 +227,3 @@ export const attributeAssistantService = {
   chatGptLogout: () =>
     $fetch(`${base}/chatgpt/logout`, { method: "POST" }),
 };
-

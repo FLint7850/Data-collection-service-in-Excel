@@ -327,6 +327,10 @@ def api_attribute_batch(batch_id: int):
 def api_attribute_batch_delete(batch_id: int):
     ensure_storage()
     try:
+        from runtime.attribute_batch_operations import is_attribute_batch_operation_active
+
+        if is_attribute_batch_operation_active(batch_id):
+            return jsonify({"error": "Дождитесь завершения массовой обработки товаров"}), 409
         batch = _batch(batch_id)
         deleted = delete_attribute_batch(g.db, batch)
         return jsonify({"ok": True, "deleted": deleted})
@@ -361,6 +365,86 @@ def api_attribute_product_process(product_id: int):
         return jsonify({"report": report, "product": serialize_product(product, detailed=True)})
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
+
+
+@bp.get("/api/attribute-assistant/batches/<int:batch_id>/operation")
+def api_attribute_batch_operation(batch_id: int):
+    ensure_storage()
+    try:
+        _batch(batch_id)
+        from runtime.attribute_batch_operations import get_attribute_batch_operation
+
+        return jsonify(get_attribute_batch_operation(batch_id))
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
+
+
+@bp.post("/api/attribute-assistant/batches/<int:batch_id>/process-all")
+def api_attribute_batch_process_all(batch_id: int):
+    ensure_storage()
+    payload = _json_body()
+    try:
+        _batch(batch_id)
+        donor_ids = list(dict.fromkeys(int(item) for item in (payload.get("donor_ids") or [])))
+        if not donor_ids:
+            raise ValueError("Выберите хотя бы одного донора")
+        product_ids = list(g.db.scalars(
+            select(AttributeProduct.id)
+            .where(AttributeProduct.batch_id == batch_id)
+            .order_by(AttributeProduct.sort_order, AttributeProduct.id)
+        ))
+        overrides = payload.get("url_overrides_by_product") or {}
+        if not isinstance(overrides, dict):
+            raise ValueError("Некорректный список ссылок товаров")
+        from runtime.attribute_batch_operations import start_attribute_batch_operation
+
+        state = start_attribute_batch_operation(
+            batch_id,
+            "donors",
+            product_ids,
+            donor_ids,
+            url_overrides_by_product=overrides,
+        )
+        return jsonify(state), 202
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@bp.post("/api/attribute-assistant/batches/<int:batch_id>/chatgpt/analyze-all")
+def api_attribute_batch_chatgpt_analyze_all(batch_id: int):
+    ensure_storage()
+    payload = _json_body()
+    try:
+        _batch(batch_id)
+        from services.attribute_chatgpt_control import chatgpt_status
+
+        if not chatgpt_status().get("authenticated"):
+            raise RuntimeError("Сначала подключите ChatGPT")
+        donor_ids = list(dict.fromkeys(int(item) for item in (payload.get("donor_ids") or [])))
+        product_ids = list(g.db.scalars(
+            select(AttributeProduct.id)
+            .where(AttributeProduct.batch_id == batch_id)
+            .order_by(AttributeProduct.sort_order, AttributeProduct.id)
+        ))
+        overrides = payload.get("url_overrides_by_product") or {}
+        if not isinstance(overrides, dict):
+            raise ValueError("Некорректный список ссылок товаров")
+        from runtime.attribute_batch_operations import start_attribute_batch_operation
+
+        state = start_attribute_batch_operation(
+            batch_id,
+            "chatgpt",
+            product_ids,
+            donor_ids,
+            url_overrides_by_product=overrides,
+        )
+        return jsonify(state), 202
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
 
 
 @bp.post("/api/attribute-assistant/products/<int:product_id>/similar")
@@ -512,44 +596,20 @@ def api_attribute_product_chatgpt_analyze(product_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        from services.attribute_ai import (
-            apply_analysis,
-            build_product_prompt,
-            prepare_product_source,
-            validate_analysis,
-        )
-        from services.attribute_chatgpt_control import analyze_with_chatgpt
+        from services.attribute_ai import analyze_product_with_chatgpt
 
         product = _product(product_id)
-        snapshot_product(g.db, product, "Перед анализом ChatGPT")
-        source_url, html, parsed, _resolved_by = prepare_product_source(
+        result = analyze_product_with_chatgpt(
             g.db,
             product,
-            payload.get("donor_ids") or [],
+            payload.get("donor_ids"),
+            url_overrides=payload.get("url_overrides"),
         )
-        prompt, page_evidence = build_product_prompt(
-            product,
-            source_url=source_url,
-            html=html,
-            parsed=parsed,
-        )
-        # Do not keep a SQLite write transaction open while ChatGPT is thinking.
-        g.db.commit()
-        response = analyze_with_chatgpt(prompt)
-        g.db.expire_all()
-        product = _product(product_id)
-        analysis = validate_analysis(
-            product,
-            response.get("text", ""),
-            page_evidence=page_evidence,
-        )
-        changed = apply_analysis(g.db, product, analysis, source_url=source_url)
-        g.db.flush()
         return jsonify({
-            "changed": changed,
-            "analysis": analysis,
-            "source_url": source_url,
-            "product": serialize_product(product, detailed=True),
+            "changed": result["changed"],
+            "analysis": result["analysis"],
+            "source_url": result["source_url"],
+            "product": serialize_product(result["product"], detailed=True),
         })
     except ValueError as error:
         return jsonify({"error": str(error)}), 400

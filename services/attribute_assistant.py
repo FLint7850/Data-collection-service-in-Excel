@@ -15,7 +15,9 @@ import json
 import re
 import shutil
 import socket
+import threading
 import uuid
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from ipaddress import ip_address
@@ -107,6 +109,12 @@ def product_template(product: AttributeProduct) -> AttributeTemplate | None:
 
 def clean_text(value: Any) -> str:
     return SPACE_RE.sub(" ", str(value or "").replace("\xa0", " ")).strip()
+
+
+def is_technical_dash(value: Any) -> bool:
+    """Return whether a value is the persisted technical-gap marker."""
+
+    return clean_text(value) in {"-", "–", "—", "−"}
 
 def clean_csv_cell(value: Any) -> str:
     text = str(value or "").replace("\xa0", " ").replace("\r\n", "\n").replace("\r", "\n")
@@ -285,6 +293,7 @@ def serialize_template(
                 "id": field.id,
                 "group_name": field.group_name,
                 "name": field.name,
+                "synonyms": list(field.synonyms or []),
                 "value_type": field.value_type,
                 "is_composite": field.is_composite,
                 "is_required": field.is_required,
@@ -568,6 +577,8 @@ def _make_product_values(
             None,
         )
         current = matched["value"] if matched else ""
+        if is_technical_dash(current):
+            current = "-"
         if matched:
             consumed.add(id(matched))
         final = ""
@@ -578,7 +589,9 @@ def _make_product_values(
         source_details: dict[str, Any] = {}
         dash_reason = ""
         if current == "-":
-            reason = "Технический пропуск из исходного файла требует поиска значения"
+            final = "-"
+            status = "dash"
+            reason = "Технический пропуск сохранён из исходного файла"
             dash_reason = "Импортировано из исходного CSV"
         elif current:
             canonical, match_confidence, match_reason, suggestions = _allowed_match(
@@ -824,6 +837,8 @@ class DonorPageFetcher:
         self.max_pages = max(1, parse_thread_count(max_pages))
         self._browser_session: Any = None
         self._browser_engine = ""
+        self._browser_condition = threading.Condition(threading.RLock())
+        self._active_browser_fetches = 0
 
     @staticmethod
     def _browser_engine_for(method_code: str) -> str:
@@ -843,28 +858,41 @@ class DonorPageFetcher:
         method = donor.connection_method_row
         method_code = clean_text(method.code if method else "playwright") or "playwright"
         engine = self._browser_engine_for(method_code)
-        if self._browser_session is None:
-            self._browser_session = BrowserMethodSession(
-                max_pages=self.max_pages,
-                initial_method=method_code,
+        with self._browser_condition:
+            while self._active_browser_fetches and engine != self._browser_engine:
+                self._browser_condition.wait()
+            if self._browser_session is None:
+                self._browser_session = BrowserMethodSession(
+                    max_pages=self.max_pages,
+                    initial_method=method_code,
+                )
+                self._browser_engine = engine
+            elif engine != self._browser_engine:
+                self._browser_session.restart(method=method_code)
+                self._browser_engine = engine
+            browser_session = self._browser_session
+            self._active_browser_fetches += 1
+        try:
+            return browser_session.fetch(
+                url,
+                method_code,
+                rules=dict(donor.extraction_rules or {}),
+                product_url_filters=list(donor.product_url_filters or []),
+                allow_empty_price=True,
             )
-            self._browser_engine = engine
-        elif engine != self._browser_engine:
-            self._browser_session.restart(method=method_code)
-            self._browser_engine = engine
-        return self._browser_session.fetch(
-            url,
-            method_code,
-            rules=dict(donor.extraction_rules or {}),
-            product_url_filters=list(donor.product_url_filters or []),
-            allow_empty_price=True,
-        )
+        finally:
+            with self._browser_condition:
+                self._active_browser_fetches -= 1
+                self._browser_condition.notify_all()
 
     def close(self) -> None:
-        if self._browser_session is not None:
-            self._browser_session.close()
-            self._browser_session = None
-            self._browser_engine = ""
+        with self._browser_condition:
+            while self._active_browser_fetches:
+                self._browser_condition.wait()
+            if self._browser_session is not None:
+                self._browser_session.close()
+                self._browser_session = None
+                self._browser_engine = ""
 
     def __enter__(self) -> "DonorPageFetcher":
         return self
@@ -1912,13 +1940,13 @@ def resolve_donor_url(
     return "", "Ссылка на конкретный товар по модели не найдена на сайте донора"
 
 
-def _mapping_score(source_name: str, field: AttributeTemplateField) -> float:
+def _name_mapping_score(source_name: str, target_name: str) -> float:
     source_key = normalize_key(source_name)
-    target_key = normalize_key(field.name)
+    target_key = normalize_key(target_name)
     if source_key == target_key:
         return 1.0
     source_tokens = _name_tokens(source_name)
-    target_tokens = _name_tokens(field.name)
+    target_tokens = _name_tokens(target_name)
     if source_tokens and target_tokens:
         if source_tokens == target_tokens:
             return 1.0
@@ -1941,6 +1969,11 @@ def _mapping_score(source_name: str, field: AttributeTemplateField) -> float:
     semantic_target = " ".join(sorted(target_tokens)) or target_key
     sequence = SequenceMatcher(None, semantic_source, semantic_target).ratio()
     return min(0.99, 0.48 * sequence + 0.37 * coverage + 0.15 * union)
+
+
+def _mapping_score(source_name: str, field: AttributeTemplateField) -> float:
+    names = [field.name, *list(field.synonyms or [])]
+    return max((_name_mapping_score(source_name, name) for name in names), default=0.0)
 
 
 def _allowed_value_field_index(
@@ -2019,6 +2052,23 @@ def map_attribute(
         )
         if rule:
             return rule.template_field, 100, "Сохранённое правило", []
+    synonym_fields = [
+        field
+        for field in template.fields
+        if any(normalize_key(synonym) == source_key for synonym in (field.synonyms or []))
+    ]
+    if len(synonym_fields) == 1:
+        return synonym_fields[0], 100, "Синоним атрибута", []
+    if len(synonym_fields) > 1:
+        return None, 100, "Синоним атрибута неоднозначен", [
+            {
+                "field_id": field.id,
+                "name": field.name,
+                "group_name": field.group_name,
+                "score": 100,
+            }
+            for field in synonym_fields[:4]
+        ]
     ranked = sorted(
         ((_mapping_score(source_name, field), field) for field in template.fields),
         key=lambda pair: pair[0],
@@ -2047,7 +2097,7 @@ def map_attribute(
     margin = best_score - (ranked[1][0] if len(ranked) > 1 else 0)
     if len(ranked) > 1 and margin < 0.06 and best_score < 0.94:
         return None, round(best_score * 100), "Нужно уточнить атрибут", alternatives
-    return best_field, round(best_score * 100), "Сопоставлено по названию", alternatives
+    return best_field, round(best_score * 100), "Сопоставлено по названию или синониму", alternatives
 
 
 def _decimal_text(value: Decimal) -> str:
@@ -2504,6 +2554,7 @@ def process_product_donors(
     donor_ids: list[int],
     *,
     url_overrides: dict[str, str] | None = None,
+    fetcher: DonorPageFetcher | None = None,
 ) -> dict[str, Any]:
     donor_ids = list(dict.fromkeys(int(item) for item in donor_ids))
     if not donor_ids:
@@ -2528,7 +2579,8 @@ def process_product_donors(
     raw_dir = ATTRIBUTE_ASSISTANT_DIR / "raw" / str(product.batch_id) / str(product.id)
     raw_dir.mkdir(parents=True, exist_ok=True)
     max_pages = max((donor.thread_count for donor in donors.values()), default=1)
-    with DonorPageFetcher(max_pages=max_pages) as fetcher:
+    fetcher_context = nullcontext(fetcher) if fetcher is not None else DonorPageFetcher(max_pages=max_pages)
+    with fetcher_context as active_fetcher:
         for priority, donor_id in enumerate(donor_ids):
             donor = donors.get(donor_id)
             if not donor:
@@ -2567,7 +2619,7 @@ def process_product_donors(
                 })
                 continue
             try:
-                html, final_url = fetch_donor_product_html(donor, url, fetcher=fetcher)
+                html, final_url = fetch_donor_product_html(donor, url, fetcher=active_fetcher)
                 parsed = parse_product_html_for_donor(html, final_url, donor)
                 attribute_count = len(parsed["attributes"])
                 source_status = "parsed" if attribute_count else "no_attributes"
@@ -3013,15 +3065,14 @@ def update_product_value(
         value.dash_reason = ""
         if value.current_value:
             value.final_value = value.current_value
-            value.status = "kept"
             value.source = "current_csv"
             value.reason = "Предложение отклонено; сохранено исходное значение"
         else:
             value.final_value = ""
-            value.status = "missing"
             value.reason = "Предложение отклонено пользователем"
+        value.status = "rejected"
     elif action == "dash":
-        if value.current_value:
+        if value.current_value and not is_technical_dash(value.current_value):
             raise ValueError("Технический пропуск нельзя поставить вместо заполненного исходного значения")
         reason = clean_text(dash_reason)
         if not reason:
@@ -3069,12 +3120,22 @@ def bulk_action(batch: AttributeBatch, action: str, minimum_confidence: int = 90
     changed = 0
     for product in batch.products:
         for value in product.values:
-            if value.current_value or not value.is_in_template:
+            if not value.is_in_template:
                 continue
-            if action == "accept_high" and value.status == "suggested" and value.confidence >= minimum_confidence:
+            if (
+                action == "accept_high"
+                and not value.current_value
+                and value.status == "suggested"
+                and value.confidence >= minimum_confidence
+            ):
                 update_product_value(value, action="accept")
                 changed += 1
-            elif action == "fill_dashes" and not value.final_value and value.status not in {"conflict"}:
+            elif (
+                action == "fill_dashes"
+                and not value.final_value
+                and value.status != "conflict"
+                and (not value.current_value or is_technical_dash(value.current_value))
+            ):
                 update_product_value(value, action="dash", dash_reason=dash_reason or "Не найдено после проверки источников")
                 changed += 1
         refresh_product_status(product)
@@ -3306,6 +3367,7 @@ def template_snapshot(template: AttributeTemplate) -> dict[str, Any]:
                 "id": field.id,
                 "group_name": field.group_name,
                 "name": field.name,
+                "synonyms": list(field.synonyms or []),
                 "value_type": field.value_type,
                 "is_composite": field.is_composite,
                 "is_required": field.is_required,
@@ -3429,6 +3491,7 @@ TEMPLATE_FIELD_TYPES = {"select", "text", "number", "dimensions", "boolean"}
 TEMPLATE_FIELD_UPDATE_KEYS = {
     "group_name",
     "name",
+    "synonyms",
     "value_type",
     "separator",
     "is_required",
@@ -3437,6 +3500,56 @@ TEMPLATE_FIELD_UPDATE_KEYS = {
     "sort_order",
     "conversion_rules",
 }
+
+
+def _validated_template_field_synonyms(
+    field: AttributeTemplateField,
+    synonyms: Iterable[object],
+    *,
+    canonical_name: str | None = None,
+) -> list[str]:
+    raw_synonyms = list(synonyms)
+    if len(raw_synonyms) > 100:
+        raise ValueError("Для одного атрибута допускается не больше 100 синонимов")
+    canonical_key = normalize_key(canonical_name if canonical_name is not None else field.name)
+    occupied: dict[str, str] = {}
+    for other in field.template.fields:
+        if other.id == field.id:
+            continue
+        occupied[normalize_key(other.name)] = other.name
+        for synonym in other.synonyms or []:
+            key = normalize_key(synonym)
+            if key:
+                occupied[key] = other.name
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_synonym in raw_synonyms:
+        synonym = clean_text(raw_synonym)
+        if len(synonym) > 500:
+            raise ValueError("Синоним атрибута не должен превышать 500 символов")
+        synonym_key = normalize_key(synonym)
+        if not synonym_key or synonym_key == canonical_key or synonym_key in seen:
+            continue
+        owner = occupied.get(synonym_key)
+        if owner:
+            raise ValueError(
+                f"Синоним «{synonym}» уже относится к атрибуту «{owner}»"
+            )
+        seen.add(synonym_key)
+        result.append(synonym)
+    return result
+
+
+def replace_template_field_synonyms(
+    db: Session,
+    field: AttributeTemplateField,
+    synonyms: Iterable[object],
+) -> list[str]:
+    replacement = _validated_template_field_synonyms(field, synonyms)
+    field.synonyms = replacement
+    db.flush()
+    return replacement
 
 
 def _validated_conversion_rules(value: Any) -> list[dict[str, Any]]:
@@ -3533,6 +3646,20 @@ def validate_template_field_update(
     )
     if duplicate:
         raise ValueError("Такой атрибут уже есть в этой группе")
+    name_key = normalize_key(name)
+    synonym_owner = next(
+        (
+            item
+            for item in field.template.fields
+            if item.id != field.id
+            and any(normalize_key(synonym) == name_key for synonym in (item.synonyms or []))
+        ),
+        None,
+    )
+    if synonym_owner:
+        raise ValueError(
+            f"Название уже используется как синоним атрибута «{synonym_owner.name}»"
+        )
 
     updates: dict[str, Any] = {}
     for key in ("group_name", "name", "value_type", "separator"):
@@ -3560,6 +3687,15 @@ def validate_template_field_update(
         updates["conversion_rules"] = _validated_conversion_rules(
             payload.get("conversion_rules")
         )
+    if "synonyms" in payload or "name" in payload:
+        synonyms = payload.get("synonyms") if "synonyms" in payload else field.synonyms
+        if not isinstance(synonyms, list):
+            raise ValueError("Синонимы атрибута должны быть переданы списком")
+        updates["synonyms"] = _validated_template_field_synonyms(
+            field,
+            synonyms,
+            canonical_name=name,
+        )
     return updates
 
 
@@ -3585,6 +3721,21 @@ def create_template_field(
         raise ValueError("Название группы не должно превышать 255 символов")
     if len(field_name) > 500:
         raise ValueError("Название атрибута не должно превышать 500 символов")
+    conflicting_synonym = next(
+        (
+            item
+            for item in template.fields
+            if any(
+                normalize_key(synonym) == normalize_key(field_name)
+                for synonym in (item.synonyms or [])
+            )
+        ),
+        None,
+    )
+    if conflicting_synonym:
+        raise ValueError(
+            f"Название уже используется как синоним атрибута «{conflicting_synonym.name}»"
+        )
     clean_separator = clean_text(separator) or "/"
     if len(clean_separator) > 8:
         raise ValueError("Разделитель не должен превышать 8 символов")
@@ -3798,6 +3949,7 @@ def copy_template(
             template=result,
             group_name=source_field.group_name,
             name=source_field.name,
+            synonyms=list(source_field.synonyms or []),
             is_required=source_field.is_required,
             value_type=source_field.value_type,
             is_composite=source_field.is_composite,
@@ -3909,6 +4061,20 @@ def restore_template_revision(
         restored_fields.add(int(field.id))
         field.group_name = clean_text(field_data.get("group_name")) or "Основные характеристики"
         field.name = clean_text(field_data.get("name"))
+        restored_synonyms: list[str] = []
+        restored_synonym_keys: set[str] = set()
+        canonical_key = normalize_key(field.name)
+        for raw_synonym in field_data.get("synonyms") or []:
+            synonym = clean_text(raw_synonym)
+            synonym_key = normalize_key(synonym)
+            if (
+                synonym_key
+                and synonym_key != canonical_key
+                and synonym_key not in restored_synonym_keys
+            ):
+                restored_synonym_keys.add(synonym_key)
+                restored_synonyms.append(synonym)
+        field.synonyms = restored_synonyms
         for attr in ("value_type", "separator"):
             if field_data.get(attr) is not None:
                 setattr(field, attr, clean_text(field_data.get(attr)))
@@ -4034,13 +4200,30 @@ def _product_snapshot_payload(product: AttributeProduct) -> dict[str, Any]:
 
 
 def snapshot_product(db: Session, product: AttributeProduct, action: str) -> AttributeProductRevision:
+    return save_product_snapshot(db, product, action, capture_product_snapshot(product))
+
+
+def capture_product_snapshot(product: AttributeProduct) -> dict[str, Any]:
+    """Capture a restorable snapshot without opening a write transaction."""
+
+    return _pack_snapshot(
+        _product_snapshot_payload(product),
+        PRODUCT_SNAPSHOT_SCHEMA,
+    )
+
+
+def save_product_snapshot(
+    db: Session,
+    product: AttributeProduct,
+    action: str,
+    snapshot: dict[str, Any],
+) -> AttributeProductRevision:
+    """Persist a previously captured snapshot immediately before a mutation."""
+
     revision = AttributeProductRevision(
         product_id=product.id,
         label=action,
-        snapshot=_pack_snapshot(
-            _product_snapshot_payload(product),
-            PRODUCT_SNAPSHOT_SCHEMA,
-        ),
+        snapshot=snapshot,
     )
     db.add(revision)
     db.flush()

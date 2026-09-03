@@ -224,6 +224,7 @@ def migrate_schema(connection) -> None:
     migrate_price_converter_table(connection)
     migrate_supplier_feeds_table(connection)
     migrate_attribute_assistant_tables(connection)
+    migrate_attribute_technical_dashes(connection)
     migrate_attribute_product_revisions(connection)
     compact_attribute_revision_payloads(connection)
     cleanup_obsolete_tables(connection)
@@ -646,6 +647,7 @@ def migrate_attribute_assistant_tables(connection) -> None:
             "version": "INTEGER NOT NULL DEFAULT 1",
         },
         "attribute_template_fields": {
+            "synonyms": "JSON NOT NULL DEFAULT '[]'",
             "conversion_rules": "JSON NOT NULL DEFAULT '[]'",
         },
         "attribute_allowed_values": {
@@ -771,6 +773,75 @@ def migrate_attribute_assistant_tables(connection) -> None:
         connection.execute(
             text("ALTER TABLE attribute_mapping_rules_migration_tmp RENAME TO attribute_mapping_rules")
         )
+
+
+def migrate_attribute_technical_dashes(connection) -> None:
+    """Preserve explicit '-' values without filling genuinely empty attributes."""
+
+    migration_name = "attribute_technical_dashes_v1"
+    if not table_columns(connection, "attribute_product_values"):
+        return
+    applied = connection.execute(
+        text("SELECT 1 FROM app_data_migrations WHERE name = :name"),
+        {"name": migration_name},
+    ).scalar()
+    if applied:
+        return
+
+    for column_name in ("current_value", "proposed_value", "final_value"):
+        connection.execute(
+            text(
+                f"UPDATE attribute_product_values SET {column_name} = '-' "
+                f"WHERE trim(COALESCE({column_name}, '')) IN ('–', '—', '−')"
+            )
+        )
+    connection.execute(
+        text(
+            "UPDATE attribute_product_values "
+            "SET proposed_value = '-', final_value = '-', status = 'dash', "
+            "reason = 'Технический пропуск сохранён из исходного файла', "
+            "dash_reason = CASE WHEN trim(COALESCE(dash_reason, '')) = '' "
+            "THEN 'Импортировано из исходного CSV' ELSE dash_reason END "
+            "WHERE is_in_template = 1 AND trim(COALESCE(current_value, '')) = '-' "
+            "AND trim(COALESCE(final_value, '')) = ''"
+        )
+    )
+    connection.execute(
+        text(
+            "UPDATE attribute_products SET status = CASE WHEN EXISTS ("
+            "SELECT 1 FROM attribute_product_values AS value "
+            "WHERE value.product_id = attribute_products.id AND value.is_in_template = 1 "
+            "AND (value.status IN ('missing', 'suggested', 'conflict', 'unknown', 'ambiguous') "
+            "OR trim(COALESCE(value.final_value, '')) = '')"
+            ") THEN 'needs_review' ELSE 'ready' END"
+        )
+    )
+    connection.execute(
+        text(
+            "UPDATE attribute_batches SET summary = json_object("
+            "'products', (SELECT count(*) FROM attribute_products p WHERE p.batch_id = attribute_batches.id), "
+            "'ready', (SELECT count(*) FROM attribute_products p WHERE p.batch_id = attribute_batches.id AND p.status = 'ready'), "
+            "'needs_review', (SELECT count(*) FROM attribute_products p WHERE p.batch_id = attribute_batches.id AND p.status != 'ready'), "
+            "'filled', (SELECT count(*) FROM attribute_product_values v JOIN attribute_products p ON p.id = v.product_id "
+            "WHERE p.batch_id = attribute_batches.id AND v.is_in_template = 1 "
+            "AND trim(COALESCE(v.final_value, '')) NOT IN ('', '-')), "
+            "'missing', (SELECT count(*) FROM attribute_product_values v JOIN attribute_products p ON p.id = v.product_id "
+            "WHERE p.batch_id = attribute_batches.id AND v.is_in_template = 1 "
+            "AND trim(COALESCE(v.final_value, '')) = ''), "
+            "'conflicts', (SELECT count(*) FROM attribute_product_values v JOIN attribute_products p ON p.id = v.product_id "
+            "WHERE p.batch_id = attribute_batches.id AND v.status = 'conflict'), "
+            "'suggestions', (SELECT count(*) FROM attribute_product_values v JOIN attribute_products p ON p.id = v.product_id "
+            "WHERE p.batch_id = attribute_batches.id AND v.status = 'suggested')"
+            ")"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO app_data_migrations (name, details) "
+            "VALUES (:name, json_object('marker', '-'))"
+        ),
+        {"name": migration_name},
+    )
 
 
 def _bool_value(value, default=False) -> bool:

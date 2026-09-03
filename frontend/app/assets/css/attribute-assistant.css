@@ -1180,6 +1180,18 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
   align-items: center;
 }
 
+.aa-attribute-toolbar {
+  display: flex;
+  min-width: min(100%, 260px);
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.aa-attribute-status-filter {
+  width: min(100%, 260px);
+}
+
 .aa-attribute-row-head {
   min-height: 58px;
   padding: 12px 14px;
@@ -1301,6 +1313,15 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
   .aa-card-head .aa-inline-actions,
   .aa-review-actions {
     justify-content: flex-start;
+  }
+
+  .aa-attribute-toolbar {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .aa-attribute-status-filter {
+    width: 100%;
   }
 
   .aa-create-action {
@@ -1601,15 +1622,20 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
     align-items: stretch;
   }
 }
-/* Keep source labels and statistics in separate layout columns. */
+/* Let the source use remaining space; only long statistics need half the card. */
 .aa-source-result {
   display: grid;
-  grid-template-columns: minmax(170px, .7fr) minmax(0, 1.3fr);
+  grid-template-columns: minmax(0, 1fr) fit-content(50%);
 }
 
 .aa-source-result > span,
 .aa-source-result > b {
   min-width: 0;
+}
+
+.aa-source-result small {
+  display: block;
+  max-width: 100%;
 }
 
 .aa-source-result .aa-source-result-heading {
@@ -1824,4 +1850,71 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
   min-height: 56px;
   justify-content: space-between;
   text-align: left;
+}
+
+.aa-batch-operation {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--bg);
+  padding: 14px;
+}
+
+.aa-batch-operation-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.aa-batch-operation-head > span,
+.aa-batch-operation-progress > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.aa-batch-operation-head small,
+.aa-batch-operation-progress small,
+.aa-batch-operation-progress span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.aa-batch-operation-head > .aa-inline-actions {
+  flex-shrink: 0;
+  margin-top: 0;
+}
+
+.aa-batch-operation-progress {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 12px;
+}
+
+.aa-batch-operation-progress > div {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.aa-operation-error {
+  color: var(--danger) !important;
+}
+
+@media (max-width: 900px) {
+  .aa-batch-operation-head,
+  .aa-batch-operation-progress > div {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .aa-batch-operation-head > .aa-inline-actions {
+    width: 100%;
+  }
 }

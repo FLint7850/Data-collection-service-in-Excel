@@ -3,7 +3,7 @@ import { attributeAssistantService as api } from "~/services/attribute-assistant
 import type {
   AttributeAllowedValue,
   AttributeBatch,
-
+  AttributeBatchOperation,
   AttributeDonor,
   AttributeHistoryItem,
   AttributeMappingRule,
@@ -26,10 +26,34 @@ definePageMeta({
 });
 
 const toast = useToast();
+const route = useRoute();
+const router = useRouter();
+type MainTab = "start" | "templates" | "review";
+type RouteWriteMode = "push" | "replace";
+
+const ALL_FILTER_VALUE = "all";
+const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
+const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "no_suggestion"]);
+
+function routeQueryValue(value: unknown): string {
+  return Array.isArray(value) ? String(value[0] || "") : String(value || "");
+}
+
+function routeSegments(): string[] {
+  const raw = route.params.state;
+  const values = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return values.flatMap((value) => String(value).split("/")).filter(Boolean);
+}
+
+function positiveRouteId(value: string | undefined): number | null {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 const loading = ref(true);
 const busy = ref("");
 const error = ref("");
-const tab = ref<"start" | "templates" | "review">("start");
+const tab = ref<MainTab>("start");
 const inputMode = ref<"csv" | "urls">("csv");
 const workspace = ref<AttributeWorkspace>({ templates: [], donors: [], batches: [], dashboard: { active_templates: 0, batches: 0, products: 0, ready: 0, conflicts: 0, missing: 0 } });
 const selectedTemplateId = ref<number | null>(null);
@@ -73,6 +97,8 @@ const appDialog = ref<{
 const templateFieldEditor = ref<{
   id: number;
   name: string;
+  synonyms: string[];
+  synonymDraft: string;
   group_name: string;
   value_type: string;
   is_composite: boolean;
@@ -88,9 +114,13 @@ const unknownSelections = ref<Record<string, number>>({});
 const donorRecommendations = ref<AttributeDonor[]>([]);
 const donorUrlOverrides = ref<Record<string, string>>({});
 const historyItems = ref<AttributeHistoryItem[]>([]);
+const batchOperation = ref<AttributeBatchOperation | null>(null);
 
-const productQuery = ref("");
-const productStatusFilter = ref("");
+const productQuery = ref(routeQueryValue(route.query.product_query));
+const initialProductStatus = routeQueryValue(route.query.product_status);
+const initialAttributeStatus = routeQueryValue(route.query.attribute_status);
+const productStatusFilter = ref(PRODUCT_STATUS_VALUES.has(initialProductStatus) ? initialProductStatus : ALL_FILTER_VALUE);
+const attributeStatusFilter = ref(ATTRIBUTE_STATUS_VALUES.has(initialAttributeStatus) ? initialAttributeStatus : ALL_FILTER_VALUE);
 const allowedOptionCache = ref<Record<number, Array<{ id: number; value: string }>>>({});
 const allowedSearchQueries = ref<Record<number, string>>({});
 const searchingAllowedValueIds = ref<Set<number>>(new Set());
@@ -103,6 +133,12 @@ const templateForm = reactive({
 });
 let authPoll: ReturnType<typeof setInterval> | null = null;
 let productRequestToken = 0;
+let routeApplyToken = 0;
+let routeStateReady = false;
+let applyingRouteState = false;
+let writtenRoute = "";
+let filterRouteTimer: ReturnType<typeof setTimeout> | null = null;
+let batchOperationPoll: ReturnType<typeof setTimeout> | null = null;
 const newTemplateField = reactive({
   group_name: "Основные характеристики",
   name: "",
@@ -143,16 +179,25 @@ const templateFieldTypeItems = [
   { label: "Габариты", value: "dimensions" },
   { label: "Да / нет", value: "boolean" },
 ];
+
+function matchesProductStatus(product: AttributeProduct, status: string): boolean {
+  if (status === ALL_FILTER_VALUE) return true;
+  if (status === "conflict") return product.status === status || product.counts.conflicts > 0;
+  if (status === "missing") return product.status === status || product.counts.missing > 0;
+  if (status === "outside_template") return product.counts.outside_template > 0;
+  return product.status === status;
+}
+
 const productStatusItems = computed(() => {
   const products = selectedBatch.value?.products || [];
-  const outsideTemplateCount = products.filter((product) => product.counts.outside_template > 0).length;
+  const count = (status: string) => products.filter((product) => matchesProductStatus(product, status)).length;
   return [
-    { label: "Все статусы", value: "" },
-    { label: "Готовые", value: "ready" },
-    { label: "С конфликтами", value: "conflict" },
-    { label: "С пропусками", value: "missing" },
-    { label: `Вне шаблона (${outsideTemplateCount})`, value: "outside_template" },
-    { label: "Нужна проверка", value: "needs_review" },
+    { label: `Все товары (${products.length})`, value: ALL_FILTER_VALUE },
+    { label: `Готовые (${count("ready")})`, value: "ready" },
+    { label: `С конфликтами (${count("conflict")})`, value: "conflict" },
+    { label: `С пропусками (${count("missing")})`, value: "missing" },
+    { label: `Вне шаблона (${count("outside_template")})`, value: "outside_template" },
+    { label: `Нужна проверка (${count("needs_review")})`, value: "needs_review" },
   ];
 });
 const mainTabItems = computed(() => [
@@ -183,10 +228,7 @@ const selectedDonorRows = computed(() =>
 const filteredProducts = computed(() => (selectedBatch.value?.products || []).filter((product) => {
   const query = productQuery.value.trim().toLocaleLowerCase("ru-RU");
   const queryMatches = !query || `${product.model} ${product.name} ${product.brand}`.toLocaleLowerCase("ru-RU").includes(query);
-  const statusMatches = !productStatusFilter.value || product.status === productStatusFilter.value
-    || (productStatusFilter.value === "conflict" && product.counts.conflicts > 0)
-    || (productStatusFilter.value === "missing" && product.counts.missing > 0)
-    || (productStatusFilter.value === "outside_template" && product.counts.outside_template > 0);
+  const statusMatches = matchesProductStatus(product, productStatusFilter.value);
   return queryMatches && statusMatches;
 }));
 
@@ -196,10 +238,53 @@ function productListIndicator(product: AttributeProduct): string {
   }
   return String(product.counts.conflicts || product.counts.missing || "✓");
 }
+
+function hasPendingProposal(value: AttributeValue): boolean {
+  const proposal = displayedProposal(value);
+  return Boolean(proposal && proposal !== value.final_value);
+}
+
+function matchesAttributeStatus(value: AttributeValue, status: string): boolean {
+  if (status === ALL_FILTER_VALUE) return true;
+  if (status === "outside_template") return !value.is_in_template;
+  if (!value.is_in_template) return false;
+  if (status === "conflict") return value.status === "conflict";
+  if (status === "suggested") {
+    return value.status !== "conflict" && hasPendingProposal(value);
+  }
+  if (status === "no_suggestion") {
+    return value.status !== "conflict" && !hasPendingProposal(value);
+  }
+  return true;
+}
+
+const attributeValues = computed(() => selectedProduct.value?.values || []);
+const filteredAttributeValues = computed(() =>
+  attributeValues.value.filter((value) => matchesAttributeStatus(value, attributeStatusFilter.value)),
+);
+const batchOperationRunning = computed(() =>
+  ["queued", "running"].includes(batchOperation.value?.status || ""),
+);
+const batchChatGptLoading = computed(() =>
+  busy.value === "chatgpt-all"
+  || (batchOperationRunning.value && batchOperation.value?.kind === "chatgpt"),
+);
+const attributeStatusItems = computed(() => {
+  const values = attributeValues.value;
+  const count = (status: string) => values.filter((value) => matchesAttributeStatus(value, status)).length;
+  return [
+    { label: `Все атрибуты (${values.length})`, value: ALL_FILTER_VALUE },
+    { label: `Вне шаблона (${count("outside_template")})`, value: "outside_template" },
+    { label: `Конфликт (${count("conflict")})`, value: "conflict" },
+    { label: `Предложения (${count("suggested")})`, value: "suggested" },
+    { label: `Нет предложения (${count("no_suggestion")})`, value: "no_suggestion" },
+  ];
+});
+
 const valuesByGroup = computed(() => {
   const groups = new Map<string, AttributeValue[]>();
   const outsideTemplate: AttributeValue[] = [];
-  for (const value of selectedProduct.value?.values || []) {
+  for (const value of filteredAttributeValues.value) {
     if (!value.is_in_template) {
       outsideTemplate.push(value);
       continue;
@@ -217,6 +302,100 @@ const displayedProductSources = computed(() =>
     return kind === "donor" || kind === "chatgpt";
   }),
 );
+
+function assistantRouteLocation() {
+  let path = "/attribute-assistant/new";
+  const query: Record<string, string> = {};
+
+  if (tab.value === "templates") {
+    path = templateDetails.value
+      ? `/attribute-assistant/templates/${templateDetails.value.id}`
+      : "/attribute-assistant/templates";
+  } else if (tab.value === "review" && selectedBatch.value) {
+    path = `/attribute-assistant/review/${selectedBatch.value.id}`;
+    if (selectedProduct.value) path += `/${selectedProduct.value.id}`;
+    if (productQuery.value) query.product_query = productQuery.value;
+    if (productStatusFilter.value !== ALL_FILTER_VALUE) query.product_status = productStatusFilter.value;
+    if (selectedProduct.value && attributeStatusFilter.value !== ALL_FILTER_VALUE) {
+      query.attribute_status = attributeStatusFilter.value;
+    }
+  }
+
+  return { path, query };
+}
+
+async function writeAssistantRoute(mode: RouteWriteMode = "replace") {
+  if (!import.meta.client) return;
+  const location = assistantRouteLocation();
+  const target = router.resolve(location).fullPath;
+  if (target === route.fullPath) return;
+  writtenRoute = target;
+  if (mode === "push") await router.push(location);
+  else await router.replace(location);
+}
+
+function applyRouteFilters() {
+  productQuery.value = routeQueryValue(route.query.product_query);
+  const productStatus = routeQueryValue(route.query.product_status);
+  const attributeStatus = routeQueryValue(route.query.attribute_status);
+  productStatusFilter.value = PRODUCT_STATUS_VALUES.has(productStatus) ? productStatus : ALL_FILTER_VALUE;
+  attributeStatusFilter.value = ATTRIBUTE_STATUS_VALUES.has(attributeStatus) ? attributeStatus : ALL_FILTER_VALUE;
+}
+
+async function applyAssistantRoute() {
+  const token = ++routeApplyToken;
+  applyingRouteState = true;
+  applyRouteFilters();
+  const [section, firstId, secondId] = routeSegments();
+
+  try {
+    if (section === "templates") {
+      tab.value = "templates";
+      const templateId = positiveRouteId(firstId);
+      if (templateId && templateDetails.value?.id !== templateId) {
+        await openTemplate(templateId, false);
+      }
+    } else if (section === "review") {
+      const batchId = positiveRouteId(firstId);
+      const productId = positiveRouteId(secondId);
+      if (batchId) {
+        const opened = await openBatch(batchId, productId, { syncRoute: false, resetFilters: false });
+        if (!opened) {
+          selectedBatch.value = null;
+          selectedProduct.value = null;
+          tab.value = "start";
+        }
+      } else if (selectedBatch.value) {
+        tab.value = "review";
+      } else {
+        tab.value = "start";
+      }
+    } else {
+      tab.value = "start";
+    }
+  } finally {
+    if (token === routeApplyToken) {
+      applyingRouteState = false;
+      routeStateReady = true;
+    }
+  }
+
+  if (token === routeApplyToken) await writeAssistantRoute("replace");
+}
+
+async function changeMainTab(value: string | number) {
+  const next = String(value) as MainTab;
+  if (!new Set<MainTab>(["start", "templates", "review"]).has(next)) return;
+  if (next === "review" && !selectedBatch.value) return;
+  tab.value = next;
+  await writeAssistantRoute("push");
+}
+
+async function useTemplateForNewBatch(id: number) {
+  selectedTemplateId.value = id;
+  tab.value = "start";
+  await writeAssistantRoute("push");
+}
 
 function notify(title: string) {
   toast.add({ title, color: "success" });
@@ -249,7 +428,6 @@ async function loadWorkspace() {
     workspace.value = data;
     selectedTemplateId.value ||= data.templates[0]?.id || null;
   }
-  loading.value = false;
 }
 
 async function loadChatGpt() {
@@ -305,7 +483,7 @@ async function importTemplate() {
   await openTemplate(result.id);
 }
 
-async function openTemplate(id: number) {
+async function openTemplate(id: number, syncRoute = true) {
   const requestKey = `template-open-${id}`;
   if (busy.value === requestKey) return;
   selectedTemplateId.value = id;
@@ -327,6 +505,7 @@ async function openTemplate(id: number) {
   templateRevisionsLoaded.value = false;
   mappingRules.value = rules.items;
   valueMappingRules.value = valueRules.items;
+  if (syncRoute) await writeAssistantRoute("push");
 }
 
 async function loadTemplateRevisions() {
@@ -478,6 +657,7 @@ async function removeTemplate(template: AttributeTemplate) {
     selectedTemplateId.value = remaining[0]?.id || null;
   }
   await loadWorkspace();
+  if (tab.value === "templates") await writeAssistantRoute("replace");
   notify("Шаблон удалён");
 }
 
@@ -569,9 +749,12 @@ async function restoreTemplateVersion(id: number) {
 }
 
 function editField(field: NonNullable<AttributeTemplate["fields"]>[number]) {
+  error.value = "";
   templateFieldEditor.value = {
     id: field.id,
     name: field.name,
+    synonyms: [...(field.synonyms || [])],
+    synonymDraft: "",
     group_name: field.group_name,
     value_type: field.value_type,
     is_composite: field.is_composite,
@@ -579,9 +762,34 @@ function editField(field: NonNullable<AttributeTemplate["fields"]>[number]) {
   };
 }
 
+function addTemplateFieldSynonym() {
+  const editor = templateFieldEditor.value;
+  if (!editor) return;
+  const synonym = editor.synonymDraft.trim();
+  if (!synonym) return;
+  const key = synonym.toLocaleLowerCase("ru-RU");
+  if (key === editor.name.trim().toLocaleLowerCase("ru-RU")) {
+    error.value = "Синоним не должен совпадать с названием атрибута.";
+    return;
+  }
+  if (editor.synonyms.some((item) => item.toLocaleLowerCase("ru-RU") === key)) {
+    error.value = "Такой синоним уже добавлен.";
+    return;
+  }
+  editor.synonyms.push(synonym);
+  editor.synonymDraft = "";
+  error.value = "";
+}
+
+function removeTemplateFieldSynonym(index: number) {
+  templateFieldEditor.value?.synonyms.splice(index, 1);
+}
+
 async function saveTemplateFieldEdit() {
   const editor = templateFieldEditor.value;
   if (!editor || !editor.name.trim()) return;
+  if (editor.synonymDraft.trim()) addTemplateFieldSynonym();
+  if (templateFieldEditor.value?.synonymDraft.trim()) return;
   let conversionRules: unknown;
   try {
     conversionRules = JSON.parse(editor.conversion_rules || "[]");
@@ -592,6 +800,7 @@ async function saveTemplateFieldEdit() {
   }
   const result = await run(`field-${editor.id}`, () => api.updateField(editor.id, {
     name: editor.name,
+    synonyms: editor.synonyms,
     group_name: editor.group_name,
     value_type: editor.value_type,
     is_composite: editor.is_composite,
@@ -600,7 +809,7 @@ async function saveTemplateFieldEdit() {
   if (!result) return;
   templateDetails.value = result;
   templateFieldEditor.value = null;
-  notify("Атрибут обновлён");
+  notify("Атрибут и синонимы обновлены");
 }
 
 function addFieldValue(field: NonNullable<AttributeTemplate["fields"]>[number]) {
@@ -752,15 +961,141 @@ async function createBatch() {
   if (batch) await openBatch(batch.id);
 }
 
-async function openBatch(id: number) {
+function clearBatchOperationPoll() {
+  if (batchOperationPoll) clearTimeout(batchOperationPoll);
+  batchOperationPoll = null;
+}
+
+function currentProductOverrides(): Record<string, Record<string, string>> {
+  if (!selectedProduct.value) return {};
+  return { [String(selectedProduct.value.id)]: { ...donorUrlOverrides.value } };
+}
+
+function scheduleBatchOperationPoll(batchId: number, delay = 1400) {
+  clearBatchOperationPoll();
+  batchOperationPoll = setTimeout(() => void loadBatchOperation(batchId), delay);
+}
+
+async function loadBatchOperation(batchId: number) {
+  try {
+    const previous = batchOperation.value;
+    const operation = await api.batchOperation(batchId);
+    if (selectedBatch.value?.id !== batchId) return;
+    batchOperation.value = operation;
+    if (["queued", "running"].includes(operation.status)) {
+      scheduleBatchOperationPoll(batchId);
+      return;
+    }
+    clearBatchOperationPoll();
+    const justFinished = previous?.id === operation.id
+      && ["queued", "running"].includes(previous.status)
+      && ["completed", "failed"].includes(operation.status);
+    if (!justFinished) return;
+    await refreshBatch();
+    const productId = selectedProduct.value?.id;
+    if (productId && selectedBatch.value?.id === batchId) {
+      await openProduct(productId, { syncRoute: false, resetAttributeFilter: false });
+    }
+    const summary = "Обработано: " + operation.processed
+      + " · успешно: " + operation.succeeded
+      + " · ошибок: " + operation.failed;
+    if (operation.status === "failed") {
+      toast.add({ title: "Массовая операция остановлена", description: operation.error || summary, color: "error" });
+    } else if (operation.failed) {
+      toast.add({ title: "Массовая операция завершена с ошибками", description: summary, color: "warning" });
+    } else {
+      notify("Массовая операция завершена · " + summary);
+    }
+  } catch (caught) {
+    if (selectedBatch.value?.id !== batchId) return;
+    clearBatchOperationPoll();
+    error.value = errorMessage(caught);
+    if (!batchOperation.value || batchOperationRunning.value) {
+      scheduleBatchOperationPoll(batchId, 5000);
+    }
+  }
+}
+
+async function processAllProducts() {
+  if (!selectedBatch.value || !selectedDonors.value.length || batchOperationRunning.value) return;
+  const total = selectedBatch.value.summary.products;
+  if (!await confirmAction({
+    title: "Найти и проверить все товары (" + total + ")?",
+    description: "Выбранные доноры будут применены ко всей текущей обработке. Для неё используется один общий браузерный сеанс.",
+    confirmLabel: "Начать проверку",
+  })) return;
+  const result = await run("process-all", () =>
+    api.processBatch(
+      selectedBatch.value!.id,
+      selectedDonors.value,
+      currentProductOverrides(),
+    ),
+  );
+  if (!result) return;
+  batchOperation.value = result;
+  scheduleBatchOperationPoll(result.batch_id);
+  notify("Проверка запущена для " + result.total + " товаров");
+}
+
+async function askChatGptForAllProducts() {
+  if (!selectedBatch.value || batchOperationRunning.value) return;
+  if (!chatGpt.value?.authenticated) {
+    error.value = "Сначала подключите ChatGPT в блоке подключения выше.";
+    return;
+  }
+  const total = selectedBatch.value.summary.products;
+  if (!await confirmAction({
+    title: "Спросить ChatGPT по всем товарам (" + total + ")?",
+    description: "Каждый товар будет отправлен ChatGPT отдельным запросом. Запросы выполняются параллельно с ограничением нагрузки; ошибка одного товара не останавливает остальные.",
+    confirmLabel: "Начать анализ",
+  })) return;
+  const result = await run("chatgpt-all", () =>
+    api.analyzeBatchWithChatGpt(
+      selectedBatch.value!.id,
+      selectedDonors.value,
+      currentProductOverrides(),
+    ),
+  );
+  if (!result) return;
+  batchOperation.value = result;
+  scheduleBatchOperationPoll(result.batch_id);
+  notify("ChatGPT-анализ запущен для " + result.total + " товаров");
+}
+
+async function openBatch(
+  id: number,
+  requestedProductId: number | null = null,
+  options: { syncRoute?: boolean; resetFilters?: boolean } = {},
+) {
+  const syncRoute = options.syncRoute ?? true;
+  const resetFilters = options.resetFilters ?? true;
+  const batchChanged = selectedBatch.value?.id !== id;
+  if (resetFilters && batchChanged) {
+    productQuery.value = "";
+    productStatusFilter.value = ALL_FILTER_VALUE;
+    attributeStatusFilter.value = ALL_FILTER_VALUE;
+  }
   const batch = await run("batch", () => api.batch(id));
-  if (!batch) return;
+  if (!batch) return false;
+  clearBatchOperationPoll();
+  batchOperation.value = null;
   selectedBatch.value = batch;
+  void loadBatchOperation(id);
 
   tab.value = "review";
-  const first = batch.products?.[0];
-  if (first) await openProduct(first.id);
+  const requested = requestedProductId
+    ? batch.products?.find((product) => product.id === requestedProductId)
+    : null;
+  const first = requested || batch.products?.[0];
+  if (first) {
+    await openProduct(first.id, {
+      syncRoute: false,
+      resetAttributeFilter: resetFilters && selectedProduct.value?.id !== first.id,
+    });
+  }
   else selectedProduct.value = null;
+  if (syncRoute) await writeAssistantRoute("push");
+  return true;
 }
 
 async function removeBatch(batch: AttributeBatch) {
@@ -775,11 +1110,14 @@ async function removeBatch(batch: AttributeBatch) {
   const result = await run(requestKey, () => api.removeBatch(batch.id));
   if (!result) return;
   if (selectedBatch.value?.id === batch.id) {
+    clearBatchOperationPoll();
+    batchOperation.value = null;
     selectedBatch.value = null;
     selectedProduct.value = null;
 
     historyItems.value = [];
     tab.value = "start";
+    await writeAssistantRoute("replace");
   }
   await loadWorkspace();
   notify(`Обработка удалена · товаров: ${result.deleted.products}, файлов: ${result.deleted.files}`);
@@ -798,7 +1136,15 @@ async function refreshProductHistory(productId = selectedProduct.value?.id) {
   }
 }
 
-async function openProduct(id: number) {
+async function openProduct(
+  id: number,
+  options: { syncRoute?: boolean; resetAttributeFilter?: boolean } = {},
+) {
+  const syncRoute = options.syncRoute ?? true;
+  const resetAttributeFilter = options.resetAttributeFilter ?? true;
+  if (resetAttributeFilter && selectedProduct.value?.id !== id) {
+    attributeStatusFilter.value = ALL_FILTER_VALUE;
+  }
   const token = ++productRequestToken;
   loadingProductId.value = id;
   error.value = "";
@@ -807,11 +1153,11 @@ async function openProduct(id: number) {
     product = await api.product(id);
   } catch (caught) {
     if (token === productRequestToken) error.value = errorMessage(caught);
-    return;
+    return false;
   } finally {
     if (token === productRequestToken) loadingProductId.value = null;
   }
-  if (token !== productRequestToken) return;
+  if (token !== productRequestToken) return false;
   selectedProduct.value = product;
   historyItems.value = [];
   selectedDonors.value = [...(product.selected_donor_ids || [])];
@@ -832,6 +1178,8 @@ async function openProduct(id: number) {
       selectedDonors.value = recommendations.items.filter((item) => item.recommended).slice(0, 4).map((item) => item.id);
     }
   });
+  if (syncRoute) await writeAssistantRoute("push");
+  return true;
 }
 
 function toggleDonor(id: number) {
@@ -897,7 +1245,11 @@ async function askChatGpt() {
     return;
   }
   const result = await run("chatgpt-product", () =>
-    api.analyzeProductWithChatGpt(selectedProduct.value!.id, selectedDonors.value),
+    api.analyzeProductWithChatGpt(
+      selectedProduct.value!.id,
+      selectedDonors.value,
+      donorUrlOverrides.value,
+    ),
   );
   if (!result) return;
   selectedProduct.value = result.product;
@@ -998,7 +1350,8 @@ async function ensureAllowedOptions(value: AttributeValue, open: boolean) {
 }
 
 function selectedFinalParts(value: AttributeValue) {
-  return new Set((value.final_value || displayedProposal(value)).split("/").map((item) => item.trim()).filter(Boolean));
+  const selected = value.status === "rejected" ? value.final_value : value.final_value || displayedProposal(value);
+  return new Set(selected.split("/").map((item) => item.trim()).filter(Boolean));
 }
 function sourceStatusText(
   status: string,
@@ -1053,6 +1406,10 @@ function displayedProposal(value: AttributeValue) {
   return value.proposed_value || bestCandidate(value)?.value || "";
 }
 
+function isTechnicalDash(value: string) {
+  return /^[-–—−]$/u.test(value.trim());
+}
+
 function displayedProposalSource(value: AttributeValue) {
   const candidate = bestCandidate(value);
   return sourceTitle(value.proposed_value ? value.source : candidate?.source || "");
@@ -1067,10 +1424,10 @@ function valueStatusLabel(value: AttributeValue) {
   if (value.status === "conflict") return "Конфликт";
   if (value.status === "unknown") return "Нет в справочнике";
   if (value.status === "dash") return "Технический пропуск";
+  if (value.status === "rejected") return "Отклонено";
   if (value.current_value) return value.source === "current_site" ? "Сохранено со страницы" : "Сохранено из CSV";
   if (value.status === "approved") return "Принято";
   if (value.status === "suggested") return "Нужно проверить";
-  if (value.status === "rejected") return "Отклонено";
   return "Не заполнено";
 }
 
@@ -1085,7 +1442,7 @@ function currentValueCaption(value: AttributeValue) {
 
 function valueStatusColor(value: AttributeValue): "error" | "warning" | "success" | "neutral" {
   if (!value.is_in_template) return "warning";
-  if (value.status === "conflict") return "error";
+  if (value.status === "conflict" || value.status === "rejected") return "error";
   if (value.status === "unknown") return "warning";
   if (value.current_value || value.status === "approved") return "success";
   return "neutral";
@@ -1127,6 +1484,7 @@ async function removeOutsideTemplateValue(value: AttributeValue) {
 
 function selectedFinalValue(value: AttributeValue) {
   if (value.final_value && value.final_value !== "-") return value.final_value;
+  if (value.status === "rejected") return "";
   return displayedProposal(value);
 }
 
@@ -1232,11 +1590,42 @@ async function exportBatch() {
   window.location.href = `/api/attribute-assistant/batches/${selectedBatch.value.id}/download`;
 }
 
+watch(
+  [productQuery, productStatusFilter, attributeStatusFilter],
+  () => {
+    if (!routeStateReady || applyingRouteState || tab.value !== "review") return;
+    if (filterRouteTimer) clearTimeout(filterRouteTimer);
+    filterRouteTimer = setTimeout(() => {
+      filterRouteTimer = null;
+      if (!routeStateReady || applyingRouteState || tab.value !== "review") return;
+      void writeAssistantRoute("replace");
+    }, 180);
+  },
+);
+
+watch(
+  () => route.fullPath,
+  (fullPath) => {
+    if (fullPath === writtenRoute) {
+      writtenRoute = "";
+      return;
+    }
+    if (routeStateReady) void applyAssistantRoute();
+  },
+);
+
 onMounted(async () => {
-  await Promise.all([loadWorkspace(), loadChatGpt()]);
+  try {
+    await Promise.all([loadWorkspace(), loadChatGpt()]);
+    await applyAssistantRoute();
+  } finally {
+    loading.value = false;
+  }
 });
 onBeforeUnmount(() => {
   if (authPoll) clearInterval(authPoll);
+  if (filterRouteTimer) clearTimeout(filterRouteTimer);
+  clearBatchOperationPoll();
   allowedSearchTimers.forEach((timer) => clearTimeout(timer));
   allowedSearchTimers.clear();
 });
@@ -1264,13 +1653,14 @@ onBeforeUnmount(() => {
     </SectionHeader>
 
     <UTabs
-      v-model="tab"
+      :model-value="tab"
       :items="mainTabItems"
       :content="false"
       variant="link"
       size="lg"
       class="aa-tabs"
       aria-label="Разделы вкладки"
+      @update:model-value="changeMainTab"
     />
 
     <UAlert
@@ -1515,7 +1905,7 @@ onBeforeUnmount(() => {
             >
               {{ templateDetails.is_active ? "Деактивировать" : "Активировать" }}
             </UButton>
-            <UButton color="primary" @click="selectedTemplateId = templateDetails.id; tab = 'start'">Использовать</UButton>
+            <UButton color="primary" @click="useTemplateForNewBatch(templateDetails.id)">Использовать</UButton>
             <UButton
               color="error"
               variant="soft"
@@ -1574,7 +1964,10 @@ onBeforeUnmount(() => {
               <UButton color="neutral" variant="ghost" block class="aa-template-field-trigger">
                 <span class="aa-template-field-title">
                   <strong>{{ field.group_name }} · {{ field.name }}</strong>
-                  <small>{{ field.value_type }} · {{ field.allowed_values_count }} значений</small>
+                  <small>
+                    {{ field.value_type }} · {{ field.allowed_values_count }} значений
+                    <template v-if="field.synonyms?.length"> · {{ field.synonyms.length }} синон.</template>
+                  </small>
                 </span>
                 <UIcon name="i-lucide-chevron-down" :class="['aa-template-field-chevron', { open }]" />
               </UButton>
@@ -1703,7 +2096,7 @@ onBeforeUnmount(() => {
     <template v-else-if="tab === 'review' && selectedBatch">
       <div class="aa-review-head">
         <div>
-          <UButton color="neutral" variant="ghost" icon="i-lucide-arrow-left" @click="tab = 'start'">← К загрузке</UButton>
+          <UButton color="neutral" variant="ghost" icon="i-lucide-arrow-left" @click="changeMainTab('start')">← К загрузке</UButton>
           <h2>{{ selectedBatch.name }}</h2>
           <p>{{ selectedBatch.template.category }} · {{ selectedBatch.summary.products }} товаров</p>
         </div>
@@ -1841,7 +2234,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-else class="aa-priority-empty">Выберите доноров слева. Ссылка на товар будет найдена по модели автоматически.</div>
                 <div class="aa-inline-actions">
-                  <UButton color="primary" :disabled="busy === 'process' || !selectedDonors.length" @click="processDonors">
+                  <UButton color="primary" :disabled="batchOperationRunning || busy === 'process' || !selectedDonors.length" @click="processDonors">
                     <UIcon name="i-lucide-wand-sparkles" /> Найти и проверить
                   </UButton>
                   <UButton
@@ -1849,12 +2242,56 @@ onBeforeUnmount(() => {
                     variant="soft"
                     icon="i-lucide-sparkles"
                     :loading="busy === 'chatgpt-product'"
+                    :disabled="batchOperationRunning || !chatGpt?.authenticated"
                     :title="chatGpt?.authenticated ? 'Проанализировать страницу выбранного товара через ChatGPT' : 'Сначала подключите ChatGPT'"
                     @click="askChatGpt"
                   >Спросить ChatGPT</UButton>
-                  <UButton color="neutral" variant="soft" :disabled="busy === 'similar'" @click="useSimilar">Похожие товары</UButton>
+                  <UButton color="neutral" variant="soft" :disabled="batchOperationRunning || busy === 'similar'" @click="useSimilar">Похожие товары</UButton>
                 </div>
               </div>
+            </div>
+
+            <div class="aa-batch-operation">
+              <div class="aa-batch-operation-head">
+                <span>
+                  <strong>Все товары текущей проверки</strong>
+                  <small>Массовая обработка продолжится в фоне, даже если выбрать другой товар</small>
+                </span>
+                <div class="aa-inline-actions">
+                  <UButton
+                    color="primary"
+                    icon="i-lucide-scan-search"
+                    :loading="busy === 'process-all'"
+                    :disabled="batchOperationRunning || !selectedDonors.length"
+                    @click="processAllProducts"
+                  >Найти и проверить (все товары)</UButton>
+                  <UButton
+                    color="primary"
+                    variant="soft"
+                    icon="i-lucide-sparkles"
+                    :loading="batchChatGptLoading"
+                    :disabled="batchChatGptLoading || batchOperationRunning || !batchOperation || !chatGpt?.authenticated"
+                    @click="askChatGptForAllProducts"
+                  >Спросить ChatGPT (все товары)</UButton>
+                </div>
+              </div>
+              <div v-if="batchOperation?.kind === 'donors' && batchOperation.status !== 'idle'" class="aa-batch-operation-progress">
+                <div>
+                  <strong>{{ batchOperationRunning ? "Поиск и проверка всех товаров" : "Последняя массовая операция" }}</strong>
+                  <span>
+                    {{ batchOperation.processed }} из {{ batchOperation.total }}
+                    · успешно {{ batchOperation.succeeded }}
+                    · ошибок {{ batchOperation.failed }}
+                    · извлечено {{ batchOperation.attributes_found }}
+                  </span>
+                </div>
+                <UProgress :model-value="batchOperation.percent" color="primary" size="sm" />
+                <small v-if="batchOperation.current_product">Сейчас: {{ batchOperation.current_product }}</small>
+                <small v-else-if="batchOperation.status === 'failed'" class="aa-operation-error">{{ batchOperation.error || batchOperation.errors[0]?.error }}</small>
+              </div>
+              <p v-else-if="batchOperation?.kind === 'chatgpt' && batchOperation.status === 'failed'" class="aa-operation-error" role="alert">
+                {{ batchOperation.error || batchOperation.errors[0]?.error || "Не удалось выполнить анализ ChatGPT" }}
+              </p>
             </div>
 
 
@@ -1872,7 +2309,7 @@ onBeforeUnmount(() => {
                     <strong>{{ source.donor_name }}</strong>
                     <em :class="['aa-source-kind', `is-${sourceKind(source)}`]">{{ sourceKindLabel(source) }}</em>
                   </span>
-                  <small>{{ source.message || source.role }}</small>
+                  <small :title="source.message || source.role">{{ source.message || source.role }}</small>
                 </span>
                 <b>{{ sourceStatusText(source.status, source.attributes_found, source.mapped, source.ambiguous, source.unknown, source.already_filled) }}</b>
               </ULink>
@@ -1884,10 +2321,30 @@ onBeforeUnmount(() => {
               <div>
                 <span class="aa-step">Проверка</span>
                 <h2>Атрибуты товара</h2>
+                <small class="aa-muted">Заполненные значения защищены</small>
               </div>
-              <span class="aa-muted">Заполненные значения защищены</span>
+              <div class="aa-attribute-toolbar">
+                <USelect
+                  v-model="attributeStatusFilter"
+                  :items="attributeStatusItems"
+                  value-key="value"
+                  class="aa-attribute-status-filter"
+                  aria-label="Фильтр атрибутов по статусу"
+                />
+                <span class="aa-muted">
+                  Показано {{ filteredAttributeValues.length }} из {{ attributeValues.length }}
+                </span>
+              </div>
             </div>
 
+            <UAlert
+              v-if="!valuesByGroup.length"
+              color="neutral"
+              variant="soft"
+              icon="i-lucide-list-filter"
+              title="По выбранному фильтру атрибутов нет"
+              description="Выберите другой статус или покажите все атрибуты."
+            />
             <div v-for="[group, values] in valuesByGroup" :key="group" class="aa-attribute-group">
               <h3>{{ group }}</h3>
               <article v-for="value in values" :key="value.id" :class="['aa-attribute', `is-${value.status}`, { 'is-outside-template': !value.is_in_template }]">
@@ -1904,12 +2361,12 @@ onBeforeUnmount(() => {
                 <div class="aa-attribute-comparison">
                   <div class="aa-comparison-cell is-current">
                     <span>Было</span>
-                    <strong>{{ value.current_value || "—" }}</strong>
+                    <strong>{{ value.current_value }}</strong>
                     <small>{{ currentValueCaption(value) }}</small>
                   </div>
                   <div class="aa-comparison-cell is-proposed">
                     <span>Предложение</span>
-                    <strong :class="{ 'aa-not-found': !displayedProposal(value) }">{{ displayedProposal(value) || "—" }}</strong>
+                    <strong :class="{ 'aa-not-found': !displayedProposal(value) }">{{ displayedProposal(value) }}</strong>
                     <small v-if="displayedProposal(value)">
                       {{ displayedProposalSource(value) }}
                       <template v-if="displayedProposalConfidence(value)"> · {{ displayedProposalConfidence(value) }}%</template>
@@ -1950,7 +2407,7 @@ onBeforeUnmount(() => {
                       @update:open="ensureAllowedOptions(value, $event)"
                       @update:model-value="selectFinalValue(value, $event)"
                     />
-                    <strong v-else>{{ value.final_value || displayedProposal(value) || "—" }}</strong>
+                    <strong v-else>{{ value.final_value || displayedProposal(value) }}</strong>
                     <small v-if="value.status === 'dash'">{{ value.dash_reason }}</small>
                     <small v-else-if="value.status === 'conflict'">Выберите итог или отклоните предложение</small>
                     <small v-else-if="value.allowed_values.length && value.final_value">Можно выбрать другое значение из шаблона</small>
@@ -1970,7 +2427,7 @@ onBeforeUnmount(() => {
                     @click="removeOutsideTemplateValue(value)"
                   >Удалить атрибут</UButton>
                   <UButton
-                    v-if="displayedProposal(value) && displayedProposal(value) !== value.final_value"
+                    v-if="value.status !== 'rejected' && displayedProposal(value) && displayedProposal(value) !== value.final_value"
                     color="success"
                     variant="soft"
                     icon="i-lucide-check"
@@ -1978,7 +2435,7 @@ onBeforeUnmount(() => {
                     @click="valueAction(value, 'accept', displayedProposal(value))"
                   >Принять</UButton>
                   <UButton
-                    v-if="displayedProposal(value) && displayedProposal(value) !== value.final_value"
+                    v-if="value.status !== 'rejected' && displayedProposal(value) && displayedProposal(value) !== value.final_value"
                     color="error"
                     variant="ghost"
                     icon="i-lucide-x"
@@ -1986,7 +2443,7 @@ onBeforeUnmount(() => {
                     @click="valueAction(value, 'reject')"
                   >Отклонить</UButton>
                   <UButton
-                    v-if="!value.current_value && !value.final_value"
+                    v-if="(!value.current_value || isTechnicalDash(value.current_value)) && !value.final_value"
                     color="neutral"
                     variant="ghost"
                     icon="i-lucide-minus"
@@ -2081,13 +2538,14 @@ onBeforeUnmount(() => {
     <UModal
       :open="Boolean(templateFieldEditor)"
       title="Редактирование атрибута"
-      description="Измените структуру поля шаблона."
+      description="Измените структуру поля и названия, встречающиеся у доноров."
       :dismissible="busy !== `field-${templateFieldEditor?.id}`"
       :ui="{ content: 'sm:max-w-2xl' }"
       @update:open="(open) => { if (!open) templateFieldEditor = null }"
     >
       <template v-if="templateFieldEditor" #body>
         <div class="aa-dialog-form">
+          <UAlert v-if="error" color="error" variant="subtle" :description="error" />
           <UFormField label="Название" required>
             <UInput v-model="templateFieldEditor.name" class="w-full" />
           </UFormField>
@@ -2108,6 +2566,52 @@ onBeforeUnmount(() => {
             />
           </UFormField>
           <UCheckbox v-model="templateFieldEditor.is_composite" label="Составное значение через /" />
+          <div class="aa-synonym-editor">
+            <div class="aa-synonym-editor-title">
+              <span>
+                <strong>Синонимы атрибута</strong>
+                <small>{{ templateFieldEditor.synonyms.length }} добавлено</small>
+              </span>
+            </div>
+            <p class="aa-muted">
+              Названия характеристик у доноров, соответствующие этому атрибуту шаблона.
+            </p>
+            <div v-if="templateFieldEditor.synonyms.length" class="aa-synonym-list">
+              <div
+                v-for="(synonym, index) in templateFieldEditor.synonyms"
+                :key="`${synonym}-${index}`"
+                class="aa-synonym-row"
+              >
+                <span>{{ synonym }}</span>
+                <UButton
+                  type="button"
+                  color="error"
+                  variant="ghost"
+                  size="xs"
+                  icon="i-lucide-x"
+                  :aria-label="`Удалить синоним ${synonym}`"
+                  @click="removeTemplateFieldSynonym(index)"
+                />
+              </div>
+            </div>
+            <p v-else class="aa-synonym-empty">Синонимов пока нет.</p>
+            <form class="aa-synonym-add" @submit.prevent="addTemplateFieldSynonym">
+              <UInput
+                v-model="templateFieldEditor.synonymDraft"
+                autocomplete="off"
+                placeholder="Например: диаметр загрузочного проёма"
+                class="w-full"
+              />
+              <UButton
+                type="submit"
+                color="neutral"
+                variant="soft"
+                :disabled="!templateFieldEditor.synonymDraft.trim()"
+              >
+                Добавить
+              </UButton>
+            </form>
+          </div>
           <UFormField label="Правила конвертации (JSON-массив)">
             <UTextarea v-model="templateFieldEditor.conversion_rules" :rows="6" class="w-full font-mono" />
           </UFormField>

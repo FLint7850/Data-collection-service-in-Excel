@@ -277,6 +277,7 @@ class AttributeTemplateField(Base):
     value_type: Mapped[str] = mapped_column(String(32), default="select", nullable=False)
     is_composite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     separator: Mapped[str] = mapped_column(String(8), default="/", nullable=False)
+    synonyms: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     conversion_rules: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     use_dash_if_empty: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
