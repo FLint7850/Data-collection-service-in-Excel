@@ -1150,6 +1150,118 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(color.status, "kept")
         self.assertTrue(any(item["source"] == "ChatGPT" for item in color.source_details["candidates"]))
 
+    def test_chatgpt_presence_marker_confirms_semantic_current_value(self):
+        from services import attribute_ai
+
+        template = service.import_template_csv(
+            self.db,
+            (
+                "Индикация (Основные)\r\n"
+                "Есть\r\n"
+                "Выполнения программы/Неисправностей\r\n"
+            ).encode("cp1251"),
+            name="Стиральные машины",
+            category="Стиральные машины",
+        )
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            (
+                '_MODEL_;_ATTRIBUTES_\r\n'
+                'WM-100;"Основные|Индикация|Выполнения программы/Неисправностей"\r\n'
+            ).encode("cp1251"),
+            filename="products.csv",
+        )
+        product = batch.products[0]
+        target = next(value for value in product.values if value.attribute_name == "Индикация")
+        source_name = "Индикация хода программы / неисправностей"
+
+        canonical, _confidence, reason, _nearest = service._allowed_match(
+            target.template_field,
+            "Есть",
+            source_name,
+        )
+        self.assertEqual(canonical, "")
+        self.assertIn("наличие характеристики", reason)
+        service.apply_candidate(
+            product,
+            target,
+            value="Есть",
+            confidence=85,
+            source="ChatGPT",
+            reason="Старое ошибочное предложение",
+            priority=90,
+            source_name=source_name,
+            source_url="https://example.com/wm-100",
+        )
+        self.assertEqual(target.status, "conflict")
+
+        analysis = attribute_ai.validate_analysis(
+            product,
+            {
+                "attributes": [
+                    {
+                        "source_id": 1,
+                        "field_id": target.template_field_id,
+                        "confidence": 85,
+                    }
+                ],
+                "warnings": [],
+            },
+            source_facts=[{"source_id": 1, "name": source_name, "value": "Есть"}],
+        )
+        self.assertEqual(
+            analysis["suggestions"][0]["proposed_value"],
+            "Выполнения программы/Неисправностей",
+        )
+        attribute_ai.apply_analysis(
+            self.db,
+            product,
+            analysis,
+            source_url="https://example.com/wm-100",
+        )
+        candidates = target.source_details["candidates"]
+        self.assertEqual([item["value"] for item in candidates], [
+            "Выполнения программы/Неисправностей"
+        ])
+        self.assertEqual(target.status, "kept")
+
+    def test_chatgpt_allowed_value_overrides_presence_marker(self):
+        from services import attribute_ai
+
+        template = service.import_template_csv(
+            self.db,
+            "Индикация (Основные)\r\nЕсть\r\nНеисправностей\r\n".encode("cp1251"),
+            name="Стиральные машины",
+            category="Стиральные машины",
+        )
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        target = next(
+            value for value in batch.products[0].values if value.attribute_name == "Индикация"
+        )
+        analysis = attribute_ai.validate_analysis(
+            batch.products[0],
+            {
+                "attributes": [
+                    {
+                        "name": "Индикация неисправностей",
+                        "value": "Есть",
+                        "allowed_value": "Неисправностей",
+                        "field_id": target.template_field_id,
+                        "confidence": 85,
+                        "evidence": "Индикация неисправностей: Есть",
+                    }
+                ]
+            },
+            page_evidence="Индикация неисправностей: Есть",
+        )
+        self.assertEqual(analysis["suggestions"][0]["proposed_value"], "Неисправностей")
+
     def test_chatgpt_conflict_does_not_overwrite_manual_final_value(self):
         from services import attribute_ai
 

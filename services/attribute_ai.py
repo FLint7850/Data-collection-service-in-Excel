@@ -19,9 +19,12 @@ from sqlalchemy.orm import Session
 from config import ATTRIBUTE_ASSISTANT_DIR
 from models import AttributeProduct, AttributeProductSource, Donor
 from services.attribute_assistant import (
+    _is_presence_marker,
     apply_candidate,
     _allowed_match,
     _mapping_score,
+    _name_tokens,
+    _recalculate_candidate_state,
     clean_text,
     fetch_donor_product_html,
     fetch_public_html,
@@ -36,7 +39,7 @@ from services.attribute_assistant import (
 )
 
 
-ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v11"
+ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v12"
 ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD = 30
 ATTRIBUTE_AI_MAX_PAGE_CHARS = 60_000
 ATTRIBUTE_AI_MAX_RESPONSE_CHARS = 2_000_000
@@ -67,6 +70,7 @@ UNIVERSAL_ATTRIBUTE_PROMPT = """
 - field_id должен существовать в template_field_catalog. Если подходящего поля нет или смысл неоднозначен, верни field_id: null, сохранив сам факт.
 - Не копируй current_value без подтверждающей цитаты. Верни подтверждающий или опровергающий факт: сервис сам определит совпадение или конфликт.
 - allowed_value должен полностью совпадать с одним из allowed_values соответствующего поля. Если подходящего значения нет или оно совпадает с value, не включай allowed_value.
+- Значения «да», «есть», «нет» и аналогичные являются итогом только для логического поля. Если такое значение лишь подтверждает наличие варианта, указанного в названии характеристики, верни этот вариант через allowed_value; не предлагай маркер наличия для смыслового списка.
 - allowed_values уже являются релевантной выборкой из полного справочника; allowed_values_total показывает исходный размер.
 - source_hints — только автоматически отобранные кандидаты по сходству названий. Проверь их смысл самостоятельно и не считай готовым сопоставлением.
 - Не пропускай подтверждённый факт только потому, что поле уже заполнено или его значение отсутствует в выборке allowed_values.
@@ -374,6 +378,80 @@ def _canonical_allowed(field, proposed: object) -> str:
     return ""
 
 
+def _current_value_supported_by_source_name(field, target, source_name: str) -> str:
+    """Confirm an existing semantic value when a presence row names its options."""
+
+    current = clean_text(target.final_value or target.current_value or target.proposed_value)
+    if not current or _is_presence_marker(field, current):
+        return ""
+    canonical, _confidence, _reason, _alternatives = _allowed_match(
+        field,
+        current,
+        field.name,
+    )
+    if not canonical:
+        return ""
+    source_tokens = _name_tokens(source_name) - _name_tokens(field.name)
+    if not source_tokens:
+        return ""
+    separator = clean_text(field.separator) or "/"
+    parts = (
+        [clean_text(part) for part in canonical.split(separator) if clean_text(part)]
+        if field.is_composite
+        else [canonical]
+    )
+    for part in parts:
+        variants = [part]
+        part_key = normalize_key(part)
+        allowed = next(
+            (
+                item
+                for item in field.allowed_values
+                if item.is_active and (item.normalized_value or normalize_key(item.value)) == part_key
+            ),
+            None,
+        )
+        if allowed is not None:
+            variants.extend(synonym.synonym for synonym in allowed.synonyms)
+        supported = False
+        for variant in variants:
+            variant_tokens = _name_tokens(variant)
+            if not variant_tokens:
+                continue
+            overlap = source_tokens & variant_tokens
+            if overlap and len(overlap) / len(variant_tokens) >= 0.5:
+                supported = True
+                break
+        if not supported:
+            return ""
+    return canonical
+
+
+def _clear_replaceable_chatgpt_evidence(product: AttributeProduct) -> None:
+    """Discard stale, unapproved ChatGPT evidence before applying a fresh result."""
+
+    protected_statuses = {"approved", "dash", "rejected"}
+    for target in product.values:
+        if target.status in protected_statuses:
+            continue
+        details = dict(target.source_details or {})
+        previous = list(details.get("candidates") or [])
+        candidates = [
+            item
+            for item in previous
+            if not (isinstance(item, dict) and clean_text(item.get("source")) == "ChatGPT")
+        ]
+        if len(candidates) == len(previous) and "chatgpt" not in details:
+            continue
+        details["candidates"] = candidates
+        details.pop("chatgpt", None)
+        target.source_details = details
+        if clean_text(target.source) == "ChatGPT" and not target.current_value:
+            target.proposed_value = ""
+            target.source = ""
+        _recalculate_candidate_state(product, target)
+
+
 def validate_analysis(
     product: AttributeProduct,
     response: object,
@@ -467,15 +545,34 @@ def validate_analysis(
             continue
         if field_id in seen_fields:
             continue
-        canonical, _match_confidence, match_reason, _alternatives = _allowed_match(
-            field,
-            value,
-            name,
-        )
-        explanation = f"Семантически сопоставлено ChatGPT; {match_reason}"
-        if not canonical and item.get("allowed_value"):
-            canonical = _canonical_allowed(field, item["allowed_value"])
-            explanation = "Предложено ChatGPT по странице товара; значение проверено по справочнику"
+        presence_marker = _is_presence_marker(field, value)
+        canonical = ""
+        explanation = ""
+        if presence_marker and item.get("allowed_value"):
+            allowed_value = _canonical_allowed(field, item["allowed_value"])
+            if allowed_value and not _is_presence_marker(field, allowed_value):
+                canonical = allowed_value
+                explanation = (
+                    "Название характеристики раскрыто ChatGPT; "
+                    "значение проверено по справочнику"
+                )
+        if presence_marker and not canonical:
+            canonical = _current_value_supported_by_source_name(field, target, name)
+            if canonical:
+                explanation = (
+                    "Исходное значение подтверждено названием характеристики; "
+                    "маркер наличия не использован как итог"
+                )
+        if not presence_marker:
+            canonical, _match_confidence, match_reason, _alternatives = _allowed_match(
+                field,
+                value,
+                name,
+            )
+            explanation = f"Семантически сопоставлено ChatGPT; {match_reason}"
+            if not canonical and item.get("allowed_value"):
+                canonical = _canonical_allowed(field, item["allowed_value"])
+                explanation = "Предложено ChatGPT по странице товара; значение проверено по справочнику"
         if not canonical:
             warnings.append(
                 f"Сопоставление «{name}» → «{field.name}» проверено, "
@@ -505,6 +602,7 @@ def validate_analysis(
 
 
 def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, Any], *, source_url: str) -> int:
+    _clear_replaceable_chatgpt_evidence(product)
     values = {
         item.template_field_id: item
         for item in product.values

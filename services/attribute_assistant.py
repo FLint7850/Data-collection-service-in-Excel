@@ -2298,6 +2298,13 @@ def _allowed_match(
     source_name: str = "",
 ) -> tuple[str, int, str, list[str]]:
     allowed = [item for item in field.allowed_values if item.is_active]
+    if _is_presence_marker(field, raw_value):
+        return (
+            "",
+            0,
+            "Логическое значение описывает наличие характеристики, а не значение справочника",
+            [],
+        )
     if field.is_composite:
         try:
             normalized_full = normalize_value(raw_value, field.value_type, True)
@@ -2342,6 +2349,21 @@ def _allowed_match(
             return canonical, confidence, reason, list(dict.fromkeys(suggestions))[:3]
         last_reason = reason
     return "", 0, last_reason, list(dict.fromkeys(suggestions))[:3]
+
+
+def _is_presence_marker(field: AttributeTemplateField, value: Any) -> bool:
+    """Return whether a yes/no value only marks presence of a semantic option."""
+
+    key = normalize_key(value)
+    boolean_keys = BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
+    if key not in boolean_keys or field.value_type == "boolean":
+        return False
+    active_keys = {
+        item.normalized_value or normalize_key(item.value)
+        for item in field.allowed_values
+        if item.is_active
+    }
+    return any(item_key and item_key not in boolean_keys for item_key in active_keys)
 
 def _allowed_match_single(
     field: AttributeTemplateField,
