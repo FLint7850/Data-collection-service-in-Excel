@@ -82,9 +82,32 @@ RUSSIAN_NAME_SUFFIXES = (
 
 NUMBER_WITH_UNIT_RE = re.compile(
     r"^\s*([+-]?\d+(?:[.,]\d+)?)\s*"
-    r"(месяц(?:а|ев)?|мес\.?|год(?:а|ов)?|лет|квт(?:/ч)?|вт(?:/ч)?|см|мм|м|кг|г|л|дб|гц|ч)?\s*$",
+    r"(месяц(?:а|ев)?|мес\.?|год(?:а|ов)?|лет|квт(?:/ч)?|вт(?:/ч)?|см|мм|м|кг|мг|г|мл|л|дб|гц|ч)?\s*$",
     re.IGNORECASE,
 )
+LINEAR_UNIT_FACTORS: dict[str, tuple[str, Decimal]] = {
+    "мм": ("length", Decimal("0.001")),
+    "см": ("length", Decimal("0.01")),
+    "м": ("length", Decimal("1")),
+    "мг": ("mass", Decimal("0.001")),
+    "г": ("mass", Decimal("1")),
+    "кг": ("mass", Decimal("1000")),
+    "мл": ("volume", Decimal("0.001")),
+    "л": ("volume", Decimal("1")),
+    "вт": ("power", Decimal("1")),
+    "квт": ("power", Decimal("1000")),
+}
+LINEAR_UNIT_ALIASES = {
+    "миллиметр": "мм", "миллиметра": "мм", "миллиметров": "мм",
+    "сантиметр": "см", "сантиметра": "см", "сантиметров": "см",
+    "метр": "м", "метра": "м", "метров": "м",
+    "миллиграмм": "мг", "миллиграмма": "мг", "миллиграммов": "мг",
+    "грамм": "г", "грамма": "г", "граммов": "г",
+    "килограмм": "кг", "килограмма": "кг", "килограммов": "кг",
+    "миллилитр": "мл", "миллилитра": "мл", "миллилитров": "мл",
+    "литр": "л", "литра": "л", "литров": "л",
+    **{unit: unit for unit in LINEAR_UNIT_FACTORS},
+}
 PROCESSING_MODES = {
     "check", "suggest", "auto", "auto_exact", "auto_primary",
     "auto_confident", "auto_all",
@@ -326,6 +349,7 @@ def allowed_value_options(
     field: AttributeTemplateField,
     query: str = "",
     limit: int = 80,
+    offset: int = 0,
     include_inactive: bool = False,
 ) -> dict[str, Any]:
     available = [item for item in field.allowed_values if include_inactive or item.is_active]
@@ -347,10 +371,15 @@ def allowed_value_options(
     else:
         matches = available
     safe_limit = max(1, min(int(limit or 80), 200))
+    safe_offset = max(0, int(offset or 0))
+    page = matches[safe_offset:safe_offset + safe_limit]
     return {
         "field_id": field.id,
         "total": len(available),
         "matched": len(matches),
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "has_more": safe_offset + len(page) < len(matches),
         "values": [
             {
                 "id": item.id,
@@ -359,7 +388,7 @@ def allowed_value_options(
                 "is_combination": item.is_combination,
                 "synonyms": [synonym.synonym for synonym in item.synonyms],
             }
-            for item in matches[:safe_limit]
+            for item in page
         ],
     }
 
@@ -594,8 +623,9 @@ def _make_product_values(
             reason = "Технический пропуск сохранён из исходного файла"
             dash_reason = "Импортировано из исходного CSV"
         elif current:
+            matched_source_name = clean_text(matched.get("source_name")) if matched else ""
             canonical, match_confidence, match_reason, suggestions = _allowed_match(
-                field, current, field.name
+                field, current, matched_source_name or field.name
             )
             if canonical:
                 final = canonical
@@ -612,7 +642,7 @@ def _make_product_values(
                     "unknown_values": [{
                         "value": current,
                         "source": current_source,
-                        "source_name": field.name,
+                        "source_name": matched_source_name or field.name,
                         "url": product.source_url,
                         "role": current_role,
                         "suggestions": suggestions,
@@ -1375,6 +1405,7 @@ def _page_attribute_stack(
                 "group_name": field.group_name,
                 "name": field.name,
                 "value": item["value"],
+                "source_name": item["name"],
             })
         else:
             result.append(item)
@@ -1608,7 +1639,51 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
                 restored.template_field.id if restored.template_field is not None else None
             )
             target = targets.get(restored_field_id)
-            if target is None or target.current_value:
+            if target is None:
+                continue
+            if target.current_value:
+                if (
+                    target.source != "current_site"
+                    or normalize_key(target.current_value) != normalize_key(restored.current_value)
+                ):
+                    continue
+                before = (
+                    target.final_value,
+                    target.confidence,
+                    target.status,
+                    target.reason,
+                    dict(target.source_details or {}),
+                )
+                previous_details = dict(target.source_details or {})
+                restored_details = dict(restored.source_details or {})
+                unknown_values = [
+                    item for item in list(previous_details.get("unknown_values") or [])
+                    if not (
+                        isinstance(item, dict)
+                        and clean_text(item.get("source")) == "current_site"
+                    )
+                ] + list(restored_details.get("unknown_values") or [])
+                if unknown_values:
+                    previous_details["unknown_values"] = unknown_values
+                else:
+                    previous_details.pop("unknown_values", None)
+                target.source_details = previous_details
+                if target.status not in {"approved", "rejected"}:
+                    target.final_value = restored.final_value
+                    target.confidence = restored.confidence
+                    target.status = restored.status
+                    target.reason = restored.reason
+                    if restored.final_value and previous_details.get("candidates"):
+                        _recalculate_candidate_state(product, target)
+                after = (
+                    target.final_value,
+                    target.confidence,
+                    target.status,
+                    target.reason,
+                    dict(target.source_details or {}),
+                )
+                if after != before:
+                    changed += 1
                 continue
             previous_status = target.status
             previous_details = dict(target.source_details or {})
@@ -1976,6 +2051,18 @@ def _mapping_score(source_name: str, field: AttributeTemplateField) -> float:
     return max((_name_mapping_score(source_name, name) for name in names), default=0.0)
 
 
+def _name_supports_value_hint(source_name: str, target_name: str) -> bool:
+    # A dictionary value may complete an abbreviated name, but must not discard
+    # donor qualifiers to force a specific attribute into a more general field.
+    source_tokens = _name_tokens(source_name)
+    target_tokens = _name_tokens(target_name)
+    if not source_tokens:
+        # Names made entirely of generic words still need lexical evidence.
+        source_tokens = set(normalize_key(source_name).split())
+        target_tokens = set(normalize_key(target_name).split())
+    return bool(source_tokens and source_tokens <= target_tokens)
+
+
 def _allowed_value_field_index(
     fields: Iterable[AttributeTemplateField],
     wanted_keys: set[str] | None = None,
@@ -2041,6 +2128,8 @@ def map_attribute(
     value_index: dict[str, list[AttributeTemplateField]] | None = None,
 ) -> tuple[AttributeTemplateField | None, int, str, list[dict[str, Any]]]:
     source_key = normalize_key(source_name)
+    if not source_key:
+        return None, 0, "Название атрибута не заполнено", []
     if donor_id:
         rule = db.scalar(
             select(AttributeMappingRule).where(
@@ -2052,6 +2141,18 @@ def map_attribute(
         )
         if rule:
             return rule.template_field, 100, "Сохранённое правило", []
+    # Exact field names take precedence over synonyms, token normalization and
+    # dictionary hints. An unknown value does not change the attribute's identity.
+    exact_fields = [
+        field for field in template.fields if normalize_key(field.name) == source_key
+    ]
+    if len(exact_fields) == 1:
+        return exact_fields[0], 100, "Точное совпадение названия", []
+    if len(exact_fields) > 1:
+        return None, 100, "Название атрибута неоднозначно", [
+            {"field_id": field.id, "name": field.name, "group_name": field.group_name, "score": 100}
+            for field in exact_fields[:4]
+        ]
     synonym_fields = [
         field
         for field in template.fields
@@ -2084,7 +2185,13 @@ def map_attribute(
     if len(exact_value_fields) == 1:
         matching_field = exact_value_fields[0]
         name_score = _mapping_score(source_name, matching_field)
-        if not ranked or ranked[0][0] < 0.74 or ranked[0][1].id == matching_field.id:
+        name_supported = any(
+            _name_supports_value_hint(source_name, name)
+            for name in [matching_field.name, *(matching_field.synonyms or [])]
+        )
+        if name_supported and (
+            not ranked or ranked[0][0] < 0.74 or ranked[0][0] - name_score < 0.06
+        ):
             return (
                 matching_field,
                 max(90, round(name_score * 100)),
@@ -2095,7 +2202,7 @@ def map_attribute(
         return None, round((ranked[0][0] if ranked else 0) * 100), "Низкая схожесть названий", alternatives
     best_score, best_field = ranked[0]
     margin = best_score - (ranked[1][0] if len(ranked) > 1 else 0)
-    if len(ranked) > 1 and margin < 0.06 and best_score < 0.94:
+    if len(ranked) > 1 and margin < 0.06:
         return None, round(best_score * 100), "Нужно уточнить атрибут", alternatives
     return best_field, round(best_score * 100), "Сопоставлено по названию или синониму", alternatives
 
@@ -2103,6 +2210,20 @@ def map_attribute(
 def _decimal_text(value: Decimal) -> str:
     text = format(value.normalize(), "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _canonical_linear_unit(value: Any) -> str:
+    return LINEAR_UNIT_ALIASES.get(normalize_key(value), "")
+
+
+def _linear_unit_from_name(value: Any) -> str:
+    # Units in donor tables are commonly stored in the attribute label rather
+    # than repeated in every value (for example, "Длина кабеля, м" + "1.8").
+    for token in reversed(WORD_RE.findall(normalize_key(value))):
+        unit = _canonical_linear_unit(token)
+        if unit:
+            return unit
+    return ""
 
 
 def _converted_value_candidates(
@@ -2128,28 +2249,38 @@ def _converted_value_candidates(
         number = Decimal(match.group(1).replace(",", "."))
     except InvalidOperation:
         return list(dict.fromkeys(candidates))
-    unit = normalize_key(match.group(2) or "")
-    field_key = normalize_key(field.name + " " + source_name)
-    if (unit.startswith(("месяц", "мес")) or (not unit and "мес" in normalize_key(source_name))) and number % 12 == 0:
+    raw_unit = normalize_key(match.group(2) or "")
+    source_unit = (
+        _canonical_linear_unit(raw_unit)
+        or _linear_unit_from_name(raw_unit)
+        or _linear_unit_from_name(source_name)
+    )
+    target_unit = _linear_unit_from_name(field.name)
+    if (raw_unit.startswith(("месяц", "мес")) or (not raw_unit and "мес" in normalize_key(source_name))) and number % 12 == 0:
         years = int(number / 12)
         candidates[:0] = [
             f"{years} год",
             f"{years} года",
             f"{years} лет",
         ]
-    elif unit.startswith("квт") and "вт" in field_key and "квт" not in normalize_key(field.name):
-        candidates.insert(0, _decimal_text(number * 1000))
-    elif unit == "м" and "см" in normalize_key(field.name):
-        candidates.insert(0, _decimal_text(number * 100))
-    elif unit == "мм" and "см" in normalize_key(field.name):
-        candidates.insert(0, _decimal_text(number / 10))
-    elif unit:
+    elif source_unit and target_unit:
+        source_family, source_factor = LINEAR_UNIT_FACTORS[source_unit]
+        target_family, target_factor = LINEAR_UNIT_FACTORS[target_unit]
+        if source_family == target_family:
+            converted = _decimal_text(number * source_factor / target_factor)
+            candidates[:0] = [converted, f"{converted} {target_unit}"]
+        elif raw_unit:
+            candidates.insert(0, _decimal_text(number))
+    elif target_unit:
+        normalized_number = _decimal_text(number)
+        candidates[:0] = [normalized_number, f"{normalized_number} {target_unit}"]
+    elif source_unit or raw_unit:
         candidates.insert(0, _decimal_text(number))
     for rule in list(field.conversion_rules or []):
         if not isinstance(rule, dict):
             continue
         from_unit = normalize_key(rule.get("from_unit"))
-        if from_unit and from_unit != unit:
+        if from_unit and from_unit != raw_unit and _canonical_linear_unit(from_unit) != source_unit:
             continue
         try:
             factor = Decimal(str(rule.get("factor", 1)).replace(",", "."))
@@ -2248,6 +2379,25 @@ def _allowed_match_single(
             for synonym in item.synonyms
         ):
             return item.value, 98, "Синоним значения", []
+    if NUMBER_RE.fullmatch(value):
+        try:
+            numeric_value = Decimal(value.replace(",", "."))
+        except InvalidOperation:
+            numeric_value = None
+        if numeric_value is not None:
+            numeric_allowed: list[tuple[Decimal, int, str]] = []
+            for item in allowed:
+                if not NUMBER_RE.fullmatch(clean_text(item.value)):
+                    continue
+                try:
+                    item_number = Decimal(clean_text(item.value).replace(",", "."))
+                except InvalidOperation:
+                    continue
+                numeric_allowed.append((abs(item_number - numeric_value), item.sort_order, item.value))
+            numeric_allowed.sort(key=lambda row: (row[0], row[1], row[2]))
+            return "", 0, "Точного числового значения нет в справочнике", [
+                item for _distance, _order, item in numeric_allowed[:3]
+            ]
     ranked = sorted(
         ((SequenceMatcher(None, key, normalize_key(item.value)).ratio(), item.value) for item in allowed),
         reverse=True,
@@ -2273,6 +2423,12 @@ def _candidate_value_key(target: AttributeProductValue, value: Any) -> str:
     return normalize_key(value)
 
 
+def _current_reference_value(target: AttributeProductValue) -> str:
+    # current_value remains the original source text for audit. final_value may
+    # contain its canonical dictionary equivalent (for example, 1.8 m -> 180 cm).
+    return target.final_value or target.current_value
+
+
 def _recalculate_candidate_state(
     product: AttributeProduct,
     target: AttributeProductValue,
@@ -2282,7 +2438,7 @@ def _recalculate_candidate_state(
         if isinstance(item, dict) and clean_text(item.get("value"))
     ]
     if target.current_value:
-        current_key = _candidate_value_key(target, target.current_value)
+        current_key = _candidate_value_key(target, _current_reference_value(target))
         conflicts = [
             item for item in candidates
             if _candidate_value_key(target, item["value"]) != current_key
@@ -2379,7 +2535,8 @@ def apply_candidate(
         "donor_id": donor_id,
         "matches_current": bool(
             target.current_value
-            and _candidate_value_key(target, target.current_value) == _candidate_value_key(target, value)
+            and _candidate_value_key(target, _current_reference_value(target))
+            == _candidate_value_key(target, value)
         ),
     }
     candidates.append(candidate)

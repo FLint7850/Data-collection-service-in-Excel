@@ -140,6 +140,9 @@ export interface AttributeAllowedValueOptions {
   field_id: number;
   total: number;
   matched: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
   values: AttributeAllowedValue[];
 }
 

@@ -49,9 +49,9 @@ export const attributeAssistantService = {
       body: { value, synonym },
     }),
 
-  allowedValues: (fieldId: number, query = "", editor = false) =>
+  allowedValues: (fieldId: number, query = "", editor = false, offset = 0, limit = 80) =>
     $fetch<AttributeAllowedValueOptions>(`${base}/fields/${fieldId}/allowed-values`, {
-      query: { q: query, limit: 80, editor: editor ? 1 : 0 },
+      query: { q: query, limit, offset, editor: editor ? 1 : 0 },
     }),
 
   importBatch: (

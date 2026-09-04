@@ -235,8 +235,12 @@ def api_attribute_allowed_values(field_id: int):
         limit = int(request.args.get("limit", "80"))
     except ValueError:
         limit = 80
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        offset = 0
     return jsonify(allowed_value_options(
-        field, request.args.get("q", ""), limit,
+        field, request.args.get("q", ""), limit, offset,
         include_inactive=request.args.get("editor", "").lower() in {"1", "true", "yes"},
     ))
 

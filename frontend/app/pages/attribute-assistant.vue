@@ -34,6 +34,7 @@ type RouteWriteMode = "push" | "replace";
 const ALL_FILTER_VALUE = "all";
 const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
 const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "no_suggestion"]);
+const ALLOWED_OPTIONS_PAGE_SIZE = 40;
 
 function routeQueryValue(value: unknown): string {
   return Array.isArray(value) ? String(value[0] || "") : String(value || "");
@@ -125,6 +126,17 @@ const allowedOptionCache = ref<Record<number, Array<{ id: number; value: string 
 const allowedSearchQueries = ref<Record<number, string>>({});
 const searchingAllowedValueIds = ref<Set<number>>(new Set());
 const allowedSearchTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const allowedRequestTokens = new Map<number, number>();
+const allowedOptionPages = ref<Record<number, {
+  query: string;
+  total: number;
+  matched: number;
+  hasMore: boolean;
+}>>({});
+type AllowedSelectInstance = { viewportRef?: HTMLElement | { value?: HTMLElement | null } | null };
+const allowedSelectRefs = new Map<string, AllowedSelectInstance>();
+const allowedSelectRefCallbacks = new Map<string, (instance: unknown) => void>();
+const allowedScrollBindings = new Map<string, { valueId: number; check: () => void; cleanup: () => void }>();
 const templateForm = reactive({
   name: "",
   category: "",
@@ -1162,11 +1174,7 @@ async function openProduct(
   historyItems.value = [];
   selectedDonors.value = [...(product.selected_donor_ids || [])];
   donorUrlOverrides.value = { ...(product.donor_url_overrides || {}) };
-  allowedOptionCache.value = {};
-  allowedSearchQueries.value = {};
-  searchingAllowedValueIds.value = new Set();
-  for (const timer of allowedSearchTimers.values()) clearTimeout(timer);
-  allowedSearchTimers.clear();
+  resetAllowedOptionState();
   void Promise.all([
     api.donorRecommendations(id).catch(() => ({ items: [] })),
     api.productHistory(id).catch(() => ({ items: [] })),
@@ -1325,28 +1333,182 @@ function setAllowedSearchLoading(valueId: number, loading: boolean) {
 
 async function searchAllowed(value: AttributeValue, query: string) {
   if (!value.field_id) return;
+  const normalizedQuery = query.trim();
+  const token = (allowedRequestTokens.get(value.id) || 0) + 1;
+  allowedRequestTokens.set(value.id, token);
   setAllowedSearchLoading(value.id, true);
-  const result = await api.allowedValues(value.field_id, query).catch(() => null);
-  if (result && allowedSearchQueries.value[value.id] === query) {
+  const result = await api.allowedValues(
+    value.field_id,
+    normalizedQuery,
+    false,
+    0,
+    ALLOWED_OPTIONS_PAGE_SIZE,
+  ).catch(() => null);
+  if (
+    result
+    && allowedRequestTokens.get(value.id) === token
+    && allowedSearchQueries.value[value.id] === normalizedQuery
+  ) {
     allowedOptionCache.value = { ...allowedOptionCache.value, [value.id]: result.values };
+    allowedOptionPages.value = {
+      ...allowedOptionPages.value,
+      [value.id]: {
+        query: normalizedQuery,
+        total: result.total,
+        matched: result.matched,
+        hasMore: result.has_more,
+      },
+    };
   }
-  if (allowedSearchQueries.value[value.id] === query) setAllowedSearchLoading(value.id, false);
+  if (allowedRequestTokens.get(value.id) === token) {
+    setAllowedSearchLoading(value.id, false);
+    await nextTick();
+    checkAllowedMenus(value.id);
+  }
+}
+
+async function loadMoreAllowed(value: AttributeValue) {
+  if (!value.field_id || searchingAllowedValueIds.value.has(value.id)) return;
+  const page = allowedOptionPages.value[value.id];
+  if (!page?.hasMore || page.query !== (allowedSearchQueries.value[value.id] || "")) return;
+  const token = (allowedRequestTokens.get(value.id) || 0) + 1;
+  allowedRequestTokens.set(value.id, token);
+  setAllowedSearchLoading(value.id, true);
+  const loaded = allowedOptionCache.value[value.id] || [];
+  const result = await api.allowedValues(
+    value.field_id,
+    page.query,
+    false,
+    loaded.length,
+    ALLOWED_OPTIONS_PAGE_SIZE,
+  ).catch(() => null);
+  if (
+    result
+    && allowedRequestTokens.get(value.id) === token
+    && allowedSearchQueries.value[value.id] === page.query
+  ) {
+    const merged = [...loaded];
+    const known = new Set(merged.map((item) => item.id));
+    for (const item of result.values) {
+      if (!known.has(item.id)) merged.push(item);
+    }
+    allowedOptionCache.value = { ...allowedOptionCache.value, [value.id]: merged };
+    allowedOptionPages.value = {
+      ...allowedOptionPages.value,
+      [value.id]: {
+        query: page.query,
+        total: result.total,
+        matched: result.matched,
+        hasMore: result.has_more,
+      },
+    };
+  }
+  if (allowedRequestTokens.get(value.id) === token) {
+    setAllowedSearchLoading(value.id, false);
+    await nextTick();
+    checkAllowedMenus(value.id);
+  }
 }
 
 function queueAllowedSearch(value: AttributeValue, query: string) {
-  allowedSearchQueries.value = { ...allowedSearchQueries.value, [value.id]: query };
+  const normalizedQuery = query.trim();
+  allowedSearchQueries.value = { ...allowedSearchQueries.value, [value.id]: normalizedQuery };
   const previous = allowedSearchTimers.get(value.id);
   if (previous) clearTimeout(previous);
   allowedSearchTimers.set(value.id, setTimeout(() => {
     allowedSearchTimers.delete(value.id);
-    void searchAllowed(value, query.trim());
+    void searchAllowed(value, normalizedQuery);
   }, 250));
 }
 
 async function ensureAllowedOptions(value: AttributeValue, open: boolean) {
-  if (!open || !value.field_id || allowedOptionCache.value[value.id] || searchingAllowedValueIds.value.has(value.id)) return;
+  if (!open || !value.field_id || searchingAllowedValueIds.value.has(value.id)) return;
+  const page = allowedOptionPages.value[value.id];
+  if (page?.query === "" && allowedOptionCache.value[value.id]) return;
   allowedSearchQueries.value = { ...allowedSearchQueries.value, [value.id]: "" };
   await searchAllowed(value, "");
+}
+
+function finalAllowedMenuKey(value: AttributeValue) {
+  return `final-${value.id}`;
+}
+
+function unknownAllowedMenuKey(value: AttributeValue, index: number) {
+  return `unknown-${value.id}-${index}`;
+}
+
+function clearAllowedScrollBinding(key: string) {
+  allowedScrollBindings.get(key)?.cleanup();
+  allowedScrollBindings.delete(key);
+}
+
+function setAllowedSelectRef(key: string, instance: unknown) {
+  if (!instance) {
+    clearAllowedScrollBinding(key);
+    allowedSelectRefs.delete(key);
+    return;
+  }
+  allowedSelectRefs.set(key, instance as AllowedSelectInstance);
+}
+
+function allowedSelectRef(key: string) {
+  let callback = allowedSelectRefCallbacks.get(key);
+  if (!callback) {
+    callback = (instance: unknown) => setAllowedSelectRef(key, instance);
+    allowedSelectRefCallbacks.set(key, callback);
+  }
+  return callback;
+}
+
+function allowedViewport(instance: AllowedSelectInstance | undefined): HTMLElement | null {
+  const exposed = instance?.viewportRef;
+  if (exposed instanceof HTMLElement) return exposed;
+  return exposed?.value instanceof HTMLElement ? exposed.value : null;
+}
+
+function checkAllowedMenus(valueId: number) {
+  for (const binding of allowedScrollBindings.values()) {
+    if (binding.valueId === valueId) binding.check();
+  }
+}
+
+async function handleAllowedMenuOpen(
+  value: AttributeValue,
+  key: string,
+  open: boolean,
+) {
+  clearAllowedScrollBinding(key);
+  if (!open) return;
+  await ensureAllowedOptions(value, true);
+  await nextTick();
+  const viewport = allowedViewport(allowedSelectRefs.get(key));
+  if (!viewport) return;
+  const check = () => {
+    if (viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 48) {
+      void loadMoreAllowed(value);
+    }
+  };
+  viewport.addEventListener("scroll", check, { passive: true });
+  allowedScrollBindings.set(key, {
+    valueId: value.id,
+    check,
+    cleanup: () => viewport.removeEventListener("scroll", check),
+  });
+  check();
+}
+
+function resetAllowedOptionState() {
+  for (const binding of allowedScrollBindings.values()) binding.cleanup();
+  allowedScrollBindings.clear();
+  allowedSelectRefs.clear();
+  allowedSelectRefCallbacks.clear();
+  allowedOptionCache.value = {};
+  allowedOptionPages.value = {};
+  allowedSearchQueries.value = {};
+  searchingAllowedValueIds.value = new Set();
+  allowedRequestTokens.clear();
+  for (const timer of allowedSearchTimers.values()) clearTimeout(timer);
+  allowedSearchTimers.clear();
 }
 
 function selectedFinalParts(value: AttributeValue) {
@@ -1626,8 +1788,7 @@ onBeforeUnmount(() => {
   if (authPoll) clearInterval(authPoll);
   if (filterRouteTimer) clearTimeout(filterRouteTimer);
   clearBatchOperationPoll();
-  allowedSearchTimers.forEach((timer) => clearTimeout(timer));
-  allowedSearchTimers.clear();
+  resetAllowedOptionState();
 });
 </script>
 
@@ -2377,6 +2538,7 @@ onBeforeUnmount(() => {
                     <span>Итог</span>
                     <USelectMenu
                       v-if="value.is_composite && value.allowed_values_count"
+                      :ref="allowedSelectRef(finalAllowedMenuKey(value))"
                       class="aa-final-select aa-final-select--multiple"
                       :model-value="[...selectedFinalParts(value)]"
                       :items="optionsFor(value).filter((item) => !item.value.includes('/'))"
@@ -2385,14 +2547,17 @@ onBeforeUnmount(() => {
                       :search-input="{ placeholder: 'Найти значение…' }"
                       :loading="searchingAllowedValueIds.has(value.id)"
                       :reset-search-term-on-blur="true"
+                      :ignore-filter="true"
+                      :virtualize="true"
                       multiple
                       :disabled="busy === `value-${value.id}`"
                       @update:search-term="queueAllowedSearch(value, $event)"
-                      @update:open="ensureAllowedOptions(value, $event)"
+                      @update:open="handleAllowedMenuOpen(value, finalAllowedMenuKey(value), $event)"
                       @update:model-value="selectFinalValue(value, $event)"
                     />
                     <USelectMenu
                       v-else-if="value.allowed_values_count"
+                      :ref="allowedSelectRef(finalAllowedMenuKey(value))"
                       class="aa-final-select"
                       :model-value="selectedFinalValue(value)"
                       :items="optionsFor(value)"
@@ -2402,17 +2567,19 @@ onBeforeUnmount(() => {
                       :search-input="{ placeholder: 'Найти значение…' }"
                       :loading="searchingAllowedValueIds.has(value.id)"
                       :reset-search-term-on-blur="true"
+                      :ignore-filter="true"
+                      :virtualize="true"
                       :disabled="busy === `value-${value.id}`"
                       @update:search-term="queueAllowedSearch(value, $event)"
-                      @update:open="ensureAllowedOptions(value, $event)"
+                      @update:open="handleAllowedMenuOpen(value, finalAllowedMenuKey(value), $event)"
                       @update:model-value="selectFinalValue(value, $event)"
                     />
                     <strong v-else>{{ value.final_value || displayedProposal(value) }}</strong>
                     <small v-if="value.status === 'dash'">{{ value.dash_reason }}</small>
                     <small v-else-if="value.status === 'conflict'">Выберите итог или отклоните предложение</small>
-                    <small v-else-if="value.allowed_values.length && value.final_value">Можно выбрать другое значение из шаблона</small>
-                    <small v-else-if="value.allowed_values.length && displayedProposal(value)">Предложение системы уже подставлено</small>
-                    <small v-else-if="value.allowed_values.length">Выберите значение из шаблона</small>
+                    <small v-else-if="value.allowed_values_count && value.final_value">Можно выбрать другое значение из шаблона</small>
+                    <small v-else-if="value.allowed_values_count && displayedProposal(value)">Предложение системы уже подставлено</small>
+                    <small v-else-if="value.allowed_values_count">Выберите значение из шаблона</small>
                     <small v-else>В шаблоне нет значений для выбора</small>
                   </div>
                 </div>
@@ -2503,6 +2670,7 @@ onBeforeUnmount(() => {
                   <span v-if="unknown.suggestions?.length">Ближайшее: {{ unknown.suggestions.join(", ") }}</span>
                   <div v-if="unknown.donor_id && value.field_id && !value.current_value" class="aa-unknown-map">
                     <USelectMenu
+                      :ref="allowedSelectRef(unknownAllowedMenuKey(value, index))"
                       v-model="unknownSelections[unknownSelectionKey(value, index)]"
                       class="aa-unknown-select"
                       :items="optionsFor(value)"
@@ -2512,8 +2680,10 @@ onBeforeUnmount(() => {
                       :search-input="{ placeholder: 'Найти значение…' }"
                       :loading="searchingAllowedValueIds.has(value.id)"
                       :reset-search-term-on-blur="true"
+                      :ignore-filter="true"
+                      :virtualize="true"
                       @update:search-term="queueAllowedSearch(value, $event)"
-                      @update:open="ensureAllowedOptions(value, $event)"
+                      @update:open="handleAllowedMenuOpen(value, unknownAllowedMenuKey(value, index), $event)"
                     />
                     <UButton
                       color="primary"

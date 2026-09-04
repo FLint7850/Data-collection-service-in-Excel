@@ -367,6 +367,160 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertGreaterEqual(confidence, 90)
         self.assertIn("справочника", reason)
 
+    def test_exact_attribute_name_precedes_similar_names_and_dictionary_values(self):
+        template = service.import_template_csv(
+            self.db,
+            "Основной цвет (Основные);Цвет (Основные)\r\nБелый;Чёрный\r\n".encode("cp1251"),
+            name="Техника",
+            category="Техника",
+        )
+        field, confidence, reason, _alternatives = service.map_attribute(
+            self.db, template, None, "  ЦВЕТ:  ", "Белый"
+        )
+        self.assertEqual(field, template.fields[1])
+        self.assertEqual(confidence, 100)
+        self.assertIn("Точное", reason)
+
+        # A stale alias on another field must not override the actual field name.
+        template.fields[0].synonyms = ["Цвет"]
+        mapped, *_ = service.map_attribute(self.db, template, None, "Цвет", "Белый")
+        self.assertEqual(mapped, template.fields[1])
+
+    def test_duplicate_exact_attribute_names_require_disambiguation(self):
+        template = service.import_template_csv(
+            self.db,
+            "Цвет (Корпус);Цвет (Дверца)\r\nБелый;Чёрный\r\n".encode("cp1251"),
+            name="Техника",
+            category="Техника",
+        )
+        field, _confidence, reason, alternatives = service.map_attribute(
+            self.db, template, None, "Цвет", "Белый"
+        )
+        self.assertIsNone(field)
+        self.assertIn("неоднознач", reason)
+        self.assertEqual({item["field_id"] for item in alternatives}, {f.id for f in template.fields})
+
+    def test_unique_dictionary_value_cannot_replace_attribute_name_evidence(self):
+        template = service.import_template_csv(
+            self.db,
+            "Основной цвет (Основные)\r\nБелый\r\nЧёрный, серебристый\r\n".encode("cp1251"),
+            name="Техника",
+            category="Техника",
+        )
+        for source_name in ("Цвет дверцы люка", "Материал барабана", ""):
+            with self.subTest(source_name=source_name):
+                field, confidence, _reason, _alternatives = service.map_attribute(
+                    self.db, template, None, source_name, "черный, серебристый"
+                )
+                self.assertIsNone(field)
+                self.assertLess(confidence, 74)
+
+        # Explicit user synonyms remain authoritative, including specific names.
+        template.fields[0].synonyms = ["Цвет дверцы люка"]
+        field, confidence, reason, _alternatives = service.map_attribute(
+            self.db, template, None, "Цвет дверцы люка", "черный, серебристый"
+        )
+        self.assertEqual(field, template.fields[0])
+        self.assertEqual(confidence, 100)
+        self.assertIn("Синоним", reason)
+
+    def test_equal_normalized_names_are_not_resolved_by_template_order(self):
+        template = service.import_template_csv(
+            self.db,
+            "Основной цвет (Основные);Общий цвет (Основные)\r\nБелый;Чёрный\r\n".encode("cp1251"),
+            name="Техника",
+            category="Техника",
+        )
+        field, _confidence, reason, _alternatives = service.map_attribute(
+            self.db, template, None, "Цвет", "Красный"
+        )
+        self.assertIsNone(field)
+        self.assertIn("уточнить", reason)
+        for value, expected in (("Белый", template.fields[0]), ("Чёрный", template.fields[1])):
+            with self.subTest(value=value):
+                field, _confidence, _reason, _alternatives = service.map_attribute(
+                    self.db, template, None, "Цвет", value
+                )
+                self.assertEqual(field, expected)
+
+    def test_door_color_does_not_conflict_with_main_color_regardless_of_row_order(self):
+        template = service.import_template_csv(
+            self.db,
+            "Основной цвет (Основные)\r\nБелый\r\nЧёрный, серебристый\r\n".encode("cp1251"),
+            name="Стиральные машины",
+            category="Стиральные машины",
+        )
+        attributes = [
+            {"name": "Цвет", "value": "белый"},
+            {"name": "Цвет дверцы люка", "value": "черный, серебристый"},
+        ]
+        for rows in (attributes, list(reversed(attributes))):
+            with self.subTest(first_attribute=rows[0]["name"]):
+                batch = service.create_batch_from_csv(
+                    self.db,
+                    template,
+                    '_MODEL_;_ATTRIBUTES_\r\nWM 410 W;"Основные|Основной цвет|Белый"\r\n'.encode("cp1251"),
+                    filename="products.csv",
+                )
+                product = batch.products[0]
+                stats = service.apply_parsed_attributes(
+                    self.db, product, rows, source="Технопарк", priority=1,
+                )
+                target = product.values[0]
+                candidates = target.source_details.get("candidates") or []
+                self.assertEqual(stats["mapped"], 1)
+                self.assertEqual(stats["ambiguous"], 1)
+                self.assertEqual(target.current_value, "Белый")
+                self.assertEqual(target.final_value, "Белый")
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["source_name"], "Цвет")
+                self.assertEqual(candidates[0]["value"], "Белый")
+                self.assertEqual(target.status, "kept")
+
+    def test_specific_attribute_maps_to_its_own_template_field(self):
+        template = service.import_template_csv(
+            self.db,
+            (
+                "Основной цвет (Основные);Цвет дверцы люка (Основные)\r\n"
+                "Чёрный, серебристый;Белый\r\n"
+            ).encode("cp1251"),
+            name="Стиральные машины",
+            category="Стиральные машины",
+        )
+        field, confidence, reason, _alternatives = service.map_attribute(
+            self.db, template, None, "Цвет дверцы люка", "черный, серебристый"
+        )
+        # Even if its value is absent from that field's dictionary, the exact
+        # attribute must not be redirected to a different field accepting it.
+        self.assertEqual(field, template.fields[1])
+        self.assertEqual(confidence, 100)
+        self.assertIn("Точное", reason)
+
+    def test_explicit_donor_mapping_rule_still_overrides_automatic_matching(self):
+        template = service.import_template_csv(
+            self.db,
+            "Цвет корпуса (Основные);Цвет (Основные)\r\nБелый;Чёрный\r\n".encode("cp1251"),
+            name="Техника",
+            category="Техника",
+        )
+        donor = Donor(
+            brand=Brand(name="Test donor", group_name="Test"),
+            legacy_id="attribute-name-mapping",
+            site_url="https://example.com",
+        )
+        self.db.add(donor)
+        self.db.flush()
+        service.save_mapping_rule(
+            self.db, donor_id=donor.id, template=template,
+            field=template.fields[0], donor_attribute_name="Цвет",
+        )
+        field, confidence, reason, _alternatives = service.map_attribute(
+            self.db, template, donor.id, "Цвет", "Белый"
+        )
+        self.assertEqual(field, template.fields[0])
+        self.assertEqual(confidence, 100)
+        self.assertEqual(reason, "Сохранённое правило")
+
     def test_specific_feature_does_not_map_to_generic_one_word_field(self):
         template = service.import_template_csv(
             self.db,
@@ -423,6 +577,34 @@ class AttributeAssistantTest(unittest.TestCase):
         service.update_product_value(value, action="accept", manual_value="Белый")
         self.assertEqual(value.final_value, "Белый")
         self.assertEqual(value.status, "approved")
+
+    def test_allowed_value_options_support_stable_lazy_pages(self):
+        values = [f"Значение {index:03d}" for index in range(105)]
+        template = service.import_template_csv(
+            self.db,
+            ("Большой справочник (Основные)\r\n" + "\r\n".join(values) + "\r\n").encode("cp1251"),
+            name="Большой справочник",
+            category="Тест > Большой справочник",
+        )
+        field = template.fields[0]
+        first = service.allowed_value_options(field, limit=30, offset=0)
+        second = service.allowed_value_options(field, limit=30, offset=30)
+        last = service.allowed_value_options(field, limit=30, offset=90)
+
+        self.assertEqual(first["total"], 105)
+        self.assertEqual(first["offset"], 0)
+        self.assertTrue(first["has_more"])
+        self.assertEqual([item["value"] for item in second["values"]], values[30:60])
+        self.assertTrue(set(item["id"] for item in first["values"]).isdisjoint(
+            item["id"] for item in second["values"]
+        ))
+        self.assertEqual([item["value"] for item in last["values"]], values[90:])
+        self.assertFalse(last["has_more"])
+
+        filtered = service.allowed_value_options(field, "значение 10", limit=4, offset=4)
+        self.assertEqual(filtered["matched"], 5)
+        self.assertEqual([item["value"] for item in filtered["values"]], ["Значение 104"])
+        self.assertFalse(filtered["has_more"])
 
     def test_allowed_value_synonyms_can_be_replaced_and_removed(self):
         template = self.make_template()
@@ -657,6 +839,50 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(color.current_value, "Белый")
         self.assertEqual(color.final_value, "Белый")
         self.assertEqual(color.source, "current_site")
+
+    def test_cached_url_attributes_renormalize_legacy_unit_values(self):
+        template = service.import_template_csv(
+            self.db,
+            "Длина сетевого кабеля, см (Размеры)\r\n100.8\r\n180\r\n198\r\n".encode("cp1251"),
+            name="Стиральные машины",
+            category="Тест > Стиральные машины",
+        )
+        html = """
+        <h1>WM 410 W</h1>
+        <h2>Характеристики</h2>
+        <div><div><div>Длина сетевого кабеля, м</div><div>1.8</div></div></div>
+        """
+        with patch.object(
+            service,
+            "fetch_public_html",
+            return_value=(html, "https://example.com/products/wm-410-w"),
+        ):
+            batch = service.create_batch_from_urls(
+                self.db,
+                ["https://example.com/products/wm-410-w"],
+                template=template,
+            )
+        value = batch.products[0].values[0]
+        value.final_value = ""
+        value.confidence = 0
+        value.status = "unknown"
+        value.reason = "Значения нет в справочнике"
+        value.source_details = {
+            "unknown_values": [{
+                "value": "1.8",
+                "source": "current_site",
+                "source_name": "Длина сетевого кабеля, см",
+                "suggestions": ["100.8", "218", "198"],
+            }]
+        }
+
+        changed = service.restore_cached_site_current_values(batch.products[0])
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(value.current_value, "1.8")
+        self.assertEqual(value.final_value, "180")
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.source_details.get("unknown_values") or [], [])
     def test_url_import_does_not_mix_processing_events_with_product_revisions(self):
         template = self.make_template()
         html = """
@@ -1545,6 +1771,108 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(canonical, "1200")
         self.assertGreaterEqual(confidence, 98)
         self.assertIn("Конвертация", reason)
+
+    def test_length_units_are_read_from_attribute_names_and_converted_exactly(self):
+        template = service.import_template_csv(
+            self.db,
+            (
+                "Длина сетевого кабеля, см (Размеры);Длина сливного шланга, см (Размеры)\r\n"
+                "100.8;140\r\n"
+                "180;145\r\n"
+                "198;161.4\r\n"
+            ).encode("cp1251"),
+            name="Стиральные машины",
+            category="Тест > Стиральные машины",
+        )
+        cable, drain = template.fields
+        cases = (
+            (cable, "1.8", "Длина сетевого кабеля, м", "180"),
+            (cable, "1800", "Длина сетевого кабеля, мм", "180"),
+            (drain, "1.45", "Длина сливного шланга, м", "145"),
+            (drain, "1450 мм", "Длина сливного шланга", "145"),
+        )
+        for field, raw_value, source_name, expected in cases:
+            with self.subTest(raw_value=raw_value, source_name=source_name):
+                canonical, confidence, reason, suggestions = service._allowed_match(
+                    field, raw_value, source_name
+                )
+                self.assertEqual(canonical, expected)
+                self.assertEqual(confidence, 100)
+                self.assertIn("Конвертация", reason)
+                self.assertEqual(suggestions, [])
+
+    def test_original_page_attribute_unit_is_preserved_during_template_alignment(self):
+        template = service.import_template_csv(
+            self.db,
+            "Длина сетевого кабеля, см (Размеры)\r\n100.8\r\n180\r\n198\r\n".encode("cp1251"),
+            name="Стиральные машины",
+            category="Тест > Стиральные машины",
+        )
+        stack = service._page_attribute_stack(
+            self.db,
+            template,
+            [{"group": "Размеры", "name": "Длина сетевого кабеля, м", "value": "1.8"}],
+        )
+        self.assertEqual(stack[0]["name"], "Длина сетевого кабеля, см")
+        self.assertEqual(stack[0]["source_name"], "Длина сетевого кабеля, м")
+
+        batch = AttributeBatch(template=template, name="URL", input_mode="urls", processing_mode="suggest")
+        product = AttributeProduct(
+            batch=batch,
+            template=template,
+            model="WM 410 W",
+            name="Стиральная машина",
+            source_url="https://example.com/product",
+        )
+        service._make_product_values(
+            product, template, stack, current_source="current_site", current_role="Страница сайта",
+        )
+        self.db.add(batch)
+        self.db.flush()
+        value = product.values[0]
+        self.assertEqual(value.current_value, "1.8")
+        self.assertEqual(value.final_value, "180")
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.source_details, {})
+
+        stats = service.apply_parsed_attributes(
+            self.db,
+            product,
+            [{"name": "Длина сетевого кабеля, м", "value": "1.8"}],
+            source="Донор",
+            priority=0,
+        )
+        self.assertEqual(stats["mapped"], 1)
+        self.assertEqual(value.status, "kept")
+        self.assertTrue(value.source_details["candidates"][0]["matches_current"])
+
+    def test_donor_length_conversion_creates_proposal_instead_of_unknown_value(self):
+        template = service.import_template_csv(
+            self.db,
+            "Длина сливного шланга, см (Размеры)\r\n140\r\n145\r\n161.4\r\n".encode("cp1251"),
+            name="Стиральные машины",
+            category="Тест > Стиральные машины",
+        )
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM 410 W;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        product = batch.products[0]
+        stats = service.apply_parsed_attributes(
+            self.db,
+            product,
+            [{"name": "Длина сливного шланга, м", "value": "1.45"}],
+            source="Донор",
+            priority=0,
+        )
+        value = product.values[0]
+        self.assertEqual(stats["mapped"], 1)
+        self.assertEqual(stats["unknown"], 0)
+        self.assertEqual(value.proposed_value, "145")
+        self.assertEqual(value.status, "suggested")
+        self.assertEqual(value.source_details.get("unknown_values") or [], [])
 
     def test_processing_modes_have_distinct_auto_acceptance_policies(self):
         template = self.make_template()

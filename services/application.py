@@ -58,7 +58,7 @@ def ensure_default_user() -> None:
 def run_data_migrations() -> None:
     """Apply idempotent data migrations outside request handlers."""
 
-    migration_name = "20260901_attribute_url_current_values_v1"
+    migration_name = "20260904_attribute_url_current_values_v2"
     with session_scope() as db_session:
         applied = db_session.scalar(
             text("SELECT name FROM app_data_migrations WHERE name = :name"),
