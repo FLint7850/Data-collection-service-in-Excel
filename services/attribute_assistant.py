@@ -140,8 +140,7 @@ def is_technical_dash(value: Any) -> bool:
     return clean_text(value) in {"-", "–", "—", "−"}
 
 def clean_csv_cell(value: Any) -> str:
-    text = str(value or "").replace("\xa0", " ").replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join(clean_text(line) for line in text.split("\n")).strip()
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 
@@ -223,8 +222,23 @@ def normalize_dimensions(value: Any) -> str:
     return re.sub(r"\s*[xXхХ×]\s*", "x", text).replace(",", ".")
 
 
+def exact_value_key(value: Any) -> str:
+    """Compare the actual value, preserving case, letters, punctuation and inner spaces."""
+    return "" if value is None else str(value).strip()
+
+
+def dictionary_value_key(value: Any, value_type: str = "select") -> str:
+    # Equality does not depend on a field's type. Type conversions happen explicitly.
+    return exact_value_key(value)
+
+
+def set_field_value_type(db: Session, field: AttributeTemplateField, value_type: str) -> None:
+    # Accept historical snapshots and clients; every dictionary now uses exact keys.
+    field.value_type = "select" if value_type == "select_exact" else value_type
+
+
 def normalize_value(value: Any, value_type: str = "select", composite: bool = False) -> str:
-    text = clean_text(value)
+    text = exact_value_key(value)
     if not text:
         return ""
     if value_type == "number":
@@ -232,7 +246,7 @@ def normalize_value(value: Any, value_type: str = "select", composite: bool = Fa
     if value_type == "dimensions":
         return normalize_dimensions(text)
     if value_type == "boolean":
-        key = normalize_key(text)
+        key = exact_value_key(text).casefold()
         if key in {"да", "есть", "yes", "true", "1", "имеется"}:
             return "Да"
         if key in {"нет", "no", "false", "0", "отсутствует"}:
@@ -254,7 +268,7 @@ def infer_value_type(name: str, values: Iterable[str]) -> tuple[str, bool]:
         return "number", False
     if any(word in name_key for word in ("список программ", "дополнительные программы", "индикация")):
         return "select", True
-    return "select", any("/" in value for value in sample)
+    return "select", False
 
 
 def decode_csv(data: bytes) -> str:
@@ -353,11 +367,14 @@ def allowed_value_options(
     include_inactive: bool = False,
 ) -> dict[str, Any]:
     available = [item for item in field.allowed_values if include_inactive or item.is_active]
-    query_key = normalize_key(query)
+    query_key = exact_value_key(query).casefold()
     if query_key:
         ranked: list[tuple[int, int, AttributeAllowedValue]] = []
         for item in available:
-            searchable = [item.normalized_value, *(synonym.normalized_synonym for synonym in item.synonyms)]
+            # Search may ignore case; it never merges entries or accepts a value.
+            searchable = [exact_value_key(item.value).casefold(), *(
+                exact_value_key(synonym.synonym).casefold() for synonym in item.synonyms
+            )]
             matching = [text for text in searchable if query_key in text]
             if not matching:
                 continue
@@ -465,7 +482,7 @@ def import_template_csv(
                     normalized = normalize_value(raw_part, value_type, False)
                 except ValueError:
                     continue
-                key = normalize_key(normalized)
+                key = dictionary_value_key(normalized, field.value_type)
                 if not key or key in seen:
                     continue
                 seen.add(key)
@@ -489,7 +506,7 @@ def add_allowed_value(db: Session, field: AttributeTemplateField, value: str, sy
     normalized = normalize_value(value, field.value_type, False)
     if len(normalized) > 1000:
         raise ValueError("Значение не должно превышать 1000 символов")
-    key = normalize_key(normalized)
+    key = dictionary_value_key(normalized, field.value_type)
     if not key:
         raise ValueError("Значение не может быть пустым")
     existing = db.scalar(
@@ -511,11 +528,11 @@ def add_allowed_value(db: Session, field: AttributeTemplateField, value: str, sy
         )
         db.add(allowed)
         db.flush()
-    synonym_key = normalize_key(synonym)
+    synonym_key = dictionary_value_key(synonym, field.value_type)
     if len(clean_text(synonym)) > 1000:
         raise ValueError("Синоним не должен превышать 1000 символов")
     if synonym_key and not any(item.normalized_synonym == synonym_key for item in allowed.synonyms):
-        db.add(AttributeValueSynonym(allowed_value=allowed, synonym=clean_text(synonym), normalized_synonym=synonym_key))
+        db.add(AttributeValueSynonym(allowed_value=allowed, synonym=exact_value_key(synonym), normalized_synonym=synonym_key))
     return allowed
 
 
@@ -528,16 +545,16 @@ def replace_allowed_value_synonyms(
     raw_synonyms = list(synonyms)
     if len(raw_synonyms) > 100:
         raise ValueError("Для одного значения допускается не больше 100 синонимов")
-    canonical_key = normalize_key(allowed.value)
+    canonical_key = dictionary_value_key(allowed.value, allowed.field.value_type)
     existing = {item.normalized_synonym: item for item in allowed.synonyms}
     replacement: list[AttributeValueSynonym] = []
     seen: set[str] = set()
 
     for raw_synonym in raw_synonyms:
-        synonym = clean_text(raw_synonym)
+        synonym = exact_value_key(raw_synonym)
         if len(synonym) > 1000:
             raise ValueError("Синоним не должен превышать 1000 символов")
-        synonym_key = normalize_key(synonym)
+        synonym_key = dictionary_value_key(synonym, allowed.field.value_type)
         if not synonym_key or synonym_key == canonical_key or synonym_key in seen:
             continue
         seen.add(synonym_key)
@@ -568,7 +585,7 @@ def parse_attribute_stack(value: str) -> list[dict[str, str]]:
         result.append({
             "group_name": clean_text(parts[0]),
             "name": clean_text(parts[1]),
-            "value": clean_text(parts[2]),
+            "value": exact_value_key(parts[2]),
         })
     return result
 
@@ -1005,8 +1022,8 @@ def _append_parsed_attribute(
     group: Any = "",
 ) -> None:
     clean_name = clean_text(name).rstrip(":").strip()
-    clean_value = clean_text(value)
-    key = (normalize_key(clean_name), normalize_key(clean_value))
+    clean_value = exact_value_key(value)
+    key = (normalize_key(clean_name), exact_value_key(clean_value))
     if not clean_name or not clean_value or clean_name == clean_value or key in seen:
         return
     result["attributes"].append({
@@ -1145,11 +1162,11 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
                 if isinstance(prop, dict) and prop.get("name"):
                     result["attributes"].append({
                         "name": clean_text(prop.get("name")),
-                        "value": clean_text(prop.get("value")),
+                        "value": exact_value_key(prop.get("value")),
                         "group": "",
                     })
     selectors = ("table tr", ".characteristics tr", ".specifications tr", ".properties tr")
-    seen = {(normalize_key(item["name"]), normalize_key(item["value"])) for item in result["attributes"]}
+    seen = {(normalize_key(item["name"]), exact_value_key(item["value"])) for item in result["attributes"]}
     for row in soup.select(",".join(selectors)):
         cells = row.find_all(["th", "td"], recursive=False) or row.find_all(["th", "td"])
         if len(cells) < 2:
@@ -1287,7 +1304,7 @@ def parse_product_html_for_donor(
         group_selector = clean_text(settings.get("attribute_group_selector"))
         if row_selector and name_selector and value_selector:
             seen = {
-                (normalize_key(item.get("name")), normalize_key(item.get("value")))
+                (normalize_key(item.get("name")), exact_value_key(item.get("value")))
                 for item in result["attributes"]
             }
             for row in soup.select(row_selector):
@@ -1380,12 +1397,12 @@ def _page_attribute_stack(
         {
             "group_name": clean_text(item.get("group")),
             "name": clean_text(item.get("name")),
-            "value": clean_text(item.get("value")),
+            "value": exact_value_key(item.get("value")),
         }
         for item in attributes
-        if clean_text(item.get("name")) and clean_text(item.get("value"))
+        if clean_text(item.get("name")) and exact_value_key(item.get("value"))
     ]
-    value_keys = {normalize_key(item["value"]) for item in cleaned if normalize_key(item["value"])}
+    value_keys = {exact_value_key(item["value"]) for item in cleaned if exact_value_key(item["value"])}
     value_index = _allowed_value_field_index(template.fields, value_keys)
     claimed_fields: set[int] = set()
     result: list[dict[str, str]] = []
@@ -1594,7 +1611,7 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
         (
             normalize_key(item.get("group_name")),
             normalize_key(item.get("name")),
-            normalize_key(item.get("value")),
+            exact_value_key(item.get("value")),
         )
         for item in list((product.processing_state or {}).get("removed_outside_template_attributes") or [])
         if isinstance(item, dict)
@@ -1608,13 +1625,13 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
         (
             normalize_key(value.group_name),
             normalize_key(value.attribute_name),
-            normalize_key(value.current_value or value.final_value),
+            exact_value_key(value.current_value or value.final_value),
         )
         for value in shadow.values
         if not value.is_in_template and (
             normalize_key(value.group_name),
             normalize_key(value.attribute_name),
-            normalize_key(value.current_value or value.final_value),
+            exact_value_key(value.current_value or value.final_value),
         ) not in removed_extra_keys
     }
     changed = 0
@@ -1622,7 +1639,7 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
         existing_key = (
             normalize_key(existing.group_name),
             normalize_key(existing.attribute_name),
-            normalize_key(existing.current_value or existing.final_value),
+            exact_value_key(existing.current_value or existing.final_value),
         )
         if (
             not existing.is_in_template
@@ -1644,7 +1661,7 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
             if target.current_value:
                 if (
                     target.source != "current_site"
-                    or normalize_key(target.current_value) != normalize_key(restored.current_value)
+                    or _candidate_value_key(target, target.current_value) != _candidate_value_key(target, restored.current_value)
                 ):
                     continue
                 before = (
@@ -1713,7 +1730,7 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
         restored_key = (
             normalize_key(restored.group_name),
             normalize_key(restored.attribute_name),
-            normalize_key(restored.current_value or restored.final_value),
+            exact_value_key(restored.current_value or restored.final_value),
         )
         if restored_key in removed_extra_keys:
             continue
@@ -1724,7 +1741,7 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
                 and (
                     normalize_key(value.group_name),
                     normalize_key(value.attribute_name),
-                    normalize_key(value.current_value or value.final_value),
+                    exact_value_key(value.current_value or value.final_value),
                 ) == restored_key
             ),
             None,
@@ -2077,7 +2094,7 @@ def _allowed_value_field_index(
         for item in field.allowed_values:
             if not item.is_active:
                 continue
-            item_keys = {item.normalized_value}
+            item_keys = {dictionary_value_key(item.value, field.value_type)}
             for key in item_keys:
                 if keys and key not in keys:
                     continue
@@ -2090,22 +2107,18 @@ def _fields_with_exact_value(
     raw_value: str,
     value_index: dict[str, list[AttributeTemplateField]] | None = None,
 ) -> list[AttributeTemplateField]:
-    raw_key = normalize_key(raw_value)
+    raw_key = exact_value_key(raw_value)
     if not raw_key:
         return []
     # Boolean and numeric values are too common to identify an attribute safely.
     # They remain value-validation signals after the name has been mapped.
     if (
-        raw_key in BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
-        or NUMBER_RE.fullmatch(clean_text(raw_value))
-        or DIMENSION_RE.fullmatch(clean_text(raw_value))
+        raw_key.casefold() in BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
+        or NUMBER_RE.fullmatch(exact_value_key(raw_value))
+        or DIMENSION_RE.fullmatch(exact_value_key(raw_value))
     ):
         return []
-    equivalent_keys = (
-        BOOLEAN_TRUE_KEYS if raw_key in BOOLEAN_TRUE_KEYS
-        else BOOLEAN_FALSE_KEYS if raw_key in BOOLEAN_FALSE_KEYS
-        else {raw_key}
-    )
+    equivalent_keys = {raw_key}
     index = (
         value_index
         if value_index is not None
@@ -2231,17 +2244,16 @@ def _converted_value_candidates(
     raw_value: str,
     source_name: str = "",
 ) -> list[str]:
-    text_value = clean_text(raw_value)
+    text_value = exact_value_key(raw_value)
     candidates = [text_value]
-    simplified = clean_text(re.sub(r"\s*\([^()]*\)\s*$", "", text_value))
-    if simplified and simplified != text_value:
-        candidates.insert(0, simplified)
     for rule in list(field.conversion_rules or []):
         if not isinstance(rule, dict):
             continue
-        source = normalize_key(rule.get("from_value"))
-        if source and source == normalize_key(text_value) and clean_text(rule.get("to_value")):
-            candidates.insert(0, clean_text(rule["to_value"]))
+        source = exact_value_key(rule.get("from_value"))
+        if source and source == text_value and exact_value_key(rule.get("to_value")):
+            candidates.insert(0, exact_value_key(rule["to_value"]))
+    if field.value_type not in {"number", "dimensions", "boolean"} and not field.conversion_rules:
+        return list(dict.fromkeys(candidates))
     match = NUMBER_WITH_UNIT_RE.fullmatch(text_value)
     if not match:
         return list(dict.fromkeys(candidates))
@@ -2298,6 +2310,10 @@ def _allowed_match(
     source_name: str = "",
 ) -> tuple[str, int, str, list[str]]:
     allowed = [item for item in field.allowed_values if item.is_active]
+    if field.value_type not in {"number", "dimensions", "boolean"}:
+        direct = _allowed_match_single(field, exact_value_key(raw_value), allowed, source_name)
+        if direct[0] and allowed:
+            return direct
     if _is_presence_marker(field, raw_value):
         return (
             "",
@@ -2311,7 +2327,7 @@ def _allowed_match(
         except ValueError as error:
             return "", 0, str(error), []
         combination = next(
-            (item for item in allowed if item.is_combination and item.normalized_value == normalize_key(normalized_full)),
+            (item for item in allowed if item.is_combination and exact_value_key(item.value) == exact_value_key(normalized_full)),
             None,
         )
         if combination:
@@ -2344,7 +2360,7 @@ def _allowed_match(
         canonical, confidence, reason, nearest = _allowed_match_single(field, normalized, allowed, source_name)
         suggestions.extend(nearest)
         if canonical:
-            if normalize_key(candidate) != normalize_key(raw_value):
+            if exact_value_key(candidate) != exact_value_key(raw_value):
                 reason = "Конвертация единиц; " + reason
             return canonical, confidence, reason, list(dict.fromkeys(suggestions))[:3]
         last_reason = reason
@@ -2354,12 +2370,12 @@ def _allowed_match(
 def _is_presence_marker(field: AttributeTemplateField, value: Any) -> bool:
     """Return whether a yes/no value only marks presence of a semantic option."""
 
-    key = normalize_key(value)
+    key = exact_value_key(value).casefold()
     boolean_keys = BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
     if key not in boolean_keys or field.value_type == "boolean":
         return False
     active_keys = {
-        item.normalized_value or normalize_key(item.value)
+        exact_value_key(item.value).casefold()
         for item in field.allowed_values
         if item.is_active
     }
@@ -2371,63 +2387,35 @@ def _allowed_match_single(
     allowed: list[AttributeAllowedValue],
     source_name: str = "",
 ) -> tuple[str, int, str, list[str]]:
-    key = normalize_key(value)
-    value_keys = {
-        key,
-        clean_text(value).casefold(),
-    }
-    source_key = normalize_key(source_name)
-    if NUMBER_RE.fullmatch(value) and "мес" in source_key:
-        month_key = normalize_key(f"{value} мес")
-        month_match = next((item for item in allowed if item.normalized_value == month_key), None)
-        if month_match:
-            return month_match.value, 100, "Единица измерения взята из названия характеристики", []
+    key = exact_value_key(value)
+    if not key:
+        return "", 0, "Значение не заполнено", []
+    for item in allowed:
+        if exact_value_key(item.value) == key:
+            return item.value, 100, "Точное значение справочника", []
+    for item in allowed:
+        if any(exact_value_key(synonym.synonym) == key for synonym in item.synonyms):
+            return item.value, 98, "Синоним значения", []
     if field.value_type in {"number", "dimensions"} and not allowed:
         return value, 96, "Формат проверен", []
     if field.value_type == "text" and not allowed:
         return value, 95, "Текстовое значение проверено", []
-    for item in allowed:
-        item_keys = {item.normalized_value, normalize_key(item.value), clean_text(item.value).casefold()}
-        if value_keys & item_keys:
-            return item.value, 100, "Точное значение справочника", []
-        if (
-            (key in BOOLEAN_TRUE_KEYS and item.normalized_value in BOOLEAN_TRUE_KEYS)
-            or (key in BOOLEAN_FALSE_KEYS and item.normalized_value in BOOLEAN_FALSE_KEYS)
-        ):
-            return item.value, 98, "Логическое значение нормализовано", []
-    for item in allowed:
-        if any(
-            value_keys & {synonym.normalized_synonym, normalize_key(synonym.synonym)}
-            for synonym in item.synonyms
-        ):
-            return item.value, 98, "Синоним значения", []
     if NUMBER_RE.fullmatch(value):
-        try:
-            numeric_value = Decimal(value.replace(",", "."))
-        except InvalidOperation:
-            numeric_value = None
-        if numeric_value is not None:
-            numeric_allowed: list[tuple[Decimal, int, str]] = []
-            for item in allowed:
-                if not NUMBER_RE.fullmatch(clean_text(item.value)):
-                    continue
-                try:
-                    item_number = Decimal(clean_text(item.value).replace(",", "."))
-                except InvalidOperation:
-                    continue
-                numeric_allowed.append((abs(item_number - numeric_value), item.sort_order, item.value))
-            numeric_allowed.sort(key=lambda row: (row[0], row[1], row[2]))
-            return "", 0, "Точного числового значения нет в справочнике", [
-                item for _distance, _order, item in numeric_allowed[:3]
-            ]
+        numeric_value = Decimal(value.replace(",", "."))
+        numeric_allowed = []
+        for item in allowed:
+            if NUMBER_RE.fullmatch(item.value):
+                distance = abs(Decimal(item.value.replace(",", ".")) - numeric_value)
+                numeric_allowed.append((distance, item.sort_order, item.value))
+        numeric_allowed.sort()
+        return "", 0, "Точного числового значения нет в справочнике", [
+            item for _distance, _order, item in numeric_allowed[:3]
+        ]
     ranked = sorted(
-        ((SequenceMatcher(None, key, normalize_key(item.value)).ratio(), item.value) for item in allowed),
+        ((SequenceMatcher(None, key, exact_value_key(item.value)).ratio(), item.value) for item in allowed),
         reverse=True,
     )
-    suggestions = [value for _score, value in ranked[:3]]
-    if ranked and ranked[0][0] >= 0.88:
-        return ranked[0][1], round(ranked[0][0] * 100), "Ближайшее значение справочника", suggestions
-    return "", 0, "Значения нет в справочнике", suggestions
+    return "", 0, "Значения нет в справочнике", [item for _score, item in ranked[:3]]
 
 
 def _target_value(product: AttributeProduct, field_id: int) -> AttributeProductValue | None:
@@ -2439,10 +2427,10 @@ def _candidate_value_key(target: AttributeProductValue, value: Any) -> str:
     if field:
         try:
             normalized = normalize_value(value, field.value_type, field.is_composite)
-            return normalize_key(normalized)
+            return dictionary_value_key(normalized, field.value_type)
         except ValueError:
             pass
-    return normalize_key(value)
+    return exact_value_key(value)
 
 
 def _current_reference_value(target: AttributeProductValue) -> str:
@@ -2457,7 +2445,7 @@ def _recalculate_candidate_state(
 ) -> None:
     candidates = [
         item for item in list((target.source_details or {}).get("candidates") or [])
-        if isinstance(item, dict) and clean_text(item.get("value"))
+        if isinstance(item, dict) and exact_value_key(item.get("value"))
     ]
     if target.current_value:
         current_key = _candidate_value_key(target, _current_reference_value(target))
@@ -2495,7 +2483,7 @@ def _recalculate_candidate_state(
         candidates,
         key=lambda item: (int(item.get("priority") or 0), -int(item.get("confidence") or 0)),
     )[0]
-    target.proposed_value = clean_text(best.get("value"))
+    target.proposed_value = exact_value_key(best.get("value"))
     target.source = clean_text(best.get("source"))
     supporting_sources = {
         (clean_text(item.get("source")), clean_text(item.get("url")))
@@ -2546,7 +2534,7 @@ def apply_candidate(
     ]
     candidate = {
         "value": value,
-        "raw_value": clean_text(raw_value) or value,
+        "raw_value": exact_value_key(raw_value) or value,
         "confidence": confidence,
         "source": source,
         "reason": reason,
@@ -2588,15 +2576,11 @@ def apply_parsed_attributes(
     if template is None:
         stats["not_in_template"] = len(attributes)
         return stats
-    value_keys = {
-        normalize_key(item.get("value"))
-        for item in attributes
-        if normalize_key(item.get("value"))
-    }
+    value_keys = {exact_value_key(item.get("value")) for item in attributes if exact_value_key(item.get("value"))}
     value_index = _allowed_value_field_index(template.fields, value_keys)
     for item in attributes:
         source_name = clean_text(item.get("name"))
-        raw_value = clean_text(item.get("value"))
+        raw_value = exact_value_key(item.get("value"))
         if not source_name or not raw_value:
             continue
         field, mapping_confidence, mapping_reason, _alternatives = map_attribute(
@@ -2652,7 +2636,7 @@ def apply_parsed_attributes(
             item for item in previous_unknown
             if not (
                 isinstance(item, dict)
-                and normalize_key(item.get("value")) == normalize_key(raw_value)
+                and dictionary_value_key(item.get("value"), field.value_type) == dictionary_value_key(raw_value, field.value_type)
                 and int(item.get("donor_id") or 0) == int(donor_id or 0)
             )
         ]
@@ -2958,7 +2942,7 @@ def _saved_value_mapping(
         select(AttributeValueMappingRule).where(
             AttributeValueMappingRule.donor_id == donor_id,
             AttributeValueMappingRule.template_field_id == field.id,
-            AttributeValueMappingRule.normalized_raw_value == normalize_key(raw_value),
+            AttributeValueMappingRule.normalized_raw_value == dictionary_value_key(raw_value, field.value_type),
             AttributeValueMappingRule.is_active.is_(True),
         )
     )
@@ -2977,8 +2961,8 @@ def save_value_mapping_rule(
 ) -> AttributeValueMappingRule:
     if not db.get(Donor, donor_id):
         raise ValueError("Донор не найден")
-    raw = clean_text(raw_value)
-    key = normalize_key(raw)
+    raw = exact_value_key(raw_value)
+    key = dictionary_value_key(raw, field.value_type)
     if not key:
         raise ValueError("Исходное значение донора не заполнено")
     allowed = db.get(AttributeAllowedValue, allowed_value_id)
@@ -3218,7 +3202,7 @@ def update_product_value(
 ) -> AttributeProductValue:
     field = value.template_field
     if action == "accept":
-        manual_selected = clean_text(manual_value)
+        manual_selected = exact_value_key(manual_value)
         selected = manual_selected or value.proposed_value
         if not selected:
             raise ValueError("Нет предложения для подтверждения")
@@ -3279,7 +3263,7 @@ def delete_extra_product_value(db: Session, value: AttributeProductValue) -> Att
         marker = {
             "group_name": normalize_key(value.group_name),
             "name": normalize_key(value.attribute_name),
-            "value": normalize_key(value.current_value or value.final_value),
+            "value": exact_value_key(value.current_value or value.final_value),
         }
         if marker not in removed:
             removed.append(marker)
@@ -3666,7 +3650,7 @@ def save_allowed_value_revision(
     return revision
 
 
-TEMPLATE_FIELD_TYPES = {"select", "text", "number", "dimensions", "boolean"}
+TEMPLATE_FIELD_TYPES = {"select", "select_exact", "text", "number", "dimensions", "boolean"}
 TEMPLATE_FIELD_UPDATE_KEYS = {
     "group_name",
     "name",
@@ -3810,6 +3794,8 @@ def validate_template_field_update(
         raise ValueError("Название группы не должно превышать 255 символов")
     if len(name) > 500:
         raise ValueError("Название атрибута не должно превышать 500 символов")
+    if value_type == "select_exact":
+        value_type = "select"
     if value_type not in TEMPLATE_FIELD_TYPES:
         raise ValueError("Неизвестный тип атрибута")
     if not separator or len(separator) > 8:
@@ -3892,6 +3878,8 @@ def create_template_field(
     group = clean_text(group_name) or "Основные характеристики"
     field_name = clean_text(name)
     kind = clean_text(value_type) or "select"
+    if kind == "select_exact":
+        kind = "select"
     if not field_name:
         raise ValueError("Укажите название атрибута")
     if kind not in TEMPLATE_FIELD_TYPES:
@@ -4005,6 +3993,9 @@ def preview_template_csv(
         seen_columns.add(key)
         raw_values = [row.get(header, "") for row in rows if row.get(header, "") not in {"", "-"}]
         value_type, composite = infer_value_type(name, raw_values)
+        old = existing.get(key)
+        if old and old.value_type in {"select", "select_exact"}:
+            value_type, composite = "select", old.is_composite
         normalized_values: list[str] = []
         invalid: list[str] = []
         for raw in raw_values:
@@ -4016,8 +4007,8 @@ def preview_template_csv(
             if normalized not in normalized_values:
                 normalized_values.append(normalized)
         old = existing.get(key)
-        old_values = {item.normalized_value for item in old.allowed_values} if old else set()
-        new_keys = {normalize_key(item) for item in normalized_values}
+        old_values = {dictionary_value_key(item.value, value_type) for item in old.allowed_values} if old else set()
+        new_keys = {dictionary_value_key(item, value_type) for item in normalized_values}
         fields.append({
             "order": order,
             "group_name": group,
@@ -4027,8 +4018,8 @@ def preview_template_csv(
             "values": normalized_values,
             "invalid_values": invalid[:20],
             "change": "update" if old else "add",
-            "added_values": [item for item in normalized_values if normalize_key(item) not in old_values],
-            "removed_values": [item.value for item in old.allowed_values if item.normalized_value not in new_keys] if old else [],
+            "added_values": [item for item in normalized_values if dictionary_value_key(item, value_type) not in old_values],
+            "removed_values": [item.value for item in old.allowed_values if dictionary_value_key(item.value, value_type) not in new_keys] if old else [],
         })
         if normalize_key(name) in {"атрибут", "атрибуты", "характеристики"} and len(normalized_values) > 8:
             warnings.append(
@@ -4073,7 +4064,7 @@ def update_template_from_csv(
             db.add(field)
             db.flush()
         field.sort_order = int(item["order"])
-        field.value_type = item["value_type"]
+        set_field_value_type(db, field, item["value_type"])
         field.is_composite = bool(item["is_composite"])
         touched.add(field.id)
         if mode == "replace":
@@ -4175,7 +4166,7 @@ def restore_template_revision(
         if not allowed or allowed.field.template_id != template.id:
             raise ValueError("Значение из версии шаблона не найдено")
         normalized = normalize_value(value_data.get("value"), allowed.field.value_type, False)
-        normalized_key = normalize_key(normalized)
+        normalized_key = dictionary_value_key(normalized, allowed.field.value_type)
         duplicate = db.scalar(
             select(AttributeAllowedValue.id).where(
                 AttributeAllowedValue.field_id == allowed.field_id,
@@ -4256,7 +4247,10 @@ def restore_template_revision(
         field.synonyms = restored_synonyms
         for attr in ("value_type", "separator"):
             if field_data.get(attr) is not None:
-                setattr(field, attr, clean_text(field_data.get(attr)))
+                if attr == "value_type":
+                    set_field_value_type(db, field, clean_text(field_data.get(attr)))
+                else:
+                    setattr(field, attr, clean_text(field_data.get(attr)))
         for attr in ("is_composite", "is_required", "use_dash_if_empty"):
             if field_data.get(attr) is not None:
                 setattr(field, attr, bool(field_data.get(attr)))
@@ -4280,12 +4274,12 @@ def restore_template_revision(
             )
             allowed = (
                 allowed_by_id.get(int(value_data.get("id") or 0))
-                or allowed_by_key.get(normalize_key(normalized_value))
+                or allowed_by_key.get(dictionary_value_key(normalized_value, field.value_type))
             )
             if allowed is None:
                 allowed = add_allowed_value(db, field, normalized_value)
             allowed.value = normalized_value
-            allowed.normalized_value = normalize_key(normalized_value)
+            allowed.normalized_value = dictionary_value_key(normalized_value, field.value_type)
             allowed.is_combination = bool(value_data.get("is_combination"))
             allowed.is_active = bool(value_data.get("is_active", True))
             allowed.sort_order = int(value_data.get("sort_order") or 0)
@@ -4487,9 +4481,9 @@ def restore_product_snapshot(
         value.template_field = field
         value.group_name = clean_text(item.get("group_name"))
         value.attribute_name = clean_text(item.get("attribute_name") or item.get("name"))
-        value.current_value = clean_text(item.get("current_value"))
-        value.proposed_value = clean_text(item.get("proposed_value"))
-        value.final_value = clean_text(item.get("final_value"))
+        value.current_value = exact_value_key(item.get("current_value"))
+        value.proposed_value = exact_value_key(item.get("proposed_value"))
+        value.final_value = exact_value_key(item.get("final_value"))
         value.source = clean_text(item.get("source"))
         value.confidence = max(0, min(100, int(item.get("confidence") or 0)))
         value.status = clean_text(item.get("status")) or "missing"
@@ -4543,9 +4537,9 @@ def product_history(db: Session, product: AttributeProduct) -> list[dict[str, An
 
     def _state_key(item: dict[str, Any]) -> tuple[Any, ...]:
         return (
-            clean_text(item.get("current_value")),
-            clean_text(item.get("proposed_value")),
-            clean_text(item.get("final_value")),
+            exact_value_key(item.get("current_value")),
+            exact_value_key(item.get("proposed_value")),
+            exact_value_key(item.get("final_value")),
             clean_text(item.get("source")),
             int(item.get("confidence") or 0),
             clean_text(item.get("status")),
@@ -4554,14 +4548,14 @@ def product_history(db: Session, product: AttributeProduct) -> list[dict[str, An
         )
 
     def _display_value(item: dict[str, Any]) -> str:
-        final_value = clean_text(item.get("final_value"))
+        final_value = exact_value_key(item.get("final_value"))
         if final_value:
             return final_value
         if clean_text(item.get("status")) == "dash":
             return "-"
         return (
-            clean_text(item.get("proposed_value"))
-            or clean_text(item.get("current_value"))
+            exact_value_key(item.get("proposed_value"))
+            or exact_value_key(item.get("current_value"))
             or "—"
         )
 

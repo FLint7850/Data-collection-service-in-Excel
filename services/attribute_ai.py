@@ -8,6 +8,7 @@ embedded into the prompt and later used to validate returned evidence.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from difflib import SequenceMatcher
@@ -29,6 +30,8 @@ from services.attribute_assistant import (
     fetch_donor_product_html,
     fetch_public_html,
     normalize_key,
+    dictionary_value_key,
+    exact_value_key,
     parse_product_html,
     parse_product_html_for_donor,
     product_template,
@@ -114,7 +117,7 @@ def _page_evidence(html: str, parsed: dict[str, Any]) -> str:
         if not isinstance(item, dict):
             continue
         name = clean_text(item.get("name"))
-        value = clean_text(item.get("value"))
+        value = exact_value_key(item.get("value"))
         if name and value:
             attributes.append(f"{name}: {value}")
     identity = [
@@ -141,7 +144,7 @@ def _parsed_attributes(parsed: dict[str, Any]) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         name = clean_text(item.get("name"))
-        value = clean_text(item.get("value"))
+        value = exact_value_key(item.get("value"))
         if name and value:
             result.append({"name": name, "value": value})
     return result
@@ -154,7 +157,7 @@ def _field_source_hints(field, target, parsed: dict[str, Any]) -> list[dict[str,
         if not isinstance(item, dict):
             continue
         source_name = clean_text(item.get("name"))
-        value = clean_text(item.get("value"))
+        value = exact_value_key(item.get("value"))
         if not source_name or not value:
             continue
         score = _mapping_score(source_name, field)
@@ -169,7 +172,7 @@ def _field_source_hints(field, target, parsed: dict[str, Any]) -> list[dict[str,
     for item in [*(details.get("candidates") or []), *(details.get("unknown_values") or [])]:
         if not isinstance(item, dict):
             continue
-        value = clean_text(item.get("raw_value") or item.get("value"))
+        value = exact_value_key(item.get("raw_value") or item.get("value"))
         if value:
             hints.append({
                 "name": clean_text(item.get("source_name")) or field.name,
@@ -182,7 +185,7 @@ def _field_source_hints(field, target, parsed: dict[str, Any]) -> list[dict[str,
                 hints.append({"name": field.name, "value": cleaned})
     unique: dict[tuple[str, str], dict[str, str]] = {}
     for item in hints:
-        unique[(normalize_key(item["name"]), normalize_key(item["value"]))] = item
+        unique[(normalize_key(item["name"]), dictionary_value_key(item["value"], field.value_type))] = item
     return list(unique.values())
 
 
@@ -207,13 +210,13 @@ def _shortlist_allowed_values(
             if value and value not in selected:
                 selected.append(value)
 
-    hint_keys = [normalize_key(item["value"]) for item in hints if normalize_key(item["value"])]
+    hint_keys = [dictionary_value_key(item["value"], field.value_type) for item in hints if clean_text(item["value"])]
     evidence_tokens = set(normalize_key(evidence).split())
     ranked: list[tuple[float, int, str]] = []
     for item in active:
         if item.value in selected:
             continue
-        key = normalize_key(item.value)
+        key = dictionary_value_key(item.value, field.value_type)
         tokens = set(key.split())
         score = max(
             (SequenceMatcher(None, hint_key, key).ratio() for hint_key in hint_keys),
@@ -250,9 +253,9 @@ def _template_context(
         return result
     for field in template.fields:
         target = values_by_field.get(field.id)
-        current = clean_text(target.current_value if target else "")
-        proposed = clean_text(target.proposed_value if target else "")
-        final = clean_text(target.final_value if target else "")
+        current = exact_value_key(target.current_value if target else "")
+        proposed = exact_value_key(target.proposed_value if target else "")
+        final = exact_value_key(target.final_value if target else "")
         hints = _field_source_hints(field, target, parsed)
         allowed = _shortlist_allowed_values(field, hints, evidence)
         if not allowed:
@@ -364,16 +367,21 @@ def _parse_json_response(value: object) -> dict[str, Any]:
     return parsed
 
 
-def _evidence_present(quote: str, evidence: str) -> bool:
+def _evidence_present(quote: str, evidence: str, *, exact: bool = False) -> bool:
+    if exact:
+        key = exact_value_key(quote)
+        return bool(key) and re.search(
+            r"(?<![\w+./%−-])" + re.escape(key) + r"(?![\w+./%−-])", exact_value_key(evidence),
+        ) is not None
     return bool(normalize_key(quote)) and normalize_key(quote) in normalize_key(evidence)
 
 
 def _canonical_allowed(field, proposed: object) -> str:
-    key = normalize_key(proposed)
+    key = dictionary_value_key(proposed, field.value_type)
     if not key:
         return ""
     for item in field.allowed_values:
-        if item.is_active and normalize_key(item.value) == key:
+        if item.is_active and dictionary_value_key(item.value, field.value_type) == key:
             return item.value
     return ""
 
@@ -381,7 +389,7 @@ def _canonical_allowed(field, proposed: object) -> str:
 def _current_value_supported_by_source_name(field, target, source_name: str) -> str:
     """Confirm an existing semantic value when a presence row names its options."""
 
-    current = clean_text(target.final_value or target.current_value or target.proposed_value)
+    current = exact_value_key(target.final_value or target.current_value or target.proposed_value)
     if not current or _is_presence_marker(field, current):
         return ""
     canonical, _confidence, _reason, _alternatives = _allowed_match(
@@ -402,12 +410,12 @@ def _current_value_supported_by_source_name(field, target, source_name: str) -> 
     )
     for part in parts:
         variants = [part]
-        part_key = normalize_key(part)
+        part_key = exact_value_key(part)
         allowed = next(
             (
                 item
                 for item in field.allowed_values
-                if item.is_active and (item.normalized_value or normalize_key(item.value)) == part_key
+                if item.is_active and exact_value_key(item.value) == part_key
             ),
             None,
         )
@@ -481,11 +489,11 @@ def validate_analysis(
         if type(source_id) is not int or source_id <= 0:
             continue
         name = clean_text(fact.get("name"))
-        value = clean_text(fact.get("value"))
+        value = exact_value_key(fact.get("value"))
         if name and value:
             indexed_source_facts[source_id] = {"name": name, "value": value}
     indexed_fact_keys = {
-        (normalize_key(fact["name"]), normalize_key(fact["value"]))
+        (normalize_key(fact["name"]), exact_value_key(fact["value"]))
         for fact in indexed_source_facts.values()
     }
 
@@ -508,9 +516,9 @@ def validate_analysis(
             quote = f"{name}: {value}"
         else:
             name = clean_text(item.get("name"))
-            value = clean_text(item.get("value"))
-            quote = clean_text(item.get("evidence"))
-        key = (normalize_key(name), normalize_key(value))
+            value = exact_value_key(item.get("value"))
+            quote = exact_value_key(item.get("evidence"))
+        key = (normalize_key(name), exact_value_key(value))
         if not name or not value:
             warnings.append("Одна характеристика ChatGPT отклонена: нет названия или значения")
             continue
@@ -545,6 +553,12 @@ def validate_analysis(
             continue
         if field_id in seen_fields:
             continue
+        if source_id is None and (
+            (page_evidence and not _evidence_present(quote, page_evidence, exact=True))
+            or not _evidence_present(value, quote, exact=True)
+        ):
+            warnings.append(f"Сопоставление «{name}» отклонено: цитата не подтверждает точное значение")
+            continue
         presence_marker = _is_presence_marker(field, value)
         canonical = ""
         explanation = ""
@@ -570,9 +584,6 @@ def validate_analysis(
                 name,
             )
             explanation = f"Семантически сопоставлено ChatGPT; {match_reason}"
-            if not canonical and item.get("allowed_value"):
-                canonical = _canonical_allowed(field, item["allowed_value"])
-                explanation = "Предложено ChatGPT по странице товара; значение проверено по справочнику"
         if not canonical:
             warnings.append(
                 f"Сопоставление «{name}» → «{field.name}» проверено, "
@@ -615,11 +626,11 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
         target = values.get(suggestion.get("template_field_id"))
         if target is None:
             continue
-        proposed = clean_text(suggestion.get("proposed_value"))
+        proposed = exact_value_key(suggestion.get("proposed_value"))
         if not proposed:
             continue
         confidence = max(50, min(85, int(suggestion.get("confidence") or 50)))
-        protected_final = clean_text(target.final_value) if not clean_text(target.current_value) else ""
+        protected_final = exact_value_key(target.final_value) if not exact_value_key(target.current_value) else ""
         protected_state = {
             "proposed_value": target.proposed_value,
             "source": target.source,
@@ -642,7 +653,7 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
             target.proposed_value = protected_state["proposed_value"]
             target.source = protected_state["source"]
             target.confidence = protected_state["confidence"]
-            if normalize_key(protected_final) == normalize_key(proposed):
+            if dictionary_value_key(protected_final, target.template_field.value_type) == dictionary_value_key(proposed, target.template_field.value_type):
                 target.status = protected_state["status"] or "approved"
                 target.reason = "ChatGPT подтверждает выбранное значение"
             else:
@@ -651,7 +662,7 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
         details = dict(target.source_details or {})
         details["chatgpt"] = {
             "url": source_url,
-            "evidence": clean_text(suggestion.get("evidence")),
+            "evidence": exact_value_key(suggestion.get("evidence")),
             "explanation": clean_text(suggestion.get("explanation")),
             "confidence": confidence,
             "prompt_version": ATTRIBUTE_AI_PROMPT_VERSION,
@@ -662,11 +673,11 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
     observed_attributes = [
         {
             "name": clean_text(item.get("name")),
-            "value": clean_text(item.get("value")),
+            "value": exact_value_key(item.get("value")),
             "evidence": clean_text(item.get("evidence")),
         }
         for item in analysis.get("observed_attributes") or []
-        if isinstance(item, dict) and clean_text(item.get("name")) and clean_text(item.get("value"))
+        if isinstance(item, dict) and clean_text(item.get("name")) and exact_value_key(item.get("value"))
     ]
     suggestions_count = len(analysis.get("suggestions") or [])
     chatgpt_source = next((source for source in product.sources if source.role == "chatgpt"), None)

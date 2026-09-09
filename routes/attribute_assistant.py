@@ -47,7 +47,8 @@ from services.attribute_assistant import (
     export_batch_csv,
     export_batch_report_csv,
     import_template_csv,
-    normalize_key,
+    dictionary_value_key,
+    set_field_value_type,
     normalize_value,
     preview_template_csv,
     product_history,
@@ -519,7 +520,7 @@ def api_attribute_value_mapping_rule(value_id: int):
             if not (
                 isinstance(item, dict)
                 and int(item.get("donor_id") or 0) == rule.donor_id
-                and normalize_key(item.get("value")) == rule.normalized_raw_value
+                and dictionary_value_key(item.get("value"), value.template_field.value_type) == rule.normalized_raw_value
             )
         ]
         value.source_details = details
@@ -684,6 +685,7 @@ def api_attribute_template_update_csv(template_id: int):
         g.db.flush()
         return jsonify({"preview": preview, "template": serialize_template(template, include_values=True)})
     except ValueError as error:
+        g.db.rollback()
         return jsonify({"error": str(error)}), 400
 
 
@@ -808,6 +810,7 @@ def api_attribute_template_restore(template_id: int, revision_id: int):
         restore_template_revision(g.db, template, revision)
         return jsonify(serialize_template(template, include_values=True))
     except ValueError as error:
+        g.db.rollback()
         return jsonify({"error": str(error)}), 400
 
 
@@ -821,12 +824,15 @@ def api_attribute_field_update(field_id: int):
     try:
         updates = validate_template_field_update(g.db, field, payload)
         save_template_revision(g.db, field.template, "before_field_edit", {"field_id": field.id})
+        if "value_type" in updates:
+            set_field_value_type(g.db, field, updates["value_type"])
         for key, value in updates.items():
             setattr(field, key, value)
         field.template.version += 1
         g.db.flush()
         return jsonify(serialize_template(field.template, include_values=True))
     except (TypeError, ValueError) as error:
+        g.db.rollback()
         return jsonify({"error": str(error)}), 400
     except IntegrityError:
         g.db.rollback()
@@ -844,7 +850,7 @@ def api_attribute_allowed_update(allowed_id: int):
         save_allowed_value_revision(g.db, allowed, "before_dictionary_edit")
         if "value" in payload:
             normalized = normalize_value(payload.get("value"), allowed.field.value_type, False)
-            key = normalize_key(normalized)
+            key = dictionary_value_key(normalized, allowed.field.value_type)
             if not key:
                 raise ValueError("Значение не может быть пустым")
             duplicate = next((item for item in allowed.field.allowed_values if item.id != allowed.id and item.normalized_value == key), None)
@@ -874,6 +880,7 @@ def api_attribute_allowed_update(allowed_id: int):
             "template_version": allowed.field.template.version,
         })
     except ValueError as error:
+        g.db.rollback()
         return jsonify({"error": str(error)}), 400
 
 

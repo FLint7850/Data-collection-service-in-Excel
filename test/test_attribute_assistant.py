@@ -360,7 +360,7 @@ class AttributeAssistantTest(unittest.TestCase):
             category="Холодильники",
         )
         field, confidence, reason, _alternatives = service.map_attribute(
-            self.db, template, None, "Тип", "встраиваемый"
+            self.db, template, None, "Тип", "Встраиваемый"
         )
         self.assertIsNotNone(field)
         self.assertEqual(field.name, "Тип установки")
@@ -450,6 +450,8 @@ class AttributeAssistantTest(unittest.TestCase):
             name="Стиральные машины",
             category="Стиральные машины",
         )
+        # Lowercase is an explicitly configured synonym, not implicit equality.
+        service.add_allowed_value(self.db, template.fields[0], "Белый", synonym="белый")
         attributes = [
             {"name": "Цвет", "value": "белый"},
             {"name": "Цвет дверцы люка", "value": "черный, серебристый"},
@@ -615,7 +617,7 @@ class AttributeAssistantTest(unittest.TestCase):
             allowed,
             ["белая", " White ", "БЕЛАЯ", "Белый", ""],
         )
-        self.assertEqual([item.synonym for item in allowed.synonyms], ["белая", "White"])
+        self.assertEqual([item.synonym for item in allowed.synonyms], ["белая", "White", "БЕЛАЯ"])
 
         service.replace_allowed_value_synonyms(self.db, allowed, ["Снежный"])
         self.assertEqual([item.synonym for item in allowed.synonyms], ["Снежный"])
@@ -1181,8 +1183,8 @@ class AttributeAssistantTest(unittest.TestCase):
             "Есть",
             source_name,
         )
-        self.assertEqual(canonical, "")
-        self.assertIn("наличие характеристики", reason)
+        self.assertEqual(canonical, "Есть")
+        self.assertIn("Точное значение", reason)
         service.apply_candidate(
             product,
             target,
@@ -1511,7 +1513,7 @@ class AttributeAssistantTest(unittest.TestCase):
         for value in product.values:
             self.assertTrue(value.source_details["chatgpt"]["evidence"] in evidence)
 
-    def test_chatgpt_compact_response_accepts_dictionary_choice_without_losing_raw_value(self):
+    def test_chatgpt_compact_response_requires_explicit_value_synonym(self):
         from services import attribute_ai
 
         template = self.make_template()
@@ -1524,8 +1526,14 @@ class AttributeAssistantTest(unittest.TestCase):
         analysis = attribute_ai.validate_analysis(
             batch.products[0], {"attributes": [record]}, page_evidence=record["evidence"],
         )
-        self.assertEqual(analysis["warnings"], [])
         self.assertEqual(analysis["observed_attributes"][0]["value"], "светлый")
+        self.assertEqual(analysis["suggestions"], [])
+        self.assertTrue(analysis["warnings"])
+        service.add_allowed_value(self.db, template.fields[0], "Белый", synonym="светлый")
+        analysis = attribute_ai.validate_analysis(
+            batch.products[0], {"attributes": [record]}, page_evidence=record["evidence"],
+        )
+        self.assertEqual(analysis["warnings"], [])
         self.assertEqual(len(analysis["suggestions"]), 1)
         suggestion = analysis["suggestions"][0]
         self.assertEqual(suggestion["proposed_value"], "Белый")
@@ -1644,6 +1652,7 @@ class AttributeAssistantTest(unittest.TestCase):
 
     def test_donor_candidates_are_kept_for_protected_current_value(self):
         template = self.make_template()
+        service.add_allowed_value(self.db, template.fields[0], "Белый", synonym="белый")
         batch = service.create_batch_from_csv(
             self.db,
             template,
@@ -2233,7 +2242,7 @@ class AttributeAssistantTest(unittest.TestCase):
             category="Техника",
         )
         energy, cable = template.fields
-        self.assertEqual(service._allowed_match(energy, "D (старое обозначение класса)")[0], "D")
+        self.assertEqual(service._allowed_match(energy, "D (старое обозначение класса)")[0], "")
         self.assertEqual(service._allowed_match(cable, "2.3 м", "Длина шнура")[0], "230")
 
     def test_saved_donor_value_mapping_is_applied_before_fuzzy_matching(self):

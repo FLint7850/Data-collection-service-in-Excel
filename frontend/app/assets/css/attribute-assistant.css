@@ -108,6 +108,30 @@ grid-template-columns: minmax(0, 1.65fr) minmax(300px, .75fr);
 grid-template-columns: minmax(300px, .7fr) minmax(0, 1.4fr);
 }
 
+.aa-grid--templates > .aa-card {
+  min-width: 0;
+  align-self: stretch;
+}
+
+/* The import form sets the row height; the template list scrolls inside it. */
+.aa-grid--templates > .aa-card--main {
+  display: flex;
+  min-height: 0;
+  contain: size;
+}
+
+.aa-grid--templates > .aa-card--main > [data-slot="body"] {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.aa-grid--templates > .aa-card--main .aa-card-head {
+  flex-shrink: 0;
+}
+
 .aa-side {
 display: flex;
 flex-direction: column;
@@ -241,8 +265,17 @@ text-align: center;
 }
 
 .aa-template-list {
-display: flex;
-flex-direction: column;
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+
+.aa-template-list > .aa-template-row {
+  flex-shrink: 0;
 }
 
 .aa-template-row {
@@ -775,6 +808,15 @@ font-size: 12px;
 
 
 @media (max-width: 1120px) {
+  .aa-grid--templates > .aa-card--main {
+    contain: none;
+  }
+
+  .aa-template-list {
+    max-height: min(32rem, 65vh);
+    flex-basis: auto;
+  }
+
 .aa-grid--start,
 .aa-grid--templates,
 .aa-source-grid {

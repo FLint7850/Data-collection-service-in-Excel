@@ -3,7 +3,12 @@ FROM node:24-alpine@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b
 WORKDIR /app
 COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm ci --prefer-offline --no-audit --no-fund
+    npm ci --prefer-offline --no-audit --no-fund \
+        --fetch-retries=5 \
+        --fetch-retry-factor=2 \
+        --fetch-retry-mintimeout=10000 \
+        --fetch-retry-maxtimeout=60000 \
+        --maxsockets=5
 COPY . .
 RUN npm run test \
     && npm run typecheck \

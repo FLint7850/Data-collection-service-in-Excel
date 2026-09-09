@@ -224,6 +224,7 @@ def migrate_schema(connection) -> None:
     migrate_price_converter_table(connection)
     migrate_supplier_feeds_table(connection)
     migrate_attribute_assistant_tables(connection)
+    migrate_attribute_value_keys(connection)
     migrate_attribute_technical_dashes(connection)
     migrate_attribute_product_revisions(connection)
     compact_attribute_revision_payloads(connection)
@@ -773,6 +774,64 @@ def migrate_attribute_assistant_tables(connection) -> None:
         connection.execute(
             text("ALTER TABLE attribute_mapping_rules_migration_tmp RENAME TO attribute_mapping_rules")
         )
+
+
+
+def migrate_attribute_value_keys(connection) -> None:
+    """Rebuild equality keys from stored text without merging or replacing records."""
+    from services.attribute_assistant import exact_value_key
+    import uuid
+
+    name = "attribute_literal_value_keys_v3"
+    if connection.execute(
+        text("SELECT 1 FROM app_data_migrations WHERE name = :name"), {"name": name},
+    ).scalar():
+        return
+    specifications = (
+        ("attribute_allowed_values", "value", "normalized_value", ("field_id",)),
+        ("attribute_value_synonyms", "synonym", "normalized_synonym", ("allowed_value_id",)),
+        ("attribute_value_mapping_rules", "raw_value", "normalized_raw_value", ("donor_id", "template_field_id")),
+    )
+    prepared = []
+    counts = {}
+    for table, source, key_column, scope in specifications:
+        if not table_columns(connection, table):
+            return
+        columns = ", ".join(("id", source, key_column, *scope))
+        rows = connection.execute(text(f"SELECT {columns} FROM {table}")).mappings().all()
+        seen = set()
+        changes = []
+        occupied = {row[key_column] for row in rows}
+        for row in rows:
+            new_key = exact_value_key(row[source])
+            identity = (*[row[column] for column in scope], new_key)
+            if identity in seen:
+                raise ValueError(f"Повторяющееся значение в {table}, ID {row['id']}; миграция отменена без объединения записей")
+            seen.add(identity)
+            occupied.add(new_key)
+            if new_key != row[key_column]:
+                changes.append({"row_id": row["id"], "value_key": new_key})
+        # Temporary keys prevent transient unique-index collisions with old keys.
+        prefix = "__literal_keys_" + uuid.uuid4().hex + "_"
+        while any(prefix + str(row["row_id"]) in occupied for row in changes):
+            prefix = "__literal_keys_" + uuid.uuid4().hex + "_"
+        prepared.append((table, key_column, changes, prefix))
+        counts[table] = len(changes)
+    for table, key_column, changes, prefix in prepared:
+        if not changes:
+            continue
+        query = text(f"UPDATE {table} SET {key_column} = :value_key WHERE id = :row_id")
+        connection.execute(query, [
+            {"row_id": row["row_id"], "value_key": prefix + str(row["row_id"])} for row in changes
+        ])
+        connection.execute(query, changes)
+    connection.execute(text(
+        "UPDATE attribute_template_fields SET value_type = 'select' WHERE value_type = 'select_exact'"
+    ))
+    connection.execute(
+        text("INSERT INTO app_data_migrations (name, details) VALUES (:name, :details)"),
+        {"name": name, "details": json.dumps(counts)},
+    )
 
 
 def migrate_attribute_technical_dashes(connection) -> None:
