@@ -523,3 +523,41 @@ class AttributeValueMappingRule(Base):
             "donor_id", "template_field_id", "normalized_raw_value",
         ),
     )
+
+
+class AttributeShopConnection(Base):
+    __tablename__ = "attribute_shop_connections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    endpoint: Mapped[str] = mapped_column(String(2000), nullable=False, unique=True)
+    api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    language_code: Mapped[str] = mapped_column(String(12), default="ru-ru", nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    remote_source_id: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    sync_token: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    sync_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    last_report: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class AttributeShopTemplateLink(Base):
+    __tablename__ = "attribute_shop_template_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    connection_id: Mapped[int] = mapped_column(
+        ForeignKey("attribute_shop_connections.id", ondelete="CASCADE"), nullable=False
+    )
+    remote_category_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    language_code: Mapped[str] = mapped_column(String(12), nullable=False)
+    template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("attribute_templates.id", ondelete="SET NULL"), nullable=True
+    )
+    source_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("connection_id", "remote_category_id", "language_code",
+                         name="uq_attribute_shop_category_language"),
+    )

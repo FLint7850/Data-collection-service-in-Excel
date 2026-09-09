@@ -1,5 +1,6 @@
 """Flask blueprints."""
 
+from routes.opencart import bp as routes_opencart_bp
 from routes.attribute_assistant import bp as routes_attribute_assistant_bp
 from routes.auth import bp as routes_auth_bp
 from routes.feeds import bp as routes_feeds_bp
@@ -12,6 +13,7 @@ from routes.projects import bp as routes_projects_bp
 from routes.settings import bp as routes_settings_bp
 
 BLUEPRINTS = [
+    routes_opencart_bp,
     routes_attribute_assistant_bp,
     routes_auth_bp,
     routes_feeds_bp,

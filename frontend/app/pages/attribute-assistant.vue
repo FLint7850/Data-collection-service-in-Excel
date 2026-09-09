@@ -1,1794 +1,223 @@
 <script setup lang="ts">
-import { attributeAssistantService as api } from "~/services/attribute-assistant.service";
-import type {
-  AttributeAllowedValue,
-  AttributeBatch,
-  AttributeBatchOperation,
-  AttributeDonor,
-  AttributeHistoryItem,
-  AttributeMappingRule,
-  AttributeValueMappingRule,
-  AttributeProcessingMode,
-  AttributeProduct,
-  AttributeSource,
-  AttributeTemplate,
-  AttributeTemplatePreview,
-  AttributeValue,
-  AttributeWorkspace,
-  ChatGptLogin,
-  ChatGptStatus,
-} from "~/types/attribute-assistant";
-import { errorMessage } from "~/utils/format";
+import {
+  displayedProposal,
+  displayedProposalConfidence,
+  displayedProposalSource,
+  finalAllowedMenuKey,
+  formatHistoryDate,
+  inputModeItems,
+  isTechnicalDash,
+  processingModeItems,
+  selectedFinalParts,
+  selectedFinalValue,
+  sourceKind,
+  sourceKindLabel,
+  sourceStatusText,
+  sourceTitle,
+  templateFieldTypeItems,
+  templateUpdateModeItems,
+  unknownAllowedMenuKey,
+  unknownSelectionKey,
+  valueStatusColor,
+  valueStatusLabel,
+} from "~/utils/attribute-assistant";
 
 definePageMeta({
   title: "Атрибуты",
   eyebrow: "Автоматическое заполнение",
 });
 
-const toast = useToast();
-const route = useRoute();
-const router = useRouter();
-type MainTab = "start" | "templates" | "review";
-type RouteWriteMode = "push" | "replace";
+const assistant = useAttributeAssistant();
 
-const ALL_FILTER_VALUE = "all";
-const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
-const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "no_suggestion"]);
-const ALLOWED_OPTIONS_PAGE_SIZE = 40;
+const allowedValuesState = useAttributeAllowedValues();
 
-function routeQueryValue(value: unknown): string {
-  return Array.isArray(value) ? String(value[0] || "") : String(value || "");
-}
+const templatesState = useAttributeTemplates(assistant);
 
-function routeSegments(): string[] {
-  const raw = route.params.state;
-  const values = Array.isArray(raw) ? raw : raw ? [raw] : [];
-  return values.flatMap((value) => String(value).split("/")).filter(Boolean);
-}
-
-function positiveRouteId(value: string | undefined): number | null {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-}
-
-const loading = ref(true);
-const busy = ref("");
-const error = ref("");
-const tab = ref<MainTab>("start");
-const inputMode = ref<"csv" | "urls">("csv");
-const workspace = ref<AttributeWorkspace>({ templates: [], donors: [], batches: [], dashboard: { active_templates: 0, batches: 0, products: 0, ready: 0, conflicts: 0, missing: 0 } });
-const selectedTemplateId = ref<number | null>(null);
-const selectedBatch = ref<AttributeBatch | null>(null);
-const selectedProduct = ref<AttributeProduct | null>(null);
-const loadingProductId = ref<number | null>(null);
-const selectedDonors = ref<number[]>([]);
-const productFile = ref<File | null>(null);
-const templateFile = ref<File | null>(null);
-const urlsText = ref("");
-const processingMode = ref<AttributeProcessingMode>("suggest");
-const chatGpt = ref<ChatGptStatus | null>(null);
-const deviceLogin = ref<ChatGptLogin | null>(null);
-const templateDetails = ref<AttributeTemplate | null>(null);
-const templatePreview = ref<AttributeTemplatePreview | null>(null);
-const templateUpdateFile = ref<File | null>(null);
-const templateUpdateMode = ref<"merge" | "replace">("merge");
-const templateRevisions = ref<Array<{ id: number; version: number; action: string; created_at: string }>>([]);
-const templateRevisionsLoaded = ref(false);
-const templateRevisionsLoading = ref(false);
-const mappingRules = ref<AttributeMappingRule[]>([]);
-const valueMappingRules = ref<AttributeValueMappingRule[]>([]);
-const loadedTemplateFieldIds = ref<Set<number>>(new Set());
-const loadingTemplateFieldIds = ref<Set<number>>(new Set());
-const templateFieldQueries = ref<Record<number, string>>({});
-const templateFieldMatchedCounts = ref<Record<number, number>>({});
-const templateFieldSearchTimers = new Map<number, ReturnType<typeof setTimeout>>();
-const templateFieldSearchTokens = new Map<number, number>();
-const showNewTemplateField = ref(false);
-const allowedValueEditor = ref<{
-  id: number;
-  fieldName: string;
-  value: string;
-  synonyms: string[];
-  synonymDraft: string;
-} | null>(null);
-const appDialog = ref<{
-  confirm: (options: Record<string, unknown>) => Promise<boolean>;
-  prompt: (options: Record<string, unknown>) => Promise<string | null>;
-} | null>(null);
-const templateFieldEditor = ref<{
-  id: number;
-  name: string;
-  synonyms: string[];
-  synonymDraft: string;
-  group_name: string;
-  value_type: string;
-  is_composite: boolean;
-  conversion_rules: string;
-} | null>(null);
-const fieldValueEditor = ref<{
-  fieldId: number;
-  fieldName: string;
-  value: string;
-  synonym: string;
-} | null>(null);
-const unknownSelections = ref<Record<string, number>>({});
-const donorRecommendations = ref<AttributeDonor[]>([]);
-const donorUrlOverrides = ref<Record<string, string>>({});
-const historyItems = ref<AttributeHistoryItem[]>([]);
-const batchOperation = ref<AttributeBatchOperation | null>(null);
-
-const productQuery = ref(routeQueryValue(route.query.product_query));
-const initialProductStatus = routeQueryValue(route.query.product_status);
-const initialAttributeStatus = routeQueryValue(route.query.attribute_status);
-const productStatusFilter = ref(PRODUCT_STATUS_VALUES.has(initialProductStatus) ? initialProductStatus : ALL_FILTER_VALUE);
-const attributeStatusFilter = ref(ATTRIBUTE_STATUS_VALUES.has(initialAttributeStatus) ? initialAttributeStatus : ALL_FILTER_VALUE);
-const allowedOptionCache = ref<Record<number, Array<{ id: number; value: string }>>>({});
-const allowedSearchQueries = ref<Record<number, string>>({});
-const searchingAllowedValueIds = ref<Set<number>>(new Set());
-const allowedSearchTimers = new Map<number, ReturnType<typeof setTimeout>>();
-const allowedRequestTokens = new Map<number, number>();
-const allowedOptionPages = ref<Record<number, {
-  query: string;
-  total: number;
-  matched: number;
-  hasMore: boolean;
-}>>({});
-type AllowedSelectInstance = { viewportRef?: HTMLElement | { value?: HTMLElement | null } | null };
-const allowedSelectRefs = new Map<string, AllowedSelectInstance>();
-const allowedSelectRefCallbacks = new Map<string, (instance: unknown) => void>();
-const allowedScrollBindings = new Map<string, { valueId: number; check: () => void; cleanup: () => void }>();
-const templateForm = reactive({
-  name: "",
-  category: "",
-  product_type: "",
-  description: "",
-});
-let authPoll: ReturnType<typeof setInterval> | null = null;
-let productRequestToken = 0;
-let routeApplyToken = 0;
-let routeStateReady = false;
-let applyingRouteState = false;
-let writtenRoute = "";
-let filterRouteTimer: ReturnType<typeof setTimeout> | null = null;
-let batchOperationPoll: ReturnType<typeof setTimeout> | null = null;
-const newTemplateField = reactive({
-  group_name: "Основные характеристики",
-  name: "",
-  value_type: "select",
-  is_required: true,
-  is_composite: false,
-  separator: "/",
-});
-
-const templates = computed(() => workspace.value.templates);
-const templateSelectItems = computed(() => [
-  { label: "Определить автоматически", value: null as number | null },
-  ...templates.value.map((item) => ({
-    label: `${item.category} · ${item.name}`,
-    value: item.id,
-  })),
-]);
-const productTemplateItems = computed(() => templates.value.map((item) => ({
-  label: `${item.category} · ${item.name}`,
-  value: item.id,
-})));
-const processingModeItems: Array<{ label: string; value: AttributeProcessingMode }> = [
-  { label: "Только проверить, без предложений в итог", value: "check" },
-  { label: "Показать предложения, решение вручную", value: "suggest" },
-  { label: "Автопринять только точные 100%", value: "auto_exact" },
-  { label: "Автопринять уверенное от главного донора", value: "auto_primary" },
-  { label: "Автопринять подтверждённое от 95%", value: "auto_confident" },
-  { label: "Автопринять всё найденное в справочнике", value: "auto_all" },
-];
-const templateUpdateModeItems = [
-  { label: "Объединить", value: "merge" },
-  { label: "Заменить значения из файла", value: "replace" },
-];
-const templateFieldTypeItems = [
-  { label: "Из справочника", value: "select" },
-  { label: "Текст", value: "text" },
-  { label: "Число", value: "number" },
-  { label: "Габариты", value: "dimensions" },
-  { label: "Да / нет", value: "boolean" },
-];
-
-function matchesProductStatus(product: AttributeProduct, status: string): boolean {
-  if (status === ALL_FILTER_VALUE) return true;
-  if (status === "conflict") return product.status === status || product.counts.conflicts > 0;
-  if (status === "missing") return product.status === status || product.counts.missing > 0;
-  if (status === "outside_template") return product.counts.outside_template > 0;
-  return product.status === status;
-}
-
-const productStatusItems = computed(() => {
-  const products = selectedBatch.value?.products || [];
-  const count = (status: string) => products.filter((product) => matchesProductStatus(product, status)).length;
-  return [
-    { label: `Все товары (${products.length})`, value: ALL_FILTER_VALUE },
-    { label: `Готовые (${count("ready")})`, value: "ready" },
-    { label: `С конфликтами (${count("conflict")})`, value: "conflict" },
-    { label: `С пропусками (${count("missing")})`, value: "missing" },
-    { label: `Вне шаблона (${count("outside_template")})`, value: "outside_template" },
-    { label: `Нужна проверка (${count("needs_review")})`, value: "needs_review" },
-  ];
-});
-const mainTabItems = computed(() => [
-  { label: "Новая обработка", icon: "i-lucide-sparkles", value: "start" },
-  { label: "Шаблоны", icon: "i-lucide-layout-template", value: "templates" },
-  {
-    label: "Проверка",
-    icon: "i-lucide-list-checks",
-    value: "review",
-    disabled: !selectedBatch.value,
-    badge: selectedBatch.value?.summary.needs_review || undefined,
-  },
-]);
-const inputModeItems = [
-  { label: "CSV-файл", icon: "i-lucide-file-spreadsheet", value: "csv" },
-  { label: "Ссылки сайта", icon: "i-lucide-link", value: "urls" },
-];
-const donors = computed(() => workspace.value.donors);
-const displayedDonors = computed(() => donorRecommendations.value.length ? donorRecommendations.value : donors.value);
-const selectedTemplate = computed(() =>
-  templates.value.find((item) => item.id === selectedTemplateId.value),
-);
-const selectedDonorRows = computed(() =>
-  selectedDonors.value
-    .map((id) => displayedDonors.value.find((item) => item.id === id))
-    .filter((item): item is AttributeDonor => Boolean(item)),
-);
-const filteredProducts = computed(() => (selectedBatch.value?.products || []).filter((product) => {
-  const query = productQuery.value.trim().toLocaleLowerCase("ru-RU");
-  const queryMatches = !query || `${product.model} ${product.name} ${product.brand}`.toLocaleLowerCase("ru-RU").includes(query);
-  const statusMatches = matchesProductStatus(product, productStatusFilter.value);
-  return queryMatches && statusMatches;
-}));
-
-function productListIndicator(product: AttributeProduct): string {
-  if (productStatusFilter.value === "outside_template") {
-    return `${product.counts.outside_template}`;
-  }
-  return String(product.counts.conflicts || product.counts.missing || "✓");
-}
-
-function hasPendingProposal(value: AttributeValue): boolean {
-  const proposal = displayedProposal(value);
-  return Boolean(proposal && proposal !== value.final_value);
-}
-
-function matchesAttributeStatus(value: AttributeValue, status: string): boolean {
-  if (status === ALL_FILTER_VALUE) return true;
-  if (status === "outside_template") return !value.is_in_template;
-  if (!value.is_in_template) return false;
-  if (status === "conflict") return value.status === "conflict";
-  if (status === "suggested") {
-    return value.status !== "conflict" && hasPendingProposal(value);
-  }
-  if (status === "no_suggestion") {
-    return value.status !== "conflict" && !hasPendingProposal(value);
-  }
-  return true;
-}
-
-const attributeValues = computed(() => selectedProduct.value?.values || []);
-const filteredAttributeValues = computed(() =>
-  attributeValues.value.filter((value) => matchesAttributeStatus(value, attributeStatusFilter.value)),
-);
-const batchOperationRunning = computed(() =>
-  ["queued", "running"].includes(batchOperation.value?.status || ""),
-);
-const batchChatGptLoading = computed(() =>
-  busy.value === "chatgpt-all"
-  || (batchOperationRunning.value && batchOperation.value?.kind === "chatgpt"),
-);
-const attributeStatusItems = computed(() => {
-  const values = attributeValues.value;
-  const count = (status: string) => values.filter((value) => matchesAttributeStatus(value, status)).length;
-  return [
-    { label: `Все атрибуты (${values.length})`, value: ALL_FILTER_VALUE },
-    { label: `Вне шаблона (${count("outside_template")})`, value: "outside_template" },
-    { label: `Конфликт (${count("conflict")})`, value: "conflict" },
-    { label: `Предложения (${count("suggested")})`, value: "suggested" },
-    { label: `Нет предложения (${count("no_suggestion")})`, value: "no_suggestion" },
-  ];
-});
-
-const valuesByGroup = computed(() => {
-  const groups = new Map<string, AttributeValue[]>();
-  const outsideTemplate: AttributeValue[] = [];
-  for (const value of filteredAttributeValues.value) {
-    if (!value.is_in_template) {
-      outsideTemplate.push(value);
-      continue;
-    }
-    const key = value.group_name || "Без группы";
-    groups.set(key, [...(groups.get(key) || []), value]);
-  }
-  const result: Array<[string, AttributeValue[]]> = [...groups.entries()];
-  if (outsideTemplate.length) result.unshift(["Вне шаблона", outsideTemplate]);
-  return result;
-});
-const displayedProductSources = computed(() =>
-  (selectedProduct.value?.sources || []).filter((source) => {
-    const kind = sourceKind(source);
-    return kind === "donor" || kind === "chatgpt";
-  }),
+const reviewState = useAttributeReview(
+    assistant,
+    allowedValuesState,
 );
 
-function assistantRouteLocation() {
-  let path = "/attribute-assistant/new";
-  const query: Record<string, string> = {};
-
-  if (tab.value === "templates") {
-    path = templateDetails.value
-      ? `/attribute-assistant/templates/${templateDetails.value.id}`
-      : "/attribute-assistant/templates";
-  } else if (tab.value === "review" && selectedBatch.value) {
-    path = `/attribute-assistant/review/${selectedBatch.value.id}`;
-    if (selectedProduct.value) path += `/${selectedProduct.value.id}`;
-    if (productQuery.value) query.product_query = productQuery.value;
-    if (productStatusFilter.value !== ALL_FILTER_VALUE) query.product_status = productStatusFilter.value;
-    if (selectedProduct.value && attributeStatusFilter.value !== ALL_FILTER_VALUE) {
-      query.attribute_status = attributeStatusFilter.value;
-    }
-  }
-
-  return { path, query };
-}
-
-async function writeAssistantRoute(mode: RouteWriteMode = "replace") {
-  if (!import.meta.client) return;
-  const location = assistantRouteLocation();
-  const target = router.resolve(location).fullPath;
-  if (target === route.fullPath) return;
-  writtenRoute = target;
-  if (mode === "push") await router.push(location);
-  else await router.replace(location);
-}
-
-function applyRouteFilters() {
-  productQuery.value = routeQueryValue(route.query.product_query);
-  const productStatus = routeQueryValue(route.query.product_status);
-  const attributeStatus = routeQueryValue(route.query.attribute_status);
-  productStatusFilter.value = PRODUCT_STATUS_VALUES.has(productStatus) ? productStatus : ALL_FILTER_VALUE;
-  attributeStatusFilter.value = ATTRIBUTE_STATUS_VALUES.has(attributeStatus) ? attributeStatus : ALL_FILTER_VALUE;
-}
-
-async function applyAssistantRoute() {
-  const token = ++routeApplyToken;
-  applyingRouteState = true;
-  applyRouteFilters();
-  const [section, firstId, secondId] = routeSegments();
-
-  try {
-    if (section === "templates") {
-      tab.value = "templates";
-      const templateId = positiveRouteId(firstId);
-      if (templateId && templateDetails.value?.id !== templateId) {
-        await openTemplate(templateId, false);
-      }
-    } else if (section === "review") {
-      const batchId = positiveRouteId(firstId);
-      const productId = positiveRouteId(secondId);
-      if (batchId) {
-        const opened = await openBatch(batchId, productId, { syncRoute: false, resetFilters: false });
-        if (!opened) {
-          selectedBatch.value = null;
-          selectedProduct.value = null;
-          tab.value = "start";
-        }
-      } else if (selectedBatch.value) {
-        tab.value = "review";
-      } else {
-        tab.value = "start";
-      }
-    } else {
-      tab.value = "start";
-    }
-  } finally {
-    if (token === routeApplyToken) {
-      applyingRouteState = false;
-      routeStateReady = true;
-    }
-  }
-
-  if (token === routeApplyToken) await writeAssistantRoute("replace");
-}
-
-async function changeMainTab(value: string | number) {
-  const next = String(value) as MainTab;
-  if (!new Set<MainTab>(["start", "templates", "review"]).has(next)) return;
-  if (next === "review" && !selectedBatch.value) return;
-  tab.value = next;
-  await writeAssistantRoute("push");
-}
-
-async function useTemplateForNewBatch(id: number) {
-  selectedTemplateId.value = id;
-  tab.value = "start";
-  await writeAssistantRoute("push");
-}
-
-function notify(title: string) {
-  toast.add({ title, color: "success" });
-}
-
-async function run<T>(key: string, task: () => Promise<T>): Promise<T | null> {
-  busy.value = key;
-  error.value = "";
-  try {
-    return await task();
-  } catch (caught) {
-    error.value = errorMessage(caught);
-    return null;
-  } finally {
-    busy.value = "";
-  }
-}
-
-async function confirmAction(options: Record<string, unknown>) {
-  return Boolean(await appDialog.value?.confirm(options));
-}
-
-async function promptValue(options: Record<string, unknown>) {
-  return (await appDialog.value?.prompt(options)) ?? null;
-}
-
-async function loadWorkspace() {
-  const data = await run("load", () => api.workspace());
-  if (data) {
-    workspace.value = data;
-    selectedTemplateId.value ||= data.templates[0]?.id || null;
-  }
-}
-
-async function loadChatGpt() {
-  chatGpt.value = await api.chatGptStatus();
-  if (chatGpt.value.authenticated && authPoll) {
-    clearInterval(authPoll);
-    authPoll = null;
-    deviceLogin.value = null;
-  }
-}
-
-async function loginChatGpt() {
-  const login = await run("chatgpt-login", () => api.chatGptLogin());
-  if (!login) return;
-  deviceLogin.value = login;
-  window.open(login.verification_url, "_blank", "noopener,noreferrer");
-  await navigator.clipboard?.writeText(login.user_code).catch(() => undefined);
-  authPoll && clearInterval(authPoll);
-  authPoll = setInterval(() => void loadChatGpt(), 3000);
-}
-
-async function logoutChatGpt() {
-  if (await run("chatgpt-logout", () => api.chatGptLogout())) {
-    await loadChatGpt();
-  }
-}
-
-async function previewNewTemplate() {
-  if (!templateFile.value) {
-    error.value = "Выберите CSV-файл шаблона.";
-    return;
-  }
-  templatePreview.value = await run("template-preview", () => api.previewTemplate(templateFile.value!));
-}
-
-async function importTemplate() {
-  if (!templateFile.value) {
-    error.value = "Выберите CSV-файл шаблона.";
-    return;
-  }
-  if (!templatePreview.value) await previewNewTemplate();
-  if (!templatePreview.value?.can_import) {
-    error.value = "Предварительная проверка не разрешает импорт.";
-    return;
-  }
-  const result = await run("template-import", () => api.importTemplate(templateFile.value!, templateForm));
-  if (!result) return;
-  notify("Шаблон импортирован");
-  await loadWorkspace();
-  selectedTemplateId.value = result.id;
-  templateFile.value = null;
-  templatePreview.value = null;
-  await openTemplate(result.id);
-}
-
-async function openTemplate(id: number, syncRoute = true) {
-  const requestKey = `template-open-${id}`;
-  if (busy.value === requestKey) return;
-  selectedTemplateId.value = id;
-  const result = await run(requestKey, () => Promise.all([
-    api.template(id),
-    api.mappingRules(id).catch(() => ({ items: [] })),
-    api.valueMappingRules(id).catch(() => ({ items: [] })),
-  ]));
-  if (!result) return;
-  const [details, rules, valueRules] = result;
-  templateDetails.value = details;
-  loadedTemplateFieldIds.value = new Set();
-  templateFieldQueries.value = {};
-  templateFieldMatchedCounts.value = {};
-  templateFieldSearchTimers.forEach((timer) => clearTimeout(timer));
-  templateFieldSearchTimers.clear();
-  templateFieldSearchTokens.clear();
-  templateRevisions.value = [];
-  templateRevisionsLoaded.value = false;
-  mappingRules.value = rules.items;
-  valueMappingRules.value = valueRules.items;
-  if (syncRoute) await writeAssistantRoute("push");
-}
-
-async function loadTemplateRevisions() {
-  const templateId = templateDetails.value?.id;
-  if (!templateId || templateRevisionsLoaded.value || templateRevisionsLoading.value) return;
-  templateRevisionsLoading.value = true;
-  try {
-    const result = await api.templateRevisions(templateId);
-    if (templateDetails.value?.id !== templateId) return;
-    templateRevisions.value = result.items;
-    templateRevisionsLoaded.value = true;
-  } catch (caught) {
-    error.value = errorMessage(caught);
-  } finally {
-    templateRevisionsLoading.value = false;
-  }
-}
-
-function handleTemplateHistoryOpen(open: boolean) {
-  if (open) void loadTemplateRevisions();
-}
-
-function setTemplateFieldLoading(fieldId: number, loading: boolean) {
-  const next = new Set(loadingTemplateFieldIds.value);
-  if (loading) next.add(fieldId);
-  else next.delete(fieldId);
-  loadingTemplateFieldIds.value = next;
-}
-
-async function loadTemplateFieldValues(fieldId: number) {
-  if (
-    loadedTemplateFieldIds.value.has(fieldId)
-    || loadingTemplateFieldIds.value.has(fieldId)
-  ) return;
-  setTemplateFieldLoading(fieldId, true);
-  try {
-    const result = await api.allowedValues(fieldId, "", true);
-    if (templateDetails.value?.fields) {
-      templateDetails.value = {
-        ...templateDetails.value,
-        fields: templateDetails.value.fields.map((field) => field.id === fieldId
-          ? { ...field, allowed_values: result.values, allowed_values_count: result.total }
-          : field),
-      };
-    }
-    loadedTemplateFieldIds.value = new Set([...loadedTemplateFieldIds.value, fieldId]);
-  } catch (caught) {
-    error.value = errorMessage(caught);
-  } finally {
-    setTemplateFieldLoading(fieldId, false);
-  }
-}
-
-function handleTemplateFieldOpen(open: boolean, fieldId: number) {
-  if (open) void loadTemplateFieldValues(fieldId);
-}
-
-function queueTemplateFieldValueSearch(fieldId: number, event: Event) {
-  const query = (event.target as HTMLInputElement).value;
-  templateFieldQueries.value = { ...templateFieldQueries.value, [fieldId]: query };
-  const previousTimer = templateFieldSearchTimers.get(fieldId);
-  if (previousTimer) clearTimeout(previousTimer);
-  const token = (templateFieldSearchTokens.get(fieldId) || 0) + 1;
-  templateFieldSearchTokens.set(fieldId, token);
-  templateFieldSearchTimers.set(fieldId, setTimeout(async () => {
-    setTemplateFieldLoading(fieldId, true);
-    try {
-      const result = await api.allowedValues(fieldId, query, true);
-      if (templateFieldSearchTokens.get(fieldId) !== token || !templateDetails.value?.fields) return;
-      templateDetails.value = {
-        ...templateDetails.value,
-        fields: templateDetails.value.fields.map((field) => field.id === fieldId
-          ? { ...field, allowed_values: result.values, allowed_values_count: result.total }
-          : field),
-      };
-      templateFieldMatchedCounts.value = { ...templateFieldMatchedCounts.value, [fieldId]: result.matched };
-    } catch (caught) {
-      if (templateFieldSearchTokens.get(fieldId) === token) error.value = errorMessage(caught);
-    } finally {
-      if (templateFieldSearchTokens.get(fieldId) === token) setTemplateFieldLoading(fieldId, false);
-    }
-  }, 250));
-}
-async function updateTemplateCsv() {
-  if (!templateDetails.value || !templateUpdateFile.value) return;
-  const preview = await run("template-update-preview", () => api.previewTemplate(templateUpdateFile.value!, templateDetails.value!.id));
-  if (!preview) return;
-  templatePreview.value = preview;
-  if (!preview.can_import || !await confirmAction({
-    title: "Обновить шаблон?",
-    description: `Будет применено полей: ${preview.fields.length}. Предупреждений: ${preview.warnings.length}.`,
-    confirmLabel: "Применить",
-  })) return;
-  const result = await run("template-update", () => api.updateTemplateCsv(templateDetails.value!.id, templateUpdateFile.value!, templateUpdateMode.value));
-  if (!result) return;
-  templateDetails.value = result.template;
-  templateUpdateFile.value = null;
-  await loadWorkspace();
-  notify("Шаблон обновлён");
-}
-
-async function copyCurrentTemplate() {
-  if (!templateDetails.value) return;
-  const name = await promptValue({
-    title: "Создать копию шаблона",
-    label: "Название копии",
-    defaultValue: `${templateDetails.value.name} — копия`,
-    confirmLabel: "Создать",
-  });
-  if (!name?.trim()) return;
-  const result = await run("template-copy", () => api.copyTemplate(templateDetails.value!.id, name));
-  if (result) {
-    await loadWorkspace();
-    await openTemplate(result.id);
-    notify("Копия шаблона создана");
-  }
-}
-
-async function toggleTemplateActive() {
-  if (!templateDetails.value) return;
-  const result = await run("template-active", () => api.updateTemplate(templateDetails.value!.id, { is_active: !templateDetails.value!.is_active }));
-  if (result) {
-    templateDetails.value = result;
-    await loadWorkspace();
-  }
-}
-
-
-async function removeTemplate(template: AttributeTemplate) {
-  const requestKey = `template-remove-${template.id}`;
-  if (busy.value === requestKey) return;
-  if (!await confirmAction({
-    title: `Удалить шаблон «${template.name}»?`,
-    description: "Будут удалены атрибуты, значения, синонимы и история шаблона. Используемый шаблон сервер удалить не позволит.",
-    confirmLabel: "Удалить шаблон",
-    color: "error",
-  })) return;
-  const result = await run(requestKey, () => api.removeTemplate(template.id));
-  if (!result) return;
-
-  if (templateDetails.value?.id === template.id) {
-    templateDetails.value = null;
-    templateRevisions.value = [];
-    mappingRules.value = [];
-    valueMappingRules.value = [];
-  }
-  const remaining = workspace.value.templates.filter((item) => item.id !== template.id);
-  if (selectedTemplateId.value === template.id) {
-    selectedTemplateId.value = remaining[0]?.id || null;
-  }
-  await loadWorkspace();
-  if (tab.value === "templates") await writeAssistantRoute("replace");
-  notify("Шаблон удалён");
-}
-
-
-async function removeMapping(id: number) {
-  if (!await confirmAction({
-    title: "Удалить сопоставление?",
-    description: "Автоматическое сопоставление атрибута донора больше не будет применяться.",
-    confirmLabel: "Удалить",
-    color: "error",
-  })) return;
-  if (await run(`mapping-remove-${id}`, () => api.removeMappingRule(id))) {
-    mappingRules.value = mappingRules.value.filter((item) => item.id !== id);
-  }
-}
-async function removeValueMapping(id: number) {
-  if (!await confirmAction({
-    title: "Удалить соответствие значения?",
-    description: "Сохранённое правило для значения донора больше не будет применяться.",
-    confirmLabel: "Удалить",
-    color: "error",
-  })) return;
-  if (await run(`value-mapping-remove-${id}`, () => api.removeValueMappingRule(id))) {
-    valueMappingRules.value = valueMappingRules.value.filter((item) => item.id !== id);
-  }
-}
-
-async function createTemplateField() {
-  if (!templateDetails.value || !newTemplateField.name.trim()) {
-    error.value = "Укажите название нового атрибута.";
-    return;
-  }
-  const result = await run("field-create", () =>
-    api.createField(templateDetails.value!.id, { ...newTemplateField }),
-  );
-  if (!result) return;
-  templateDetails.value = result;
-  newTemplateField.name = "";
-  showNewTemplateField.value = false;
-  await loadWorkspace();
-  notify("Атрибут добавлен");
-}
-
-async function removeTemplateField(field: NonNullable<AttributeTemplate["fields"]>[number]) {
-  const requestKey = `field-remove-${field.id}`;
-  if (!templateDetails.value || busy.value === requestKey) return;
-  if (!await confirmAction({
-    title: `Удалить атрибут «${field.name}»?`,
-    description: "Заполненные значения товаров сохранятся как дополнительные атрибуты.",
-    confirmLabel: "Удалить атрибут",
-    color: "error",
-  })) return;
-  const previous = templateDetails.value;
-  const remainingFields = (previous.fields || []).filter((item) => item.id !== field.id);
-  templateDetails.value = { ...previous, fields: remainingFields, field_count: remainingFields.length };
-  workspace.value = {
-    ...workspace.value,
-    templates: workspace.value.templates.map((item) => item.id === previous.id
-      ? { ...item, field_count: remainingFields.length }
-      : item),
-  };
-  const result = await run(requestKey, () => api.removeField(field.id));
-  if (!result) {
-    templateDetails.value = previous;
-    workspace.value = {
-      ...workspace.value,
-      templates: workspace.value.templates.map((item) => item.id === previous.id
-        ? { ...item, field_count: previous.field_count }
-        : item),
-    };
-    return;
-  }
-  const revisions = await api.templateRevisions(previous.id).catch(() => null);
-  if (revisions) templateRevisions.value = revisions.items;
-  notify("Атрибут удалён");
-}
-
-async function restoreTemplateVersion(id: number) {
-  if (!templateDetails.value || !await confirmAction({
-    title: "Восстановить версию шаблона?",
-    description: "Текущая структура и значения шаблона будут заменены выбранной версией.",
-    confirmLabel: "Восстановить",
-  })) return;
-  const result = await run("template-restore", () => api.restoreTemplate(templateDetails.value!.id, id));
-  if (result) {
-    templateDetails.value = result;
-    await openTemplate(result.id);
-  }
-}
-
-function editField(field: NonNullable<AttributeTemplate["fields"]>[number]) {
-  error.value = "";
-  templateFieldEditor.value = {
-    id: field.id,
-    name: field.name,
-    synonyms: [...(field.synonyms || [])],
-    synonymDraft: "",
-    group_name: field.group_name,
-    value_type: field.value_type,
-    is_composite: field.is_composite,
-    conversion_rules: JSON.stringify(field.conversion_rules || [], null, 2),
-  };
-}
-
-function addTemplateFieldSynonym() {
-  const editor = templateFieldEditor.value;
-  if (!editor) return;
-  const synonym = editor.synonymDraft.trim();
-  if (!synonym) return;
-  const key = synonym.toLocaleLowerCase("ru-RU");
-  if (key === editor.name.trim().toLocaleLowerCase("ru-RU")) {
-    error.value = "Синоним не должен совпадать с названием атрибута.";
-    return;
-  }
-  if (editor.synonyms.some((item) => item.toLocaleLowerCase("ru-RU") === key)) {
-    error.value = "Такой синоним уже добавлен.";
-    return;
-  }
-  editor.synonyms.push(synonym);
-  editor.synonymDraft = "";
-  error.value = "";
-}
-
-function removeTemplateFieldSynonym(index: number) {
-  templateFieldEditor.value?.synonyms.splice(index, 1);
-}
-
-async function saveTemplateFieldEdit() {
-  const editor = templateFieldEditor.value;
-  if (!editor || !editor.name.trim()) return;
-  if (editor.synonymDraft.trim()) addTemplateFieldSynonym();
-  if (templateFieldEditor.value?.synonymDraft.trim()) return;
-  let conversionRules: unknown;
-  try {
-    conversionRules = JSON.parse(editor.conversion_rules || "[]");
-    if (!Array.isArray(conversionRules)) throw new Error("not an array");
-  } catch {
-    error.value = "Правила конвертации должны быть корректным JSON-массивом.";
-    return;
-  }
-  const result = await run(`field-${editor.id}`, () => api.updateField(editor.id, {
-    name: editor.name,
-    synonyms: editor.synonyms,
-    group_name: editor.group_name,
-    value_type: editor.value_type,
-    is_composite: editor.is_composite,
-    conversion_rules: conversionRules,
-  }));
-  if (!result) return;
-  templateDetails.value = result;
-  templateFieldEditor.value = null;
-  notify("Атрибут и синонимы обновлены");
-}
-
-function addFieldValue(field: NonNullable<AttributeTemplate["fields"]>[number]) {
-  fieldValueEditor.value = {
-    fieldId: field.id,
-    fieldName: field.name,
-    value: "",
-    synonym: "",
-  };
-}
-
-async function saveFieldValue() {
-  const editor = fieldValueEditor.value;
-  if (!editor?.value.trim()) return;
-  const result = await run(
-    `field-value-${editor.fieldId}`,
-    () => api.addAllowedValue(editor.fieldId, editor.value, editor.synonym),
-  );
-  if (!result || !templateDetails.value) return;
-  fieldValueEditor.value = null;
-  await openTemplate(templateDetails.value.id);
-  notify("Значение добавлено");
-}
-
-function editAllowedValue(fieldName: string, allowed: AttributeAllowedValue) {
-  error.value = "";
-  allowedValueEditor.value = {
-    id: allowed.id,
-    fieldName,
-    value: allowed.value,
-    synonyms: [...(allowed.synonyms || [])],
-    synonymDraft: "",
-  };
-}
-
-function closeAllowedValueEditor() {
-  const editor = allowedValueEditor.value;
-  if (editor && busy.value === `allowed-${editor.id}`) return;
-  allowedValueEditor.value = null;
-}
-
-function addAllowedValueSynonym() {
-  const editor = allowedValueEditor.value;
-  if (!editor) return;
-  const synonym = editor.synonymDraft.trim();
-  if (!synonym) return;
-  const key = synonym.toLocaleLowerCase("ru-RU");
-  if (key === editor.value.trim().toLocaleLowerCase("ru-RU")) {
-    error.value = "Синоним не должен совпадать с разрешённым значением.";
-    return;
-  }
-  if (editor.synonyms.some((item) => item.toLocaleLowerCase("ru-RU") === key)) {
-    error.value = "Такой синоним уже добавлен.";
-    return;
-  }
-  editor.synonyms.push(synonym);
-  editor.synonymDraft = "";
-  error.value = "";
-}
-
-function removeAllowedValueSynonym(index: number) {
-  allowedValueEditor.value?.synonyms.splice(index, 1);
-}
-
-async function saveAllowedValue() {
-  const editor = allowedValueEditor.value;
-  if (!editor) return;
-  const value = editor.value.trim();
-  if (!value) {
-    error.value = "Разрешённое значение не может быть пустым.";
-    return;
-  }
-  if (editor.synonymDraft.trim()) addAllowedValueSynonym();
-  if (allowedValueEditor.value?.synonymDraft.trim()) return;
-  const result = await run(`allowed-${editor.id}`, () => api.updateAllowedValue(editor.id, {
-    value,
-    synonyms: editor.synonyms,
-  }));
-  if (!result) return;
-  patchAllowedValue(editor.id, result.value);
-  if (templateDetails.value) templateDetails.value = { ...templateDetails.value, version: result.template_version };
-  allowedValueEditor.value = null;
-  notify("Значение и синонимы сохранены");
-}
-
-function patchAllowedValue(id: number, values: Partial<{ value: string; is_active: boolean; is_combination: boolean; synonyms: string[] }>) {
-  if (!templateDetails.value?.fields) return;
-  templateDetails.value = {
-    ...templateDetails.value,
-    fields: templateDetails.value.fields.map((field) => ({
-      ...field,
-      allowed_values: field.allowed_values.map((allowed) => allowed.id === id ? { ...allowed, ...values } : allowed),
-    })),
-  };
-}
-
-function allowedValueMenuItems(fieldName: string, allowed: AttributeAllowedValue) {
-  return [
-    {
-      label: "Значение и синонимы",
-      icon: "i-lucide-pencil",
-      onSelect: () => editAllowedValue(fieldName, allowed),
-    },
-    {
-      label: allowed.is_active ? "Отключить" : "Включить",
-      icon: allowed.is_active ? "i-lucide-circle-off" : "i-lucide-circle-check",
-      disabled: busy.value === `allowed-${allowed.id}`,
-      onSelect: () => void toggleAllowedValue(allowed.id, allowed.is_active),
-    },
-  ];
-}
-
-async function toggleAllowedValue(id: number, active: boolean) {
-  const nextActive = !active;
-  patchAllowedValue(id, { is_active: nextActive });
-  const result = await run(`allowed-${id}`, () => api.updateAllowedValue(id, { is_active: !active }));
-  if (!result) {
-    patchAllowedValue(id, { is_active: active });
-    return;
-  }
-  patchAllowedValue(id, result.value || { is_active: nextActive });
-  if (templateDetails.value) templateDetails.value = { ...templateDetails.value, version: result.template_version };
-  notify(nextActive ? "Значение включено" : "Значение отключено");
-}
-async function createBatch() {
-  if (inputMode.value === "csv") {
-    if (!productFile.value || !selectedTemplateId.value) {
-      error.value = "Выберите CSV товаров и шаблон категории.";
-      return;
-    }
-    const batch = await run("batch-import", () =>
-      api.importBatch(
-        productFile.value!,
-        selectedTemplateId.value!,
-        processingMode.value,
-      ),
-    );
-    if (batch) await openBatch(batch.id);
-    return;
-  }
-  const urls = urlsText.value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-  if (!urls.length) {
-    error.value = "Вставьте хотя бы одну ссылку.";
-    return;
-  }
-  const batch = await run("url-import", () =>
-    api.importUrls(urls, selectedTemplateId.value, processingMode.value),
-  );
-  if (batch) await openBatch(batch.id);
-}
-
-function clearBatchOperationPoll() {
-  if (batchOperationPoll) clearTimeout(batchOperationPoll);
-  batchOperationPoll = null;
-}
-
-function currentProductOverrides(): Record<string, Record<string, string>> {
-  if (!selectedProduct.value) return {};
-  return { [String(selectedProduct.value.id)]: { ...donorUrlOverrides.value } };
-}
-
-function scheduleBatchOperationPoll(batchId: number, delay = 1400) {
-  clearBatchOperationPoll();
-  batchOperationPoll = setTimeout(() => void loadBatchOperation(batchId), delay);
-}
-
-async function loadBatchOperation(batchId: number) {
-  try {
-    const previous = batchOperation.value;
-    const operation = await api.batchOperation(batchId);
-    if (selectedBatch.value?.id !== batchId) return;
-    batchOperation.value = operation;
-    if (["queued", "running"].includes(operation.status)) {
-      scheduleBatchOperationPoll(batchId);
-      return;
-    }
-    clearBatchOperationPoll();
-    const justFinished = previous?.id === operation.id
-      && ["queued", "running"].includes(previous.status)
-      && ["completed", "failed"].includes(operation.status);
-    if (!justFinished) return;
-    await refreshBatch();
-    const productId = selectedProduct.value?.id;
-    if (productId && selectedBatch.value?.id === batchId) {
-      await openProduct(productId, { syncRoute: false, resetAttributeFilter: false });
-    }
-    const summary = "Обработано: " + operation.processed
-      + " · успешно: " + operation.succeeded
-      + " · ошибок: " + operation.failed;
-    if (operation.status === "failed") {
-      toast.add({ title: "Массовая операция остановлена", description: operation.error || summary, color: "error" });
-    } else if (operation.failed) {
-      toast.add({ title: "Массовая операция завершена с ошибками", description: summary, color: "warning" });
-    } else {
-      notify("Массовая операция завершена · " + summary);
-    }
-  } catch (caught) {
-    if (selectedBatch.value?.id !== batchId) return;
-    clearBatchOperationPoll();
-    error.value = errorMessage(caught);
-    if (!batchOperation.value || batchOperationRunning.value) {
-      scheduleBatchOperationPoll(batchId, 5000);
-    }
-  }
-}
-
-async function processAllProducts() {
-  if (!selectedBatch.value || !selectedDonors.value.length || batchOperationRunning.value) return;
-  const total = selectedBatch.value.summary.products;
-  if (!await confirmAction({
-    title: "Найти и проверить все товары (" + total + ")?",
-    description: "Выбранные доноры будут применены ко всей текущей обработке. Для неё используется один общий браузерный сеанс.",
-    confirmLabel: "Начать проверку",
-  })) return;
-  const result = await run("process-all", () =>
-    api.processBatch(
-      selectedBatch.value!.id,
-      selectedDonors.value,
-      currentProductOverrides(),
-    ),
-  );
-  if (!result) return;
-  batchOperation.value = result;
-  scheduleBatchOperationPoll(result.batch_id);
-  notify("Проверка запущена для " + result.total + " товаров");
-}
-
-async function askChatGptForAllProducts() {
-  if (!selectedBatch.value || batchOperationRunning.value) return;
-  if (!chatGpt.value?.authenticated) {
-    error.value = "Сначала подключите ChatGPT в блоке подключения выше.";
-    return;
-  }
-  const total = selectedBatch.value.summary.products;
-  if (!await confirmAction({
-    title: "Спросить ChatGPT по всем товарам (" + total + ")?",
-    description: "Каждый товар будет отправлен ChatGPT отдельным запросом. Запросы выполняются параллельно с ограничением нагрузки; ошибка одного товара не останавливает остальные.",
-    confirmLabel: "Начать анализ",
-  })) return;
-  const result = await run("chatgpt-all", () =>
-    api.analyzeBatchWithChatGpt(
-      selectedBatch.value!.id,
-      selectedDonors.value,
-      currentProductOverrides(),
-    ),
-  );
-  if (!result) return;
-  batchOperation.value = result;
-  scheduleBatchOperationPoll(result.batch_id);
-  notify("ChatGPT-анализ запущен для " + result.total + " товаров");
-}
-
-async function openBatch(
-  id: number,
-  requestedProductId: number | null = null,
-  options: { syncRoute?: boolean; resetFilters?: boolean } = {},
-) {
-  const syncRoute = options.syncRoute ?? true;
-  const resetFilters = options.resetFilters ?? true;
-  const batchChanged = selectedBatch.value?.id !== id;
-  if (resetFilters && batchChanged) {
-    productQuery.value = "";
-    productStatusFilter.value = ALL_FILTER_VALUE;
-    attributeStatusFilter.value = ALL_FILTER_VALUE;
-  }
-  const batch = await run("batch", () => api.batch(id));
-  if (!batch) return false;
-  clearBatchOperationPoll();
-  batchOperation.value = null;
-  selectedBatch.value = batch;
-  void loadBatchOperation(id);
-
-  tab.value = "review";
-  const requested = requestedProductId
-    ? batch.products?.find((product) => product.id === requestedProductId)
-    : null;
-  const first = requested || batch.products?.[0];
-  if (first) {
-    await openProduct(first.id, {
-      syncRoute: false,
-      resetAttributeFilter: resetFilters && selectedProduct.value?.id !== first.id,
-    });
-  }
-  else selectedProduct.value = null;
-  if (syncRoute) await writeAssistantRoute("push");
-  return true;
-}
-
-async function removeBatch(batch: AttributeBatch) {
-  const requestKey = `batch-remove-${batch.id}`;
-  if (busy.value === requestKey) return;
-  if (!await confirmAction({
-    title: `Удалить обработку «${batch.name}»?`,
-    description: "Будут удалены загруженный CSV, отчёты, страницы доноров и все результаты этой обработки. Шаблон останется.",
-    confirmLabel: "Удалить обработку",
-    color: "error",
-  })) return;
-  const result = await run(requestKey, () => api.removeBatch(batch.id));
-  if (!result) return;
-  if (selectedBatch.value?.id === batch.id) {
-    clearBatchOperationPoll();
-    batchOperation.value = null;
-    selectedBatch.value = null;
-    selectedProduct.value = null;
-
-    historyItems.value = [];
-    tab.value = "start";
-    await writeAssistantRoute("replace");
-  }
-  await loadWorkspace();
-  notify(`Обработка удалена · товаров: ${result.deleted.products}, файлов: ${result.deleted.files}`);
-}
-
-async function refreshProductHistory(productId = selectedProduct.value?.id) {
-  if (!productId) {
-    historyItems.value = [];
-    return;
-  }
-  try {
-    const history = await api.productHistory(productId);
-    if (selectedProduct.value?.id === productId) historyItems.value = history.items;
-  } catch {
-    error.value = "Не удалось обновить историю изменений товара.";
-  }
-}
-
-async function openProduct(
-  id: number,
-  options: { syncRoute?: boolean; resetAttributeFilter?: boolean } = {},
-) {
-  const syncRoute = options.syncRoute ?? true;
-  const resetAttributeFilter = options.resetAttributeFilter ?? true;
-  if (resetAttributeFilter && selectedProduct.value?.id !== id) {
-    attributeStatusFilter.value = ALL_FILTER_VALUE;
-  }
-  const token = ++productRequestToken;
-  loadingProductId.value = id;
-  error.value = "";
-  let product: AttributeProduct;
-  try {
-    product = await api.product(id);
-  } catch (caught) {
-    if (token === productRequestToken) error.value = errorMessage(caught);
-    return false;
-  } finally {
-    if (token === productRequestToken) loadingProductId.value = null;
-  }
-  if (token !== productRequestToken) return false;
-  selectedProduct.value = product;
-  historyItems.value = [];
-  selectedDonors.value = [...(product.selected_donor_ids || [])];
-  donorUrlOverrides.value = { ...(product.donor_url_overrides || {}) };
-  resetAllowedOptionState();
-  void Promise.all([
-    api.donorRecommendations(id).catch(() => ({ items: [] })),
-    api.productHistory(id).catch(() => ({ items: [] })),
-  ]).then(([recommendations, history]) => {
-    if (token !== productRequestToken) return;
-    donorRecommendations.value = recommendations.items;
-    historyItems.value = history.items;
-    if (!selectedDonors.value.length) {
-      selectedDonors.value = recommendations.items.filter((item) => item.recommended).slice(0, 4).map((item) => item.id);
-    }
-  });
-  if (syncRoute) await writeAssistantRoute("push");
-  return true;
-}
-
-function toggleDonor(id: number) {
-  selectedDonors.value = selectedDonors.value.includes(id)
-    ? selectedDonors.value.filter((item) => item !== id)
-    : [...selectedDonors.value, id];
-}
-
-function moveDonor(index: number, direction: number) {
-  const next = index + direction;
-  if (next < 0 || next >= selectedDonors.value.length) return;
-  const copy = [...selectedDonors.value];
-  const current = copy[index];
-  const target = copy[next];
-  if (current === undefined || target === undefined) return;
-  copy[index] = target; copy[next] = current;
-  selectedDonors.value = copy;
-}
-
-async function processDonors() {
-  if (!selectedProduct.value || !selectedDonors.value.length) {
-    error.value = "Выберите доноров в порядке приоритета.";
-    return;
-  }
-  const result = await run("process", () =>
-    api.processProduct(selectedProduct.value!.id, selectedDonors.value, donorUrlOverrides.value),
-  );
-  if (result) {
-    selectedProduct.value = result.product;
-    await refreshBatch();
-    const reports = result.report.reports || [];
-    const opened = reports.filter((item) => ["parsed", "no_attributes"].includes(item.status)).length;
-    const found = reports.reduce((sum, item) => sum + (item.attributes_found || 0), 0);
-    const mapped = reports.reduce((sum, item) => sum + (item.mapped || 0), 0);
-    const ambiguous = reports.reduce((sum, item) => sum + (item.ambiguous || 0), 0);
-    const unknown = reports.reduce((sum, item) => sum + (item.unknown || 0), 0);
-    const alreadyFilled = reports.reduce((sum, item) => sum + (item.already_filled || 0), 0);
-    const failed = reports.length - opened;
-    notify(
-      `Страниц открыто: ${opened} · характеристик извлечено: ${found} · предложений: ${mapped}`
-      + (alreadyFilled ? ` · уже заполнено: ${alreadyFilled}` : "")
-      + (ambiguous ? ` · требуют сопоставления: ${ambiguous}` : "")
-      + (unknown ? ` · вне справочника: ${unknown}` : "")
-      + (failed ? ` · проблем: ${failed}` : ""),
-    );
-  }
-}
-
-async function useSimilar() {
-  if (!selectedProduct.value) return;
-  const result = await run("similar", () => api.useSimilar(selectedProduct.value!.id));
-  if (result) {
-    selectedProduct.value = result.product;
-    await refreshBatch();
-    notify(`Добавлено предложений: ${result.changed}`);
-  }
-}
-
-async function askChatGpt() {
-  if (!selectedProduct.value) return;
-  if (!chatGpt.value?.authenticated) {
-    error.value = "Сначала подключите ChatGPT в блоке подключения выше.";
-    return;
-  }
-  const result = await run("chatgpt-product", () =>
-    api.analyzeProductWithChatGpt(
-      selectedProduct.value!.id,
-      selectedDonors.value,
-      donorUrlOverrides.value,
-    ),
-  );
-  if (!result) return;
-  selectedProduct.value = result.product;
-  await refreshBatch();
-  const warnings = result.analysis.warnings.length;
-  notify(
-    warnings
-      ? `ChatGPT: предложений ${result.changed}, предупреждений ${warnings}`
-      : `ChatGPT: добавлено предложений ${result.changed}`,
-  );
-}
-
-async function assignCurrentTemplate(selection: unknown) {
-  if (!selectedProduct.value) return;
-  const templateId = Number(selection);
-  if (!templateId) return;
-  const result = await run("assign-template", () => api.assignTemplate(selectedProduct.value!.id, templateId));
-  if (result) {
-    selectedProduct.value = result;
-    await refreshBatch();
-  }
-}
-
-
-async function exportReadyOnly() {
-  if (!selectedBatch.value) return;
-  const result = await run("export-ready", () => api.export(selectedBatch.value!.id, true));
-  if (result) window.location.href = `/api/attribute-assistant/batches/${selectedBatch.value.id}/download`;
-}
-
-function formatHistoryDate(value: string) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? value
-    : new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(date);
-}
-
-async function restoreHistory(id: number) {
-  if (!selectedProduct.value || !await confirmAction({
-    title: "Восстановить состояние товара?",
-    description: "Текущие решения по атрибутам будут заменены выбранным состоянием.",
-    confirmLabel: "Восстановить",
-  })) return;
-  const product = await run("history-restore", () => api.restoreProduct(selectedProduct.value!.id, id));
-  if (product) {
-    selectedProduct.value = product;
-    await openProduct(product.id);
-    await refreshBatch();
-  }
-}
-
-function optionsFor(value: AttributeValue) {
-  const loaded = allowedOptionCache.value[value.id] || value.allowed_values;
-  const result = [...loaded];
-  const pinned = [value.final_value, displayedProposal(value)]
-    .flatMap((item) => value.is_composite ? item.split("/") : [item])
-    .map((item) => item.trim())
-    .filter((item) => item && item !== "-");
-  for (const item of [...new Set(pinned)].reverse()) {
-    if (!result.some((option) => option.value === item)) {
-      result.unshift({ id: -result.length - 1, value: item });
-    }
-  }
-  return result;
-}
-
-function setAllowedSearchLoading(valueId: number, loading: boolean) {
-  const next = new Set(searchingAllowedValueIds.value);
-  if (loading) next.add(valueId);
-  else next.delete(valueId);
-  searchingAllowedValueIds.value = next;
-}
-
-async function searchAllowed(value: AttributeValue, query: string) {
-  if (!value.field_id) return;
-  const normalizedQuery = query.trim();
-  const token = (allowedRequestTokens.get(value.id) || 0) + 1;
-  allowedRequestTokens.set(value.id, token);
-  setAllowedSearchLoading(value.id, true);
-  const result = await api.allowedValues(
-    value.field_id,
-    normalizedQuery,
-    false,
-    0,
-    ALLOWED_OPTIONS_PAGE_SIZE,
-  ).catch(() => null);
-  if (
-    result
-    && allowedRequestTokens.get(value.id) === token
-    && allowedSearchQueries.value[value.id] === normalizedQuery
-  ) {
-    allowedOptionCache.value = { ...allowedOptionCache.value, [value.id]: result.values };
-    allowedOptionPages.value = {
-      ...allowedOptionPages.value,
-      [value.id]: {
-        query: normalizedQuery,
-        total: result.total,
-        matched: result.matched,
-        hasMore: result.has_more,
-      },
-    };
-  }
-  if (allowedRequestTokens.get(value.id) === token) {
-    setAllowedSearchLoading(value.id, false);
-    await nextTick();
-    checkAllowedMenus(value.id);
-  }
-}
-
-async function loadMoreAllowed(value: AttributeValue) {
-  if (!value.field_id || searchingAllowedValueIds.value.has(value.id)) return;
-  const page = allowedOptionPages.value[value.id];
-  if (!page?.hasMore || page.query !== (allowedSearchQueries.value[value.id] || "")) return;
-  const token = (allowedRequestTokens.get(value.id) || 0) + 1;
-  allowedRequestTokens.set(value.id, token);
-  setAllowedSearchLoading(value.id, true);
-  const loaded = allowedOptionCache.value[value.id] || [];
-  const result = await api.allowedValues(
-    value.field_id,
-    page.query,
-    false,
-    loaded.length,
-    ALLOWED_OPTIONS_PAGE_SIZE,
-  ).catch(() => null);
-  if (
-    result
-    && allowedRequestTokens.get(value.id) === token
-    && allowedSearchQueries.value[value.id] === page.query
-  ) {
-    const merged = [...loaded];
-    const known = new Set(merged.map((item) => item.id));
-    for (const item of result.values) {
-      if (!known.has(item.id)) merged.push(item);
-    }
-    allowedOptionCache.value = { ...allowedOptionCache.value, [value.id]: merged };
-    allowedOptionPages.value = {
-      ...allowedOptionPages.value,
-      [value.id]: {
-        query: page.query,
-        total: result.total,
-        matched: result.matched,
-        hasMore: result.has_more,
-      },
-    };
-  }
-  if (allowedRequestTokens.get(value.id) === token) {
-    setAllowedSearchLoading(value.id, false);
-    await nextTick();
-    checkAllowedMenus(value.id);
-  }
-}
-
-function queueAllowedSearch(value: AttributeValue, query: string) {
-  const normalizedQuery = query.trim();
-  allowedSearchQueries.value = { ...allowedSearchQueries.value, [value.id]: normalizedQuery };
-  const previous = allowedSearchTimers.get(value.id);
-  if (previous) clearTimeout(previous);
-  allowedSearchTimers.set(value.id, setTimeout(() => {
-    allowedSearchTimers.delete(value.id);
-    void searchAllowed(value, normalizedQuery);
-  }, 250));
-}
-
-async function ensureAllowedOptions(value: AttributeValue, open: boolean) {
-  if (!open || !value.field_id || searchingAllowedValueIds.value.has(value.id)) return;
-  const page = allowedOptionPages.value[value.id];
-  if (page?.query === "" && allowedOptionCache.value[value.id]) return;
-  allowedSearchQueries.value = { ...allowedSearchQueries.value, [value.id]: "" };
-  await searchAllowed(value, "");
-}
-
-function finalAllowedMenuKey(value: AttributeValue) {
-  return `final-${value.id}`;
-}
-
-function unknownAllowedMenuKey(value: AttributeValue, index: number) {
-  return `unknown-${value.id}-${index}`;
-}
-
-function clearAllowedScrollBinding(key: string) {
-  allowedScrollBindings.get(key)?.cleanup();
-  allowedScrollBindings.delete(key);
-}
-
-function setAllowedSelectRef(key: string, instance: unknown) {
-  if (!instance) {
-    clearAllowedScrollBinding(key);
-    allowedSelectRefs.delete(key);
-    return;
-  }
-  allowedSelectRefs.set(key, instance as AllowedSelectInstance);
-}
-
-function allowedSelectRef(key: string) {
-  let callback = allowedSelectRefCallbacks.get(key);
-  if (!callback) {
-    callback = (instance: unknown) => setAllowedSelectRef(key, instance);
-    allowedSelectRefCallbacks.set(key, callback);
-  }
-  return callback;
-}
-
-function allowedViewport(instance: AllowedSelectInstance | undefined): HTMLElement | null {
-  const exposed = instance?.viewportRef;
-  if (exposed instanceof HTMLElement) return exposed;
-  return exposed?.value instanceof HTMLElement ? exposed.value : null;
-}
-
-function checkAllowedMenus(valueId: number) {
-  for (const binding of allowedScrollBindings.values()) {
-    if (binding.valueId === valueId) binding.check();
-  }
-}
-
-async function handleAllowedMenuOpen(
-  value: AttributeValue,
-  key: string,
-  open: boolean,
-) {
-  clearAllowedScrollBinding(key);
-  if (!open) return;
-  await ensureAllowedOptions(value, true);
-  await nextTick();
-  const viewport = allowedViewport(allowedSelectRefs.get(key));
-  if (!viewport) return;
-  const check = () => {
-    if (viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 48) {
-      void loadMoreAllowed(value);
-    }
-  };
-  viewport.addEventListener("scroll", check, { passive: true });
-  allowedScrollBindings.set(key, {
-    valueId: value.id,
-    check,
-    cleanup: () => viewport.removeEventListener("scroll", check),
-  });
-  check();
-}
-
-function resetAllowedOptionState() {
-  for (const binding of allowedScrollBindings.values()) binding.cleanup();
-  allowedScrollBindings.clear();
-  allowedSelectRefs.clear();
-  allowedSelectRefCallbacks.clear();
-  allowedOptionCache.value = {};
-  allowedOptionPages.value = {};
-  allowedSearchQueries.value = {};
-  searchingAllowedValueIds.value = new Set();
-  allowedRequestTokens.clear();
-  for (const timer of allowedSearchTimers.values()) clearTimeout(timer);
-  allowedSearchTimers.clear();
-}
-
-function selectedFinalParts(value: AttributeValue) {
-  const selected = value.status === "rejected" ? value.final_value : value.final_value || displayedProposal(value);
-  return new Set(selected.split("/").map((item) => item.trim()).filter(Boolean));
-}
-function sourceStatusText(
-  status: string,
-  attributesFound = 0,
-  mapped = 0,
-  ambiguous = 0,
-  unknown = 0,
-  alreadyFilled = 0,
-) {
-  if (status === "parsed") return `Извлечено: ${attributesFound} · сопоставлено: ${mapped} · проверено заполненных: ${alreadyFilled} · не сопоставлено: ${ambiguous} · вне справочника: ${unknown}`;
-  if (status === "resolved") return "Ссылка найдена";
-  if (status === "no_attributes") return "Страница открыта, характеристик нет";
-  if (status === "not_found") return "Не найдена";
-  if (status === "error") return "Ошибка";
-  return status || "Нет данных";
-}
-
-function sourceTitle(source: string) {
-  const labels: Record<string, string> = {
-    current_csv: "Исходный CSV сайта",
-    own_site: "Официальный сайт",
-    manual: "Ручной выбор",
-    similar: "Похожий товар",
-    ai: "ChatGPT",
-  };
-  return labels[source] || source || "Источник";
-}
-
-function sourceKind(source: AttributeSource) {
-  if (source.source_type) return source.source_type;
-  if (source.role === "chatgpt") return "chatgpt";
-  if (source.donor_id) return "donor";
- return "site";
-}
-
-function sourceKindLabel(source: AttributeSource) {
-  return {
-    chatgpt: "ChatGPT",
-    donor: "Донор",
-    site: "Страница сайта",
- }[sourceKind(source)];
-}
-
-function bestCandidate(value: AttributeValue) {
-  return [...(value.source_details.candidates || [])].sort((left, right) => {
-    const priorityDifference = (left.priority ?? 999) - (right.priority ?? 999);
-    return priorityDifference || (right.confidence ?? 0) - (left.confidence ?? 0);
-  })[0];
-}
-
-function displayedProposal(value: AttributeValue) {
-  return value.proposed_value || bestCandidate(value)?.value || "";
-}
-
-function isTechnicalDash(value: string) {
-  return /^[-–—−]$/u.test(value.trim());
-}
-
-function displayedProposalSource(value: AttributeValue) {
-  const candidate = bestCandidate(value);
-  return sourceTitle(value.proposed_value ? value.source : candidate?.source || "");
-}
-
-function displayedProposalConfidence(value: AttributeValue) {
-  return value.confidence || bestCandidate(value)?.confidence || 0;
-}
-
-function valueStatusLabel(value: AttributeValue) {
-  if (!value.is_in_template) return "Вне шаблона";
-  if (value.status === "conflict") return "Конфликт";
-  if (value.status === "unknown") return "Нет в справочнике";
-  if (value.status === "dash") return "Технический пропуск";
-  if (value.status === "rejected") return "Отклонено";
-  if (value.current_value) return value.source === "current_site" ? "Сохранено со страницы" : "Сохранено из CSV";
-  if (value.status === "approved") return "Принято";
-  if (value.status === "suggested") return "Нужно проверить";
-  return "Не заполнено";
-}
-
-function currentValueCaption(value: AttributeValue) {
-  if (value.current_value) {
-    return value.source === "current_site" || selectedBatch.value?.input_mode === "urls"
-      ? "Исходная страница сайта"
-      : "Исходный CSV сайта";
-  }
-  return selectedBatch.value?.input_mode === "urls" ? "На странице не найдено" : "В файле не заполнено";
-}
-
-function valueStatusColor(value: AttributeValue): "error" | "warning" | "success" | "neutral" {
-  if (!value.is_in_template) return "warning";
-  if (value.status === "conflict" || value.status === "rejected") return "error";
-  if (value.status === "unknown") return "warning";
-  if (value.current_value || value.status === "approved") return "success";
-  return "neutral";
-}
-
-async function valueAction(value: AttributeValue, action: "accept" | "reject" | "dash", manual = "") {
-  const dashReason = action === "dash"
-    ? await promptValue({
-        title: "Технический пропуск",
-        label: "Причина",
-        defaultValue: "Не найдено после проверки источников",
-        confirmLabel: "Поставить «-»",
-      }) || ""
-    : "";
-  if (action === "dash" && !dashReason) return;
-  const updated = await run(`value-${value.id}`, () =>
-    api.updateValue(value.id, { action, value: manual, dash_reason: dashReason }),
-  );
-  if (!updated || !selectedProduct.value?.values) return;
-  const index = selectedProduct.value.values.findIndex((item) => item.id === updated.id);
-  if (index >= 0) selectedProduct.value.values[index] = updated;
-  await refreshBatch();
-}
-
-async function removeOutsideTemplateValue(value: AttributeValue) {
-  if (value.is_in_template) return;
-  if (!await confirmAction({
-    title: `Удалить атрибут «${value.name}»?`,
-    description: "Он исчезнет из текущей обработки и последующих экспортов. Шаблон не изменится.",
-    confirmLabel: "Удалить атрибут",
-    color: "error",
-  })) return;
-  const result = await run(`value-remove-${value.id}`, () => api.removeExtraValue(value.id));
-  if (!result) return;
-  selectedProduct.value = result.product;
-  await refreshBatch();
-  notify("Атрибут вне шаблона удалён");
-}
-
-function selectedFinalValue(value: AttributeValue) {
-  if (value.final_value && value.final_value !== "-") return value.final_value;
-  if (value.status === "rejected") return "";
-  return displayedProposal(value);
-}
-
-async function selectFinalValue(value: AttributeValue, selection: unknown) {
-  const parts = (Array.isArray(selection) ? selection : [selection])
-    .filter((item): item is string => typeof item === "string" && Boolean(item));
-  const selected = value.is_composite
-    ? parts.sort((left, right) => left.localeCompare(right, "ru")).join("/")
-    : parts[0] || "";
-  if (!selected) return;
-  await valueAction(value, "accept", selected);
-  if (!error.value) {
-    notify(`Итог для «${value.name}» сохранён`);
-  }
-}
-
-async function addUnknown(value: AttributeValue, unknown: NonNullable<AttributeValue["source_details"]["unknown_values"]>[number]) {
-  if (!value.field_id) return;
-  const confirmed = await confirmAction({
-    title: `Добавить «${unknown.value}» в справочник?`,
-    description: "Значение станет разрешённым для этого атрибута и будет применено к товару.",
-    confirmLabel: "Добавить и применить",
-  });
-  if (!confirmed) return;
-  const result = await run(`dictionary-${value.id}`, async () => {
-    await api.addAllowedValue(value.field_id!, unknown.value);
-    return api.updateValue(value.id, { action: "accept", value: unknown.value });
-  });
-  if (result && selectedProduct.value?.values) {
-    const index = selectedProduct.value.values.findIndex((item) => item.id === result.id);
-    if (index >= 0) selectedProduct.value.values[index] = result;
-    await refreshBatch();
-    notify("Значение добавлено в справочник");
-  }
-}
-
-function unknownSelectionKey(value: AttributeValue, index: number) {
-  return `${value.id}:${index}`;
-}
-
-async function rememberUnknownValue(
-  value: AttributeValue,
-  unknown: NonNullable<AttributeValue["source_details"]["unknown_values"]>[number],
-  index: number,
-) {
-  const allowedValueId = unknownSelections.value[unknownSelectionKey(value, index)];
-  if (!unknown.donor_id || !allowedValueId) {
-    error.value = "Выберите разрешённое значение для этого донора.";
-    return;
-  }
-  const result = await run(`value-mapping-${value.id}-${index}`, () =>
-    api.rememberValueMapping(value.id, {
-      donor_id: unknown.donor_id!,
-      raw_value: unknown.value,
-      allowed_value_id: allowedValueId,
-    }),
-  );
-  if (!result || !selectedProduct.value?.values) return;
-  const valueIndex = selectedProduct.value.values.findIndex((item) => item.id === result.value.id);
-  if (valueIndex >= 0) selectedProduct.value.values[valueIndex] = result.value;
-  delete unknownSelections.value[unknownSelectionKey(value, index)];
-  await refreshBatch();
-  notify("Значение применено и запомнено для донора");
-}
-
-async function refreshBatch() {
-  if (!selectedBatch.value) return;
-  const batch = await api.batch(selectedBatch.value.id);
-  selectedBatch.value = batch;
-  const index = workspace.value.batches.findIndex((item) => item.id === batch.id);
-  if (index >= 0) workspace.value.batches[index] = batch;
-  await refreshProductHistory();
-}
-
-async function bulk(action: "accept_high" | "fill_dashes") {
-  if (!selectedBatch.value) return;
-  const confirmed = await confirmAction({
-    title: action === "accept_high" ? "Принять уверенные предложения?" : "Заполнить технические пропуски?",
-    description: action === "accept_high"
-      ? "Будут подтверждены все предложения с уверенностью от 90%."
-      : "Во все оставшиеся неконфликтные поля будет поставлен технический пропуск.",
-    confirmLabel: action === "accept_high" ? "Принять" : "Заполнить",
-  });
-  if (!confirmed) return;
-  const result = await run("bulk", () =>
-    api.bulk(selectedBatch.value!.id, {
-      action,
-      minimum_confidence: 90,
-      dash_reason: "Не найдено после проверки источников",
-    }),
-  );
-  if (result) {
-    selectedBatch.value = result.batch;
-    if (selectedProduct.value) await openProduct(selectedProduct.value.id);
-    notify(`Изменено значений: ${result.changed}`);
-  }
-}
-
-async function exportBatch() {
-  if (!selectedBatch.value) return;
-  const result = await run("export", () => api.export(selectedBatch.value!.id));
-  if (!result) return;
-  window.location.href = `/api/attribute-assistant/batches/${selectedBatch.value.id}/download`;
-}
-
-watch(
-  [productQuery, productStatusFilter, attributeStatusFilter],
-  () => {
-    if (!routeStateReady || applyingRouteState || tab.value !== "review") return;
-    if (filterRouteTimer) clearTimeout(filterRouteTimer);
-    filterRouteTimer = setTimeout(() => {
-      filterRouteTimer = null;
-      if (!routeStateReady || applyingRouteState || tab.value !== "review") return;
-      void writeAssistantRoute("replace");
-    }, 180);
-  },
+const routeState = useAttributeAssistantRoute(
+    assistant,
+    templatesState,
+    reviewState,
 );
 
-watch(
-  () => route.fullPath,
-  (fullPath) => {
-    if (fullPath === writtenRoute) {
-      writtenRoute = "";
-      return;
-    }
-    if (routeStateReady) void applyAssistantRoute();
-  },
-);
+/**
+ * Основное состояние страницы.
+ */
+const {
+  loading,
+  busy,
+  error,
+  tab,
+  inputMode,
+  workspace,
+  templates,
+  selectedTemplateId,
+  productFile,
+  urlsText,
+  processingMode,
+  chatGpt,
+  deviceLogin,
+  appDialog,
+  templateSelectItems,
+  productTemplateItems,
+  loadWorkspace,
+  loadChatGpt,
+  loginChatGpt,
+  logoutChatGpt,
+} = assistant;
 
+/**
+ * Шаблоны.
+ */
+const {
+  templateFile,
+  templateDetails,
+  templatePreview,
+  templateUpdateFile,
+  templateUpdateMode,
+  templateRevisions,
+  templateRevisionsLoading,
+  mappingRules,
+  valueMappingRules,
+  loadedTemplateFieldIds,
+  loadingTemplateFieldIds,
+  templateFieldQueries,
+  templateFieldMatchedCounts,
+  showNewTemplateField,
+  allowedValueEditor,
+  templateFieldEditor,
+  fieldValueEditor,
+  templateForm,
+  newTemplateField,
+  previewNewTemplate,
+  importTemplate,
+  openTemplate,
+  onShopSynced,
+  handleTemplateHistoryOpen,
+  handleTemplateFieldOpen,
+  queueTemplateFieldValueSearch,
+  updateTemplateCsv,
+  copyCurrentTemplate,
+  toggleTemplateActive,
+  removeTemplate,
+  removeMapping,
+  removeValueMapping,
+  createTemplateField,
+  removeTemplateField,
+  restoreTemplateVersion,
+  editField,
+  addTemplateFieldSynonym,
+  removeTemplateFieldSynonym,
+  saveTemplateFieldEdit,
+  addFieldValue,
+  saveFieldValue,
+  editAllowedValue,
+  closeAllowedValueEditor,
+  addAllowedValueSynonym,
+  removeAllowedValueSynonym,
+  saveAllowedValue,
+  allowedValueMenuItems,
+} = templatesState;
+
+/**
+ * Проверка товаров / batch / доноры / атрибуты.
+ */
+const {
+  selectedBatch,
+  selectedProduct,
+  loadingProductId,
+  selectedDonors,
+  unknownSelections,
+  donorUrlOverrides,
+  historyItems,
+  batchOperation,
+  productQuery,
+  productStatusFilter,
+  attributeStatusFilter,
+  displayedDonors,
+  selectedDonorRows,
+  filteredProducts,
+  productStatusItems,
+  attributeValues,
+  filteredAttributeValues,
+  attributeStatusItems,
+  valuesByGroup,
+  batchOperationRunning,
+  batchChatGptLoading,
+  displayedProductSources,
+  productListIndicator,
+  currentValueCaption,
+  createBatch,
+  processAllProducts,
+  askChatGptForAllProducts,
+  openBatch,
+  removeBatch,
+  openProduct,
+  toggleDonor,
+  moveDonor,
+  processDonors,
+  useSimilar,
+  askChatGpt,
+  assignCurrentTemplate,
+  exportReadyOnly,
+  restoreHistory,
+  valueAction,
+  removeOutsideTemplateValue,
+  selectFinalValue,
+  addUnknown,
+  rememberUnknownValue,
+  bulk,
+  exportBatch,
+} = reviewState;
+
+/**
+ * Поиск и lazy-loading значений справочника.
+ */
+const {
+  searchingAllowedValueIds,
+  optionsFor,
+  queueAllowedSearch,
+  allowedSelectRef,
+  handleAllowedMenuOpen,
+} = allowedValuesState;
+
+/**
+ * Роутинг.
+ */
+const {
+  mainTabItems,
+  applyAssistantRoute,
+  changeMainTab,
+  useTemplateForNewBatch,
+} = routeState;
+
+/**
+ * Первичная загрузка страницы.
+ */
 onMounted(async () => {
   try {
-    await Promise.all([loadWorkspace(), loadChatGpt()]);
+    await Promise.all([
+      loadWorkspace(),
+      loadChatGpt(),
+    ]);
     await applyAssistantRoute();
   } finally {
     loading.value = false;
   }
 });
+
+/**
+ * Очистка polling, debounce, listeners и timers.
+ */
 onBeforeUnmount(() => {
-  if (authPoll) clearInterval(authPoll);
-  if (filterRouteTimer) clearTimeout(filterRouteTimer);
-  clearBatchOperationPoll();
-  resetAllowedOptionState();
+  routeState.dispose();
+  reviewState.dispose();
+  templatesState.dispose();
+  assistant.dispose();
 });
 </script>
 
@@ -1963,6 +392,7 @@ onBeforeUnmount(() => {
 
 
     <template v-else-if="tab === 'templates'">
+      <AttributeShopSync @synced="onShopSynced" />
       <div class="aa-grid aa-grid--templates">
         <UCard as="section" variant="outline" class="aa-card">
           <div class="aa-card-head">
