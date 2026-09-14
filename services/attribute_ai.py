@@ -21,7 +21,9 @@ from config import ATTRIBUTE_ASSISTANT_DIR
 from models import AttributeProduct, AttributeProductSource, Donor
 from services.attribute_assistant import (
     _is_presence_marker,
+    _has_confirmed_decision,
     apply_candidate,
+    record_unknown_value,
     _allowed_match,
     _mapping_score,
     _name_tokens,
@@ -31,6 +33,8 @@ from services.attribute_assistant import (
     fetch_public_html,
     normalize_key,
     dictionary_value_key,
+    value_match_key,
+    _canonical_matching_value,
     exact_value_key,
     parse_product_html,
     parse_product_html_for_donor,
@@ -42,7 +46,7 @@ from services.attribute_assistant import (
 )
 
 
-ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v12"
+ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v14-astra-cm-ignore-case"
 ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD = 30
 ATTRIBUTE_AI_MAX_PAGE_CHARS = 60_000
 ATTRIBUTE_AI_MAX_RESPONSE_CHARS = 2_000_000
@@ -71,6 +75,9 @@ UNIVERSAL_ATTRIBUTE_PROMPT = """
 - Для факта из parser_attributes не повторяй name, value и evidence: сервис восстановит их по source_id.
 - Только для нового факта, которого нет в parser_attributes, верни name, value и короткую дословную evidence из page_evidence.
 - field_id должен существовать в template_field_catalog. Если подходящего поля нет или смысл неоднозначен, верни field_id: null, сохранив сам факт.
+- Линейные размеры сравнивай в сантиметрах: миллиметры дели на 10, метры умножай на 100. Единицы ищи в значении и исходном названии атрибута; размер в сантиметрах не масштабируй повторно. Для габаритов пересчитай каждую сторону, сохраняя порядок. В value и evidence оставляй исходный текст: точный пересчёт выполняет сервис.
+- Если атрибут соответствует шаблону, а значение отсутствует в справочнике, обязательно верни field_id и исходный факт. Ближайший allowed_value — только предложение для ручной проверки, а не подтверждённое равенство.
+- При сравнении значений со справочником игнорируй только регистр букв: «Встраиваемый» и «встраиваемый» равны. Знаки, пробелы внутри значения и буквы сохраняй: A+, A++, 60/65 и 60-65 различаются. В allowed_value используй написание из шаблона; в исходных фактах сохраняй текст страницы.
 - Не копируй current_value без подтверждающей цитаты. Верни подтверждающий или опровергающий факт: сервис сам определит совпадение или конфликт.
 - allowed_value должен полностью совпадать с одним из allowed_values соответствующего поля. Если подходящего значения нет или оно совпадает с value, не включай allowed_value.
 - Значения «да», «есть», «нет» и аналогичные являются итогом только для логического поля. Если такое значение лишь подтверждает наличие варианта, указанного в названии характеристики, верни этот вариант через allowed_value; не предлагай маркер наличия для смыслового списка.
@@ -210,13 +217,13 @@ def _shortlist_allowed_values(
             if value and value not in selected:
                 selected.append(value)
 
-    hint_keys = [dictionary_value_key(item["value"], field.value_type) for item in hints if clean_text(item["value"])]
+    hint_keys = [value_match_key(item["value"]) for item in hints if clean_text(item["value"])]
     evidence_tokens = set(normalize_key(evidence).split())
     ranked: list[tuple[float, int, str]] = []
     for item in active:
         if item.value in selected:
             continue
-        key = dictionary_value_key(item.value, field.value_type)
+        key = value_match_key(item.value)
         tokens = set(key.split())
         score = max(
             (SequenceMatcher(None, hint_key, key).ratio() for hint_key in hint_keys),
@@ -377,13 +384,7 @@ def _evidence_present(quote: str, evidence: str, *, exact: bool = False) -> bool
 
 
 def _canonical_allowed(field, proposed: object) -> str:
-    key = dictionary_value_key(proposed, field.value_type)
-    if not key:
-        return ""
-    for item in field.allowed_values:
-        if item.is_active and dictionary_value_key(item.value, field.value_type) == key:
-            return item.value
-    return ""
+    return _canonical_matching_value(field.allowed_values, proposed)
 
 
 def _current_value_supported_by_source_name(field, target, source_name: str) -> str:
@@ -410,12 +411,12 @@ def _current_value_supported_by_source_name(field, target, source_name: str) -> 
     )
     for part in parts:
         variants = [part]
-        part_key = exact_value_key(part)
+        part_key = value_match_key(part)
         allowed = next(
             (
                 item
                 for item in field.allowed_values
-                if item.is_active and exact_value_key(item.value) == part_key
+                if item.is_active and value_match_key(item.value) == part_key
             ),
             None,
         )
@@ -438,9 +439,8 @@ def _current_value_supported_by_source_name(field, target, source_name: str) -> 
 def _clear_replaceable_chatgpt_evidence(product: AttributeProduct) -> None:
     """Discard stale, unapproved ChatGPT evidence before applying a fresh result."""
 
-    protected_statuses = {"approved", "dash", "rejected"}
     for target in product.values:
-        if target.status in protected_statuses:
+        if _has_confirmed_decision(target):
             continue
         details = dict(target.source_details or {})
         previous = list(details.get("candidates") or [])
@@ -449,13 +449,18 @@ def _clear_replaceable_chatgpt_evidence(product: AttributeProduct) -> None:
             for item in previous
             if not (isinstance(item, dict) and clean_text(item.get("source")) == "ChatGPT")
         ]
-        if len(candidates) == len(previous) and "chatgpt" not in details:
+        previous_unknown = list(details.get("unknown_values") or [])
+        unknown = [item for item in previous_unknown
+                   if not (isinstance(item, dict) and clean_text(item.get("source")) == "ChatGPT")]
+        if len(candidates) == len(previous) and len(unknown) == len(previous_unknown) and "chatgpt" not in details:
             continue
+        details["unknown_values"] = unknown
         details["candidates"] = candidates
         details.pop("chatgpt", None)
         target.source_details = details
         if clean_text(target.source) == "ChatGPT" and not target.current_value:
             target.proposed_value = ""
+            target.final_value = ""
             target.source = ""
         _recalculate_candidate_state(product, target)
 
@@ -500,6 +505,7 @@ def validate_analysis(
     observed: list[dict[str, str]] = []
     seen_observed: set[tuple[str, str]] = set()
     suggestions: list[dict[str, Any]] = []
+    unmatched: list[dict[str, Any]] = []
     seen_fields: set[int] = set()
     for item in attributes:
         if not isinstance(item, dict):
@@ -562,6 +568,8 @@ def validate_analysis(
         presence_marker = _is_presence_marker(field, value)
         canonical = ""
         explanation = ""
+        alternatives: list[str] = []
+        match_reason = "Логическое значение описывает наличие характеристики, а не значение справочника"
         if presence_marker and item.get("allowed_value"):
             allowed_value = _canonical_allowed(field, item["allowed_value"])
             if allowed_value and not _is_presence_marker(field, allowed_value):
@@ -578,13 +586,20 @@ def validate_analysis(
                     "маркер наличия не использован как итог"
                 )
         if not presence_marker:
-            canonical, _match_confidence, match_reason, _alternatives = _allowed_match(
+            canonical, _match_confidence, match_reason, alternatives = _allowed_match(
                 field,
                 value,
                 name,
             )
             explanation = f"Семантически сопоставлено ChatGPT; {match_reason}"
         if not canonical:
+            model_proposal = _canonical_allowed(field, item.get("allowed_value"))
+            if model_proposal and not presence_marker:
+                alternatives = list(dict.fromkeys([model_proposal, *alternatives]))[:3]
+            unmatched.append({
+                "template_field_id": field_id, "source_name": name, "value": value,
+                "suggestions": alternatives, "reason": match_reason, "evidence": quote,
+            })
             warnings.append(
                 f"Сопоставление «{name}» → «{field.name}» проверено, "
                 "но значения нет в справочнике"
@@ -598,6 +613,7 @@ def validate_analysis(
                 "attribute_name": field.name,
                 "source_name": name,
                 "proposed_value": canonical,
+                "raw_value": value,
                 "confidence": confidence,
                 "explanation": explanation,
                 "evidence": quote,
@@ -606,6 +622,7 @@ def validate_analysis(
 
     return {
         "observed_attributes": observed,
+        "unmatched_attributes": unmatched,
         "suggestions": suggestions,
         "warnings": list(dict.fromkeys(warnings)),
         "prompt_version": ATTRIBUTE_AI_PROMPT_VERSION,
@@ -620,6 +637,17 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
         if item.template_field_id is not None
     }
     changed = 0
+    unmatched_count = 0
+    for fact in analysis.get("unmatched_attributes") or []:
+        target = values.get(fact.get("template_field_id"))
+        if target is None:
+            continue
+        record_unknown_value(
+            product, target, raw_value=fact["value"], source="ChatGPT",
+            source_name=fact["source_name"], source_url=source_url, role="ChatGPT",
+            suggestions=fact.get("suggestions") or [], reason=fact["reason"],
+        )
+        unmatched_count += 1
     for suggestion in analysis.get("suggestions") or []:
         if not isinstance(suggestion, dict):
             continue
@@ -647,13 +675,14 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
             priority=90,
             source_name=clean_text(suggestion.get("source_name")) or target.attribute_name,
             source_url=source_url,
+            raw_value=exact_value_key(suggestion.get("raw_value")),
         )
         if protected_final:
             target.final_value = protected_final
             target.proposed_value = protected_state["proposed_value"]
             target.source = protected_state["source"]
             target.confidence = protected_state["confidence"]
-            if dictionary_value_key(protected_final, target.template_field.value_type) == dictionary_value_key(proposed, target.template_field.value_type):
+            if value_match_key(protected_final) == value_match_key(proposed):
                 target.status = protected_state["status"] or "approved"
                 target.reason = "ChatGPT подтверждает выбранное значение"
             else:
@@ -697,7 +726,7 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
         "attributes": observed_attributes,
         "processing_stats": {
             "mapped": changed,
-            "unknown": 0,
+            "unknown": unmatched_count,
             "ambiguous": max(0, suggestions_count - changed),
             "already_filled": 0,
         },

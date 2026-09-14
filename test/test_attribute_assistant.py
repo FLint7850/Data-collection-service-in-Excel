@@ -450,8 +450,7 @@ class AttributeAssistantTest(unittest.TestCase):
             name="Стиральные машины",
             category="Стиральные машины",
         )
-        # Lowercase is an explicitly configured synonym, not implicit equality.
-        service.add_allowed_value(self.db, template.fields[0], "Белый", synonym="белый")
+        # Matching ignores case without requiring a separate lowercase synonym.
         attributes = [
             {"name": "Цвет", "value": "белый"},
             {"name": "Цвет дверцы люка", "value": "черный, серебристый"},
@@ -1954,7 +1953,8 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(value.current_value, "1.8")
         self.assertEqual(value.final_value, "180")
         self.assertEqual(value.status, "kept")
-        self.assertEqual(value.source_details, {})
+        self.assertEqual(value.source_details["current_source_name"], "Длина сетевого кабеля, м")
+        self.assertIn("180 см", value.source_details["current_value_hint"])
 
         stats = service.apply_parsed_attributes(
             self.db,

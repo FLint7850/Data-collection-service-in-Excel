@@ -62,21 +62,39 @@ export function bestCandidate(value: AttributeValue) {
 }
 
 export function displayedProposal(value: AttributeValue) {
-    return value.proposed_value || bestCandidate(value)?.value || "";
+    const nearest = ["suggested", "unknown"].includes(value.status)
+        ? value.source_details.unknown_values?.flatMap((item) => item.suggestions || [])[0]
+        : "";
+    return value.proposed_value || bestCandidate(value)?.value || nearest || "";
+}
+
+export function originalValueHints(value: AttributeValue): string[] {
+    const hints = value.source_details.current_value_hint ? [value.source_details.current_value_hint] : [];
+    for (const item of value.source_details.unknown_values || []) {
+        hints.push(`${item.source_name}: ${item.value} — ${item.reason}`);
+    }
+    return [...new Set(hints)];
+}
+
+export function attributeValuesMatch(left: string, right: string): boolean {
+    return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
 export function hasPendingProposal(value: AttributeValue): boolean {
+    if (value.status === "rejected" || value.status === "dash") return false;
     const proposal = displayedProposal(value);
-    return Boolean(proposal && proposal !== value.final_value);
+    return Boolean(proposal && !attributeValuesMatch(proposal, value.final_value));
 }
 
 export function matchesAttributeStatus(value: AttributeValue, status: string): boolean {
     if (status === ALL_FILTER_VALUE) return true;
     if (status === "outside_template") return !value.is_in_template;
     if (!value.is_in_template) return false;
-    if (status === "conflict") return value.status === "conflict";
-    if (status === "suggested") return value.status !== "conflict" && hasPendingProposal(value);
-    if (status === "no_suggestion") return value.status !== "conflict" && !hasPendingProposal(value);
+    const reviewStatus = value.status === "unknown"
+        ? (hasPendingProposal(value) ? "suggested" : "conflict") : value.status;
+    if (status === "conflict") return reviewStatus === "conflict";
+    if (status === "suggested") return reviewStatus === "suggested" || (reviewStatus !== "conflict" && hasPendingProposal(value));
+    if (status === "no_suggestion") return !["conflict", "suggested"].includes(reviewStatus) && !hasPendingProposal(value);
     return true;
 }
 
@@ -153,19 +171,20 @@ export function isTechnicalDash(value: string) {
 export function valueStatusLabel(value: AttributeValue) {
     if (!value.is_in_template) return "Вне шаблона";
     if (value.status === "conflict") return "Конфликт";
-    if (value.status === "unknown") return "Нет в справочнике";
+    if (value.status === "unknown") return hasPendingProposal(value) ? "Есть предложение" : "Конфликт";
     if (value.status === "dash") return "Технический пропуск";
     if (value.status === "rejected") return "Отклонено";
-    if (value.current_value) return value.source === "current_site" ? "Сохранено со страницы" : "Сохранено из CSV";
     if (value.status === "approved") return "Принято";
-    if (value.status === "suggested") return "Нужно проверить";
+    if (value.status === "suggested") return "Есть предложение";
+    if (value.current_value) return value.source === "current_site" ? "Сохранено со страницы" : "Сохранено из CSV";
     return "Не заполнено";
 }
 
 export function valueStatusColor(value: AttributeValue): "error" | "warning" | "success" | "neutral" {
     if (!value.is_in_template) return "warning";
     if (value.status === "conflict" || value.status === "rejected") return "error";
-    if (value.status === "unknown") return "warning";
+    if (value.status === "unknown") return hasPendingProposal(value) ? "warning" : "error";
+    if (value.status === "suggested") return "warning";
     if (value.current_value || value.status === "approved") return "success";
     return "neutral";
 }

@@ -208,9 +208,11 @@ class ExactDictionaryTest(unittest.TestCase):
         self.assertEqual(target.final_value, "A++")
         self.assertEqual(target.source_details["candidates"][0]["value"], "A")
 
-    def test_unknown_product_value_remains_unknown(self):
+    def test_unknown_product_value_has_manual_suggestions_without_auto_acceptance(self):
         product = self.product("A+++")
-        self.assertEqual(product.values[0].status, "unknown")
+        self.assertEqual(product.values[0].status, "suggested")
+        self.assertEqual(product.values[0].proposed_value, "A++")
+        self.assertEqual(product.values[0].current_value, "A+++")
         self.assertEqual(product.values[0].final_value, "")
 
     def test_html_parser_does_not_deduplicate_distinct_classes(self):

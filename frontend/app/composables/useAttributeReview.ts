@@ -157,6 +157,7 @@ export function useAttributeReview(
                 ? "Исходная страница сайта"
                 : "Исходный CSV сайта";
         }
+        if (value.source_details.unknown_values?.length) return "Исходное значение из источника приведено ниже";
         return selectedBatch.value?.input_mode === "urls"
             ? "На странице не найдено"
             : "В файле не заполнено";

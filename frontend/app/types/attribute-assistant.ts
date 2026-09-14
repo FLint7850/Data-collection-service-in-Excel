@@ -72,6 +72,8 @@ export interface AttributeValue {
   allowed_values_count: number;
   allowed_values: Array<{ id: number; value: string; is_combination?: boolean }>;
   source_details: {
+    current_source_name?: string;
+    current_value_hint?: string;
     candidates?: Array<{
       value: string;
       raw_value: string;

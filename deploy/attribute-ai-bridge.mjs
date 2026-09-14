@@ -16,7 +16,8 @@ const configuredIdleTimeoutMs = Number(process.env.ATTRIBUTE_CHATGPT_IDLE_TIMEOU
 const analysisIdleTimeoutMs = Number.isFinite(configuredIdleTimeoutMs) && configuredIdleTimeoutMs > 0
   ? configuredIdleTimeoutMs : 600000;
 const maxRequestBytes = Number(process.env.ATTRIBUTE_AI_MAX_REQUEST_BYTES || 8 * 1024 * 1024);
-const analysisReasoningEffort = process.env.ATTRIBUTE_CHATGPT_REASONING_EFFORT?.trim() || "low";
+const analysisModel = process.env.ATTRIBUTE_CHATGPT_MODEL?.trim() || "gpt-6-astra";
+const analysisReasoningEffort = process.env.ATTRIBUTE_CHATGPT_REASONING_EFFORT?.trim() || "medium";
 const configuredConcurrency = Number(process.env.ATTRIBUTE_CHATGPT_CONCURRENCY || 3);
 const analysisConcurrency = Number.isInteger(configuredConcurrency)
   ? Math.max(1, Math.min(8, configuredConcurrency)) : 3;
@@ -61,6 +62,7 @@ export class CodexAppServer {
     idleTimeoutMs = analysisIdleTimeoutMs,
     sandboxDir = resolve(codexHome, "attribute-analysis-sandbox"),
     reasoningEffort = analysisReasoningEffort,
+    model = analysisModel,
   } = {}) {
     this.child = null;
     this.nextId = 1;
@@ -72,6 +74,7 @@ export class CodexAppServer {
     this.idleTimeoutMs = idleTimeoutMs;
     this.sandboxDir = sandboxDir;
     this.reasoningEffort = reasoningEffort;
+    this.model = model;
   }
 
   async ensureStarted() {
@@ -245,6 +248,8 @@ export class CodexAppServer {
         plan: account.planType || account.plan || "",
       } : null,
       proxy_enabled: Boolean(proxyUrl),
+      model: this.model,
+      reasoning_effort: this.reasoningEffort,
     };
   }
 
@@ -270,6 +275,7 @@ export class CodexAppServer {
     mkdirSync(sandboxDir, { recursive: true });
     const started = await this.request("thread/start", {
       cwd: sandboxDir,
+      model: this.model,
       approvalPolicy: "never",
       sandbox: "read-only",
       ephemeral: true,
@@ -295,6 +301,7 @@ export class CodexAppServer {
         threadId,
         input: [{ type: "text", text: prompt }],
         effort: this.reasoningEffort,
+        model: this.model,
       }, 60000);
       turnId = turn?.turn?.id || turn?.turnId || "";
       const event = await completion.promise;

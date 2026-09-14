@@ -227,8 +227,23 @@ def exact_value_key(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def value_match_key(value: Any) -> str:
+    """Ignore letter case when matching; preserve punctuation, letters and inner spaces."""
+    return exact_value_key(value).lower()
+
+
+def _canonical_matching_value(allowed: Iterable[AttributeAllowedValue], value: Any) -> str:
+    active = [item for item in allowed if item.is_active]
+    exact_key = exact_value_key(value)
+    exact = next((item.value for item in active if exact_value_key(item.value) == exact_key), "")
+    if exact:
+        return exact
+    key = value_match_key(value)
+    return next((item.value for item in active if value_match_key(item.value) == key), "") if key else ""
+
+
 def dictionary_value_key(value: Any, value_type: str = "select") -> str:
-    # Equality does not depend on a field's type. Type conversions happen explicitly.
+    # Persist literal keys so imported IDs and dictionary spelling remain unchanged.
     return exact_value_key(value)
 
 
@@ -653,7 +668,7 @@ def _make_product_values(
                     if canonical != current else "Исходное значение подтверждено справочником"
                 )
             else:
-                status = "unknown"
+                status = "suggested" if suggestions else "conflict"
                 reason = match_reason
                 source_details = {
                     "unknown_values": [{
@@ -666,12 +681,18 @@ def _make_product_values(
                         "reason": match_reason,
                     }]
                 }
+            if matched_source_name and matched_source_name != field.name:
+                source_details["current_source_name"] = matched_source_name
+            centimeters = _centimeter_value(current, matched_source_name or field.name, field.name)
+            if centimeters is not None and centimeters != current:
+                source_details["current_value_hint"] = f"{matched_source_name or field.name}: {current} → {centimeters} см"
         product.values.append(
             AttributeProductValue(
                 template_field=field,
                 group_name=field.group_name,
                 attribute_name=field.name,
                 current_value=current,
+                proposed_value=suggestions[0] if current and status == "suggested" else "",
                 final_value=final,
                 source=source,
                 confidence=confidence,
@@ -1665,6 +1686,7 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
                 ):
                     continue
                 before = (
+                    target.proposed_value,
                     target.final_value,
                     target.confidence,
                     target.status,
@@ -1673,6 +1695,11 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
                 )
                 previous_details = dict(target.source_details or {})
                 restored_details = dict(restored.source_details or {})
+                for key in ("current_source_name", "current_value_hint"):
+                    if key in restored_details:
+                        previous_details[key] = restored_details[key]
+                    else:
+                        previous_details.pop(key, None)
                 unknown_values = [
                     item for item in list(previous_details.get("unknown_values") or [])
                     if not (
@@ -1690,9 +1717,11 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
                     target.confidence = restored.confidence
                     target.status = restored.status
                     target.reason = restored.reason
-                    if restored.final_value and previous_details.get("candidates"):
+                    target.proposed_value = restored.proposed_value or ""
+                    if previous_details.get("candidates") or previous_details.get("unknown_values"):
                         _recalculate_candidate_state(product, target)
                 after = (
+                    target.proposed_value,
                     target.final_value,
                     target.confidence,
                     target.status,
@@ -1715,16 +1744,8 @@ def restore_cached_site_current_values(product: AttributeProduct) -> int:
                 target.confidence = restored.confidence
                 target.status = restored.status
                 target.reason = restored.reason
-                conflicts = [
-                    candidate
-                    for candidate in list(previous_details.get("candidates") or [])
-                    if candidate.get("value")
-                    and _candidate_value_key(target, candidate["value"])
-                    != _candidate_value_key(target, target.current_value)
-                ]
-                if conflicts:
-                    target.status = "conflict"
-                    target.reason = "Источник расходится с исходным значением; значение страницы сохранено"
+                target.proposed_value = restored.proposed_value or ""
+                _recalculate_candidate_state(product, target)
             changed += 1
             continue
         restored_key = (
@@ -2084,7 +2105,7 @@ def _allowed_value_field_index(
     fields: Iterable[AttributeTemplateField],
     wanted_keys: set[str] | None = None,
 ) -> dict[str, list[AttributeTemplateField]]:
-    keys = set(wanted_keys or set())
+    keys = {value_match_key(key) for key in (wanted_keys or set())}
     if keys & BOOLEAN_TRUE_KEYS:
         keys.update(BOOLEAN_TRUE_KEYS)
     if keys & BOOLEAN_FALSE_KEYS:
@@ -2094,7 +2115,7 @@ def _allowed_value_field_index(
         for item in field.allowed_values:
             if not item.is_active:
                 continue
-            item_keys = {dictionary_value_key(item.value, field.value_type)}
+            item_keys = {value_match_key(item.value)}
             for key in item_keys:
                 if keys and key not in keys:
                     continue
@@ -2107,7 +2128,7 @@ def _fields_with_exact_value(
     raw_value: str,
     value_index: dict[str, list[AttributeTemplateField]] | None = None,
 ) -> list[AttributeTemplateField]:
-    raw_key = exact_value_key(raw_value)
+    raw_key = value_match_key(raw_value)
     if not raw_key:
         return []
     # Boolean and numeric values are too common to identify an attribute safely.
@@ -2239,6 +2260,79 @@ def _linear_unit_from_name(value: Any) -> str:
     return ""
 
 
+def _centimeter_value(
+    raw_value: str, source_name: str = "", field_name: str = "", *, preserve_format: bool = False,
+) -> str | None:
+    """Convert only linear measures, preserving dimension order and range separators."""
+    text = exact_value_key(raw_value)
+    unit_pattern = r"(?:миллиметр(?:а|ов|ы|ах)?|сантиметр(?:а|ов|ы|ах)?|метр(?:а|ов|ы|ах)?|millimeters?|millimetres?|centimeters?|centimetres?|meters?|metres?|мм|см|mm|cm|м|m)"
+    aliases = {"mm": "мм", "cm": "см", "m": "м"}
+
+    def unit(value):
+        key = value.casefold()
+        if key.startswith(("миллиметр", "millimeter", "millimetre")):
+            return "мм"
+        if key.startswith(("сантиметр", "centimeter", "centimetre")):
+            return "см"
+        if key.startswith(("метр", "meter", "metre")):
+            return "м"
+        return aliases.get(key) or _canonical_linear_unit(key)
+
+    def name_unit(name):
+        matches = list(re.finditer(r"(?<![\w/])(" + unit_pattern + r")(?![\w²³/])", name, re.I))
+        return unit(matches[-1].group(1)) if matches else ""
+
+    # Area, volume and rates must never become linear centimeters.
+    if re.search(r"(?:мм|см|mm|cm|м|m)\s*(?:[²³]|[23]\b|\^|/)", source_name + " " + field_name, re.I):
+        return None
+    part_re = re.compile(r"([+]?[0-9]+(?:[.,][0-9]+)?)\s*(" + unit_pattern + r")?(?=$|\s|[xXхХ×*/\-–—−])", re.I)
+    parts = list(part_re.finditer(text))
+    if not parts or text[:parts[0].start()].strip() or text[parts[-1].end():].strip():
+        return None
+    separators = [text[left.end():right.start()].strip() for left, right in zip(parts, parts[1:])]
+    if any(separator not in {"x", "X", "х", "Х", "×", "*", "/", "-", "–", "—", "−"} for separator in separators):
+        return None
+    explicit_units = [unit(part.group(2)) if part.group(2) else "" for part in parts]
+    inherited = name_unit(source_name) or name_unit(field_name)
+    if not inherited and not any(explicit_units) and not re.search(
+        r"высот|ширин|глубин|длин|диаметр|габарит|размер|толщин|радиус|расстояни|height|width|depth|length|diameter|dimensions",
+        source_name + " " + field_name, re.I,
+    ):
+        return None
+    # A single trailing unit applies to the whole dimension tuple (600x450x850 мм).
+    if explicit_units[-1] and not any(explicit_units[:-1]):
+        inherited = explicit_units[-1]
+    inherited = inherited or "см"
+    result = []
+    formatted = text
+    for index, part in enumerate(parts):
+        source_unit = explicit_units[index] or inherited
+        number = Decimal(part.group(1).replace(",", "."))
+        factor = LINEAR_UNIT_FACTORS[source_unit][1] / LINEAR_UNIT_FACTORS["см"][1]
+        if index:
+            separator = separators[index - 1]
+            result.append("x" if separator in {"x", "X", "х", "Х", "×", "*"} else separator)
+        result.append(_decimal_text(number * factor))
+    if preserve_format:
+        for index in range(len(parts) - 1, -1, -1):
+            part = parts[index]
+            source_unit = explicit_units[index] or inherited
+            factor = LINEAR_UNIT_FACTORS[source_unit][1] / LINEAR_UNIT_FACTORS["см"][1]
+            number_text = part.group(1)
+            if factor != 1:
+                number_text = _decimal_text(Decimal(number_text.replace(",", ".")) * factor)
+                if "," in part.group(1):
+                    number_text = number_text.replace(".", ",")
+            replacement = number_text
+            if part.group(2):
+                replacement += text[part.end(1):part.start(2)] + (part.group(2) if source_unit == "см" else "см")
+            else:
+                replacement += text[part.end(1):part.end()]
+            formatted = formatted[:part.start()] + replacement + formatted[part.end():]
+        return formatted
+    return "".join(result)
+
+
 def _converted_value_candidates(
     field: AttributeTemplateField,
     raw_value: str,
@@ -2250,7 +2344,7 @@ def _converted_value_candidates(
         if not isinstance(rule, dict):
             continue
         source = exact_value_key(rule.get("from_value"))
-        if source and source == text_value and exact_value_key(rule.get("to_value")):
+        if source and value_match_key(source) == value_match_key(text_value) and exact_value_key(rule.get("to_value")):
             candidates.insert(0, exact_value_key(rule["to_value"]))
     if field.value_type not in {"number", "dimensions", "boolean"} and not field.conversion_rules:
         return list(dict.fromkeys(candidates))
@@ -2310,6 +2404,23 @@ def _allowed_match(
     source_name: str = "",
 ) -> tuple[str, int, str, list[str]]:
     allowed = [item for item in field.allowed_values if item.is_active]
+    centimeters = _centimeter_value(raw_value, source_name, field.name)
+    if centimeters is not None:
+        if not allowed and field.value_type in {"number", "dimensions"}:
+            try:
+                normalized = normalize_value(centimeters, field.value_type)
+            except ValueError as error:
+                return "", 0, str(error), []
+            return normalized, 96, "Конвертация единиц в сантиметры; формат проверен", []
+        formatted = _centimeter_value(raw_value, source_name, field.name, preserve_format=True)
+        variants = list(dict.fromkeys([formatted, centimeters, centimeters.replace(".", ","), f"{centimeters} см", f"{centimeters} cm"]))
+        nearest_values = []
+        for variant in variants:
+            canonical, confidence, reason, nearest = _allowed_match_single(field, variant, allowed, source_name)
+            if canonical:
+                return canonical, confidence, "Конвертация единиц в сантиметры; " + reason, []
+            nearest_values.extend(nearest)
+        return "", 0, f"Значения {centimeters} см нет в справочнике", list(dict.fromkeys(nearest_values))[:3]
     if field.value_type not in {"number", "dimensions", "boolean"}:
         direct = _allowed_match_single(field, exact_value_key(raw_value), allowed, source_name)
         if direct[0] and allowed:
@@ -2327,7 +2438,7 @@ def _allowed_match(
         except ValueError as error:
             return "", 0, str(error), []
         combination = next(
-            (item for item in allowed if item.is_combination and exact_value_key(item.value) == exact_value_key(normalized_full)),
+            (item for item in allowed if item.is_combination and value_match_key(item.value) == value_match_key(normalized_full)),
             None,
         )
         if combination:
@@ -2390,12 +2501,14 @@ def _allowed_match_single(
     key = exact_value_key(value)
     if not key:
         return "", 0, "Значение не заполнено", []
-    for item in allowed:
-        if exact_value_key(item.value) == key:
-            return item.value, 100, "Точное значение справочника", []
-    for item in allowed:
-        if any(exact_value_key(synonym.synonym) == key for synonym in item.synonyms):
-            return item.value, 98, "Синоним значения", []
+    canonical = _canonical_matching_value(allowed, value)
+    if canonical:
+        reason = "Точное значение справочника" if exact_value_key(canonical) == key else "Совпадение со справочником без учёта регистра"
+        return canonical, 100, reason, []
+    for comparison in (exact_value_key, value_match_key):
+        for item in allowed:
+            if any(comparison(synonym.synonym) == comparison(value) for synonym in item.synonyms):
+                return item.value, 98, "Синоним значения", []
     if field.value_type in {"number", "dimensions"} and not allowed:
         return value, 96, "Формат проверен", []
     if field.value_type == "text" and not allowed:
@@ -2408,14 +2521,14 @@ def _allowed_match_single(
                 distance = abs(Decimal(item.value.replace(",", ".")) - numeric_value)
                 numeric_allowed.append((distance, item.sort_order, item.value))
         numeric_allowed.sort()
-        return "", 0, "Точного числового значения нет в справочнике", [
-            item for _distance, _order, item in numeric_allowed[:3]
-        ]
+        nearby = [item for distance, _order, item in numeric_allowed
+                  if distance <= max(abs(numeric_value), abs(Decimal(item.replace(",", ".")))) * Decimal("0.2")]
+        return "", 0, "Точного числового значения нет в справочнике", nearby[:3]
     ranked = sorted(
-        ((SequenceMatcher(None, key, exact_value_key(item.value)).ratio(), item.value) for item in allowed),
+        ((SequenceMatcher(None, value_match_key(value), value_match_key(item.value)).ratio(), item.value) for item in allowed),
         reverse=True,
     )
-    return "", 0, "Значения нет в справочнике", [item for _score, item in ranked[:3]]
+    return "", 0, "Значения нет в справочнике", [item for score, item in ranked if score >= 0.6][:3]
 
 
 def _target_value(product: AttributeProduct, field_id: int) -> AttributeProductValue | None:
@@ -2427,16 +2540,80 @@ def _candidate_value_key(target: AttributeProductValue, value: Any) -> str:
     if field:
         try:
             normalized = normalize_value(value, field.value_type, field.is_composite)
-            return dictionary_value_key(normalized, field.value_type)
+            return value_match_key(normalized)
         except ValueError:
             pass
-    return exact_value_key(value)
+    return value_match_key(value)
 
 
 def _current_reference_value(target: AttributeProductValue) -> str:
     # current_value remains the original source text for audit. final_value may
     # contain its canonical dictionary equivalent (for example, 1.8 m -> 180 cm).
     return target.final_value or target.current_value
+
+
+def _has_confirmed_decision(target: AttributeProductValue) -> bool:
+    return target.status in {"rejected", "dash"} or (
+        target.status == "approved" and not (target.source_details or {}).get("auto_accepted")
+    )
+
+
+def record_unknown_value(
+    product: AttributeProduct,
+    target: AttributeProductValue,
+    *,
+    raw_value: str,
+    source: str,
+    source_name: str,
+    source_url: str = "",
+    donor_id: int | None = None,
+    role: str = "",
+    suggestions: list[str],
+    reason: str,
+) -> None:
+    """Keep a mapped fact even when its value does not belong to the dictionary."""
+    details = dict(target.source_details or {})
+
+    def same_source(item):
+        return (isinstance(item, dict) and item.get("source") == source
+                and item.get("source_name") == source_name and item.get("url", "") == source_url)
+
+    details["unknown_values"] = [item for item in details.get("unknown_values", []) if not same_source(item)] + [{
+        "value": exact_value_key(raw_value), "source": source, "source_name": source_name,
+        "url": source_url, "donor_id": donor_id, "role": role,
+        "suggestions": list(dict.fromkeys(suggestions)), "reason": reason,
+    }]
+    details["candidates"] = [item for item in details.get("candidates", []) if not same_source(item)]
+    target.source_details = details
+    if not _has_confirmed_decision(target):
+        _recalculate_candidate_state(product, target)
+
+
+def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dict]) -> bool:
+    unknown = [item for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
+    if not unknown or _has_confirmed_decision(target):
+        return False
+    current_unknown = any(item.get("value") == target.current_value
+                          and item.get("source") in {"current_site", "current_csv"} for item in unknown)
+    valid_original = bool(target.current_value and target.final_value and not current_unknown)
+    distinct = list({value_match_key(item["value"]): item["value"] for item in reversed(candidates)}.values())
+    # Disagreement between known dictionary values remains a source conflict.
+    if len(distinct) > 1 or (valid_original and any(
+        _candidate_value_key(target, value) != _candidate_value_key(target, target.final_value)
+        for value in distinct
+    )):
+        return False
+    alternatives = list(dict.fromkeys(value for item in unknown for value in item.get("suggestions", [])))
+    proposals = alternatives if valid_original else (distinct or alternatives)
+    target.proposed_value = proposals[0] if proposals else ""
+    if not valid_original:
+        target.final_value = ""
+    target.status = "suggested" if proposals else "conflict"
+    target.confidence = int(candidates[0].get("confidence", 0)) if candidates else 0
+    target.source = candidates[0].get("source", "") if candidates else unknown[0].get("source", "")
+    target.reason = ("Значение отсутствует в справочнике; есть варианты для ручного выбора"
+                     if proposals else "Атрибут соответствует шаблону, но его значение отсутствует в справочнике")
+    return True
 
 
 def _recalculate_candidate_state(
@@ -2447,12 +2624,15 @@ def _recalculate_candidate_state(
         item for item in list((target.source_details or {}).get("candidates") or [])
         if isinstance(item, dict) and exact_value_key(item.get("value"))
     ]
+    if _apply_dictionary_review(target, candidates):
+        return
     if target.current_value:
         current_key = _candidate_value_key(target, _current_reference_value(target))
         conflicts = [
             item for item in candidates
             if _candidate_value_key(target, item["value"]) != current_key
         ]
+        target.proposed_value = ""
         target.status = "conflict" if conflicts else "kept"
         target.reason = (
             "Источник расходится с исходным значением; исходное значение сохранено"
@@ -2465,7 +2645,7 @@ def _recalculate_candidate_state(
             target.proposed_value = ""
             target.source = ""
             target.confidence = 0
-            target.status = "unknown" if unknown_values else "missing"
+            target.status = "conflict" if unknown_values else "missing"
             target.reason = (
                 "Значения нет в справочнике" if unknown_values
                 else "Значение пока не найдено"
@@ -2505,6 +2685,7 @@ def _recalculate_candidate_state(
     )
     target.final_value = best["value"] if auto else ""
     target.status = "approved" if auto else "suggested"
+    target.source_details = {**(target.source_details or {}), "auto_accepted": auto}
 
 
 def apply_candidate(
@@ -2602,33 +2783,14 @@ def apply_parsed_attributes(
             )
         if not canonical:
             stats["unknown"] += 1
-            details = dict(target.source_details or {})
-            unknown = [
-                item for item in list(details.get("unknown_values") or [])
-                if not (
-                    isinstance(item, dict)
-                    and clean_text(item.get("source")) == clean_text(source)
-                    and clean_text(item.get("source_name")) == source_name
-                    and clean_text(item.get("url")) == clean_text(source_url)
-                )
-            ]
-            unknown.append({
-                "value": raw_value,
-                "source": source,
-                "source_name": source_name,
-                "url": source_url,
-                "donor_id": donor_id,
-                "role": "Основной донор" if priority == 0 else "Дополнительный донор",
-                "suggestions": suggestions,
-                "reason": value_reason,
-            })
-            details["unknown_values"] = unknown
-            target.source_details = details
+            record_unknown_value(
+                product, target, raw_value=raw_value, source=source, source_name=source_name,
+                source_url=source_url, donor_id=donor_id,
+                role="Основной донор" if priority == 0 else "Дополнительный донор",
+                suggestions=suggestions, reason=value_reason,
+            )
             if target.current_value:
                 stats["already_filled"] += 1
-            elif target.status == "missing":
-                target.status = "unknown"
-                target.reason = value_reason
             continue
         details = dict(target.source_details or {})
         previous_unknown = list(details.get("unknown_values") or [])
@@ -2636,7 +2798,9 @@ def apply_parsed_attributes(
             item for item in previous_unknown
             if not (
                 isinstance(item, dict)
-                and dictionary_value_key(item.get("value"), field.value_type) == dictionary_value_key(raw_value, field.value_type)
+                and clean_text(item.get("source")) == clean_text(source)
+                and clean_text(item.get("source_name")) == source_name
+                and clean_text(item.get("url")) == clean_text(source_url)
                 and int(item.get("donor_id") or 0) == int(donor_id or 0)
             )
         ]
@@ -2948,6 +3112,16 @@ def _saved_value_mapping(
     )
     if rule and rule.allowed_value.is_active:
         return rule.allowed_value.value
+    matches = [candidate.allowed_value.value for candidate in db.scalars(
+        select(AttributeValueMappingRule).where(
+            AttributeValueMappingRule.donor_id == donor_id,
+            AttributeValueMappingRule.template_field_id == field.id,
+            AttributeValueMappingRule.is_active.is_(True),
+        ).order_by(AttributeValueMappingRule.id)
+    ) if candidate.allowed_value.is_active and value_match_key(candidate.raw_value) == value_match_key(raw_value)]
+    # Older case variants may point to conflicting rules; do not choose one arbitrarily.
+    if matches and len({value_match_key(value) for value in matches}) == 1:
+        return matches[0]
     return ""
 
 
@@ -3217,6 +3391,7 @@ def update_product_value(
         value.final_value = selected
         value.proposed_value = selected
         value.status = "approved"
+        value.source_details = {**(value.source_details or {}), "auto_accepted": False}
         value.dash_reason = ""
         if manual_selected:
             value.source = "manual"

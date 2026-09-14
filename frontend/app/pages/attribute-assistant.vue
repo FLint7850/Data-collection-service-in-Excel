@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import {
+  attributeValuesMatch,
+  hasPendingProposal,
   displayedProposal,
   displayedProposalConfidence,
   displayedProposalSource,
   finalAllowedMenuKey,
   formatHistoryDate,
   inputModeItems,
+  originalValueHints,
   isTechnicalDash,
   processingModeItems,
   selectedFinalParts,
@@ -954,6 +957,7 @@ onBeforeUnmount(() => {
                     <span>Было</span>
                     <strong>{{ value.current_value }}</strong>
                     <small>{{ currentValueCaption(value) }}</small>
+                    <small v-for="hint in originalValueHints(value)" :key="hint" class="aa-original-value-hint">{{ hint }}</small>
                   </div>
                   <div class="aa-comparison-cell is-proposed">
                     <span>Предложение</span>
@@ -1024,7 +1028,7 @@ onBeforeUnmount(() => {
                     @click="removeOutsideTemplateValue(value)"
                   >Удалить атрибут</UButton>
                   <UButton
-                    v-if="value.status !== 'rejected' && displayedProposal(value) && displayedProposal(value) !== value.final_value"
+                    v-if="hasPendingProposal(value)"
                     color="success"
                     variant="soft"
                     icon="i-lucide-check"
@@ -1032,7 +1036,7 @@ onBeforeUnmount(() => {
                     @click="valueAction(value, 'accept', displayedProposal(value))"
                   >Принять</UButton>
                   <UButton
-                    v-if="value.status !== 'rejected' && displayedProposal(value) && displayedProposal(value) !== value.final_value"
+                    v-if="hasPendingProposal(value)"
                     color="error"
                     variant="ghost"
                     icon="i-lucide-x"
@@ -1081,7 +1085,7 @@ onBeforeUnmount(() => {
                       </div>
                       <small class="aa-candidate-reason">{{ candidate.reason }}</small>
                       <UButton
-                        v-if="candidate.value !== value.final_value"
+                        v-if="!attributeValuesMatch(candidate.value, value.final_value)"
                         color="success"
                         variant="soft"
                         icon="i-lucide-check"

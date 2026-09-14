@@ -157,7 +157,7 @@ test("activity allows one analysis to run longer than the idle timeout", async (
   assert.equal(codex.turnWaiters.size, 0);
 });
 
-test("attribute analysis explicitly uses low effort without changing the model", async (t) => {
+test("attribute analysis explicitly uses GPT-6 Astra with medium effort", async (t) => {
   const { codex, requests } = fakeCodex(t);
   const analysis = codex.analyze("all products");
   await settle();
@@ -165,9 +165,9 @@ test("attribute analysis explicitly uses low effort without changing the model",
   event(codex, "turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
   await analysis;
   assert.deepEqual(requests.find(({ method }) => method === "turn/start").params, {
-    threadId: "thread-1", input: [{ type: "text", text: "all products" }], effort: "low",
+    threadId: "thread-1", input: [{ type: "text", text: "all products" }], effort: "medium", model: "gpt-6-astra",
   });
-  assert.equal(requests.some(({ params }) => "model" in params), false);
+  assert.equal(requests.find(({ method }) => method === "thread/start").params.model, "gpt-6-astra");
 });
 
 test("effort can be adjusted for a quality comparison without changing the prompt", async (t) => {

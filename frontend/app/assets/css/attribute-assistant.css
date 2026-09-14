@@ -1960,3 +1960,9 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
     width: 100%;
   }
 }
+
+.aa-comparison-cell .aa-original-value-hint {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--ui-text-warning);
+}
