@@ -42,7 +42,8 @@ runtime/*
 !runtime/*.py
 
 # Local tunnel/runtime tools
-tools/
+/tools/*
+!/tools/opencart/
 xtunnel*.exe
 xtunnel*.zip
 vs_BuildTools.exe
