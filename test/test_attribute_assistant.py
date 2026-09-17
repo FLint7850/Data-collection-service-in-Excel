@@ -1030,6 +1030,41 @@ class AttributeAssistantTest(unittest.TestCase):
             {"name": "Редкий параметр", "value": "Особое значение", "group": "Основные"},
         ])
 
+    def test_structural_rows_keep_inline_dimension_order_fragments(self):
+        html = """
+        <h1>WG2P94A12S/C</h1>
+        <h2>Технические характеристики</h2>
+        <ul>
+          <li class="arbitrary-row">
+            <span class="arbitrary-name">
+              <span>Габаритные размеры</span><span> (шхвхг)</span>
+            </span>
+            <span class="arbitrary-value">59,5 × 84,5 × 51 см</span>
+          </li>
+          <li class="arbitrary-row">
+            <span class="arbitrary-name">
+              <span>Размеры в упаковке</span><span> (шхвхг)</span>
+            </span>
+            <span class="arbitrary-value">64,5 × 88 × 56 см</span>
+          </li>
+        </ul>
+        """
+
+        parsed = service.parse_product_html(html, "https://example.com/product")
+
+        self.assertEqual(parsed["attributes"], [
+            {
+                "name": "Габаритные размеры (шхвхг)",
+                "value": "59,5 × 84,5 × 51 см",
+                "group": "",
+            },
+            {
+                "name": "Размеры в упаковке (шхвхг)",
+                "value": "64,5 × 88 × 56 см",
+                "group": "",
+            },
+        ])
+
     def test_url_import_uses_own_page_as_current_values_and_counts_outside_template(self):
         template = self.make_template()
         html = """
@@ -2187,6 +2222,139 @@ class AttributeAssistantTest(unittest.TestCase):
                 self.assertEqual(confidence, 100)
                 self.assertIn("Конвертация", reason)
                 self.assertEqual(suggestions, [])
+
+    def test_explicit_dimension_order_is_split_into_axis_attributes(self):
+        components = service._dimension_component_attributes(
+            "Габаритные размеры (шхвхг)",
+            "59,5 × 84,5 × 51 см",
+        )
+        self.assertEqual(
+            [(item["name"], item["value"]) for item in components],
+            [("Ширина", "59,5 см"), ("Высота", "84,5 см"), ("Глубина", "51 см")],
+        )
+
+        reordered = service._dimension_component_attributes(
+            "Размеры в упаковке (Г × Ш × В)",
+            "560 × 645 × 880 мм",
+        )
+        self.assertEqual(
+            [(item["name"], item["value"]) for item in reordered],
+            [
+                ("Глубина в упаковке", "560 мм"),
+                ("Ширина в упаковке", "645 мм"),
+                ("Высота в упаковке", "880 мм"),
+            ],
+        )
+
+    def test_combined_dimensions_fill_separate_template_fields(self):
+        template = service.import_template_csv(
+            self.db,
+            (
+                "Ширина, см (Размеры);Высота, см (Размеры);Глубина, см (Размеры);"
+                "Ширина упаковки, см (Размеры);Высота упаковки, см (Размеры);"
+                "Глубина упаковки, см (Размеры)\r\n"
+                "59.5;84.5;51;64.5;88;56\r\n"
+            ).encode("cp1251"),
+            name="Стиральные машины с раздельными размерами",
+            category="Тест > Стиральные машины > Габариты",
+        )
+        parsed_attributes = [
+            {"name": "Габаритные размеры (шхвхг)", "value": "59,5 × 84,5 × 51 см"},
+            {"name": "Размеры в упаковке (шхвхг)", "value": "64,5 × 88 × 56 см"},
+        ]
+        page_stack = service._page_attribute_stack(self.db, template, parsed_attributes)
+        self.assertEqual(
+            {item["name"]: item["value"] for item in page_stack},
+            {
+                "Ширина, см": "59,5 см",
+                "Высота, см": "84,5 см",
+                "Глубина, см": "51 см",
+                "Ширина упаковки, см": "64,5 см",
+                "Высота упаковки, см": "88 см",
+                "Глубина упаковки, см": "56 см",
+            },
+        )
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWG2P94A12S;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        product = batch.products[0]
+
+        stats = service.apply_parsed_attributes(
+            self.db,
+            product,
+            parsed_attributes,
+            source="Gorenje",
+            priority=0,
+        )
+
+        self.assertEqual(stats["mapped"], 6)
+        self.assertEqual(stats["ambiguous"], 0)
+        self.assertEqual(stats["unknown"], 0)
+        self.assertEqual(
+            {value.attribute_name: value.proposed_value for value in product.values},
+            {
+                "Ширина, см": "59.5",
+                "Высота, см": "84.5",
+                "Глубина, см": "51",
+                "Ширина упаковки, см": "64.5",
+                "Высота упаковки, см": "88",
+                "Глубина упаковки, см": "56",
+            },
+        )
+        for value in product.values:
+            candidate = value.source_details["candidates"][0]
+            self.assertIn("(шхвхг)", candidate["source_name"])
+            self.assertIn("Составные габариты", candidate["reason"])
+
+    def test_dimension_tuple_without_order_is_not_guessed(self):
+        self.assertEqual(
+            service._dimension_component_attributes("Габаритные размеры", "59,5 × 84,5 × 51 см"),
+            [],
+        )
+
+    def test_combined_dimension_value_is_reordered_to_target_axis_order(self):
+        template = service.import_template_csv(
+            self.db,
+            (
+                "Габариты в упаковке, см (ВхШхГ) (Размеры)\r\n"
+                "88x64.5x56\r\n"
+            ).encode("cp1251"),
+            name="Упаковочные размеры",
+            category="Тест > Упаковочные размеры",
+        )
+        field = template.fields[0]
+
+        canonical, confidence, reason, suggestions = service._allowed_match(
+            field,
+            "64,5 × 88 × 56 см",
+            "Размеры в упаковке (шхвхг)",
+        )
+
+        self.assertEqual(canonical, "88x64.5x56")
+        self.assertEqual(confidence, 100)
+        self.assertIn("Порядок осей", reason)
+        self.assertEqual(suggestions, [])
+
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWG2P94A12S;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        stats = service.apply_parsed_attributes(
+            self.db,
+            batch.products[0],
+            [{"name": "Размеры в упаковке (шхвхг)", "value": "64,5 × 88 × 56 см"}],
+            source="Gorenje",
+            priority=0,
+        )
+        target = batch.products[0].values[0]
+        self.assertEqual(stats["mapped"], 1)
+        self.assertEqual(target.proposed_value, "88x64.5x56")
+        self.assertEqual(target.source_details["candidates"][0]["raw_value"], "64,5 × 88 × 56 см")
 
     def test_original_page_attribute_unit_is_preserved_during_template_alignment(self):
         template = service.import_template_csv(

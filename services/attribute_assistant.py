@@ -55,6 +55,23 @@ from models import (
 SPACE_RE = re.compile(r"\s+")
 NUMBER_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
 DIMENSION_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?(?:\s*[xXхХ×]\s*[+-]?\d+(?:[.,]\d+)?){1,3}$")
+DIMENSION_AXIS_TOKEN_PATTERN = (
+    r"(?:ширин[а-яё]*|высот[а-яё]*|глубин[а-яё]*|длин[а-яё]*|"
+    r"width|height|depth|length|[швгдwhdl])"
+)
+DIMENSION_AXIS_SEQUENCE_RE = re.compile(
+    r"(?<![a-zа-яё])(" + DIMENSION_AXIS_TOKEN_PATTERN + r")"
+    r"(?:\s*(?:[xх×*/;,]|\bby\b)\s*(" + DIMENSION_AXIS_TOKEN_PATTERN + r")){1,3}"
+    r"(?![a-zа-яё])",
+    re.IGNORECASE,
+)
+DIMENSION_AXIS_TOKEN_RE = re.compile(DIMENSION_AXIS_TOKEN_PATTERN, re.IGNORECASE)
+DIMENSION_AXIS_LABELS = {
+    "width": "Ширина",
+    "height": "Высота",
+    "depth": "Глубина",
+    "length": "Длина",
+}
 HEADER_GROUP_RE = re.compile(r"^(.*?)\s*\(([^()]*)\)\s*$")
 WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
 SPECIFICATION_HEADING_RE = re.compile(
@@ -195,6 +212,9 @@ def _canonical_name_token(token: str) -> str:
 
 def _name_tokens(value: Any) -> set[str]:
     text = clean_text(value).casefold().replace("ё", "е")
+    # Axis order describes the tuple layout, not the attribute's semantic identity.
+    # Treating ШxВxГ and ВxШxГ as words prevents otherwise identical fields from mapping.
+    text = DIMENSION_AXIS_SEQUENCE_RE.sub(" ", text)
     text = re.sub(r"\bх\s*\.?\s*к\s*\.?\b", " холодильная камера ", text)
     text = re.sub(r"\bм\s*\.?\s*к\s*\.?\b", " морозильная камера ", text)
     # English marketing explanations in brackets reduce Russian-name similarity.
@@ -1120,10 +1140,16 @@ def _append_structural_specification_attributes(
             ]
             if len(children) != 2:
                 continue
+            # Inline fragments commonly split a label into its title and axis order
+            # (for example, "Габаритные размеры" + "(ШxВxГ)"). Only nested
+            # block collections indicate that this is a wrapper around more rows.
             if any(
                 len([
                     nested for nested in child.find_all(recursive=False)
-                    if getattr(nested, "name", None) and _text_without_ui_noise(nested)
+                    if getattr(nested, "name", None) in {
+                        "div", "li", "section", "table", "dl", "ul", "ol",
+                    }
+                    and _text_without_ui_noise(nested)
                 ]) >= 2
                 for child in children
             ):
@@ -1456,24 +1482,21 @@ def _page_attribute_stack(
     claimed_fields: set[int] = set()
     result: list[dict[str, str]] = []
     for item in cleaned:
-        field, _confidence, _reason, _alternatives = map_attribute(
-            db,
-            template,
-            None,
-            item["name"],
-            item["value"],
-            value_index,
-        )
-        field_key = int(field.id) if field is not None and field.id is not None else 0
-        if field is not None and field_key not in claimed_fields:
+        mapping_rows = _attribute_mapping_rows(db, template, None, item, value_index)
+        mapped_any = False
+        for mapped_item, field, _confidence, _reason, _alternatives in mapping_rows:
+            field_key = int(field.id) if field is not None and field.id is not None else 0
+            if field is None or field_key in claimed_fields:
+                continue
+            mapped_any = True
             claimed_fields.add(field_key)
             result.append({
                 "group_name": field.group_name,
                 "name": field.name,
-                "value": item["value"],
-                "source_name": item["name"],
+                "value": exact_value_key(mapped_item.get("value")),
+                "source_name": clean_text(mapped_item.get("source_name") or item["name"]),
             })
-        else:
+        if not mapped_any:
             result.append(item)
     return result
 
@@ -2288,6 +2311,176 @@ def _linear_unit_from_name(value: Any) -> str:
     return ""
 
 
+def _dimension_axis(value: Any) -> str:
+    key = normalize_key(value)
+    if key == "ш" or key == "w" or key.startswith("ширин") or key == "width":
+        return "width"
+    if key == "в" or key == "h" or key.startswith("высот") or key == "height":
+        return "height"
+    if key == "г" or key == "d" or key.startswith("глубин") or key == "depth":
+        return "depth"
+    if key == "д" or key == "l" or key.startswith("длин") or key == "length":
+        return "length"
+    return ""
+
+
+def _dimension_axis_order(source_name: str) -> tuple[list[str], tuple[int, int] | None]:
+    """Read an explicit dimension order such as ШxВxГ or Depth x Width x Height."""
+
+    text = clean_text(source_name)
+    for match in DIMENSION_AXIS_SEQUENCE_RE.finditer(text):
+        axes = [
+            _dimension_axis(token.group(0))
+            for token in DIMENSION_AXIS_TOKEN_RE.finditer(match.group(0))
+        ]
+        if len(axes) >= 2 and all(axes) and len(set(axes)) == len(axes):
+            return axes, match.span()
+    return [], None
+
+
+def _dimension_component_name(source_name: str, axis: str, order_span: tuple[int, int]) -> str:
+    """Replace a generic tuple label with one axis while retaining qualifiers and units."""
+
+    context = source_name[:order_span[0]] + " " + source_name[order_span[1]:]
+    context = re.sub(r"[\(\[\{]\s*[\)\]\}]", " ", context)
+    context = re.sub(
+        r"\b(?:(?:габаритн[а-яё]*|overall)\s+)?(?:размер[а-яё]*|dimensions?|measurements?)\b",
+        " ",
+        context,
+        flags=re.IGNORECASE,
+    )
+    context = re.sub(r"\bгабарит[а-яё]*\b", " ", context, flags=re.IGNORECASE)
+    context = clean_text(context)
+    context = re.sub(r"^[\s,;:/\-–—]+|[\s,;:/\-–—]+$", "", context)
+    label = DIMENSION_AXIS_LABELS[axis]
+    if not context:
+        return label
+    if context.startswith((",", ";", ":")):
+        return label + context
+    return f"{label} {context}"
+
+
+def _dimension_component_attributes(source_name: str, raw_value: str) -> list[dict[str, str]]:
+    """Split an explicitly labelled dimension tuple into independently mappable facts."""
+
+    axes, order_span = _dimension_axis_order(source_name)
+    if not axes or order_span is None:
+        return []
+    text = exact_value_key(raw_value)
+    unit_pattern = (
+        r"(?:миллиметр(?:а|ов|ы|ах)?|сантиметр(?:а|ов|ы|ах)?|метр(?:а|ов|ы|ах)?|"
+        r"millimeters?|millimetres?|centimeters?|centimetres?|meters?|metres?|мм|см|mm|cm|м|m)"
+    )
+    part_re = re.compile(
+        r"([+]?[0-9]+(?:[.,][0-9]+)?)\s*(" + unit_pattern + r")?"
+        r"(?=$|\s|[xXхХ×*/])",
+        re.IGNORECASE,
+    )
+    parts = list(part_re.finditer(text))
+    if len(parts) != len(axes) or not parts:
+        return []
+    if text[:parts[0].start()].strip() or text[parts[-1].end():].strip():
+        return []
+    separators = [text[left.end():right.start()].strip() for left, right in zip(parts, parts[1:])]
+    if any(separator not in {"x", "X", "х", "Х", "×", "*", "/"} for separator in separators):
+        return []
+
+    explicit_units = [clean_text(part.group(2)) for part in parts]
+    inherited_unit = ""
+    if explicit_units[-1] and not any(explicit_units[:-1]):
+        inherited_unit = explicit_units[-1]
+
+    result: list[dict[str, str]] = []
+    for index, (axis, part) in enumerate(zip(axes, parts)):
+        value = clean_text(part.group(0))
+        if not explicit_units[index] and inherited_unit:
+            value = f"{part.group(1)} {inherited_unit}"
+        result.append({
+            "name": _dimension_component_name(source_name, axis, order_span),
+            "value": value,
+            "source_name": clean_text(source_name),
+            "dimension_axis": axis,
+        })
+    return result
+
+
+def _dimension_value_in_field_order(raw_value: str, source_name: str, field_name: str) -> str:
+    """Reorder a tuple when both source and target explicitly declare their axes."""
+
+    components = _dimension_component_attributes(source_name, raw_value)
+    source_axes, _source_span = _dimension_axis_order(source_name)
+    target_axes, _target_span = _dimension_axis_order(field_name)
+    if (
+        not components
+        or source_axes == target_axes
+        or len(source_axes) != len(target_axes)
+        or set(source_axes) != set(target_axes)
+    ):
+        return exact_value_key(raw_value)
+    values_by_axis = {
+        component["dimension_axis"]: component["value"]
+        for component in components
+    }
+    return " x ".join(values_by_axis[axis] for axis in target_axes)
+
+
+def _attribute_mapping_rows(
+    db: Session,
+    template: AttributeTemplate,
+    donor_id: int | None,
+    item: dict[str, Any],
+    value_index: dict[str, list[AttributeTemplateField]] | None = None,
+) -> list[tuple[dict[str, Any], AttributeTemplateField | None, int, str, list[dict[str, Any]]]]:
+    """Map one source row, decomposing only tuples whose axis order is explicit."""
+
+    original = map_attribute(
+        db,
+        template,
+        donor_id,
+        clean_text(item.get("name")),
+        exact_value_key(item.get("value")),
+        value_index,
+    )
+    components = _dimension_component_attributes(
+        clean_text(item.get("name")),
+        exact_value_key(item.get("value")),
+    )
+    if not components:
+        return [(item, *original)]
+
+    component_rows = []
+    used_field_ids: set[int] = set()
+    if original[0] is not None and original[0].id is not None:
+        used_field_ids.add(int(original[0].id))
+    for component in components:
+        mapped = map_attribute(
+            db,
+            template,
+            donor_id,
+            component["name"],
+            component["value"],
+            value_index,
+        )
+        field = mapped[0]
+        field_id = int(field.id) if field is not None and field.id is not None else 0
+        if not field_id or field_id in used_field_ids:
+            continue
+        used_field_ids.add(field_id)
+        axis_label = DIMENSION_AXIS_LABELS[component["dimension_axis"]]
+        component_rows.append((
+            component,
+            field,
+            mapped[1],
+            f"Составные габариты: ось «{axis_label}» определена по подписи; {mapped[2]}",
+            mapped[3],
+        ))
+
+    rows = component_rows
+    if original[0] is not None:
+        rows = [(item, *original), *rows]
+    return rows or [(item, *original)]
+
+
 def _centimeter_value(
     raw_value: str, source_name: str = "", field_name: str = "", *, preserve_format: bool = False,
 ) -> str | None:
@@ -2432,21 +2625,24 @@ def _allowed_match(
     source_name: str = "",
 ) -> tuple[str, int, str, list[str]]:
     allowed = [item for item in field.allowed_values if item.is_active]
-    centimeters = _centimeter_value(raw_value, source_name, field.name)
+    ordered_value = _dimension_value_in_field_order(raw_value, source_name, field.name)
+    axes_reordered = exact_value_key(ordered_value) != exact_value_key(raw_value)
+    order_reason = "Порядок осей приведён к формату целевого поля; " if axes_reordered else ""
+    centimeters = _centimeter_value(ordered_value, source_name, field.name)
     if centimeters is not None:
         if not allowed and field.value_type in {"number", "dimensions"}:
             try:
                 normalized = normalize_value(centimeters, field.value_type)
             except ValueError as error:
                 return "", 0, str(error), []
-            return normalized, 96, "Конвертация единиц в сантиметры; формат проверен", []
-        formatted = _centimeter_value(raw_value, source_name, field.name, preserve_format=True)
+            return normalized, 96, order_reason + "Конвертация единиц в сантиметры; формат проверен", []
+        formatted = _centimeter_value(ordered_value, source_name, field.name, preserve_format=True)
         variants = list(dict.fromkeys([formatted, centimeters, centimeters.replace(".", ","), f"{centimeters} см", f"{centimeters} cm"]))
         nearest_values = []
         for variant in variants:
             canonical, confidence, reason, nearest = _allowed_match_single(field, variant, allowed, source_name)
             if canonical:
-                return canonical, confidence, "Конвертация единиц в сантиметры; " + reason, []
+                return canonical, confidence, order_reason + "Конвертация единиц в сантиметры; " + reason, []
             nearest_values.extend(nearest)
         return "", 0, f"Значения {centimeters} см нет в справочнике", list(dict.fromkeys(nearest_values))[:3]
     if field.value_type not in {"number", "dimensions", "boolean"}:
@@ -2787,71 +2983,77 @@ def apply_parsed_attributes(
         return stats
     value_keys = {exact_value_key(item.get("value")) for item in attributes if exact_value_key(item.get("value"))}
     value_index = _allowed_value_field_index(template.fields, value_keys)
-    for item in attributes:
-        source_name = clean_text(item.get("name"))
-        raw_value = exact_value_key(item.get("value"))
-        if not source_name or not raw_value:
+    for original_item in attributes:
+        original_name = clean_text(original_item.get("name"))
+        original_value = exact_value_key(original_item.get("value"))
+        if not original_name or not original_value:
             continue
-        field, mapping_confidence, mapping_reason, _alternatives = map_attribute(
-            db, template, donor_id, source_name, raw_value, value_index
+        mapping_rows = _attribute_mapping_rows(
+            db, template, donor_id, original_item, value_index
         )
-        if not field:
-            stats["ambiguous"] += 1
-            continue
-        target = _target_value(product, field.id)
-        if not target:
-            stats["not_in_template"] += 1
-            continue
-        saved_value = _saved_value_mapping(db, donor_id, field, raw_value)
-        if saved_value:
-            canonical, value_confidence, value_reason, suggestions = saved_value, 100, "Сохранённое правило значения", []
-        else:
-            canonical, value_confidence, value_reason, suggestions = _allowed_match(
-                field, raw_value, source_name
+        for item, field, mapping_confidence, mapping_reason, _alternatives in mapping_rows:
+            mapping_name = clean_text(item.get("name"))
+            source_name = clean_text(item.get("source_name") or mapping_name)
+            raw_value = exact_value_key(item.get("value"))
+            if not mapping_name or not raw_value:
+                continue
+            if not field:
+                stats["ambiguous"] += 1
+                continue
+            target = _target_value(product, field.id)
+            if not target:
+                stats["not_in_template"] += 1
+                continue
+            saved_value = _saved_value_mapping(db, donor_id, field, raw_value)
+            if saved_value:
+                canonical, value_confidence, value_reason, suggestions = saved_value, 100, "Сохранённое правило значения", []
+            else:
+                canonical, value_confidence, value_reason, suggestions = _allowed_match(
+                    field, raw_value, source_name
+                )
+            if not canonical:
+                stats["unknown"] += 1
+                record_unknown_value(
+                    product, target, raw_value=raw_value, source=source, source_name=source_name,
+                    source_url=source_url, donor_id=donor_id,
+                    role="Основной донор" if priority == 0 else "Дополнительный донор",
+                    suggestions=suggestions, reason=value_reason,
+                )
+                if target.current_value:
+                    stats["already_filled"] += 1
+                continue
+            details = dict(target.source_details or {})
+            previous_unknown = list(details.get("unknown_values") or [])
+            details["unknown_values"] = [
+                unknown_item for unknown_item in previous_unknown
+                if not (
+                    isinstance(unknown_item, dict)
+                    and clean_text(unknown_item.get("source")) == clean_text(source)
+                    and clean_text(unknown_item.get("source_name")) == source_name
+                    and clean_text(unknown_item.get("url")) == clean_text(source_url)
+                    and int(unknown_item.get("donor_id") or 0) == int(donor_id or 0)
+                )
+            ]
+            if details["unknown_values"] != previous_unknown:
+                target.source_details = details
+            confidence = min(mapping_confidence, value_confidence)
+            apply_candidate(
+                product,
+                target,
+                value=canonical,
+                confidence=confidence,
+                source=source,
+                reason=f"{mapping_reason}; {value_reason}",
+                priority=priority,
+                source_name=source_name,
+                source_url=source_url,
+                raw_value=raw_value,
+                source_role="Основной донор" if priority == 0 else "Дополнительный донор",
+                donor_id=donor_id,
             )
-        if not canonical:
-            stats["unknown"] += 1
-            record_unknown_value(
-                product, target, raw_value=raw_value, source=source, source_name=source_name,
-                source_url=source_url, donor_id=donor_id,
-                role="Основной донор" if priority == 0 else "Дополнительный донор",
-                suggestions=suggestions, reason=value_reason,
-            )
+            stats["mapped"] += 1
             if target.current_value:
                 stats["already_filled"] += 1
-            continue
-        details = dict(target.source_details or {})
-        previous_unknown = list(details.get("unknown_values") or [])
-        details["unknown_values"] = [
-            item for item in previous_unknown
-            if not (
-                isinstance(item, dict)
-                and clean_text(item.get("source")) == clean_text(source)
-                and clean_text(item.get("source_name")) == source_name
-                and clean_text(item.get("url")) == clean_text(source_url)
-                and int(item.get("donor_id") or 0) == int(donor_id or 0)
-            )
-        ]
-        if details["unknown_values"] != previous_unknown:
-            target.source_details = details
-        confidence = min(mapping_confidence, value_confidence)
-        apply_candidate(
-            product,
-            target,
-            value=canonical,
-            confidence=confidence,
-            source=source,
-            reason=f"{mapping_reason}; {value_reason}",
-            priority=priority,
-            source_name=source_name,
-            source_url=source_url,
-            raw_value=raw_value,
-            source_role="Основной донор" if priority == 0 else "Дополнительный донор",
-            donor_id=donor_id,
-        )
-        stats["mapped"] += 1
-        if target.current_value:
-            stats["already_filled"] += 1
     refresh_product_status(product)
     return stats
 
