@@ -259,6 +259,58 @@ class SupplierFeedConfigurationTests(unittest.TestCase):
 
 
 class AttributeAssistantMigrationTests(unittest.TestCase):
+    def test_init_db_upgrades_values_without_dash_reason_and_is_repeatable(self) -> None:
+        import database.session as database_session
+        from models import AttributeBatch, AttributeCategory, AttributeProduct, AttributeProductValue, AttributeTemplate
+
+        with TemporaryDirectory() as directory:
+            engine = create_engine(f"sqlite:///{Path(directory) / 'legacy.db'}")
+            try:
+                Base.metadata.create_all(engine)
+                with sessionmaker(bind=engine).begin() as session:
+                    template = AttributeTemplate(name="Legacy", category=AttributeCategory(name="Legacy"))
+                    batch = AttributeBatch(template=template, name="Legacy", source_filename="legacy.csv")
+                    product = AttributeProduct(batch=batch, model="LEGACY")
+                    product.values = [
+                        AttributeProductValue(group_name="Main", attribute_name="Dash", current_value="—"),
+                        AttributeProductValue(group_name="Main", attribute_name="Empty", current_value=""),
+                        AttributeProductValue(group_name="Main", attribute_name="Class", current_value="A++",
+                                              proposed_value="A++", final_value="A++", status="accepted"),
+                    ]
+                    session.add(batch)
+                    session.flush()
+                    product_id = product.id
+                    value_ids = [value.id for value in product.values]
+                with engine.begin() as connection:
+                    connection.execute(text("ALTER TABLE attribute_product_values DROP COLUMN dash_reason"))
+
+                with patch.object(database_session, "engine", engine), patch.object(
+                    database_session, "DATA_DIR", Path(directory)
+                ):
+                    database_session.init_db()
+                    with engine.begin() as connection:
+                        connection.execute(text(
+                            "UPDATE attribute_product_values SET dash_reason = 'Manual reason' WHERE id = :id"
+                        ), {"id": value_ids[0]})
+                    database_session.init_db()
+
+                with engine.connect() as connection:
+                    rows = connection.execute(text(
+                        "SELECT id, product_id, current_value, proposed_value, final_value, status, dash_reason "
+                        "FROM attribute_product_values ORDER BY id"
+                    )).all()
+                    self.assertEqual(rows, [
+                        (value_ids[0], product_id, "-", "-", "-", "dash", "Manual reason"),
+                        (value_ids[1], product_id, "", "", "", "missing", ""),
+                        (value_ids[2], product_id, "A++", "A++", "A++", "accepted", ""),
+                    ])
+                    self.assertEqual(connection.execute(text(
+                        "SELECT count(*) FROM app_data_migrations WHERE name = 'attribute_technical_dashes_v1'"
+                    )).scalar_one(), 1)
+                    self.assertEqual(connection.execute(text("PRAGMA integrity_check")).scalar_one(), "ok")
+            finally:
+                engine.dispose()
+
     def test_runtime_migration_removes_only_obsolete_tables(self) -> None:
         from database.session import cleanup_obsolete_tables
 

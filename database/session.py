@@ -669,6 +669,9 @@ def migrate_attribute_assistant_tables(connection) -> None:
             "attributes_count": "INTEGER NOT NULL DEFAULT 0",
             "source_urls": "JSON NOT NULL DEFAULT '[]'",
         },
+        "attribute_product_values": {
+            "dash_reason": "VARCHAR(64) NOT NULL DEFAULT ''",
+        },
         "attribute_products": {
             "sort_order": "INTEGER NOT NULL DEFAULT 0",
             "template_id": "INTEGER",
