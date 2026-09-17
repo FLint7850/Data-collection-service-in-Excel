@@ -743,6 +743,125 @@ class AttributeAssistantTest(unittest.TestCase):
             {"name": "Цвет", "value": "Белый", "group": ""}
         ])
 
+    def test_tooltip_panels_are_excluded_before_discovering_characteristic_rows(self):
+        for marker in (
+            'class="tooltip-popper tooltip-popper_large"',
+            'data-tooltip-content=""',
+            'class="glossary-tooltip"',
+            'class="tooltip"',
+            'class="popover"',
+            'role="tooltip"',
+        ):
+            with self.subTest(marker=marker):
+                html = """
+                <script type="application/ld+json">
+                  {"@type": "Product", "name": "Gorenje WG894A1P1", "model": "WG894A1P1"}
+                </script>
+                <h2>Характеристики</h2>
+                <section>
+                  <div>
+                    <div>Тип установки
+                      <span data-tooltip="html">
+                        <div %s>
+                          <div>Тип установки</div>
+                          <div><div role="tooltip">Вложенная подсказка</div>
+                            <p>Справка про встраиваемые и отдельностоящие машины.</p>
+                          </div>
+                          <table><tr><td>Ложная строка таблицы</td><td>Справка</td></tr></table>
+                          <dl><dt>Ложное определение</dt><dd>Справка</dd></dl>
+                          <div class="characteristics__row">
+                            <span class="characteristics__name">Ложная характеристика</span>
+                            <span class="characteristics__property">Справка</span>
+                          </div>
+                        </div>
+                      </span>
+                    </div>
+                    <div>Отдельностоящая</div>
+                  </div>
+                </section>
+                """ % marker
+
+                parsed = service.parse_product_html(html)
+
+                self.assertEqual(parsed["name"], "Gorenje WG894A1P1")
+                self.assertEqual(parsed["model"], "WG894A1P1")
+                self.assertEqual(parsed["attributes"], [
+                    {"name": "Тип установки", "value": "Отдельностоящая", "group": ""},
+                ])
+
+    def test_detail_properties_extract_real_values_and_keep_text_beside_tooltips(self):
+        html = """
+        <div class="detail-properties__inner">
+          <h3 class="detail-properties__title">Специальные программы</h3>
+          <div class="detail-properties__table">
+            <div class="detail-properties__field detail-properties__field_subgroup">
+              <div class="detail-properties__name"><b>Стандартные программы:</b></div>
+              <div class="detail-properties__value">&nbsp;</div>
+            </div>
+            <div class="detail-properties__field">
+              <div class="detail-properties__name">
+                <img class="detail-properties__icon" src="/cotton.svg"> Хлопок
+                <span class="tooltip-hd__icon" data-tooltip="html">
+                  <div class="tooltip-popper" data-tooltip-content="">
+                    <div class="tooltip-popper__title">Программа «Хлопок»</div>
+                    <div class="tooltip-popper__text"><p>Справка о программе.</p></div>
+                  </div>
+                </span>
+              </div>
+              <div class="detail-properties__value">Да</div>
+            </div>
+            <div class="detail-properties__field">
+              <div class="detail-properties__name">Особенности</div>
+              <div class="detail-properties__value">
+                <span data-tooltip="html">Автоматическое взвешивание
+                  <div class="tooltip-popper" data-tooltip-content="">
+                    <div>Взвешивание</div><div>Справка о взвешивании.</div>
+                  </div>
+                </span>
+                <br><span>Самоочистка</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        """
+
+        parsed = service.parse_product_html(html)
+
+        self.assertEqual(parsed["attributes"], [
+            {"name": "Хлопок", "value": "Да", "group": ""},
+            {"name": "Особенности", "value": "Автоматическое взвешивание Самоочистка", "group": ""},
+        ])
+
+    def test_donor_selectors_do_not_collect_rows_inside_tooltips(self):
+        donor = Donor(
+            brand=Brand(name="Test", group_name="Test"),
+            legacy_id="tooltip-donor",
+            site_url="https://example.com",
+            selector_settings={
+                "attribute_row_selector": ".custom-row",
+                "attribute_name_selector": ".custom-name",
+                "attribute_value_selector": ".custom-value",
+            },
+        )
+        html = """
+        <div class="custom-row">
+          <div class="custom-name">Тип установки</div>
+          <div class="custom-value">Отдельностоящая</div>
+        </div>
+        <div data-tooltip-content="">
+          <div class="custom-row">
+            <div class="custom-name">Тип установки</div>
+            <div class="custom-value">Справка про типы установки.</div>
+          </div>
+        </div>
+        """
+
+        parsed = service.parse_product_html_for_donor(html, donor.site_url, donor)
+
+        self.assertEqual(parsed["attributes"], [
+            {"name": "Тип установки", "value": "Отдельностоящая", "group": ""},
+        ])
+
     def test_structural_two_column_characteristics_are_extracted_without_site_classes(self):
         html = """
         <h1>WM-100</h1>

@@ -61,6 +61,10 @@ SPECIFICATION_HEADING_RE = re.compile(
     r"(?:характеристик|параметр|спецификац|specification|properties)",
     re.IGNORECASE,
 )
+UI_NOISE_SELECTOR = (
+    "script,style,svg,canvas,noscript,.glossary-tooltip,.tooltip,.popover,"
+    ".tooltip-popper,[data-tooltip-content],[role='tooltip']"
+)
 IGNORED_NAME_TOKENS = {
     "максимальная", "максимальный", "макс", "мин", "об", "минуту", "ед",
     "значение", "характеристика", "параметр", "тип",
@@ -1024,14 +1028,17 @@ def _jsonld_items(value: Any) -> Iterable[dict[str, Any]]:
             yield from _jsonld_items(item)
 
 
+def _remove_ui_noise(node: Any) -> None:
+    # Remove children first because tooltip containers may be nested.
+    for noisy in reversed(node.select(UI_NOISE_SELECTOR)):
+        noisy.decompose()
+
+
 def _text_without_ui_noise(node: Any) -> str:
     """Read a specification cell without tooltip/help text nested inside it."""
 
     fragment = BeautifulSoup(str(node), "html.parser")
-    for noisy in fragment.select(
-        "script,style,svg,canvas,noscript,.glossary-tooltip,.tooltip,.popover,[role='tooltip']"
-    ):
-        noisy.decompose()
+    _remove_ui_noise(fragment)
     return clean_text(fragment.get_text(" "))
 
 
@@ -1186,6 +1193,9 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
                         "value": exact_value_key(prop.get("value")),
                         "group": "",
                     })
+    # Read JSON-LD first, then exclude help panels from row discovery as well as cell text.
+    # A tooltip's title/body pair otherwise looks like a two-column specification.
+    _remove_ui_noise(soup)
     selectors = ("table tr", ".characteristics tr", ".specifications tr", ".properties tr")
     seen = {(normalize_key(item["name"]), exact_value_key(item["value"])) for item in result["attributes"]}
     for row in soup.select(",".join(selectors)):
@@ -1212,6 +1222,7 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
     # Product sites often render specifications as semantic div/span pairs rather than tables.
     # Keep the selectors structural so this works across categories without domain-specific code.
     semantic_rows = (
+        (".detail-properties__field", ".detail-properties__name", ".detail-properties__value"),
         (".characteristics__row", ".characteristics__name", ".characteristics__property"),
         (".characteristic__row", ".characteristic__name", ".characteristic__value"),
         (".specifications__row", ".specifications__name", ".specifications__value"),
@@ -1300,6 +1311,7 @@ def parse_product_html_for_donor(
         settings = {**settings, **scoped}
     rules = dict(donor.extraction_rules or {})
     soup = BeautifulSoup(html, "html.parser")
+    _remove_ui_noise(soup)
 
     def selected_text(selector: object) -> str:
         text_selector = clean_text(selector)
