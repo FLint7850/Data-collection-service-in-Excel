@@ -628,9 +628,23 @@ def _make_product_values(
     existing_by_name: dict[str, list[dict[str, str]]] = {}
     for item in stack:
         existing_by_name.setdefault(normalize_key(item["name"]), []).append(item)
+    canonical_keys = {normalize_key(field.name) for field in template.fields}
+    synonym_owners: dict[str, list[AttributeTemplateField]] = {}
+    for field in template.fields:
+        for synonym in field.synonyms or []:
+            key = normalize_key(synonym)
+            if key and key not in canonical_keys and field not in synonym_owners.get(key, []):
+                synonym_owners.setdefault(key, []).append(field)
     consumed: set[int] = set()
     for field in template.fields:
         candidates = existing_by_name.get(normalize_key(field.name), [])
+        if not candidates:
+            candidates = [
+                item
+                for key, owners in synonym_owners.items()
+                if owners == [field]
+                for item in existing_by_name.get(key, [])
+            ]
         matched = next(
             (
                 item for item in candidates
@@ -659,7 +673,9 @@ def _make_product_values(
             reason = "Технический пропуск сохранён из исходного файла"
             dash_reason = "Импортировано из исходного CSV"
         elif current:
-            matched_source_name = clean_text(matched.get("source_name")) if matched else ""
+            matched_source_name = clean_text(
+                matched.get("source_name") or matched.get("name")
+            ) if matched else ""
             canonical, match_confidence, match_reason, suggestions = _allowed_match(
                 field, current, matched_source_name or field.name
             )
@@ -3900,6 +3916,121 @@ def replace_template_field_synonyms(
     field.synonyms = replacement
     db.flush()
     return replacement
+
+
+def apply_template_field_synonyms(db: Session, field: AttributeTemplateField) -> int:
+    """Apply saved aliases to existing unmatched facts without fetching donor pages."""
+    keys = {normalize_key(synonym) for synonym in field.synonyms or []}
+    if not keys:
+        return 0
+    products = db.scalars(
+        select(AttributeProduct).join(AttributeBatch).where(
+            (AttributeProduct.template_id == field.template_id)
+            | (
+                AttributeProduct.template_id.is_(None)
+                & (AttributeBatch.template_id == field.template_id)
+            )
+        )
+    )
+    changed = 0
+    batches: dict[int, AttributeBatch] = {}
+    for product in products:
+        if product_template(product) is not field.template:
+            continue
+        target = _target_value(product, field.id)
+        if target is None or _has_confirmed_decision(target):
+            continue
+        extras = [
+            value for value in product.values
+            if not value.is_in_template
+            and normalize_key(value.attribute_name) in keys
+            and value.source in {"current_csv", "current_site"}
+            and value.current_value
+            and not _has_confirmed_decision(value)
+        ]
+        donor_rows = []
+        for source in product.sources:
+            if source.role not in {"primary", "verification"} or source.donor is None:
+                continue
+            attributes = [
+                item for item in (source.parsed_data or {}).get("attributes") or []
+                if normalize_key(item.get("name")) in keys
+                and map_attribute(
+                    db, field.template, source.donor_id, item.get("name"), item.get("value", "")
+                )[0] is field
+            ]
+            if attributes:
+                donor_rows.append((source, attributes))
+        if not extras and not donor_rows:
+            continue
+        before = capture_product_snapshot(product)
+        for extra in extras:
+            # Keep a differing original visible instead of silently replacing it.
+            if target.current_value:
+                continue
+            shadow = SimpleNamespace(values=[], source_url=product.source_url)
+            _make_product_values(
+                shadow, field.template,
+                [{"name": extra.attribute_name, "group_name": extra.group_name, "value": extra.current_value}],
+                current_source=extra.source,
+                current_role="Исходная страница сайта" if extra.source == "current_site" else "Исходный CSV сайта",
+            )
+            restored = next(value for value in shadow.values if value.template_field is field)
+            if not restored.current_value:
+                continue
+            details = dict(target.source_details or {})
+            for key, value in (restored.source_details or {}).items():
+                if key == "unknown_values":
+                    details[key] = [*details.get(key, []), *value]
+                else:
+                    details[key] = value
+            for key in (
+                "current_value", "proposed_value", "final_value", "confidence",
+                "status", "reason", "source", "dash_reason",
+            ):
+                setattr(target, key, getattr(restored, key))
+            target.source_details = details
+            if details.get("candidates"):
+                _recalculate_candidate_state(product, target)
+            product.values.remove(extra)
+        for source, attributes in donor_rows:
+            # A newly explicit alias can replace an earlier fuzzy assignment.
+            names = {normalize_key(item["name"]) for item in attributes}
+            for existing in product.values:
+                if _has_confirmed_decision(existing):
+                    continue
+                details = dict(existing.source_details or {})
+                updated = False
+                for key in ("candidates", "unknown_values"):
+                    evidence = list(details.get(key) or [])
+                    kept = [
+                        item for item in evidence
+                        if not (
+                            int(item.get("donor_id") or 0) == source.donor_id
+                            and clean_text(item.get("url")) == source.url
+                            and normalize_key(item.get("source_name")) in names
+                        )
+                    ]
+                    if kept != evidence:
+                        details[key] = kept
+                        updated = True
+                if updated:
+                    existing.source_details = details
+                    if not existing.current_value:
+                        existing.final_value = ""
+                    _recalculate_candidate_state(product, existing)
+            apply_parsed_attributes(
+                db, product, attributes, source=source.donor.brand.name,
+                priority=source.priority, donor_id=source.donor_id, source_url=source.url,
+            )
+        refresh_product_status(product)
+        if capture_product_snapshot(product) != before:
+            save_product_snapshot(db, product, "Перед применением синонимов атрибута", before)
+            changed += 1
+            batches[product.batch_id] = product.batch
+    for batch in batches.values():
+        refresh_batch_summary(batch)
+    return changed
 
 
 def _validated_conversion_rules(value: Any) -> list[dict[str, Any]]:

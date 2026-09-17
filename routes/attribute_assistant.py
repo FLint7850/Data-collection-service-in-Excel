@@ -33,6 +33,7 @@ from services.attribute_assistant import (
     assign_product_template,
     batch_report,
     apply_parsed_attributes,
+    apply_template_field_synonyms,
     apply_similar_products,
     bulk_action,
     clean_text,
@@ -830,6 +831,8 @@ def api_attribute_field_update(field_id: int):
             setattr(field, key, value)
         field.template.version += 1
         g.db.flush()
+        if "synonyms" in updates:
+            apply_template_field_synonyms(g.db, field)
         return jsonify(serialize_template(field.template, include_values=True))
     except (TypeError, ValueError) as error:
         g.db.rollback()

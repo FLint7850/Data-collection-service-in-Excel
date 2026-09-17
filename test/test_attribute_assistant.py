@@ -250,6 +250,154 @@ class AttributeAssistantTest(unittest.TestCase):
                 {"synonyms": [source_name]},
             )
 
+    def test_csv_import_uses_attribute_synonyms_and_source_units(self):
+        template = service.import_template_csv(
+            self.db,
+            "Диаметр люка, см (Основные)\r\n31\r\n".encode("cp1251"),
+            name="Стиральные машины", category="Тест",
+        )
+        field = template.fields[0]
+        service.replace_template_field_synonyms(self.db, field, ["Размер проема, мм"])
+        batch = service.create_batch_from_csv(
+            self.db, template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM-100;"Другие|РАЗМЕР ПРОЕМА, ММ|310"\r\n'.encode("cp1251"),
+            filename="synonyms.csv",
+        )
+
+        value, = batch.products[0].values
+        self.assertEqual(value.template_field_id, field.id)
+        self.assertEqual(value.current_value, "310")
+        self.assertEqual(value.final_value, "31")
+        self.assertEqual(value.source_details["current_source_name"], "РАЗМЕР ПРОЕМА, ММ")
+        self.assertFalse(value.is_extra_attribute)
+
+    def test_csv_synonyms_do_not_override_exact_names_or_ambiguous_aliases(self):
+        template = self.make_template()
+        color = template.fields[0]
+        speed = template.fields[1]
+        color.synonyms = ["Общий синоним", speed.name]
+        speed.synonyms = ["Общий синоним"]
+        batch = service.create_batch_from_csv(
+            self.db, template,
+            ('_MODEL_;_ATTRIBUTES_\r\nWM-100;"Режимы|Максимальная скорость отжима об./мин.|1000'
+             '\nОсновные|Общий синоним|1200"\r\n').encode("cp1251"),
+            filename="ambiguous.csv",
+        )
+        product = batch.products[0]
+        color_value = next(value for value in product.values if value.template_field_id == color.id)
+        speed_value = next(value for value in product.values if value.template_field_id == speed.id)
+        self.assertEqual(color_value.current_value, "")
+        self.assertEqual(speed_value.current_value, "1000")
+        self.assertEqual(
+            [(value.attribute_name, value.current_value) for value in product.values if not value.is_in_template],
+            [("Общий синоним", "1200")],
+        )
+
+    def test_saving_attribute_synonym_updates_existing_csv_and_url_products(self):
+        from app import create_app
+        template = self.make_template()
+        color = template.fields[0]
+        alias = "Окраска корпуса"
+        csv_batch = service.create_batch_from_csv(
+            self.db, template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM-100;"Основные|Окраска корпуса|Белый"\r\n'.encode("cp1251"),
+            filename="before-synonym.csv",
+        )
+        html = "<h1>WM-200</h1><table><tr><td>Окраска корпуса</td><td>Белый</td></tr></table>"
+        with patch.object(service, "fetch_public_html", return_value=(html, "https://example.com/wm-200")):
+            url_batch = service.create_batch_from_urls(
+                self.db, ["https://example.com/wm-200"], template=template,
+            )
+        products = [csv_batch.products[0], url_batch.products[0]]
+        for product in products:
+            self.assertTrue(any(not value.is_in_template for value in product.values))
+            target = next(value for value in product.values if value.template_field_id == color.id)
+            self.assertEqual(target.current_value, "")
+        self.db.commit()
+
+        with patch("services.application.SessionLocal", side_effect=lambda: Session(self.engine, expire_on_commit=False)), \
+                patch("routes.attribute_assistant.ensure_storage"), \
+                patch.object(service, "fetch_public_html") as fetch:
+            app = create_app()
+            app.config["TESTING"] = True
+            client = app.test_client()
+            with client.session_transaction() as session:
+                session["user_id"] = 1
+            response = client.patch(
+                f"/api/attribute-assistant/fields/{color.id}",
+                json={"synonyms": [alias]},
+            )
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+            fetch.assert_not_called()
+        self.db.expire_all()
+
+        for product in products:
+            value = next(value for value in product.values if value.template_field_id == color.id)
+            self.assertEqual(value.current_value, "Белый")
+            self.assertEqual(value.final_value, "Белый")
+            self.assertEqual(value.source_details["current_source_name"], alias)
+            self.assertFalse(any(not value.is_in_template for value in product.values))
+            self.assertTrue(service.product_history(self.db, product))
+        self.assertEqual(service.apply_template_field_synonyms(self.db, color), 0)
+
+    def test_attribute_synonym_reapplies_cached_donor_facts(self):
+        template = self.make_template()
+        color = template.fields[0]
+        batch = service.create_batch_from_csv(
+            self.db, template, '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode("cp1251"),
+            filename="donor-synonym.csv",
+        )
+        product = batch.products[0]
+        donor = Donor(
+            brand=Brand(name="Hausdorf", group_name="Test"), legacy_id="synonym-donor",
+            site_url="https://example.com",
+        )
+        self.db.add(donor)
+        self.db.flush()
+        attributes = [{"name": "Окраска корпуса", "value": "Белый"}]
+        product.sources.append(AttributeProductSource(
+            donor=donor, url="https://example.com/wm-100", priority=0,
+            role="primary", status="parsed", parsed_data={"attributes": attributes},
+        ))
+        service.apply_parsed_attributes(
+            self.db, product, attributes, source=donor.brand.name, priority=0,
+            donor_id=donor.id, source_url="https://example.com/wm-100",
+        )
+        target = next(value for value in product.values if value.template_field_id == color.id)
+        self.assertEqual(target.proposed_value, "")
+        service.replace_template_field_synonyms(self.db, color, ["Окраска корпуса"])
+
+        self.assertEqual(service.apply_template_field_synonyms(self.db, color), 1)
+        self.assertEqual(target.proposed_value, "Белый")
+        self.assertIn("Синоним атрибута", target.reason)
+        self.assertEqual(len(target.source_details["candidates"]), 1)
+        self.assertEqual(service.apply_template_field_synonyms(self.db, color), 0)
+        self.assertEqual(len(target.source_details["candidates"]), 1)
+
+    def test_attribute_synonym_refresh_preserves_decisions_and_other_templates(self):
+        template = self.make_template()
+        color = template.fields[0]
+        other = service.copy_template(self.db, template, name="Другой шаблон")
+        products = []
+        for selected in (template, template, template, other):
+            batch = service.create_batch_from_csv(
+                self.db, selected,
+                '_MODEL_;_ATTRIBUTES_\r\nWM-100;"Основные|Окраска корпуса|Белый"\r\n'.encode("cp1251"),
+                filename="manual-synonym.csv",
+            )
+            products.append(batch.products[0])
+        for product, status, final in zip(products, ("approved", "rejected", "dash"), ("Чёрный", "", "-")):
+            target = next(value for value in product.values if value.template_field_id == color.id)
+            target.status = status
+            target.final_value = final
+            target.source = "manual"
+        self.db.flush()
+        before = [service.capture_product_snapshot(product) for product in products]
+        service.replace_template_field_synonyms(self.db, color, ["Окраска корпуса"])
+
+        self.assertEqual(service.apply_template_field_synonyms(self.db, color), 0)
+        self.assertEqual([service.capture_product_snapshot(product) for product in products], before)
+
     def test_semantic_mapping_normalizes_inflections_and_abbreviations(self):
         template = service.import_template_csv(
             self.db,
