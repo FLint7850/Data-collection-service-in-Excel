@@ -5,7 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import Session
 
 from models import (
@@ -75,6 +75,71 @@ class OpenCartSyncTest(unittest.TestCase):
         links = list(self.db.scalars(select(AttributeShopTemplateLink)))
         self.assertIn(" красный ", links[0].state["source"]["attributes"][0]["values"])
 
+
+    def test_sync_upgrades_legacy_required_columns_without_losing_data(self):
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+        from sqlalchemy import Boolean, Column, String
+        import database.session as database_session
+
+        svc.import_snapshot(self.db, self.shop, snapshot())
+        self.db.commit()
+        ids = [(t.id, t.fields[0].id, t.fields[0].allowed_values[0].id) for t in self.templates()]
+        self.db.close()
+        legacy_columns = {
+            "attribute_categories": [("parent_name", String(255), "Saved parent"),
+                                     ("external_key", String(128), "Saved key")],
+            "attribute_template_fields": [("is_active", Boolean(), "0")],
+            "attribute_allowed_values": [("value_type", String(32), "value")],
+        }
+        with self.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
+            with connection.begin():
+                operations = Operations(MigrationContext.configure(connection))
+                for table, columns in legacy_columns.items():
+                    for name, kind, value in columns:
+                        operations.add_column(table, Column(name, kind, nullable=False, server_default=value))
+                    with operations.batch_alter_table(table) as batch:
+                        for name, kind, value in columns:
+                            batch.alter_column(name, existing_type=kind, server_default=None)
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.commit()
+        with patch.object(database_session, "engine", self.engine), patch.object(
+            database_session, "DATA_DIR", Path(self.temp.name)
+        ):
+            database_session.init_db()
+            database_session.init_db()
+
+        self.shop = self.db.get(type(self.shop), self.shop.id)
+        self.assertEqual(ids, [(t.id, t.fields[0].id, t.fields[0].allowed_values[0].id) for t in self.templates()])
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.execute(text(
+                "SELECT DISTINCT parent_name, external_key FROM attribute_categories"
+            )).all(), [("Saved parent", "Saved key")])
+            self.assertEqual(connection.execute(text(
+                "SELECT DISTINCT is_active FROM attribute_template_fields"
+            )).all(), [(0,)])
+
+        data = snapshot()
+        data["categories"].append(dict(data["categories"][1], id=205, name="New category"))
+        with patch.object(svc, "fetch_snapshot", return_value=recount(data)):
+            report = svc.sync_shop(self.db, self.shop)
+            repeated = svc.sync_shop(self.db, self.shop)
+        self.assertEqual(report["created"], 1)
+        self.assertEqual(repeated["unchanged"], 3)
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.execute(text("PRAGMA foreign_key_check")).all(), [])
+            self.assertEqual(connection.execute(text("PRAGMA integrity_check")).scalar_one(), "ok")
+            self.assertEqual(connection.execute(text(
+                "SELECT parent_name, external_key FROM attribute_categories ORDER BY id DESC LIMIT 1"
+            )).one(), ("", ""))
+            self.assertEqual(connection.execute(text(
+                "SELECT is_active FROM attribute_template_fields ORDER BY id DESC LIMIT 1"
+            )).scalar_one(), 1)
+            self.assertEqual(connection.execute(text(
+                "SELECT value_type FROM attribute_allowed_values ORDER BY id DESC LIMIT 1"
+            )).scalar_one(), "value")
 
     def test_punctuation_variants_are_imported_separately(self):
         data = snapshot()

@@ -613,6 +613,37 @@ def migrate_supplier_feeds_table(connection) -> None:
         connection.execute(text("ALTER TABLE supplier_feeds ADD COLUMN replace_rules TEXT NOT NULL DEFAULT ''"))
 
 
+def migrate_attribute_legacy_defaults(connection) -> None:
+    """Keep old column data while allowing inserts from the current ORM models.
+
+    Called by init_db with foreign keys disabled, since SQLite needs to rebuild
+    these tables to change defaults. Alembic preserves their keys and indexes.
+    """
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    legacy_defaults = {
+        "attribute_categories": {"parent_name": "''", "external_key": "''"},
+        "attribute_template_fields": {"is_active": "1"},
+        "attribute_allowed_values": {"value_type": "'value'"},
+    }
+    operations = Operations(MigrationContext.configure(connection))
+    inspector = inspect(connection)
+    for table, defaults in legacy_defaults.items():
+        if not inspector.has_table(table):
+            continue
+        columns = {column["name"]: column for column in inspector.get_columns(table)}
+        missing_defaults = {
+            name: default for name, default in defaults.items()
+            if name in columns and columns[name]["default"] is None
+        }
+        if not missing_defaults:
+            continue
+        with operations.batch_alter_table(table) as batch:
+            for name, default in missing_defaults.items():
+                batch.alter_column(name, existing_type=columns[name]["type"], server_default=text(default))
+
+
 def migrate_attribute_assistant_tables(connection) -> None:
     """Keep Attribute Assistant data readable across its two persisted schemas."""
     connection.execute(
@@ -690,6 +721,8 @@ def migrate_attribute_assistant_tables(connection) -> None:
         for column_name, definition in table_additions.items():
             if column_name not in columns:
                 connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+
+    migrate_attribute_legacy_defaults(connection)
 
     allowed_value_columns = table_columns(connection, "attribute_allowed_values")
     for obsolete_column in ("is_global", "is_recommended"):
