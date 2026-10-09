@@ -3,7 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from typing import Dict, Optional
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select, update
 
 from database.session import session_scope
 from config import MSK_TZ
@@ -113,6 +113,40 @@ def prune_old_logs(days: int = 7) -> int:
     cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=max(1, days))
     with session_scope() as db_session:
         result = db_session.execute(delete(ApplicationLog).where(ApplicationLog.created_at < cutoff))
+        return int(result.rowcount or 0)
+
+
+def run_daily_log_cleanup(now: Optional[datetime] = None) -> Optional[int]:
+    """Delete expired logs at most once per 24 hours across workers and restarts."""
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is not None:
+        current_time = current_time.astimezone(UTC).replace(tzinfo=None)
+    previous_day = current_time - timedelta(days=1)
+    with session_scope() as db_session:
+        # Check one settings row, without counting or loading the log table.
+        settings = db_session.execute(
+            select(AppSetting.auto_cleanup, AppSetting.logs_last_cleanup_at).where(AppSetting.id == 1)
+        ).one_or_none()
+        if not settings or not settings.auto_cleanup:
+            return None
+        if settings.logs_last_cleanup_at and settings.logs_last_cleanup_at > previous_day:
+            return None
+        claimed = db_session.execute(
+            update(AppSetting)
+            .where(
+                AppSetting.id == 1,
+                AppSetting.auto_cleanup.is_(True),
+                or_(AppSetting.logs_last_cleanup_at.is_(None), AppSetting.logs_last_cleanup_at <= previous_day),
+            )
+            .values(logs_last_cleanup_at=current_time)
+            .execution_options(synchronize_session=False)
+        )
+        if not claimed.rowcount:
+            return None
+        # The claim and deletion commit together; failure leaves the run due.
+        result = db_session.execute(
+            delete(ApplicationLog).where(ApplicationLog.created_at < current_time - timedelta(days=7))
+        )
         return int(result.rowcount or 0)
 
 

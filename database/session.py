@@ -216,6 +216,7 @@ def migrate_schema(connection) -> None:
         connection.exec_driver_sql(f"ALTER TABLE brands ADD COLUMN state JSON NOT NULL DEFAULT '{DEFAULT_BRAND_STATE_JSON}'")
 
     migrate_app_settings_current_table(connection)
+    migrate_log_cleanup_schedule(connection)
     migrate_news_tables(connection)
     migrate_donor_start_urls(connection)
     migrate_donors_table(connection)
@@ -450,6 +451,12 @@ def migrate_app_settings_current_table(connection) -> None:
     connection.execute(text("DROP TABLE app_settings"))
     connection.execute(text("ALTER TABLE app_settings_migration_tmp RENAME TO app_settings"))
 
+
+
+def migrate_log_cleanup_schedule(connection) -> None:
+    columns = table_columns(connection, "app_settings")
+    if columns and "logs_last_cleanup_at" not in columns:
+        connection.execute(text("ALTER TABLE app_settings ADD COLUMN logs_last_cleanup_at DATETIME"))
 
 
 def _json_or_default(value, default):

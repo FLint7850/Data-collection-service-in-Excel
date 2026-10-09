@@ -132,6 +132,7 @@ def ensure_storage() -> None:
     with _storage_init_lock:
         if _storage_initialized:
             return
+        from runtime.log_cleanup import start_log_cleanup_scheduler
         from runtime.news_tasks import start_news_scheduler
         from services.feeds import recover_interrupted_feed_comparison
         from services.file_import_service import recover_interrupted_file_import_scan
@@ -154,5 +155,6 @@ def ensure_storage() -> None:
         recover_interrupted_feed_comparison()
         load_projects()
         load_news_settings()
+        start_log_cleanup_scheduler()
         start_news_scheduler()
         _storage_initialized = True

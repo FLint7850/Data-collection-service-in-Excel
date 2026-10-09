@@ -160,6 +160,7 @@ class AppSetting(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     auto_cleanup: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    logs_last_cleanup_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     smtp: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     feed_storage: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
 

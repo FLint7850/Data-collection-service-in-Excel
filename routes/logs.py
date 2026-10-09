@@ -1,20 +1,16 @@
 """Application log API backed by SQLite."""
 
-import time
-
 from flask import Blueprint, jsonify, request
 
 from services.application import ensure_storage
 from services.log_service import (
     clear_logs,
     logs_metadata,
-    prune_old_logs,
     query_logs,
     set_log_auto_cleanup,
 )
 
 bp = Blueprint("routes_logs", __name__)
-_last_cleanup_at = 0.0
 
 
 def _positive_int(name: str, default: int, maximum: int) -> int:
@@ -27,13 +23,8 @@ def _positive_int(name: str, default: int, maximum: int) -> int:
 @bp.get("/api/logs")
 def api_logs():
     ensure_storage()
-    global _last_cleanup_at
     metadata = logs_metadata()
     auto_cleanup = bool(metadata["auto_cleanup"])
-    if auto_cleanup and time.time() - _last_cleanup_at >= 60:
-        prune_old_logs()
-        _last_cleanup_at = time.time()
-        metadata = logs_metadata()
 
     signature = str(metadata["signature"])
     requested_signature = str(request.args.get("signature") or "")
