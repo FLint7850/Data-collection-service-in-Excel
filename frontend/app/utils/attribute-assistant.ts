@@ -61,11 +61,34 @@ export function bestCandidate(value: AttributeValue) {
     })[0];
 }
 
-export function displayedProposal(value: AttributeValue) {
+function rawProposal(value: AttributeValue) {
     const nearest = ["suggested", "unknown"].includes(value.status)
         ? value.source_details.unknown_values?.flatMap((item) => item.suggestions || [])[0]
         : "";
     return value.proposed_value || bestCandidate(value)?.value || nearest || "";
+}
+
+function unchangedProposal(value: AttributeValue): boolean {
+    if (["conflict", "rejected", "dash"].includes(value.status)) return false;
+    const proposal = rawProposal(value);
+    return Boolean(value.current_value && value.final_value && proposal
+        && attributeValuesMatch(value.current_value, value.final_value)
+        && attributeValuesMatch(proposal, value.final_value)
+        && (value.source_details.candidates || []).every((candidate) => attributeValuesMatch(candidate.value, value.final_value)));
+}
+
+export function displayedProposal(value: AttributeValue) {
+    const proposal = rawProposal(value);
+    // A source can confirm the selected result while other sources disagree.
+    // Keep that disagreement visible without presenting the result as a change.
+    return value.final_value && attributeValuesMatch(proposal, value.final_value) ? "" : proposal;
+}
+
+export function attributeReviewStatus(value: AttributeValue) {
+    if (unchangedProposal(value) && ["suggested", "unknown"].includes(value.status)) return "kept";
+    if (value.current_value.trim() && ["suggested", "unknown"].includes(value.status)) return "conflict";
+    if (value.status === "unknown") return hasPendingProposal(value) ? "suggested" : "conflict";
+    return value.status;
 }
 
 export function originalValueHints(value: AttributeValue): string[] {
@@ -86,15 +109,21 @@ export function hasPendingProposal(value: AttributeValue): boolean {
     return Boolean(proposal && !attributeValuesMatch(proposal, value.final_value));
 }
 
+export function canConfirmConflictFinal(value: AttributeValue): boolean {
+    return value.is_in_template && attributeReviewStatus(value) === "conflict"
+        && Boolean(value.final_value) && !isTechnicalDash(value.final_value)
+        && !hasPendingProposal(value);
+}
+
 export function matchesAttributeStatus(value: AttributeValue, status: string): boolean {
     if (status === ALL_FILTER_VALUE) return true;
     if (status === "outside_template") return !value.is_in_template;
     if (!value.is_in_template) return false;
-    const reviewStatus = value.status === "unknown"
-        ? (hasPendingProposal(value) ? "suggested" : "conflict") : value.status;
-    if (status === "conflict") return reviewStatus === "conflict";
-    if (status === "suggested") return reviewStatus === "suggested" || (reviewStatus !== "conflict" && hasPendingProposal(value));
-    if (status === "no_suggestion") return !["conflict", "suggested"].includes(reviewStatus) && !hasPendingProposal(value);
+    const effectiveStatus = attributeReviewStatus(value);
+    if (status === "conflict") return effectiveStatus === "conflict";
+    if (status === "suggested") return !value.current_value.trim()
+        && (effectiveStatus === "suggested" || (effectiveStatus !== "conflict" && hasPendingProposal(value)));
+    if (status === "no_suggestion") return !["conflict", "suggested"].includes(effectiveStatus) && !hasPendingProposal(value);
     return true;
 }
 
@@ -170,7 +199,8 @@ export function isTechnicalDash(value: string) {
 
 export function valueStatusLabel(value: AttributeValue) {
     if (!value.is_in_template) return "Вне шаблона";
-    if (value.status === "conflict") return "Конфликт";
+    if (unchangedProposal(value)) return "Без изменений";
+    if (attributeReviewStatus(value) === "conflict") return "Конфликт";
     if (value.status === "unknown") return hasPendingProposal(value) ? "Есть предложение" : "Конфликт";
     if (value.status === "dash") return "Технический пропуск";
     if (value.status === "rejected") return "Отклонено";
@@ -182,7 +212,8 @@ export function valueStatusLabel(value: AttributeValue) {
 
 export function valueStatusColor(value: AttributeValue): "error" | "warning" | "success" | "neutral" {
     if (!value.is_in_template) return "warning";
-    if (value.status === "conflict" || value.status === "rejected") return "error";
+    if (unchangedProposal(value)) return "success";
+    if (attributeReviewStatus(value) === "conflict" || value.status === "rejected") return "error";
     if (value.status === "unknown") return hasPendingProposal(value) ? "warning" : "error";
     if (value.status === "suggested") return "warning";
     if (value.current_value || value.status === "approved") return "success";

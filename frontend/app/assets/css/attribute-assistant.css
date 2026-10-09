@@ -1,4 +1,5 @@
 .aa-page {
+  --aa-sticky-top: 76px;
   max-width: 1540px;
   margin: 0 auto;
   padding: 28px 32px 64px;
@@ -153,6 +154,37 @@ margin-bottom: 18px;
 .aa-card-head h2,
 .aa-product-title h2 {
 font-size: 22px;
+}
+
+/* UCard's default overflow clips sticky descendants to an unscrollable card. */
+.aa-card[data-slot="root"] {
+  overflow: visible;
+}
+
+.aa-card > [data-slot="body"] {
+  --aa-card-inset: 1rem;
+}
+
+.aa-card-head {
+  position: sticky;
+  top: var(--aa-sticky-top);
+  z-index: 5;
+  background: var(--ui-bg);
+  margin-inline: calc(-1 * var(--aa-card-inset, 0px));
+  padding: 12px var(--aa-card-inset, 0px);
+  box-shadow: 0 1px 0 var(--line-soft);
+}
+
+@media (min-width: 640px) {
+  .aa-card > [data-slot="body"] {
+    --aa-card-inset: 1.5rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .aa-page {
+    --aa-sticky-top: 64px;
+  }
 }
 
 .aa-drop {
@@ -538,7 +570,7 @@ color: var(--red);
 
 .aa-attribute-group h3 {
 position: sticky;
-top: 76px;
+top: calc(var(--aa-sticky-top) + var(--aa-card-head-height, 0px));
 z-index: 2;
 margin: 18px -20px 0;
 border-block: 1px solid var(--line-soft);
@@ -1143,6 +1175,14 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
 .aa-product-list {
   overflow-y: auto;
   min-height: 0;
+}
+
+.aa-product-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line-soft);
 }
 
 

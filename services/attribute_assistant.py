@@ -20,6 +20,7 @@ import uuid
 from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from fractions import Fraction
 from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,10 +30,13 @@ from urllib.parse import urljoin, urlparse
 import chardet
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, or_, select, update
+from sqlalchemy.orm.attributes import NO_VALUE
 from sqlalchemy.orm import Session, object_session, selectinload
 
 from config import ATTRIBUTE_ASSISTANT_DIR, ATTRIBUTE_ASSISTANT_MAX_URLS, REQUEST_TIMEOUT
+from services.attribute_programs import is_program_list, match_programs
+from services.attribute_listing import batch_summary, product_page
 from models import (
     AttributeAllowedValue,
     AttributeBatch,
@@ -50,6 +54,13 @@ from models import (
     Brand,
     Donor,
 )
+from services.connections import (
+    automatic_connection_methods,
+    is_browser_render_method,
+    is_debug_visible_method,
+    normalize_connection_method,
+)
+from services.scraping.http import looks_blocked_or_empty
 
 
 SPACE_RE = re.compile(r"\s+")
@@ -105,6 +116,17 @@ NUMBER_WITH_UNIT_RE = re.compile(
     r"^\s*([+-]?\d+(?:[.,]\d+)?)\s*"
     r"(месяц(?:а|ев)?|мес\.?|год(?:а|ов)?|лет|квт(?:/ч)?|вт(?:/ч)?|см|мм|м|кг|мг|г|мл|л|дб|гц|ч)?\s*$",
     re.IGNORECASE,
+)
+DURATION_UNIT_PATTERN = (
+    r"(?:месяц(?:а|ев|ы|ах|ами|е)?|мес\.?|months?|mos?|"
+    r"год(?:а|ов|ы|ах|ами)?|лет|years?|yrs?)"
+)
+DURATION_VALUE_RE = re.compile(
+    r"^\s*([+]?\d+(?:[.,]\d+)?)\s*(" + DURATION_UNIT_PATTERN + r")?\s*$",
+    re.IGNORECASE,
+)
+DURATION_NAME_UNIT_RE = re.compile(
+    r"(?<!\w)(" + DURATION_UNIT_PATTERN + r")(?!\w)", re.IGNORECASE,
 )
 LINEAR_UNIT_FACTORS: dict[str, tuple[str, Decimal]] = {
     "мм": ("length", Decimal("0.001")),
@@ -179,34 +201,12 @@ def model_tokens(value: Any) -> list[str]:
 
 
 def _canonical_name_token(token: str) -> str:
-    aliases = {
-        "полок": "полка",
-        "дверца": "дверь",
-        "дверной": "дверь",
-        "фасад": "дверь",
-        "габарит": "размер",
-        "габариты": "размер",
-        "монтаж": "крепление",
-        "электроэнергия": "энергия",
-        "энергопотребление": "энергия",
-    }
-    token = aliases.get(token, token)
-    if token.startswith(("двер", "фасад")):
-        return "двер"
-    if token.startswith(("суперзамораж", "суперзамороз")):
-        return "суперзаморозка"
-    if token.startswith("энергопотреб"):
-        return "энергия"
-    if token.startswith("электроэнерг"):
-        return "энергия"
-    if token.startswith("отделен"):
-        return "камер"
+    # Only grammatical endings are normalized here. Semantic equivalences
+    # belong to the active field synonyms/mapping rules, not a local word list.
     for suffix in RUSSIAN_NAME_SUFFIXES:
         if token.endswith(suffix) and len(token) - len(suffix) >= 4:
             token = token[:-len(suffix)]
             break
-    if token.startswith("отделен"):
-        return "камер"
     return token
 
 
@@ -215,8 +215,6 @@ def _name_tokens(value: Any) -> set[str]:
     # Axis order describes the tuple layout, not the attribute's semantic identity.
     # Treating ШxВxГ and ВxШxГ as words prevents otherwise identical fields from mapping.
     text = DIMENSION_AXIS_SEQUENCE_RE.sub(" ", text)
-    text = re.sub(r"\bх\s*\.?\s*к\s*\.?\b", " холодильная камера ", text)
-    text = re.sub(r"\bм\s*\.?\s*к\s*\.?\b", " морозильная камера ", text)
     # English marketing explanations in brackets reduce Russian-name similarity.
     text = re.sub(r"\([^)]*[a-z][^)]*\)", " ", text, flags=re.IGNORECASE)
     tokens = []
@@ -305,7 +303,8 @@ def infer_value_type(name: str, values: Iterable[str]) -> tuple[str, bool]:
         return "dimensions", False
     if sample and all(NUMBER_RE.fullmatch(value) for value in sample):
         return "number", False
-    if any(word in name_key for word in ("список программ", "дополнительные программы", "индикация")):
+    if (re.search(r"(?:список|дополнительные|основные|автоматические) программ|^программы\b", name_key)
+            or "индикация" in name_key):
         return "select", True
     return "select", False
 
@@ -644,6 +643,7 @@ def _make_product_values(
     *,
     current_source: str = "current_csv",
     current_role: str = "Исходный CSV сайта",
+    match_cache: dict | None = None,
 ) -> None:
     existing_by_name: dict[str, list[dict[str, str]]] = {}
     for item in stack:
@@ -696,9 +696,14 @@ def _make_product_values(
             matched_source_name = clean_text(
                 matched.get("source_name") or matched.get("name")
             ) if matched else ""
-            canonical, match_confidence, match_reason, suggestions = _allowed_match(
-                field, current, matched_source_name or field.name
-            )
+            cache_key = (field.id, current, matched_source_name or field.name)
+            matched_value = match_cache.get(cache_key) if match_cache is not None else None
+            if matched_value is None:
+                matched_value = _allowed_match(field, current, cache_key[2])
+                if match_cache is not None:
+                    match_cache[cache_key] = matched_value
+            canonical, match_confidence, match_reason, suggestions = matched_value
+            suggestions = list(suggestions)
             if canonical:
                 final = canonical
                 confidence = match_confidence
@@ -708,7 +713,7 @@ def _make_product_values(
                     if canonical != current else "Исходное значение подтверждено справочником"
                 )
             else:
-                status = "suggested" if suggestions else "conflict"
+                status = "conflict"
                 reason = match_reason
                 source_details = {
                     "unknown_values": [{
@@ -766,8 +771,25 @@ def _make_product_values(
 
 
 def refresh_batch_summary(batch: AttributeBatch) -> dict[str, int]:
+    session = object_session(batch)
+    if session is not None and batch.id is not None:
+        loaded_products = inspect(batch).attrs["products"].loaded_value
+        if loaded_products is not NO_VALUE:
+            for product in loaded_products:
+                loaded_values = inspect(product).attrs["values"].loaded_value
+                if loaded_values is not NO_VALUE:
+                    repaired = [_repair_confirming_evidence(value) or _repair_existing_value_status(value) for value in loaded_values]
+                    if any(repaired):
+                        refresh_product_status(product)
+        session.flush()
+        batch.summary = batch_summary(session, batch.id)
+        return batch.summary
     products = list(batch.products)
     values = [value for product in products for value in product.values]
+    for product in products:
+        repaired = [_repair_confirming_evidence(value) or _repair_existing_value_status(value) for value in product.values]
+        if any(repaired):
+            refresh_product_status(product)
     summary = {
         "products": len(products),
         "ready": sum(product.status == "ready" for product in products),
@@ -782,6 +804,8 @@ def refresh_batch_summary(batch: AttributeBatch) -> dict[str, int]:
 
 
 def refresh_product_status(product: AttributeProduct) -> str:
+    for value in product.values:
+        _repair_existing_value_status(value)
     review = any(
         value.is_in_template and (
             value.status in {"missing", "suggested", "conflict", "unknown", "ambiguous"}
@@ -819,23 +843,39 @@ def create_batch_from_csv(
     stored = input_dir / f"{batch.id}_{uuid.uuid4().hex[:8]}.csv"
     stored.write_bytes(data)
     batch.original_path = str(stored)
+    # Only this import reuses matches. The cache cannot outlive template edits
+    # or syncs, and each product receives its own evidence/suggestion objects.
+    match_cache: dict = {}
+    pending: list[AttributeProduct] = []
+    product_count = 0
     for index, row in enumerate(rows, start=1):
         model = _row_value(row, "_MODEL_", "MODEL", "Модель")
         if not model:
             continue
         product = AttributeProduct(
-            template=template,
-            batch=batch,
+            template_id=template.id,
+            batch_id=batch.id,
+            sort_order=index - 1,
             external_id=_row_value(row, "_ID_", "ID"),
             model=model,
             name=_row_value(row, "_NAME_", "NAME", "Название"),
             brand=_row_value(row, "_BRAND_", "BRAND", "Бренд"),
         )
         db.add(product)
-        _make_product_values(product, template, parse_attribute_stack(_row_value(row, "_ATTRIBUTES_", "ATTRIBUTES", "Атрибуты")))
+        _make_product_values(product, template, parse_attribute_stack(_row_value(row, "_ATTRIBUTES_", "ATTRIBUTES", "Атрибуты")), match_cache=match_cache)
         refresh_product_status(product)
-    if not batch.products:
+        product_count += 1
+        pending.append(product)
+        if len(pending) >= 100:
+            db.flush()
+            for item in pending:
+                db.expunge(item)
+            pending.clear()
+    if not product_count:
         raise ValueError("В CSV не найдено ни одной заполненной модели")
+    db.flush()
+    for item in pending:
+        db.expunge(item)
     refresh_batch_summary(batch)
     db.flush()
     return batch
@@ -934,9 +974,9 @@ class DonorPageFetcher:
     """Own all network engines for one Attribute Assistant processing run.
 
     Browser-backed donor methods share one dispatcher. Switching to a
-    different browser engine closes the previous one first, so a run never owns
-    more than one browser process. max_pages remains the maximum number of tabs
-    in that browser.
+    different browser method closes the previous engine first, so a run never
+    owns more than one browser process. max_pages remains the maximum number of
+    tabs in that browser.
     """
 
     def __init__(self, max_pages: int) -> None:
@@ -944,40 +984,68 @@ class DonorPageFetcher:
 
         self.max_pages = max(1, parse_thread_count(max_pages))
         self._browser_session: Any = None
-        self._browser_engine = ""
+        self._browser_method = ""
         self._browser_condition = threading.Condition(threading.RLock())
         self._active_browser_fetches = 0
+        self._connection_state_lock = threading.Lock()
+        self._connection_transition_lock = threading.Lock()
+        self._connection_states: dict[str, dict[str, Any]] = {}
 
     @staticmethod
-    def _browser_engine_for(method_code: str) -> str:
-        if method_code.startswith("botasaurus-browser") or method_code == "botasaurus-visible":
-            return "botasaurus"
-        if method_code == "botasaurus-debug-visible":
-            return "botasaurus-debug-visible"
-        if method_code == "crawl4ai":
-            return "crawl4ai"
-        if method_code == "scrapegraphai":
-            return "scrapegraphai"
-        return "playwright"
+    def _donor_key(donor: Donor) -> str:
+        return str(donor.id or donor.legacy_id or id(donor))
 
-    def fetch_browser(self, donor: Donor, url: str) -> str | None:
+    @staticmethod
+    def _configured_method(donor: Donor) -> str:
+        method = donor.connection_method_row
+        return normalize_connection_method(method.code if method else "requests")
+
+    def _connection_state(self, donor: Donor, configured_method: str) -> dict[str, Any]:
+        key = self._donor_key(donor)
+        with self._connection_state_lock:
+            state = self._connection_states.get(key)
+            if state is None or state.get("configured_method") != configured_method:
+                state = {
+                    "configured_method": configured_method,
+                    "active_method": configured_method,
+                    "generation": 0,
+                }
+                self._connection_states[key] = state
+            return dict(state)
+
+    def _set_active_method(self, donor: Donor, configured_method: str, method_code: str) -> None:
+        key = self._donor_key(donor)
+        with self._connection_state_lock:
+            state = self._connection_states.setdefault(key, {
+                "configured_method": configured_method,
+                "active_method": configured_method,
+                "generation": 0,
+            })
+            if state.get("configured_method") != configured_method:
+                state.update({
+                    "configured_method": configured_method,
+                    "active_method": configured_method,
+                    "generation": int(state.get("generation") or 0) + 1,
+                })
+            if state.get("active_method") != method_code:
+                state["active_method"] = method_code
+                state["generation"] = int(state.get("generation") or 0) + 1
+
+    def fetch_browser(self, donor: Donor, url: str, method_code: str) -> str | None:
         from services.scraping.browser import BrowserMethodSession
 
-        method = donor.connection_method_row
-        method_code = clean_text(method.code if method else "playwright") or "playwright"
-        engine = self._browser_engine_for(method_code)
         with self._browser_condition:
-            while self._active_browser_fetches and engine != self._browser_engine:
+            while self._active_browser_fetches and method_code != self._browser_method:
                 self._browser_condition.wait()
             if self._browser_session is None:
                 self._browser_session = BrowserMethodSession(
                     max_pages=self.max_pages,
                     initial_method=method_code,
                 )
-                self._browser_engine = engine
-            elif engine != self._browser_engine:
+                self._browser_method = method_code
+            elif method_code != self._browser_method:
                 self._browser_session.restart(method=method_code)
-                self._browser_engine = engine
+                self._browser_method = method_code
             browser_session = self._browser_session
             self._active_browser_fetches += 1
         try:
@@ -993,14 +1061,138 @@ class DonorPageFetcher:
                 self._active_browser_fetches -= 1
                 self._browser_condition.notify_all()
 
-    def close(self) -> None:
+    def _close_browser_resource(self) -> None:
         with self._browser_condition:
             while self._active_browser_fetches:
                 self._browser_condition.wait()
             if self._browser_session is not None:
                 self._browser_session.close()
                 self._browser_session = None
-                self._browser_engine = ""
+                self._browser_method = ""
+
+    def _fetch_by_method(
+        self,
+        donor: Donor,
+        url: str,
+        method_code: str,
+        max_bytes: int,
+    ) -> tuple[str, str]:
+        if method_code == "requests":
+            self._close_browser_resource()
+            return fetch_public_html(url, max_bytes=max_bytes)
+
+        final_url = _resolve_public_redirect_url(url)
+        if is_browser_render_method(method_code) or is_debug_visible_method(method_code):
+            html = self.fetch_browser(donor, final_url, method_code)
+        elif method_code == "botasaurus-request":
+            self._close_browser_resource()
+            from services.scraping.http import fetch_with_botasaurus_request
+
+            html = fetch_with_botasaurus_request(final_url)
+        elif method_code == "scrapy":
+            self._close_browser_resource()
+            from services.scraping.browser import fetch_with_scrapy
+
+            html = fetch_with_scrapy(final_url)
+        elif method_code == "crawlee":
+            self._close_browser_resource()
+            from services.scraping.browser import fetch_with_crawlee
+
+            html = fetch_with_crawlee(final_url)
+        else:
+            self._close_browser_resource()
+            raise ValueError(f"Метод подключения «{method_code}» не поддерживается")
+        if not html:
+            return "", final_url
+        if len(html.encode("utf-8", errors="ignore")) > max_bytes:
+            raise ValueError("Страница превышает допустимый размер")
+        return html, final_url
+
+    def _try_method(
+        self,
+        donor: Donor,
+        url: str,
+        method_code: str,
+        max_bytes: int,
+    ) -> tuple[str, str, str]:
+        try:
+            html, final_url = self._fetch_by_method(donor, url, method_code, max_bytes)
+        except Exception as error:
+            return "", url, clean_text(error)
+        if html and not looks_blocked_or_empty(html):
+            return html, final_url, ""
+        return "", final_url, "страница похожа на блокировку или пустой JS-шаблон"
+
+    def fetch(
+        self,
+        donor: Donor,
+        url: str,
+        *,
+        max_bytes: int = 5 * 1024 * 1024,
+    ) -> tuple[str, str]:
+        """Load a donor page with the same automatic method chain as «Новинки»."""
+
+        configured_method = self._configured_method(donor)
+        if not donor.auto_connection_fallback:
+            self._set_active_method(donor, configured_method, configured_method)
+        state = self._connection_state(donor, configured_method)
+        current_method = clean_text(state.get("active_method")) or configured_method
+        generation = int(state.get("generation") or 0)
+        tried: list[str] = []
+        errors: list[str] = []
+
+        html, final_url, error = self._try_method(
+            donor, url, current_method, max_bytes
+        )
+        tried.append(current_method)
+        if html:
+            return html, final_url
+        if error:
+            errors.append(f"{current_method}: {error}")
+        if not donor.auto_connection_fallback:
+            raise ValueError(
+                f"Метод подключения «{current_method}» не смог открыть страницу"
+                + (f": {error}" if error else "")
+            )
+
+        with self._connection_transition_lock:
+            latest = self._connection_state(donor, configured_method)
+            latest_method = clean_text(latest.get("active_method")) or configured_method
+            latest_generation = int(latest.get("generation") or 0)
+            if latest_method != current_method or latest_generation != generation:
+                html, final_url, error = self._try_method(
+                    donor, url, latest_method, max_bytes
+                )
+                tried.append(latest_method)
+                if html:
+                    return html, final_url
+                if error:
+                    errors.append(f"{latest_method}: {error}")
+                current_method = latest_method
+
+            for method_code in automatic_connection_methods(configured_method):
+                if method_code == current_method or method_code in tried:
+                    continue
+                html, final_url, error = self._try_method(
+                    donor, url, method_code, max_bytes
+                )
+                tried.append(method_code)
+                if html:
+                    self._set_active_method(donor, configured_method, method_code)
+                    return html, final_url
+                if error:
+                    errors.append(f"{method_code}: {error}")
+
+        details = "; ".join(errors)
+        raise ValueError(
+            f"Не удалось загрузить страницу ни одним методом ({', '.join(tried)})"
+            + (f": {details}" if details else "")
+        )
+
+    def close(self) -> None:
+        self._close_browser_resource()
+        with self._connection_state_lock:
+            self._connection_states.clear()
 
     def __enter__(self) -> "DonorPageFetcher":
         return self
@@ -1016,42 +1208,16 @@ def fetch_donor_product_html(
     *,
     fetcher: DonorPageFetcher | None = None,
 ) -> tuple[str, str]:
-    """Load one donor page through its saved connection method without changing parser runtime."""
+    """Load one donor page through the shared «Новинки» fallback policy."""
 
-    method = donor.connection_method_row
-    method_code = clean_text(method.code if method else "requests") or "requests"
-    if method_code == "requests":
-        return fetch_public_html(url, max_bytes=max_bytes)
-    final_url = _resolve_public_redirect_url(url)
     owns_fetcher = fetcher is None
     fetcher = fetcher or DonorPageFetcher(max_pages=donor.thread_count)
     try:
-        if method and (method.is_browser_render or method.is_debug_visible):
-            html = fetcher.fetch_browser(donor, final_url)
-        elif method_code == "botasaurus-request":
-            from services.scraping.http import fetch_with_botasaurus_request
-
-            html = fetch_with_botasaurus_request(final_url)
-        elif method_code == "scrapy":
-            from services.scraping.browser import fetch_with_scrapy
-
-            html = fetch_with_scrapy(final_url)
-        elif method_code == "crawlee":
-            from services.scraping.browser import fetch_with_crawlee
-
-            html = fetch_with_crawlee(final_url)
-        else:
-            raise ValueError(f"Метод подключения «{method.name if method else method_code}» не поддерживается")
+        return fetcher.fetch(donor, url, max_bytes=max_bytes)
     finally:
         if owns_fetcher:
             fetcher.close()
-    if html:
-        if len(html.encode("utf-8", errors="ignore")) > max_bytes:
-            raise ValueError("Страница превышает допустимый размер")
-        return html, final_url
-    if donor.auto_connection_fallback:
-        return fetch_public_html(final_url, max_bytes=max_bytes)
-    raise ValueError(f"Метод подключения «{method.name if method else method_code}» не смог открыть страницу")
+
 
 def _jsonld_items(value: Any) -> Iterable[dict[str, Any]]:
     if isinstance(value, dict):
@@ -2424,6 +2590,37 @@ def _dimension_value_in_field_order(raw_value: str, source_name: str, field_name
     return " x ".join(values_by_axis[axis] for axis in target_axes)
 
 
+def _dimension_component_axis(field: AttributeTemplateField, source_name: str) -> str:
+    axes, span = _dimension_axis_order(field.name)
+    first_word = clean_text(source_name).split(" ")[0].rstrip(",;:")
+    axis = _dimension_axis(first_word)
+    if not axes or span is None or axis not in axes:
+        return ""
+    expected_name = _dimension_component_name(field.name, axis, span)
+    # Qualifiers must agree: package, appliance and installation-niche sizes
+    # cannot be combined merely because their axis labels are the same.
+    return axis if _name_tokens(expected_name) == _name_tokens(source_name) else ""
+
+
+def _assemble_dimension_value(field: AttributeTemplateField, facts: list[dict]) -> str:
+    axes, _ = _dimension_axis_order(field.name)
+    if not axes:
+        return ""
+    values_by_axis: dict[str, set[str]] = {}
+    for fact in facts:
+        name = clean_text(fact.get("name") or fact.get("source_name"))
+        axis = _dimension_component_axis(field, name)
+        number = _centimeter_value(exact_value_key(fact.get("value")), name, field.name)
+        if axis:
+            if not number or not NUMBER_RE.fullmatch(number):
+                return ""
+            values_by_axis.setdefault(axis, set()).add(normalize_number(number))
+    if not axes or any(len(values_by_axis.get(axis, set())) != 1 for axis in axes):
+        return ""
+    # Explicit centimeters prevent source-unit conversion from running twice.
+    return "x".join(next(iter(values_by_axis[axis])) for axis in axes) + " см"
+
+
 def _attribute_mapping_rows(
     db: Session,
     template: AttributeTemplate,
@@ -2554,6 +2751,66 @@ def _centimeter_value(
     return "".join(result)
 
 
+def _duration_unit(value: str) -> str:
+    key = value.casefold().rstrip(".")
+    return "months" if key.startswith(("мес", "month", "mo")) else "years"
+
+
+def _duration_quantity(value: str, source_name: str = "") -> tuple[Decimal, str] | None:
+    match = DURATION_VALUE_RE.fullmatch(exact_value_key(value))
+    if not match:
+        return None
+    name_units = list(DURATION_NAME_UNIT_RE.finditer(source_name))
+    raw_unit = match.group(2) or (name_units[-1].group(1) if name_units else "")
+    if not raw_unit:
+        return None
+    return Decimal(match.group(1).replace(",", ".")), _duration_unit(raw_unit)
+
+
+def _duration_match(
+    field: AttributeTemplateField,
+    raw_value: str,
+    source_name: str,
+) -> tuple[str, int, str, list[str]] | None:
+    """Compare calendar durations in months before accepting a bare number."""
+
+    source = _duration_quantity(raw_value, source_name or field.name)
+    if source is None:
+        return None
+    number, unit = source
+    months = number * (12 if unit == "years" else 1)
+    allowed = [item for item in field.allowed_values if item.is_active]
+    equivalents = []
+    has_duration_values = False
+    for item in allowed:
+        target = _duration_quantity(item.value, field.name)
+        if target is None:
+            continue
+        has_duration_values = True
+        target_number, target_unit = target
+        target_months = target_number * (12 if target_unit == "years" else 1)
+        if months == target_months:
+            equivalents.append(item)
+    if has_duration_values:
+        if not equivalents:
+            return "", 0, "Эквивалентного срока нет в справочнике", []
+        canonical = _canonical_matching_value(equivalents, raw_value) or equivalents[0].value
+        if exact_value_key(canonical) == exact_value_key(raw_value):
+            return canonical, 100, "Точное значение справочника; единицы срока проверены", []
+        label = "мес." if unit == "months" else "г."
+        return canonical, 100, f"Конвертация срока: {_decimal_text(number)} {label} = {canonical}; точное значение справочника", []
+    if not allowed and field.value_type == "number":
+        target_units = list(DURATION_NAME_UNIT_RE.finditer(field.name))
+        if target_units:
+            target_unit = _duration_unit(target_units[-1].group(1))
+            ratio = Fraction(months) / (12 if target_unit == "years" else 1)
+            if ratio.denominator % 3 == 0:
+                return "", 0, "Срок нельзя точно представить в годах", []
+            converted = Decimal(ratio.numerator) / Decimal(ratio.denominator)
+            return _decimal_text(converted), 96, "Конвертация срока; формат проверен", []
+    return None
+
+
 def _converted_value_candidates(
     field: AttributeTemplateField,
     raw_value: str,
@@ -2583,14 +2840,7 @@ def _converted_value_candidates(
         or _linear_unit_from_name(source_name)
     )
     target_unit = _linear_unit_from_name(field.name)
-    if (raw_unit.startswith(("месяц", "мес")) or (not raw_unit and "мес" in normalize_key(source_name))) and number % 12 == 0:
-        years = int(number / 12)
-        candidates[:0] = [
-            f"{years} год",
-            f"{years} года",
-            f"{years} лет",
-        ]
-    elif source_unit and target_unit:
+    if source_unit and target_unit:
         source_family, source_factor = LINEAR_UNIT_FACTORS[source_unit]
         target_family, target_factor = LINEAR_UNIT_FACTORS[target_unit]
         if source_family == target_family:
@@ -2624,7 +2874,12 @@ def _allowed_match(
     raw_value: str,
     source_name: str = "",
 ) -> tuple[str, int, str, list[str]]:
+    if is_program_list(field):
+        return match_programs(field, raw_value)
     allowed = [item for item in field.allowed_values if item.is_active]
+    duration = _duration_match(field, raw_value, source_name)
+    if duration is not None:
+        return duration
     ordered_value = _dimension_value_in_field_order(raw_value, source_name, field.name)
     axes_reordered = exact_value_key(ordered_value) != exact_value_key(raw_value)
     order_reason = "Порядок осей приведён к формату целевого поля; " if axes_reordered else ""
@@ -2649,7 +2904,7 @@ def _allowed_match(
         direct = _allowed_match_single(field, exact_value_key(raw_value), allowed, source_name)
         if direct[0] and allowed:
             return direct
-    if _is_presence_marker(field, raw_value):
+    if _is_presence_marker(field, raw_value, source_name):
         return (
             "",
             0,
@@ -2702,12 +2957,17 @@ def _allowed_match(
     return "", 0, last_reason, list(dict.fromkeys(suggestions))[:3]
 
 
-def _is_presence_marker(field: AttributeTemplateField, value: Any) -> bool:
+def _is_presence_marker(field: AttributeTemplateField, value: Any, source_name: str = "") -> bool:
     """Return whether a yes/no value only marks presence of a semantic option."""
 
     key = exact_value_key(value).casefold()
     boolean_keys = BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
     if key not in boolean_keys or field.value_type == "boolean":
+        return False
+    if (_canonical_matching_value(field.allowed_values, value)
+            and _name_tokens(source_name) <= _name_tokens(field.name)):
+        return False
+    if _duration_quantity(exact_value_key(value), source_name or field.name) is not None:
         return False
     active_keys = {
         exact_value_key(item.value).casefold()
@@ -2762,6 +3022,15 @@ def _target_value(product: AttributeProduct, field_id: int) -> AttributeProductV
 def _candidate_value_key(target: AttributeProductValue, value: Any) -> str:
     field = target.template_field
     if field:
+        if is_program_list(field):
+            canonical, _, _, _ = match_programs(field, value)
+            if canonical:
+                return value_match_key(canonical)
+        duration = _duration_quantity(exact_value_key(value), field.name)
+        if duration is not None:
+            number, unit = duration
+            months = number * (12 if unit == "years" else 1)
+            return f"duration-months:{_decimal_text(months)}"
         try:
             normalized = normalize_value(value, field.value_type, field.is_composite)
             return value_match_key(normalized)
@@ -2780,6 +3049,106 @@ def _has_confirmed_decision(target: AttributeProductValue) -> bool:
     return target.status in {"rejected", "dash"} or (
         target.status == "approved" and not (target.source_details or {}).get("auto_accepted")
     )
+
+
+def _clear_unchanged_proposal(target: AttributeProductValue) -> bool:
+    """Repair historical suggestions that merely confirm the original value."""
+    if target.status not in {"suggested", "unknown"} or not all(
+        (target.current_value, target.proposed_value, target.final_value)
+    ):
+        return False
+    current_key = _candidate_value_key(target, target.current_value)
+    if any(_candidate_value_key(target, value) != current_key
+           for value in (target.proposed_value, target.final_value)):
+        return False
+    if any(_candidate_value_key(target, item.get("value")) != current_key
+           for item in (target.source_details or {}).get("candidates", []) if isinstance(item, dict)):
+        return False
+    target.proposed_value = ""
+    target.status = "kept"
+    target.reason = "Источники подтверждают исходное значение; изменений нет"
+    return True
+
+
+def _repair_existing_value_status(target: AttributeProductValue) -> bool:
+    if _clear_unchanged_proposal(target):
+        return True
+    if exact_value_key(target.current_value) and target.status in {"suggested", "unknown"}:
+        target.status = "conflict"
+        return True
+    return False
+
+
+def migrate_existing_attribute_suggestions(db: Session) -> int:
+    """Repair saved statuses in bounded rows without opening batch.products."""
+    value, product = AttributeProductValue, AttributeProduct
+    statement = select(value, product.batch_id).join(product, product.id == value.product_id).where(
+        value.status.in_(["suggested", "unknown"]), func.trim(value.current_value) != "",
+    ).execution_options(yield_per=100)
+    products, batches, changed = set(), set(), 0
+    for target, batch_id in db.execute(statement):
+        if _repair_existing_value_status(target):
+            products.add(target.product_id)
+            batches.add(batch_id)
+            changed += 1
+        if changed and changed % 100 == 0:
+            db.flush()
+    db.flush()
+    ids = sorted(products)
+    pending = select(value.id).where(
+        value.product_id == product.id, value.is_in_template.is_(True),
+        or_(value.status.in_(["missing", "suggested", "conflict", "unknown", "ambiguous"]), value.final_value == ""),
+    ).exists()
+    for offset in range(0, len(ids), 500):
+        db.execute(update(product).where(product.id.in_(ids[offset:offset + 500])).values(status="ready"))
+        db.execute(update(product).where(product.id.in_(ids[offset:offset + 500]), pending).values(status="needs_review"))
+    for batch_id in batches:
+        db.execute(update(AttributeBatch).where(AttributeBatch.id == batch_id).values(summary=batch_summary(db, batch_id)))
+    return changed
+
+
+def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
+    """Recheck stored false conflicts using source facts, without fetching a page."""
+    field = target.template_field
+    if not field or _has_confirmed_decision(target):
+        return False
+    unknown = [item for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
+    if not unknown:
+        return False
+    groups: dict[tuple, list[dict]] = {}
+    for item in unknown:
+        groups.setdefault((item.get("source"), item.get("url"), item.get("donor_id")), []).append(item)
+    replacements = []
+    consumed: set[int] = set()
+    for facts in groups.values():
+        axes = [item for item in facts if _dimension_component_axis(field, clean_text(item.get("source_name")))]
+        combined = _assemble_dimension_value(field, axes)
+        if combined:
+            canonical, confidence, reason, _ = _allowed_match(field, combined, field.name)
+            if canonical:
+                replacements.append((axes[0], field.name, canonical, confidence,
+                                     "; ".join(f'{item["source_name"]}: {item["value"]}' for item in axes),
+                                     "Габариты собраны из отдельных осей; " + reason))
+                consumed.update(id(item) for item in axes)
+        for item in facts:
+            raw = exact_value_key(item.get("value"))
+            name = clean_text(item.get("source_name"))
+            if (raw.casefold() in BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
+                    and not _is_presence_marker(field, raw, name)):
+                canonical, confidence, reason, _ = _allowed_match(field, raw, name)
+                if canonical:
+                    replacements.append((item, name, canonical, confidence, raw, reason))
+                    consumed.add(id(item))
+    if not replacements:
+        return False
+    target.source_details = {**(target.source_details or {}),
+                             "unknown_values": [item for item in unknown if id(item) not in consumed]}
+    for item, name, canonical, confidence, raw, reason in replacements:
+        apply_candidate(target.product, target, value=canonical, confidence=min(confidence, 85) if item.get("source") == "ChatGPT" else confidence,
+                        source=item.get("source", ""), reason=reason, priority=90 if item.get("source") == "ChatGPT" else 0,
+                        source_name=name, source_url=item.get("url", ""), raw_value=raw,
+                        source_role=item.get("role", ""), donor_id=item.get("donor_id"))
+    return True
 
 
 def record_unknown_value(
@@ -2829,10 +3198,21 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
         return False
     alternatives = list(dict.fromkeys(value for item in unknown for value in item.get("suggestions", [])))
     proposals = alternatives if valid_original else (distinct or alternatives)
+    if valid_original and proposals:
+        proposals = [value for value in proposals
+                     if _candidate_value_key(target, value) != _candidate_value_key(target, target.final_value)]
+        if not proposals and all(
+            _candidate_value_key(target, item.get("value")) == _candidate_value_key(target, target.final_value)
+            for item in unknown
+        ):
+            target.proposed_value = ""
+            target.status = "kept"
+            target.reason = "Источники подтверждают исходное значение; изменений нет"
+            return True
     target.proposed_value = proposals[0] if proposals else ""
     if not valid_original:
         target.final_value = ""
-    target.status = "suggested" if proposals else "conflict"
+    target.status = "conflict" if target.current_value else ("suggested" if proposals else "conflict")
     target.confidence = int(candidates[0].get("confidence", 0)) if candidates else 0
     target.source = candidates[0].get("source", "") if candidates else unknown[0].get("source", "")
     target.reason = ("Значение отсутствует в справочнике; есть варианты для ручного выбора"
@@ -2927,6 +3307,18 @@ def apply_candidate(
     source_role: str = "",
     donor_id: int | None = None,
 ) -> None:
+    if is_program_list(target.template_field):
+        canonical, program_confidence, program_reason, _ = match_programs(target.template_field, value)
+        if not canonical:
+            record_unknown_value(product, target, raw_value=raw_value or value, source=source,
+                                 source_name=source_name, source_url=source_url, donor_id=donor_id,
+                                 role=source_role, suggestions=[], reason=program_reason)
+            return
+        raw_value = raw_value or value
+        if canonical != value:
+            reason += "; " + program_reason
+        value = canonical
+        confidence = min(confidence, program_confidence)
     details = dict(target.source_details or {})
     candidates = [
         item for item in list(details.get("candidates") or [])
@@ -2981,6 +3373,14 @@ def apply_parsed_attributes(
     if template is None:
         stats["not_in_template"] = len(attributes)
         return stats
+    assembled_fields: set[int] = set()
+    assembled_attributes = []
+    for field in template.fields:
+        combined = _assemble_dimension_value(field, attributes)
+        if combined:
+            assembled_fields.add(field.id)
+            assembled_attributes.append({"name": field.name, "value": combined})
+    attributes = [*attributes, *assembled_attributes]
     value_keys = {exact_value_key(item.get("value")) for item in attributes if exact_value_key(item.get("value"))}
     value_index = _allowed_value_field_index(template.fields, value_keys)
     for original_item in attributes:
@@ -3000,6 +3400,8 @@ def apply_parsed_attributes(
             if not field:
                 stats["ambiguous"] += 1
                 continue
+            if field.id in assembled_fields and _dimension_component_axis(field, source_name):
+                continue
             target = _target_value(product, field.id)
             if not target:
                 stats["not_in_template"] += 1
@@ -3007,6 +3409,9 @@ def apply_parsed_attributes(
             saved_value = _saved_value_mapping(db, donor_id, field, raw_value)
             if saved_value:
                 canonical, value_confidence, value_reason, suggestions = saved_value, 100, "Сохранённое правило значения", []
+                if is_program_list(field):
+                    canonical, value_confidence, program_reason, suggestions = match_programs(field, saved_value)
+                    value_reason += "; " + program_reason
             else:
                 canonical, value_confidence, value_reason, suggestions = _allowed_match(
                     field, raw_value, source_name
@@ -3429,6 +3834,9 @@ def serialize_value(
     include_allowed_values: bool = True,
     allowed_values_count: int | None = None,
 ) -> dict[str, Any]:
+    if value.product is not None:
+        _repair_confirming_evidence(value)
+    _repair_existing_value_status(value)
     field = value.template_field
     active_allowed = None
     if field and (include_allowed_values or allowed_values_count is None):
@@ -3467,8 +3875,13 @@ def serialize_value(
     }
 
 def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict[str, Any]:
+    repaired = [_repair_confirming_evidence(value) or _repair_existing_value_status(value) for value in product.values]
+    if any(repaired):
+        refresh_product_status(product)
+        refresh_batch_summary(product.batch)
     result = {
         "id": product.id,
+        "batch_id": product.batch_id,
         "model": product.model,
         "name": product.name,
         "brand": product.brand,
@@ -3568,13 +3981,14 @@ def serialize_batch(batch: AttributeBatch, detailed: bool = False) -> dict[str, 
         "source_filename": batch.source_filename,
         "source_urls": list(batch.source_urls or []),
         "original_ready": bool(batch.original_path and Path(batch.original_path).is_file()),
-        "summary": refresh_batch_summary(batch) if detailed or not batch.summary else dict(batch.summary),
+        "summary": refresh_batch_summary(batch) if not batch.summary else dict(batch.summary),
         "template": serialize_template(batch.template),
         "export_ready": bool(batch.export_path and Path(batch.export_path).is_file()),
         "created_at": batch.created_at.isoformat(timespec="seconds") if batch.created_at else "",
     }
     if detailed:
-        result["products"] = [serialize_product(product) for product in batch.products]
+        session = object_session(batch)
+        result["products"] = product_page(session, batch.id)["items"] if session else [serialize_product(product) for product in batch.products[:80]]
     return result
 
 
@@ -3603,6 +4017,7 @@ def update_product_value(
     action: str,
     manual_value: str = "",
     dash_reason: str = "",
+    refresh_summary: bool = True,
 ) -> AttributeProductValue:
     field = value.template_field
     if action == "accept":
@@ -3633,6 +4048,8 @@ def update_product_value(
         value.dash_reason = ""
         if value.current_value:
             value.final_value = value.current_value
+            if is_program_list(field) and not is_technical_dash(value.current_value):
+                value.final_value = match_programs(field, value.current_value)[0]
             value.source = "current_csv"
             value.reason = "Предложение отклонено; сохранено исходное значение"
         else:
@@ -3654,7 +4071,8 @@ def update_product_value(
     else:
         raise ValueError("Неизвестное действие")
     refresh_product_status(value.product)
-    refresh_batch_summary(value.product.batch)
+    if refresh_summary:
+        refresh_batch_summary(value.product.batch)
     return value
 
 
@@ -3696,7 +4114,7 @@ def bulk_action(batch: AttributeBatch, action: str, minimum_confidence: int = 90
                 and value.status == "suggested"
                 and value.confidence >= minimum_confidence
             ):
-                update_product_value(value, action="accept")
+                update_product_value(value, action="accept", refresh_summary=False)
                 changed += 1
             elif (
                 action == "fill_dashes"
@@ -3704,7 +4122,7 @@ def bulk_action(batch: AttributeBatch, action: str, minimum_confidence: int = 90
                 and value.status != "conflict"
                 and (not value.current_value or is_technical_dash(value.current_value))
             ):
-                update_product_value(value, action="dash", dash_reason=dash_reason or "Не найдено после проверки источников")
+                update_product_value(value, action="dash", dash_reason=dash_reason or "Не найдено после проверки источников", refresh_summary=False)
                 changed += 1
         refresh_product_status(product)
     refresh_batch_summary(batch)
@@ -3778,28 +4196,59 @@ def apply_similar_products(db: Session, product: AttributeProduct) -> int:
     refresh_batch_summary(product.batch)
     return changed
 
+def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
+    session = object_session(batch)
+    if session is None or batch.id is None:
+        for product in batch.products:
+            if ready_only and product.status != "ready":
+                continue
+            ordered = sorted(product.values, key=lambda value: (not value.is_in_template, value.sort_order, value.id))
+            yield {"_MODEL_": product.model, "_ATTRIBUTES_": "\n".join(
+                f"{value.group_name}|{value.attribute_name}|{value.final_value}" for value in ordered
+            )}
+        return
+    # Stream scalar rows into the CSV. Neither products nor value payloads are
+    # retained in the session, even when the batch contains thousands of rows.
+    session.flush()
+    product, value = AttributeProduct, AttributeProductValue
+    statement = select(product.id, product.model, value.id, value.group_name, value.attribute_name, value.final_value)
+    statement = statement.outerjoin(value, value.product_id == product.id).where(product.batch_id == batch.id)
+    if ready_only:
+        statement = statement.where(product.status == "ready")
+    statement = statement.order_by(product.sort_order, product.id, value.is_in_template.desc(), value.sort_order, value.id)
+    current_id, model, attributes = None, "", []
+    result = session.execute(statement.execution_options(yield_per=1000))
+    try:
+        for product_id, product_model, value_id, group_name, name, final in result:
+            if product_id != current_id:
+                if current_id is not None:
+                    yield {"_MODEL_": model, "_ATTRIBUTES_": "\n".join(attributes)}
+                current_id, model, attributes = product_id, product_model, []
+            if value_id is not None:
+                attributes.append(f"{group_name}|{name}|{final}")
+        if current_id is not None:
+            yield {"_MODEL_": model, "_ATTRIBUTES_": "\n".join(attributes)}
+    finally:
+        result.close()
+
+
 def export_batch_csv(batch: AttributeBatch, *, ready_only: bool = False) -> Path:
-    selected_products = [
-        product for product in batch.products
-        if not ready_only or product.status == "ready"
-    ]
-    if not selected_products:
+    rows = _batch_export_rows(batch, ready_only)
+    first = next(rows, None)
+    if first is None:
         raise ValueError("Нет готовых товаров для экспорта" if ready_only else "Нет товаров для экспорта")
     output_dir = ATTRIBUTE_ASSISTANT_DIR / "exports"
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = f"attributes_{batch.id}_{uuid.uuid4().hex[:8]}.csv"
     path = output_dir / filename
-    stream = io.StringIO(newline="")
-    writer = csv.DictWriter(stream, fieldnames=["_MODEL_", "_ATTRIBUTES_"], delimiter=";", lineterminator="\r\n")
-    writer.writeheader()
-    for product in selected_products:
-        ordered = sorted(product.values, key=lambda value: (not value.is_in_template, value.sort_order, value.id))
-        stack = "\n".join(
-            f"{value.group_name}|{value.attribute_name}|{value.final_value}"
-            for value in ordered
-        )
-        writer.writerow({"_MODEL_": product.model, "_ATTRIBUTES_": stack})
-    path.write_bytes(stream.getvalue().encode("cp1251", errors="replace"))
+    try:
+        with path.open("w", encoding="cp1251", errors="replace", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["_MODEL_", "_ATTRIBUTES_"], delimiter=";", lineterminator="\r\n")
+            writer.writeheader()
+            writer.writerow(first)
+            writer.writerows(rows)
+    finally:
+        rows.close()
     batch.export_path = str(path)
     batch.status = "completed"
     refresh_batch_summary(batch)

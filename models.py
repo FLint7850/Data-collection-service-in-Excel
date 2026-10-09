@@ -409,7 +409,10 @@ class AttributeProduct(Base):
         order_by="AttributeProductSource.priority",
     )
 
-    __table_args__ = (Index("ix_attribute_products_batch_model", "batch_id", "model"),)
+    __table_args__ = (
+        Index("ix_attribute_products_batch_model", "batch_id", "model"),
+        Index("ix_attribute_products_batch_sort", "batch_id", "sort_order", "id"),
+    )
 
 
 class AttributeProductValue(Base):
@@ -437,6 +440,8 @@ class AttributeProductValue(Base):
 
     product: Mapped[AttributeProduct] = relationship("AttributeProduct", back_populates="values")
     template_field: Mapped[AttributeTemplateField | None] = relationship("AttributeTemplateField")
+
+    __table_args__ = (Index("ix_attribute_product_values_product_id", "product_id"),)
 
 
 class AttributeProductSource(Base):

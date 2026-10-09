@@ -18,7 +18,7 @@ from config import (
 from pathlib import Path
 from queue import Empty, Queue
 from runtime.state import reset_state, update_state
-from services.connections import is_browser_render_method, is_debug_visible_method, normalize_connection_method, ordered_db_connection_methods
+from services.connections import automatic_connection_methods, is_browser_render_method, is_debug_visible_method, normalize_connection_method
 from services.normalization import normalize_extraction_rules, normalize_patterns, normalize_start_urls, now_iso
 from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
@@ -435,14 +435,7 @@ class ProductSiteCrawler:
 
     def fallback_method_sequence(self) -> List[str]:
         """Возвращает fallback-методы из БД без схлопывания разных браузерных движков."""
-        methods: List[str] = []
-        for method in ordered_db_connection_methods():
-            # Видимый debug-браузер не запускаем автоматически, только если выбран явно.
-            if is_debug_visible_method(method) and method != self.connection_method:
-                continue
-            if method not in methods:
-                methods.append(method)
-        return methods
+        return automatic_connection_methods(self.connection_method)
 
     def current_connection_method(self) -> str:
         lock = self.connection_method_state["lock"]

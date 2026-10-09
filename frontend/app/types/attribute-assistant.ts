@@ -150,6 +150,7 @@ export interface AttributeAllowedValueOptions {
 
 export interface AttributeProduct {
   id: number;
+  batch_id?: number;
   model: string;
   name: string;
   brand: string;
@@ -169,6 +170,18 @@ export interface AttributeProduct {
   };
   values?: AttributeValue[];
   sources?: AttributeSource[];
+}
+
+export type AttributeProductSummary = Pick<AttributeProduct, "id" | "model" | "name" | "brand" | "status" | "counts">;
+
+export interface AttributeProductPage {
+  items: AttributeProductSummary[];
+  total: number;
+  matched: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  counts: Record<string, number>;
 }
 
 export interface AttributeBatch {
@@ -192,7 +205,7 @@ export interface AttributeBatch {
   template: AttributeTemplate;
   export_ready: boolean;
   created_at: string;
-  products?: AttributeProduct[];
+  products?: AttributeProductSummary[];
 }
 
 export interface AttributeBatchOperationError {

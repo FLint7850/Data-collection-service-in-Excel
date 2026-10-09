@@ -13,6 +13,7 @@ from models import (
     AttributeTemplateRevision, utc_now,
 )
 from services import opencart_sync as svc
+from services.attribute_programs import match_programs
 
 
 def snapshot():
@@ -74,6 +75,39 @@ class OpenCartSyncTest(unittest.TestCase):
         self.assertEqual(len(field.allowed_values), 4)
         links = list(self.db.scalars(select(AttributeShopTemplateLink)))
         self.assertIn(" красный ", links[0].state["source"]["attributes"][0]["values"])
+
+    def test_program_matching_tracks_synchronized_dictionary_changes(self):
+        from services.attribute_assistant import replace_allowed_value_synonyms
+
+        data = snapshot()
+        attribute = data["attributes"][0]
+        attribute.update(name="Список программ", group_name="Программы",
+                         values=["Общая программа/Старая программа", "Старая программа"])
+        svc.import_snapshot(self.db, self.shop, recount(data))
+        self.db.commit()
+        programs = self.templates()[0].fields[0]
+        old = next(value for value in programs.allowed_values if value.value == "Старая программа")
+        replace_allowed_value_synonyms(self.db, old, ["Прежний режим"])
+        self.db.commit()
+        self.assertEqual(match_programs(programs, "Прежний режим/Общая программа")[0],
+                         "Общая программа/Старая программа")
+
+        attribute["values"] = ["Общая программа/Новая программа", "Новая программа"]
+        svc.import_snapshot(self.db, self.shop, recount(data))
+        self.db.commit()
+        self.db.expire_all()
+        programs = self.templates()[0].fields[0]
+        self.assertEqual(match_programs(programs, "Общая программа/Новая программа")[0],
+                         "Новая программа/Общая программа")
+        # Sync currently preserves old active dictionary entries. Matching
+        # follows that dictionary policy and drops them once deactivated.
+        self.assertEqual(match_programs(programs, "Прежний режим")[0], "Старая программа")
+        for value in programs.allowed_values:
+            if "Старая программа" in value.value:
+                value.is_active = False
+        self.db.commit()
+        self.assertEqual(match_programs(programs, "Прежний режим")[0], "")
+        self.assertEqual(match_programs(programs, "Старая программа")[0], "")
 
 
     def test_sync_upgrades_legacy_required_columns_without_losing_data(self):

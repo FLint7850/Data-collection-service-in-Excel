@@ -58,6 +58,17 @@ def ensure_default_user() -> None:
 def run_data_migrations() -> None:
     """Apply idempotent data migrations outside request handlers."""
 
+    review_migration = "20261008_attribute_proposals_for_missing_values_v1"
+    with session_scope() as db_session:
+        if not db_session.scalar(text("SELECT name FROM app_data_migrations WHERE name = :name"), {"name": review_migration}):
+            from services.attribute_assistant import migrate_existing_attribute_suggestions
+
+            changed = migrate_existing_attribute_suggestions(db_session)
+            db_session.execute(
+                text("INSERT INTO app_data_migrations (name, details, applied_at) VALUES (:name, json(:details), CURRENT_TIMESTAMP)"),
+                {"name": review_migration, "details": f'{{"changed":{changed}}}'},
+            )
+
     migration_name = "20260904_attribute_url_current_values_v2"
     with session_scope() as db_session:
         applied = db_session.scalar(

@@ -6,6 +6,23 @@ from unittest.mock import patch
 
 
 class BackendModuleTests(unittest.TestCase):
+    def test_automatic_connection_methods_keep_shared_order_and_debug_rule(self) -> None:
+        from services.connections import automatic_connection_methods
+
+        ordered = ["requests", "botasaurus-debug-visible", "playwright"]
+        normalize = lambda value: str(value or "requests")
+        is_debug = lambda value: value == "botasaurus-debug-visible"
+        with (
+            patch("services.connections.ordered_db_connection_methods", return_value=ordered),
+            patch("services.connections.normalize_connection_method", side_effect=normalize),
+            patch("services.connections.is_debug_visible_method", side_effect=is_debug),
+        ):
+            automatic = automatic_connection_methods("requests")
+            explicit_debug = automatic_connection_methods("botasaurus-debug-visible")
+
+        self.assertEqual(automatic, ["requests", "playwright"])
+        self.assertEqual(explicit_debug, ordered)
+
     def test_connection_catalog_fallback_survives_uninitialized_log_table(self) -> None:
         from runtime.state import connection_method_cache
         from services.connections import load_connection_methods

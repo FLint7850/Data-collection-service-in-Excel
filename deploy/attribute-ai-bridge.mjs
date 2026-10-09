@@ -289,6 +289,7 @@ export class CodexAppServer {
       if ((params.threadId || params.thread_id) !== threadId) return;
       const item = params.item || {};
       if (item.type !== "agentMessage" && item.type !== "agent_message") return;
+      if (item.phase === "commentary" || item.channel === "commentary") return;
       const text = agentText(item);
       if (text) messages.push(text);
     };
@@ -315,7 +316,7 @@ export class CodexAppServer {
         const fallback = agentText(event.params?.turn || event.params || {});
         if (fallback) messages.push(fallback);
       }
-      return { thread_id: threadId, turn_id: turnId, text: messages.join("\n").trim() };
+      return { thread_id: threadId, turn_id: turnId, text: (messages.at(-1) || "").trim() };
     } catch (error) {
       if (turnId && !completed && this.child?.stdin?.writable) {
         try {
@@ -389,7 +390,7 @@ export class AnalysisJobs {
       throw httpError("Хранилище анализов заполнено. Дождитесь освобождения завершённых задач", 503);
     }
     const job = {
-      id, digest, status: "queued", result: null, error: "", finishedAt: null,
+      id, digest, status: "queued", result: null, error: "", createdAt: Date.now(), finishedAt: null,
     };
     this.jobs.set(id, job);
     // A single queue limits all callers, including different batches and manual analysis.
@@ -432,6 +433,17 @@ export class AnalysisJobs {
     } finally {
       job.finishedAt = Date.now();
       const responseChars = typeof job.result?.text === "string" ? job.result.text.length : 0;
+      if (job.status === "completed") {
+        job.result = {
+          ...job.result,
+          metrics: {
+            queue_ms: startedAt - job.createdAt,
+            analysis_ms: job.finishedAt - startedAt,
+            prompt_chars: prompt.length,
+            response_chars: responseChars,
+          },
+        };
+      }
       this.log(`Attribute ChatGPT ${job.id}: ${job.status}, duration_ms=${job.finishedAt - startedAt}, response_chars=${responseChars}`);
     }
   }

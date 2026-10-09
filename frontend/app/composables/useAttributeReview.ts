@@ -5,6 +5,8 @@ import type {
     AttributeDonor,
     AttributeHistoryItem,
     AttributeProduct,
+    AttributeProductPage,
+    AttributeProductSummary,
     AttributeValue,
 } from "~/types/attribute-assistant";
 import type { AttributeAssistantContext } from "~/composables/useAttributeAssistant";
@@ -14,7 +16,6 @@ import {
     ATTRIBUTE_STATUS_VALUES,
     PRODUCT_STATUS_VALUES,
     matchesAttributeStatus,
-    matchesProductStatus,
     sourceKind,
     unknownSelectionKey,
 } from "~/utils/attribute-assistant";
@@ -54,13 +55,20 @@ export function useAttributeReview(
     const donorUrlOverrides = ref<Record<string, string>>({});
     const historyItems = ref<AttributeHistoryItem[]>([]);
     const batchOperation = ref<AttributeBatchOperation | null>(null);
+    const productPage = ref<AttributeProductPage | null>(null);
+    const loadingProducts = ref(false);
 
     const productQuery = ref("");
     const productStatusFilter = ref(ALL_FILTER_VALUE);
     const attributeStatusFilter = ref(ALL_FILTER_VALUE);
 
     let productRequestToken = 0;
+    let batchRequestToken = 0;
+    let listRequestToken = 0;
+    let productFilterTimer: ReturnType<typeof setTimeout> | null = null;
     let batchOperationPoll: ReturnType<typeof setTimeout> | null = null;
+    let openingBatch = false;
+    let disposed = false;
 
     const displayedDonors = computed(() =>
         donorRecommendations.value.length ? donorRecommendations.value : donors.value,
@@ -72,18 +80,13 @@ export function useAttributeReview(
             .filter((item): item is AttributeDonor => Boolean(item)),
     );
 
-    const filteredProducts = computed(() => (selectedBatch.value?.products || []).filter((product) => {
-        const query = productQuery.value.trim().toLocaleLowerCase("ru-RU");
-        const queryMatches = !query
-            || `${product.model} ${product.name} ${product.brand}`.toLocaleLowerCase("ru-RU").includes(query);
-        return queryMatches && matchesProductStatus(product, productStatusFilter.value);
-    }));
+    const filteredProducts = computed(() => productPage.value?.items || []);
 
     const productStatusItems = computed(() => {
-        const products = selectedBatch.value?.products || [];
-        const count = (status: string) => products.filter((product) => matchesProductStatus(product, status)).length;
+        const counts = productPage.value?.counts || {};
+        const count = (status: string) => counts[status] || 0;
         return [
-            { label: `Все товары (${products.length})`, value: ALL_FILTER_VALUE },
+            { label: `Все товары (${count("all")})`, value: ALL_FILTER_VALUE },
             { label: `Готовые (${count("ready")})`, value: "ready" },
             { label: `С конфликтами (${count("conflict")})`, value: "conflict" },
             { label: `С пропусками (${count("missing")})`, value: "missing" },
@@ -144,7 +147,7 @@ export function useAttributeReview(
         }),
     );
 
-    function productListIndicator(product: AttributeProduct): string {
+    function productListIndicator(product: AttributeProductSummary): string {
         if (productStatusFilter.value === "outside_template") {
             return `${product.counts.outside_template}`;
         }
@@ -218,6 +221,7 @@ export function useAttributeReview(
 
     function scheduleBatchOperationPoll(batchId: number, delay = 1400) {
         clearBatchOperationPoll();
+        if (disposed) return;
         batchOperationPoll = setTimeout(() => void loadBatchOperation(batchId), delay);
     }
 
@@ -225,7 +229,7 @@ export function useAttributeReview(
         try {
             const previous = batchOperation.value;
             const operation = await api.batchOperation(batchId);
-            if (selectedBatch.value?.id !== batchId) return;
+            if (disposed || selectedBatch.value?.id !== batchId) return;
             batchOperation.value = operation;
 
             if (["queued", "running"].includes(operation.status)) {
@@ -265,7 +269,7 @@ export function useAttributeReview(
                 notify("Массовая операция завершена · " + summary);
             }
         } catch (caught) {
-            if (selectedBatch.value?.id !== batchId) return;
+            if (disposed || selectedBatch.value?.id !== batchId) return;
             clearBatchOperationPoll();
             error.value = errorMessage(caught);
             if (!batchOperation.value || batchOperationRunning.value) {
@@ -329,6 +333,22 @@ export function useAttributeReview(
         const syncRoute = options.syncRoute ?? true;
         const resetFilters = options.resetFilters ?? true;
         const batchChanged = selectedBatch.value?.id !== id;
+        const token = ++batchRequestToken;
+        openingBatch = true;
+        if (productFilterTimer) clearTimeout(productFilterTimer);
+        productFilterTimer = null;
+        if (batchChanged) {
+            productRequestToken += 1;
+            listRequestToken += 1;
+            selectedProduct.value = null;
+            productPage.value = null;
+            historyItems.value = [];
+            donorRecommendations.value = [];
+            selectedDonors.value = [];
+            donorUrlOverrides.value = {};
+            loadingProductId.value = null;
+            loadingProducts.value = false;
+        }
 
         if (resetFilters && batchChanged) {
             productQuery.value = "";
@@ -337,6 +357,8 @@ export function useAttributeReview(
         }
 
         const batch = await run("batch", () => api.batch(id));
+        if (token !== batchRequestToken) return false;
+        openingBatch = false;
         if (!batch) return false;
 
         clearBatchOperationPoll();
@@ -345,22 +367,57 @@ export function useAttributeReview(
         void loadBatchOperation(id);
         tab.value = "review";
 
-        const requested = requestedProductId
-            ? batch.products?.find((product) => product.id === requestedProductId)
-            : null;
-        const first = requested || batch.products?.[0];
-
-        if (first) {
-            await openProduct(first.id, {
+        await loadProducts(batchChanged ? 0 : productPage.value?.offset || 0);
+        if (token !== batchRequestToken) return false;
+        if (requestedProductId && selectedProduct.value?.id !== requestedProductId) {
+            await openProduct(requestedProductId, {
                 syncRoute: false,
-                resetAttributeFilter: resetFilters && selectedProduct.value?.id !== first.id,
+                resetAttributeFilter: resetFilters,
             });
-        } else {
+        } else if (!requestedProductId) {
             selectedProduct.value = null;
         }
 
         if (syncRoute) await writeRoute("push");
         return true;
+    }
+
+    async function loadProducts(offset = 0) {
+        const batchId = selectedBatch.value?.id;
+        if (!batchId) return;
+        const token = ++listRequestToken;
+        loadingProducts.value = true;
+        try {
+            const page = await api.products(batchId, productQuery.value, productStatusFilter.value, offset);
+            if (token === listRequestToken && selectedBatch.value?.id === batchId) {
+                productPage.value = page;
+                const current = page.items.find((item) => item.id === selectedProduct.value?.id);
+                if (current && selectedProduct.value) {
+                    selectedProduct.value.status = current.status;
+                    selectedProduct.value.counts = current.counts;
+                }
+            }
+        } catch (caught) {
+            if (token === listRequestToken) error.value = errorMessage(caught);
+        } finally {
+            if (token === listRequestToken) loadingProducts.value = false;
+        }
+    }
+
+    const stopProductFilters = watch([productQuery, productStatusFilter], () => {
+        if (productFilterTimer) clearTimeout(productFilterTimer);
+        productFilterTimer = null;
+        if (openingBatch || !selectedBatch.value || disposed) return;
+        listRequestToken += 1;
+        productFilterTimer = setTimeout(() => {
+            productFilterTimer = null;
+            void loadProducts(0);
+        }, 250);
+    });
+
+    function changeProductPage(direction: number) {
+        if (!productPage.value || loadingProducts.value) return;
+        void loadProducts(Math.max(0, productPage.value.offset + direction * productPage.value.limit));
     }
 
     async function removeBatch(batch: AttributeBatch) {
@@ -377,10 +434,14 @@ export function useAttributeReview(
         if (!result) return;
 
         if (selectedBatch.value?.id === batch.id) {
+            productRequestToken += 1;
+            batchRequestToken += 1;
+            listRequestToken += 1;
             clearBatchOperationPoll();
             batchOperation.value = null;
             selectedBatch.value = null;
             selectedProduct.value = null;
+            productPage.value = null;
             historyItems.value = [];
             tab.value = "start";
             await writeRoute("replace");
@@ -428,8 +489,19 @@ export function useAttributeReview(
         }
 
         if (token !== productRequestToken) return false;
+        if (product.batch_id && product.batch_id !== selectedBatch.value?.id) {
+            error.value = "Товар не относится к выбранной обработке.";
+            return false;
+        }
 
         selectedProduct.value = product;
+        if (productPage.value) {
+            productPage.value.items = productPage.value.items.map((item) => item.id === product.id
+                ? { id: product.id, model: product.model, name: product.name, brand: product.brand,
+                    status: product.status, counts: product.counts }
+                : item);
+        }
+        donorRecommendations.value = [];
         historyItems.value = [];
         selectedDonors.value = [...(product.selected_donor_ids || [])];
         donorUrlOverrides.value = { ...(product.donor_url_overrides || {}) };
@@ -693,11 +765,13 @@ export function useAttributeReview(
 
     async function refreshBatch() {
         if (!selectedBatch.value) return;
-        const batch = await api.batch(selectedBatch.value.id);
+        const batchId = selectedBatch.value.id;
+        const batch = await api.batch(batchId);
+        if (selectedBatch.value?.id !== batchId) return;
         selectedBatch.value = batch;
         const index = workspace.value.batches.findIndex((item) => item.id === batch.id);
         if (index >= 0) workspace.value.batches[index] = batch;
-        await refreshProductHistory();
+        await Promise.all([loadProducts(productPage.value?.offset || 0), refreshProductHistory()]);
     }
 
     async function bulk(action: "accept_high" | "fill_dashes") {
@@ -720,6 +794,7 @@ export function useAttributeReview(
         );
         if (result) {
             selectedBatch.value = result.batch;
+            await loadProducts(productPage.value?.offset || 0);
             if (selectedProduct.value) await openProduct(selectedProduct.value.id);
             notify(`Изменено значений: ${result.changed}`);
         }
@@ -733,14 +808,23 @@ export function useAttributeReview(
     }
 
     function dispose() {
+        disposed = true;
         clearBatchOperationPoll();
         productRequestToken += 1;
+        batchRequestToken += 1;
+        listRequestToken += 1;
+        if (productFilterTimer) clearTimeout(productFilterTimer);
+        stopProductFilters();
     }
 
     return {
         selectedBatch,
         selectedProduct,
         loadingProductId,
+        loadingProducts,
+        productPage,
+        changeProductPage,
+        loadProducts,
         selectedDonors,
         unknownSelections,
         donorRecommendations,

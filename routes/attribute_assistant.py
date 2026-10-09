@@ -77,6 +77,7 @@ from services.attribute_assistant import (
     workspace,
 )
 from services.normalization import jsonify
+from services.attribute_listing import product_page
 
 
 bp = Blueprint("routes_attribute_assistant", __name__)
@@ -285,8 +286,9 @@ def api_attribute_batch_import():
             processing_mode=request.form.get("processing_mode", "suggest"),
         )
         g.db.flush()
-        return jsonify(serialize_batch(batch, detailed=True)), 201
+        return jsonify(serialize_batch(batch)), 201
     except (TypeError, ValueError) as error:
+        g.db.rollback()
         return jsonify({"error": str(error)}), 400
 
 
@@ -314,7 +316,7 @@ def api_attribute_batch_urls():
             processing_mode=payload.get("processing_mode", "suggest"),
         )
         g.db.flush()
-        return jsonify(serialize_batch(batch, detailed=True)), 201
+        return jsonify(serialize_batch(batch)), 201
     except (TypeError, ValueError) as error:
         return jsonify({"error": str(error)}), 400
 
@@ -324,7 +326,7 @@ def api_attribute_batch(batch_id: int):
     ensure_storage()
     try:
         batch = _batch(batch_id)
-        return jsonify(serialize_batch(batch, detailed=True))
+        return jsonify(serialize_batch(batch))
     except ValueError as error:
         return jsonify({"error": str(error)}), 404
 
@@ -342,6 +344,22 @@ def api_attribute_batch_delete(batch_id: int):
         return jsonify({"ok": True, "deleted": deleted})
     except ValueError as error:
         return jsonify({"error": str(error)}), 404
+
+
+@bp.get("/api/attribute-assistant/batches/<int:batch_id>/products")
+def api_attribute_batch_products(batch_id: int):
+    ensure_storage()
+    try:
+        _batch(batch_id)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
+    try:
+        return jsonify(product_page(
+            g.db, batch_id, query=request.args.get("q", ""), status=request.args.get("status", "all"),
+            offset=int(request.args.get("offset", 0)), limit=int(request.args.get("limit", 80)),
+        ))
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
 
 
 @bp.get("/api/attribute-assistant/products/<int:product_id>")
@@ -545,7 +563,7 @@ def api_attribute_batch_bulk(batch_id: int):
             int(payload.get("minimum_confidence") or 90),
             payload.get("dash_reason", ""),
         )
-        return jsonify({"changed": changed, "batch": serialize_batch(batch, detailed=True)})
+        return jsonify({"changed": changed, "batch": serialize_batch(batch)})
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
 

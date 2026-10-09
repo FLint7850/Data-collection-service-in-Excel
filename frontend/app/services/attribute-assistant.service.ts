@@ -12,6 +12,7 @@ import type {
   AttributeProcessingMode,
   AttributeProcessReport,
   AttributeProduct,
+  AttributeProductPage,
   AttributeTemplate,
   AttributeTemplatePreview,
   AttributeValue,
@@ -88,6 +89,10 @@ export const attributeAssistantService = {
     }),
 
   batch: (id: number) => $fetch<AttributeBatch>(`${base}/batches/${id}`),
+  products: (id: number, query = "", status = "all", offset = 0, limit = 80) =>
+    $fetch<AttributeProductPage>(`${base}/batches/${id}/products`, {
+      query: { q: query, status, offset, limit },
+    }),
   batchOperation: (id: number) =>
     $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation`),
   processBatch: (

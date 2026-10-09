@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import {
+  attributeReviewStatus,
   attributeValuesMatch,
+  canConfirmConflictFinal,
   hasPendingProposal,
   displayedProposal,
   displayedProposalConfidence,
@@ -46,6 +48,22 @@ const routeState = useAttributeAssistantRoute(
     templatesState,
     reviewState,
 );
+
+const attributeCardHead = ref<HTMLElement | null>(null);
+const attributeCardHeadHeight = ref(0);
+let attributeHeadObserver: ResizeObserver | null = null;
+watch(attributeCardHead, (element) => {
+  attributeHeadObserver?.disconnect();
+  attributeHeadObserver = null;
+  attributeCardHeadHeight.value = 0;
+  if (!element || typeof ResizeObserver === "undefined") return;
+  attributeCardHeadHeight.value = Math.ceil(element.getBoundingClientRect().height);
+  attributeHeadObserver = new ResizeObserver(() => {
+    attributeCardHeadHeight.value = Math.ceil(element.getBoundingClientRect().height);
+  });
+  attributeHeadObserver.observe(element);
+});
+onBeforeUnmount(() => attributeHeadObserver?.disconnect());
 
 /**
  * Основное состояние страницы.
@@ -133,6 +151,9 @@ const {
   selectedBatch,
   selectedProduct,
   loadingProductId,
+  loadingProducts,
+  productPage,
+  changeProductPage,
   selectedDonors,
   unknownSelections,
   donorUrlOverrides,
@@ -728,7 +749,7 @@ onBeforeUnmount(() => {
           <div class="aa-product-controls">
             <UInput v-model="productQuery" icon="i-lucide-search" class="aa-product-filter" placeholder="Модель, название, бренд" />
             <USelect v-model="productStatusFilter" :items="productStatusItems" value-key="value" class="aa-product-filter" />
-            <small class="aa-muted">Показано {{ filteredProducts.length }} из {{ selectedBatch.products?.length || 0 }}</small>
+            <small class="aa-muted">Показано {{ productPage?.matched ? (productPage.offset + 1) : 0 }}–{{ (productPage?.offset || 0) + filteredProducts.length }} из {{ productPage?.matched || 0 }}<template v-if="productQuery || productStatusFilter !== 'all'"> · всего {{ productPage?.total || 0 }}</template></small>
           </div>
           <div class="aa-product-list">
             <UButton
@@ -748,6 +769,11 @@ onBeforeUnmount(() => {
               </span>
               <b :class="product.status">{{ productListIndicator(product) }}</b>
             </UButton>
+          </div>
+          <div class="aa-product-pagination">
+            <UButton color="neutral" variant="soft" size="xs" :disabled="loadingProducts || !productPage?.offset" @click="changeProductPage(-1)">Назад</UButton>
+            <UIcon v-if="loadingProducts" name="i-lucide-loader-circle" class="animate-spin" />
+            <UButton color="neutral" variant="soft" size="xs" :disabled="loadingProducts || !productPage?.has_more" @click="changeProductPage(1)">Далее</UButton>
           </div>
         </aside>
 
@@ -910,8 +936,8 @@ onBeforeUnmount(() => {
             </div>
           </UCard>
 
-          <UCard as="section" variant="outline" class="aa-card aa-attributes">
-            <div class="aa-card-head">
+          <UCard as="section" variant="outline" class="aa-card aa-attributes" :style="{ '--aa-card-head-height': `${attributeCardHeadHeight}px` }">
+            <div ref="attributeCardHead" class="aa-card-head">
               <div>
                 <span class="aa-step">Проверка</span>
                 <h2>Атрибуты товара</h2>
@@ -941,7 +967,7 @@ onBeforeUnmount(() => {
             />
             <div v-for="[group, values] in valuesByGroup" :key="group" class="aa-attribute-group">
               <h3>{{ group }}</h3>
-              <article v-for="value in values" :key="value.id" :class="['aa-attribute', `is-${value.status}`, { 'is-outside-template': !value.is_in_template }]">
+              <article v-for="value in values" :key="value.id" :class="['aa-attribute', `is-${attributeReviewStatus(value)}`, { 'is-outside-template': !value.is_in_template }]">
                 <div class="aa-attribute-row-head">
                   <div class="aa-attribute-name">
                     <strong>{{ value.name }}</strong>
@@ -960,7 +986,7 @@ onBeforeUnmount(() => {
                     <small v-for="hint in originalValueHints(value)" :key="hint" class="aa-original-value-hint">{{ hint }}</small>
                   </div>
                   <div class="aa-comparison-cell is-proposed">
-                    <span>Предложение</span>
+                    <span>{{ value.current_value ? "Из источников" : "Предложение" }}</span>
                     <strong :class="{ 'aa-not-found': !displayedProposal(value) }">{{ displayedProposal(value) }}</strong>
                     <small v-if="displayedProposal(value)">
                       {{ displayedProposalSource(value) }}
@@ -1010,7 +1036,8 @@ onBeforeUnmount(() => {
                     />
                     <strong v-else>{{ value.final_value || displayedProposal(value) }}</strong>
                     <small v-if="value.status === 'dash'">{{ value.dash_reason }}</small>
-                    <small v-else-if="value.status === 'conflict'">Выберите итог или отклоните предложение</small>
+                    <small v-else-if="canConfirmConflictFinal(value)">Источники расходятся. Подтвердите итог или выберите другое значение</small>
+                    <small v-else-if="attributeReviewStatus(value) === 'conflict'">Выберите итоговое значение</small>
                     <small v-else-if="value.allowed_values_count && value.final_value">Можно выбрать другое значение из шаблона</small>
                     <small v-else-if="value.allowed_values_count && displayedProposal(value)">Предложение системы уже подставлено</small>
                     <small v-else-if="value.allowed_values_count">Выберите значение из шаблона</small>
@@ -1027,6 +1054,14 @@ onBeforeUnmount(() => {
                     :loading="busy === `value-remove-${value.id}`"
                     @click="removeOutsideTemplateValue(value)"
                   >Удалить атрибут</UButton>
+                  <UButton
+                    v-if="canConfirmConflictFinal(value)"
+                    color="success"
+                    variant="soft"
+                    icon="i-lucide-check"
+                    :loading="busy === `value-${value.id}`"
+                    @click="valueAction(value, 'accept', value.final_value)"
+                  >Подтвердить итог</UButton>
                   <UButton
                     v-if="hasPendingProposal(value)"
                     color="success"
@@ -1057,7 +1092,7 @@ onBeforeUnmount(() => {
                   v-if="value.source_details.candidates?.length"
                   class="aa-candidate-details"
                   content-class="aa-candidate-list"
-                  :default-open="value.status === 'conflict'"
+                  :default-open="attributeReviewStatus(value) === 'conflict'"
                 >
                   <template #label>
                     <span>Все источники</span>
@@ -1134,6 +1169,7 @@ onBeforeUnmount(() => {
             </div>
           </UCard>
         </main>
+        <EmptyState v-else icon="i-lucide-package-search" title="Выберите товар" description="Нажмите на товар в списке, чтобы загрузить его характеристики и источники." />
       </div>
     </template>
 

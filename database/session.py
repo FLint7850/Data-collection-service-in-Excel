@@ -731,6 +731,12 @@ def migrate_attribute_assistant_tables(connection) -> None:
             allowed_value_columns = table_columns(connection, "attribute_allowed_values")
 
     product_columns = original_columns.get("attribute_products", {})
+    for table, index_name, columns in (
+        ("attribute_products", "ix_attribute_products_batch_sort", "batch_id, sort_order, id"),
+        ("attribute_product_values", "ix_attribute_product_values_product_id", "product_id"),
+    ):
+        if {column.strip() for column in columns.split(",")} <= set(table_columns(connection, table)):
+            connection.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({columns})"))
     if product_columns and "template_id" not in product_columns:
         connection.execute(
             text(

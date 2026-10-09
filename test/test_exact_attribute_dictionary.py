@@ -208,12 +208,29 @@ class ExactDictionaryTest(unittest.TestCase):
         self.assertEqual(target.final_value, "A++")
         self.assertEqual(target.source_details["candidates"][0]["value"], "A")
 
-    def test_unknown_product_value_has_manual_suggestions_without_auto_acceptance(self):
+    def test_unknown_existing_value_is_conflict_with_manual_alternatives_without_auto_acceptance(self):
         product = self.product("A+++")
-        self.assertEqual(product.values[0].status, "suggested")
-        self.assertEqual(product.values[0].proposed_value, "A++")
-        self.assertEqual(product.values[0].current_value, "A+++")
-        self.assertEqual(product.values[0].final_value, "")
+        target = product.values[0]
+        self.assertEqual(target.status, "conflict")
+        self.assertEqual(target.proposed_value, "")
+        self.assertEqual(target.current_value, "A+++")
+        self.assertEqual(target.final_value, "")
+        self.assertIn("A++", target.source_details["unknown_values"][0]["suggestions"])
+        self.assertEqual(product.batch.summary["suggestions"], 0)
+        self.assertEqual(product.batch.summary["conflicts"], 1)
+
+    def test_missing_product_value_can_receive_a_suggestion_without_auto_acceptance(self):
+        product = self.product()
+        svc.apply_parsed_attributes(self.db, product, [{"name": "Класс", "value": "A++"}],
+                                    source="Донор", priority=0)
+        target = product.values[0]
+        self.assertEqual(target.status, "suggested")
+        self.assertEqual(target.current_value, "")
+        self.assertEqual(target.proposed_value, "A++")
+        self.assertEqual(target.final_value, "")
+        svc.refresh_batch_summary(product.batch)
+        self.assertEqual(product.batch.summary["suggestions"], 1)
+        self.assertEqual(product.batch.summary["conflicts"], 0)
 
     def test_html_parser_does_not_deduplicate_distinct_classes(self):
         html = "<table><tr><td>Класс</td><td>A</td></tr><tr><td>Класс</td><td>A++</td></tr></table>"

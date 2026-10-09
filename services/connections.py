@@ -118,6 +118,20 @@ def ordered_db_connection_methods(
     return ordered
 
 
+def automatic_connection_methods(initial_method: object) -> List[str]:
+    """Return the shared automatic fallback chain used by every scraper."""
+
+    selected = normalize_connection_method(initial_method)
+    methods: List[str] = []
+    for method in ordered_db_connection_methods():
+        # A visible debug browser is only allowed when the user selected it.
+        if is_debug_visible_method(method) and method != selected:
+            continue
+        if method not in methods:
+            methods.append(method)
+    return methods
+
+
 def normalize_connection_method(value: object) -> str:
     method = str(value or "requests").strip()
     codes = get_connection_method_codes()

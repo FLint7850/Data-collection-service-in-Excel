@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from models import Base, AttributeBatch, AttributeProduct
@@ -49,6 +49,185 @@ class AttributeReviewRulesTest(unittest.TestCase):
         if allowed:
             record["allowed_value"] = allowed
         return ai.validate_analysis(product, {"attributes": [record]}, source_facts=[{"name": name, "value": value}])
+
+    def test_literal_presence_in_mixed_dictionary_is_not_a_conflict(self):
+        template = self.template("Защита от детей", ("Есть", "Есть, с возможностью настройки автовключения", "Нет"))
+        product = self.product(template, "Есть")
+        self.assertFalse(svc._is_presence_marker(template.fields[0], "Есть", "Защита от детей"))
+        svc.apply_parsed_attributes(self.db, product, [{"name": "Защита от детей", "value": "Есть"}], source="Donor", priority=0)
+        analysis = self.analyze(product, "Защита от детей", "Есть")
+        self.assertEqual(analysis["unmatched_attributes"], [])
+        self.assertEqual(analysis["suggestions"][0]["proposed_value"], "Есть")
+        ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+        self.assertEqual(product.values[0].status, "kept")
+        self.assertEqual(product.values[0].proposed_value, "")
+        self.assertEqual(product.values[0].final_value, "Есть")
+
+    def test_separate_dimensions_confirm_tuple_for_parser_and_chatgpt(self):
+        facts = [{"name": "Ширина упаковки, см", "value": "65"},
+                 {"name": "Глубина упаковки, м", "value": "0.65"},
+                 {"name": "Высота упаковки, мм", "value": "920"}]
+        for method in ["parser", "gpt"]:
+            with self.subTest(method=method):
+                template = self.template("Габариты в упаковке, см (ВхШхГ) " + method, ("92x65x65",))
+                # A suffix in the template title does not belong to the field's qualifiers.
+                template.fields[0].name = "Габариты в упаковке, см (ВхШхГ)"
+                product = self.product(template, "92x65x65")
+                if method == "parser":
+                    stats = svc.apply_parsed_attributes(self.db, product, facts, source="Donor", priority=0)
+                    self.assertEqual(stats["unknown"], 0)
+                else:
+                    records = [[index, template.fields[0].id, 85] for index in range(1, 4)]
+                    analysis = ai.validate_analysis(product, {"attributes": records}, source_facts=facts)
+                    self.assertEqual(analysis["unmatched_attributes"], [])
+                    self.assertEqual(len(analysis["suggestions"]), 1)
+                    ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+                self.assertEqual(product.values[0].status, "kept")
+                self.assertEqual(product.values[0].final_value, "92x65x65")
+                self.assertEqual(product.values[0].proposed_value, "")
+
+    def test_dimension_assembly_requires_complete_consistent_axes_and_context(self):
+        field = self.template("Габариты в упаковке, см (ВхШхГ)", ("92x65x65", "93x65x65")).fields[0]
+        facts = [{"name": "Высота упаковки, см", "value": "92"},
+                 {"name": "Ширина упаковки, см", "value": "65"},
+                 {"name": "Глубина упаковки, см", "value": "65"}]
+        self.assertEqual(svc._assemble_dimension_value(field, facts), "92x65x65 см")
+        self.assertEqual(svc._assemble_dimension_value(field, facts[:2]), "")
+        self.assertEqual(svc._assemble_dimension_value(field, [*facts, {"name": facts[0]["name"], "value": "93"}]), "")
+        self.assertEqual(svc._assemble_dimension_value(field, [*facts[:2], {"name": "Глубина ниши, см", "value": "65"}]), "")
+        product = self.product(field.template, "92x65x65")
+        facts[0]["value"] = "93"
+        svc.apply_parsed_attributes(self.db, product, facts, source="Donor", priority=0)
+        self.assertEqual(product.values[0].status, "conflict")
+
+    def test_stored_false_conflicts_are_repaired_from_source_evidence(self):
+        for field_name, allowed, current, facts in [
+            ("Защита от детей", ("Есть", "Нет", "Есть с настройкой"), "Есть",
+             [{"source_name": "Защита от детей", "value": "Есть"}]),
+            ("Габариты в упаковке, см (ВхШхГ)", ("92x65x65",), "92x65x65",
+             [{"source_name": "Высота упаковки, см", "value": "92"},
+              {"source_name": "Ширина упаковки, см", "value": "65"},
+              {"source_name": "Глубина упаковки, см", "value": "65"}]),
+        ]:
+            product = self.product(self.template(field_name, allowed), current)
+            value = product.values[0]
+            value.status = "conflict"
+            value.source_details = {"unknown_values": [dict(fact, source="ChatGPT", url="https://example.com", reason="Старое неверное сопоставление") for fact in facts]}
+            result = svc.serialize_product(product, detailed=True)
+            self.assertEqual(result["counts"]["conflicts"], 0)
+            self.assertEqual(value.status, "kept")
+            self.assertEqual(value.final_value, current)
+            self.assertEqual(value.source_details["unknown_values"], [])
+
+    def test_warranty_months_match_year_dictionary_for_parser_and_chatgpt(self):
+        template = self.template("Гарантия", ("24", "1 год", "2 года", "5 лет"))
+        field = template.fields[0]
+        source_name = "Срок гарантии (мес.)"
+        field.synonyms = [source_name]
+        for raw, expected in [("12", "1 год"), ("24", "2 года"), ("60", "5 лет")]:
+            with self.subTest(months=raw):
+                product = self.product(template, expected)
+                if raw == "24":
+                    svc.apply_candidate(
+                        product, product.values[0], value=raw, raw_value=raw,
+                        confidence=85, source="ChatGPT", reason="Старое сопоставление",
+                        priority=90, source_name=source_name, source_url=product.source_url,
+                    )
+                    self.assertEqual(product.values[0].status, "conflict")
+                stats = svc.apply_parsed_attributes(
+                    self.db, product, [{"name": source_name, "value": raw}],
+                    source="Donor", priority=0,
+                )
+                self.assertEqual(stats["mapped"], 1)
+                self.assertEqual(stats["unknown"], 0)
+                analysis = self.analyze(product, source_name, raw)
+                self.assertEqual(analysis["unmatched_attributes"], [])
+                self.assertEqual(analysis["suggestions"][0]["proposed_value"], expected)
+                self.assertIn("Конвертация срока", analysis["suggestions"][0]["explanation"])
+                ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+                value = product.values[0]
+                self.assertEqual(value.status, "kept")
+                self.assertEqual(value.final_value, expected)
+                self.assertEqual(value.proposed_value, "")
+                candidates = value.source_details["candidates"]
+                self.assertEqual(len(candidates), 2)
+                self.assertTrue(all(item["matches_current"] for item in candidates))
+                self.assertTrue(all(item["raw_value"] == raw for item in candidates))
+                self.assertTrue(all(item["value"] == expected for item in candidates))
+
+    def test_duration_conversion_respects_explicit_units_and_exact_fractions(self):
+        cases = [
+            ("Гарантия", "Срок гарантии", "24 месяц", "2 года"),
+            ("Гарантия", "Срок гарантии", "12 месяцев", "1 год"),
+            ("Гарантия", "Срок гарантии (мес.)", "1 год", "12 месяцев"),
+            ("Гарантия", "Срок гарантии (лет)", "1", "12 месяцев"),
+            ("Гарантия", "Warranty (months)", "24", "2 years"),
+            ("Гарантия", "Срок гарантии", "1,5 года", "18 месяцев"),
+            ("Гарантия", "Срок гарантии (мес.)", "18", "1,5 года"),
+            ("Гарантия, лет", "Срок гарантии (месяцев)", "24", "2"),
+            ("Гарантия, мес.", "Срок гарантии (лет)", "2", "24"),
+        ]
+        for index, (field_name, source_name, raw, expected) in enumerate(cases):
+            with self.subTest(raw=raw, target=expected):
+                template = self.template(f"{field_name} {index}", (expected,))
+                field = template.fields[0]
+                canonical, confidence, reason, suggestions = svc._allowed_match(field, raw, source_name)
+                self.assertEqual(canonical, expected)
+                self.assertEqual(confidence, 100)
+                self.assertIn("Конвертация срока", reason)
+                self.assertEqual(suggestions, [])
+                analysis = self.analyze(self.product(template), source_name, raw)
+                self.assertEqual(analysis["unmatched_attributes"], [])
+                self.assertEqual(analysis["suggestions"][0]["proposed_value"], expected)
+
+    def test_duration_conversion_does_not_accept_wrong_or_ambiguous_numbers(self):
+        field = self.template("Гарантия", ("18", "24", "1 год", "2 года")).fields[0]
+        for raw in ["18", "13"]:
+            with self.subTest(months=raw):
+                self.assertEqual(svc._allowed_match(field, raw, "Срок гарантии (мес.)")[0], "")
+        self.assertEqual(svc._allowed_match(field, "24", "Срок гарантии")[0], "24")
+        self.assertEqual(svc._allowed_match(field, "2", "Срок гарантии")[0], "")
+        for item in field.allowed_values:
+            if item.value == "2 года":
+                item.is_active = False
+        self.assertEqual(svc._allowed_match(field, "24", "Срок гарантии (мес.)")[0], "")
+
+    def test_duration_conversion_preserves_raw_import_and_detects_real_conflict(self):
+        template = self.template("Гарантия", ("1 год", "2 года"))
+        product = self.product(template, "24", "Срок гарантии (мес.)")
+        value = product.values[0]
+        self.assertEqual(value.current_value, "24")
+        self.assertEqual(value.final_value, "2 года")
+        self.assertEqual(value.status, "kept")
+        ai.apply_analysis(
+            self.db, product, self.analyze(product, "Срок гарантии (мес.)", "12"),
+            source_url=product.source_url,
+        )
+        self.assertEqual(value.status, "conflict")
+        self.assertEqual(value.final_value, "2 года")
+        self.assertEqual(value.source_details["candidates"][0]["value"], "1 год")
+
+    def test_unrestricted_duration_numbers_convert_without_rounding(self):
+        field = self.template("Срок службы (лет)", (), "number").fields[0]
+        self.assertEqual(svc._allowed_match(field, "24", "Срок службы (мес.)")[0], "2")
+        self.assertEqual(svc._allowed_match(field, "18", "Срок службы (мес.)")[0], "1.5")
+        self.assertEqual(svc._allowed_match(field, "1", "Срок службы (мес.)")[0], "")
+
+    def test_equivalent_duration_dictionary_values_do_not_conflict(self):
+        template = self.template("Гарантия", ("24 месяца", "2 года"))
+        for current in ["24 месяца", ""]:
+            with self.subTest(current=current):
+                product = self.product(template, current)
+                value = product.values[0]
+                if not current:
+                    svc.update_product_value(value, action="accept", manual_value="24 месяца")
+                ai.apply_analysis(
+                    self.db, product, self.analyze(product, "Срок гарантии", "2 года"),
+                    source_url=product.source_url,
+                )
+                self.assertEqual(value.status, "kept" if current else "approved")
+                self.assertEqual(value.final_value, "24 месяца")
+                self.assertEqual(value.source_details["candidates"][0]["value"], "2 года")
 
     def test_linear_sizes_use_centimeters_for_every_field_type_and_source(self):
         cases = [
@@ -108,9 +287,9 @@ class AttributeReviewRulesTest(unittest.TestCase):
         field = self.template("Мощность, Вт", ("1200",), "number").fields[0]
         self.assertEqual(svc._allowed_match(field, "1.2 кВт")[0], "1200")
 
-    def test_bad_original_is_conflict_or_manual_suggestion(self):
+    def test_bad_original_is_conflict_even_with_dictionary_alternatives(self):
         template = self.template()
-        for raw, status in [("совершенно другое", "conflict"), ("A+++", "suggested")]:
+        for raw, status in [("совершенно другое", "conflict"), ("A+++", "conflict")]:
             product = self.product(template, raw, mode="auto_all")
             value = product.values[0]
             self.assertEqual(value.status, status)
@@ -122,6 +301,43 @@ class AttributeReviewRulesTest(unittest.TestCase):
             self.assertEqual(value.final_value, "")
             svc.refresh_product_status(product)
             self.assertEqual(product.status, "needs_review")
+
+    def test_saved_suggestions_are_repaired_with_updated_summary_without_loading_products(self):
+        from sqlalchemy.orm import raiseload
+        from services.attribute_listing import batch_summary, product_page
+
+        template = self.template()
+        existing = self.product(template, "A+++")
+        confirming = self.product(template, "A++")
+        missing = self.product(template)
+        accepted = self.product(template, "A++")
+        for product in (existing, confirming, missing):
+            product.values[0].status = "suggested"
+            product.values[0].proposed_value = "A++"
+            product.status = "needs_review"
+        svc.update_product_value(accepted.values[0], action="accept", manual_value="A+")
+        ids = [product.batch_id for product in (existing, confirming, missing, accepted)]
+        self.db.flush()
+        for product in (existing, confirming, missing):
+            product.batch.summary = batch_summary(self.db, product.batch_id)
+        self.db.commit()
+        self.db.expunge_all()
+        self.assertEqual(svc.migrate_existing_attribute_suggestions(self.db), 2)
+        self.assertEqual(svc.migrate_existing_attribute_suggestions(self.db), 0)
+        self.assertFalse(any(isinstance(item, AttributeProduct) for item in self.db.identity_map.values()))
+        batches = [self.db.scalar(select(AttributeBatch).where(AttributeBatch.id == batch_id)
+                                  .options(raiseload(AttributeBatch.products))) for batch_id in ids]
+        self.assertEqual(batches[0].summary['conflicts'], 1)
+        self.assertEqual(batches[0].summary['suggestions'], 0)
+        self.assertEqual(batches[1].summary['ready'], 1)
+        self.assertEqual(batches[1].summary['suggestions'], 0)
+        self.assertEqual(batches[2].summary['suggestions'], 1)
+        self.assertEqual(batches[3].summary['conflicts'], 0)
+        self.assertEqual(product_page(self.db, ids[0])['items'][0]['counts']['suggestions'], 0)
+        self.assertEqual(product_page(self.db, ids[0])['items'][0]['counts']['conflicts'], 1)
+        accepted_value = self.db.scalar(select(svc.AttributeProductValue).join(AttributeProduct)
+                                        .where(AttributeProduct.batch_id == ids[3]))
+        self.assertEqual((accepted_value.status, accepted_value.final_value), ('approved', 'A+'))
 
     def test_parser_and_gpt_keep_mapped_bad_values_and_same_status(self):
         template = self.template()
@@ -174,11 +390,38 @@ class AttributeReviewRulesTest(unittest.TestCase):
         self.assertEqual(product.values[0].status, "conflict")
         self.assertEqual(product.values[0].final_value, "A++")
 
-    def test_invalid_original_with_valid_candidate_is_suggested(self):
+    def test_confirming_main_donor_and_chatgpt_do_not_propose_the_conflicting_final_again(self):
+        for name, selected, alternative in [("Ширина, см", "64.4", "64"), ("Глубина, см", "51.2", "51")]:
+            with self.subTest(name=name):
+                template = self.template(name, (selected, alternative), "number")
+                product = self.product(template, selected)
+                svc.apply_parsed_attributes(self.db, product, [{"name": name, "value": selected}],
+                                            source="Asko", priority=0, source_url="https://main.example/product")
+                svc.apply_parsed_attributes(self.db, product, [{"name": name.split(',')[0], "value": alternative + " см"}],
+                                            source="Asko", priority=1, source_url="https://extra.example/product")
+                ai.apply_analysis(self.db, product, self.analyze(product, name, selected), source_url=product.source_url)
+                value = product.values[0]
+                self.assertEqual(value.status, "conflict")
+                self.assertEqual(value.proposed_value, "")
+                self.assertEqual(value.final_value, selected)
+                self.assertEqual([candidate["value"] for candidate in value.source_details["candidates"]],
+                                 [selected, alternative, selected])
+                self.assertEqual([candidate["matches_current"] for candidate in value.source_details["candidates"]],
+                                 [True, False, True])
+                payload = svc.serialize_product(product, detailed=True)
+                self.assertEqual(payload["values"][0]["proposed_value"], "")
+                self.assertEqual(payload["counts"]["conflicts"], 1)
+                svc.update_product_value(value, action="accept", manual_value=selected)
+                self.assertEqual(value.status, "approved")
+                self.assertEqual(value.final_value, selected)
+                self.assertEqual(product.batch.summary["conflicts"], 0)
+                self.assertEqual(len(value.source_details["candidates"]), 3)
+
+    def test_invalid_original_with_valid_candidate_is_conflict(self):
         template = self.template()
         product = self.product(template, "A+++")
         svc.apply_parsed_attributes(self.db, product, [{"name": "Класс", "value": "A++"}], source="Donor", priority=0)
-        self.assertEqual(product.values[0].status, "suggested")
+        self.assertEqual(product.values[0].status, "conflict")
         self.assertEqual(product.values[0].proposed_value, "A++")
         self.assertEqual(product.values[0].final_value, "")
 
@@ -191,7 +434,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
 
     def test_invalid_donor_value_is_visible_even_with_valid_original(self):
         template = self.template()
-        for raw, status in [("совершенно другое", "conflict"), ("A+++", "suggested")]:
+        for raw, status in [("совершенно другое", "conflict"), ("A+++", "conflict")]:
             for method in ["parser", "gpt"]:
                 with self.subTest(raw=raw, method=method):
                     product = self.product(template, "A++", mode="auto_all")

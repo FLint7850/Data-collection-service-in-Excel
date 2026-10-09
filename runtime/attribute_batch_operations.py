@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import threading
+import time
 import uuid
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -27,6 +28,7 @@ from services.attribute_ai import (
     build_product_prompt,
     parsed_attribute_facts,
     prepare_product_source,
+    record_analysis_metrics,
     validate_analysis,
 )
 from services.attribute_chatgpt_control import analyze_with_chatgpt
@@ -239,6 +241,7 @@ def _prepare_chatgpt_product(
 ) -> dict[str, Any] | None:
     """Prepare on the coordinator thread; never share a browser or ORM objects with AI workers."""
     db = SessionLocal()
+    started = time.perf_counter()
     product: AttributeProduct | None = None
     try:
         product = db.get(AttributeProduct, product_id)
@@ -257,9 +260,11 @@ def _prepare_chatgpt_product(
             "template_id": template_id,
             "source_url": source_url,
             "prompt": prompt,
+            "prompt_chars": len(prompt),
             "evidence": evidence,
             "source_facts": parsed_attribute_facts(parsed),
             "initial_snapshot": initial_snapshot,
+            "preparation_seconds": time.perf_counter() - started,
         }
     except Exception as error:
         db.rollback()
@@ -268,6 +273,12 @@ def _prepare_chatgpt_product(
         return None
     finally:
         db.close()
+
+
+def _analyze_prepared_product(prompt: str) -> dict[str, Any]:
+    started = time.perf_counter()
+    response = analyze_with_chatgpt(prompt)
+    return {**response, "request_seconds": time.perf_counter() - started}
 
 
 def _apply_chatgpt_result(batch_id: int, prepared: dict[str, Any], future: Future) -> None:
@@ -284,11 +295,18 @@ def _apply_chatgpt_result(batch_id: int, prepared: dict[str, Any], future: Futur
         if (product.template_id or product.batch.template_id) != prepared["template_id"]:
             raise ValueError("Шаблон товара изменился во время анализа ChatGPT. Повторите анализ")
         response = future.result()  # Already completed: no network wait inside the transaction.
+        validation_started = time.perf_counter()
         analysis = validate_analysis(
             product,
             response.get("text", ""),
             page_evidence=prepared["evidence"],
             source_facts=prepared["source_facts"],
+        )
+        record_analysis_metrics(
+            analysis, prepared["prompt_chars"], response,
+            preparation_seconds=prepared.get("preparation_seconds", 0),
+            request_seconds=response.get("request_seconds", 0),
+            validation_seconds=time.perf_counter() - validation_started,
         )
         save_product_snapshot(
             db,
@@ -371,7 +389,7 @@ def _run_chatgpt_products(
             while prepared_ready and len(analysis_pending) < CHATGPT_CONCURRENCY:
                 prepared = prepared_ready.popleft()
                 prompt = prepared.pop("prompt")
-                analysis_pending[ai_pool.submit(analyze_with_chatgpt, prompt)] = prepared
+                analysis_pending[ai_pool.submit(_analyze_prepared_product, prompt)] = prepared
             submit_preparations(source_pool)
             if not (preparation_pending or prepared_ready or analysis_pending):
                 continue

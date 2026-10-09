@@ -398,7 +398,7 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(service.apply_template_field_synonyms(self.db, color), 0)
         self.assertEqual([service.capture_product_snapshot(product) for product in products], before)
 
-    def test_semantic_mapping_normalizes_inflections_and_abbreviations(self):
+    def test_semantic_mapping_uses_saved_synonyms_and_normalizes_inflections(self):
         template = service.import_template_csv(
             self.db,
             (
@@ -419,6 +419,8 @@ class AttributeAssistantTest(unittest.TestCase):
         }
         for source_name, expected in cases.items():
             with self.subTest(source_name=source_name):
+                target = next(item for item in template.fields if item.name == expected)
+                service.replace_template_field_synonyms(self.db, target, [source_name])
                 field, confidence, _reason, _alternatives = service.map_attribute(
                     self.db, template, None, source_name
                 )
@@ -462,21 +464,14 @@ class AttributeAssistantTest(unittest.TestCase):
             parsed={"attributes": [{"name": source_name, "value": "310 мм"}]},
         )
         context = json.loads(prompt.split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
-        prompt_field = next(
-            item
-            for item in context["template_fields"]
-            if item["name"] == "Диаметр загрузочного люка, см"
-        )
         catalog_field = next(
             item
             for item in context["template_field_catalog"]
             if item["name"] == "Диаметр загрузочного люка, см"
         )
-        self.assertEqual(catalog_field["id"], prompt_field["id"])
-        self.assertIn(
-            {"name": source_name, "value": "310 мм"},
-            prompt_field["source_hints"],
-        )
+        prompt_field = next(item for item in context["template_fields"] if item["id"] == catalog_field["id"])
+        self.assertIn(1, prompt_field["source_ids"])
+        self.assertEqual(context["parser_attributes"][0], {"source_id": 1, "name": source_name, "value": "310 мм"})
         self.assertIn("31", prompt_field["allowed_values"])
 
         analysis = attribute_ai.validate_analysis(
@@ -1228,6 +1223,7 @@ class AttributeAssistantTest(unittest.TestCase):
         product = batch.products[0]
         html = """
         <h1>WM-100</h1>
+        <p>Подробное описание стиральной машины, её режимов, конструкции и особенностей эксплуатации. Подробное описание стиральной машины, её режимов, конструкции и особенностей эксплуатации. Подробное описание стиральной машины, её режимов, конструкции и особенностей эксплуатации.</p>
         <div class="characteristics__row">
           <span class="characteristics__name">Цвет</span>
           <span class="characteristics__property">Белый</span>
@@ -1287,6 +1283,93 @@ class AttributeAssistantTest(unittest.TestCase):
             )
 
         self.assertIs(fetch.call_args.kwargs["fetcher"], marker)
+
+    def test_donor_auto_connection_falls_back_from_requests_and_remembers_method(self):
+        donor = Donor(
+            brand=Brand(name="Auto fallback donor", group_name="Test"),
+            legacy_id="auto-fallback-donor",
+            site_url="https://example.com/",
+            auto_connection_fallback=True,
+        )
+        self.db.add(donor)
+        self.db.flush()
+        blocked_html = "<html><body>Access denied</body></html>"
+        valid_html = (
+            "<html><body><h1>WM-100</h1><p>"
+            + ("Подробное описание товара и его характеристик. " * 12)
+            + "</p></body></html>"
+        )
+
+        fetcher = service.DonorPageFetcher(max_pages=1)
+        try:
+            with patch.object(
+                service,
+                "automatic_connection_methods",
+                return_value=["requests", "botasaurus-request"],
+            ) as fallback_methods, patch.object(
+                service,
+                "fetch_public_html",
+                return_value=(blocked_html, "https://example.com/products/wm-100"),
+            ) as requests_fetch, patch.object(
+                service,
+                "_resolve_public_redirect_url",
+                side_effect=lambda value: value,
+            ), patch(
+                "services.scraping.http.fetch_with_botasaurus_request",
+                return_value=valid_html,
+            ) as fallback_fetch:
+                first = service.fetch_donor_product_html(
+                    donor,
+                    "https://example.com/products/wm-100",
+                    fetcher=fetcher,
+                )
+                second = service.fetch_donor_product_html(
+                    donor,
+                    "https://example.com/products/wm-101",
+                    fetcher=fetcher,
+                )
+        finally:
+            fetcher.close()
+
+        self.assertEqual(first[0], valid_html)
+        self.assertEqual(second[0], valid_html)
+        self.assertEqual(requests_fetch.call_count, 1)
+        self.assertEqual(fallback_fetch.call_count, 2)
+        fallback_methods.assert_called_once_with("requests")
+
+    def test_donor_connection_does_not_fall_back_when_auto_is_disabled(self):
+        donor = Donor(
+            brand=Brand(name="Fixed method donor", group_name="Test"),
+            legacy_id="fixed-method-donor",
+            site_url="https://example.com/",
+            auto_connection_fallback=False,
+        )
+        self.db.add(donor)
+        self.db.flush()
+
+        fetcher = service.DonorPageFetcher(max_pages=1)
+        try:
+            with patch.object(
+                service,
+                "automatic_connection_methods",
+            ) as fallback_methods, patch.object(
+                service,
+                "fetch_public_html",
+                side_effect=ValueError("blocked"),
+            ), patch(
+                "services.scraping.http.fetch_with_botasaurus_request",
+            ) as fallback_fetch:
+                with self.assertRaisesRegex(ValueError, "Requests|requests"):
+                    service.fetch_donor_product_html(
+                        donor,
+                        "https://example.com/products/wm-100",
+                        fetcher=fetcher,
+                    )
+        finally:
+            fetcher.close()
+
+        fallback_methods.assert_not_called()
+        fallback_fetch.assert_not_called()
 
     def test_chatgpt_prefers_selected_donor_over_own_site_url(self):
         from services import attribute_ai
@@ -1935,6 +2018,102 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(analysis["suggestions"][0]["proposed_value"], "Белый")
         self.assertEqual(analysis["suggestions"][0]["confidence"], 85)
 
+    def test_chatgpt_tuple_response_preserves_full_validation_and_is_smaller(self):
+        from services import attribute_ai as ai
+
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db, template, '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode('cp1251'), filename='products.csv',
+        )
+        parsed = {"attributes": [
+            {"name": "Цвет", "value": "светлый"},
+            {"name": "Скорость отжима", "value": "1000"},
+            {"name": "Габариты", "value": "45,6 х 59.5 X 60"},
+            {"name": "Список программ", "value": "Шерсть/Быстрая/Хлопок/Неизвестная"},
+            {"name": "Неизвестная характеристика", "value": "Текст источника"},
+        ]}
+        service.add_allowed_value(self.db, template.fields[0], 'Белый', synonym='светлый')
+        records = [
+            {"source_id": index + 1, "field_id": field.id, "confidence": 84}
+            for index, field in enumerate(template.fields)
+        ]
+        records[0]['allowed_value'] = 'Белый'
+        records.append({"source_id": 5, "field_id": None, "confidence": 50})
+        records.append({"name": "Особенность", "value": "ABC", "field_id": None,
+                        "evidence": "Особенность: ABC", "confidence": 70})
+        compact = [
+            [item['source_id'], item['field_id'], item['confidence']]
+            + ([item['allowed_value']] if 'allowed_value' in item else [])
+            if 'source_id' in item else item for item in records
+        ]
+        kwargs = {"source_facts": ai.parsed_attribute_facts(parsed), "page_evidence": "Особенность: ABC"}
+        old = ai.validate_analysis(batch.products[0], {"attributes": records}, **kwargs)
+        new = ai.validate_analysis(batch.products[0], {"attributes": compact}, **kwargs)
+        self.assertEqual(new, old)
+        self.assertEqual(len(new['observed_attributes']), 6)
+        self.assertEqual([item['proposed_value'] for item in new['suggestions']],
+                         ['Белый', '1000', '45.6x59.5x60', 'Быстрая/Хлопок/Шерсть'])
+        size = lambda rows: len(json.dumps({"attributes": rows}, ensure_ascii=False, separators=(',', ':')))
+        self.assertLess(size(compact), size(records) * 0.6)
+
+    def test_chatgpt_incomplete_or_malformed_tuple_analysis_is_not_applied(self):
+        from services import attribute_ai as ai
+
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db, template, '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode('cp1251'), filename='products.csv',
+        )
+        facts = [{"name": "Цвет", "value": "Белый"}, {"name": "Скорость", "value": "1000"}]
+        before = service.capture_product_snapshot(batch.products[0])
+        for rows in ([], [[1, template.fields[0].id, 85]],
+                     [[1, template.fields[0].id, 85], [2, template.fields[1].id]],
+                     [[True, template.fields[0].id, 85], [2, template.fields[1].id, 85]]):
+            with self.subTest(rows=rows):
+                with self.assertRaisesRegex(ValueError, 'Неполный анализ не применён'):
+                    ai.validate_analysis(batch.products[0], {"attributes": rows}, source_facts=facts)
+                self.assertEqual(service.capture_product_snapshot(batch.products[0]), before)
+
+    def test_chatgpt_prompt_uses_current_template_without_duplicate_facts(self):
+        from services import attribute_ai as ai
+
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db, template, '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode('cp1251'), filename='products.csv',
+        )
+        field = template.fields[3]
+        service.add_allowed_value(self.db, field, 'Новая технология', synonym='Новый режим')
+        service.replace_template_field_synonyms(self.db, field, ['Режимы обработки'])
+        parsed = {"attributes": [{"name": "Режимы обработки", "value": "Новый режим"}]}
+        def context():
+            prompt, evidence = ai.build_product_prompt(batch.products[0], source_url='https://example.com/product',
+                                                       parsed=parsed, html='<p>Режимы обработки: Новый режим</p>')
+            return json.loads(prompt.split('КОНТЕКСТ ДЛЯ АНАЛИЗА:\n', 1)[1]), evidence
+        data, evidence = context()
+        self.assertEqual(len(data['template_field_catalog']), len(template.fields))
+        self.assertEqual(data['parser_attributes'], ai.parsed_attribute_facts(parsed))
+        detail = next(item for item in data['template_fields'] if item['id'] == field.id)
+        self.assertEqual(detail['source_ids'], [1])
+        self.assertEqual(detail['program_components'], ['Быстрая', 'Новая технология', 'Хлопок', 'Шерсть'])
+        self.assertEqual(detail['program_synonyms']['новый режим'], 'Новая технология')
+        self.assertNotIn('allowed_values', detail)
+        self.assertNotIn('name', detail)
+        self.assertNotIn('ДАННЫЕ, НАЙДЕННЫЕ ПАРСЕРОМ', data['page_evidence'])
+        self.assertIn('Новый режим', evidence)
+        next(item for item in field.allowed_values if item.value == 'Новая технология').is_active = False
+        data, _ = context()
+        detail = next(item for item in data['template_fields'] if item['id'] == field.id)
+        self.assertNotIn('Новая технология', detail['program_components'])
+        self.assertNotIn('новый режим', detail.get('program_synonyms', {}))
+
+    def test_chatgpt_evidence_deduplicates_paragraphs_without_losing_dimensions(self):
+        from services import attribute_ai as ai
+
+        description = 'Длинное описание модели и её дополнительных особенностей. ' * 4
+        html = f'<p>{description}</p><table><tr><th>Высота</th><td>65</td></tr><tr><th>Ширина</th><td>65</td></tr></table><p>{description}</p>'
+        text = ai._compact_visible_text(html)
+        self.assertEqual(text.count(description.strip()), 1)
+        self.assertIn('Высота\n65\nШирина\n65', text)
+
     def test_conflicting_sources_require_review(self):
         template = self.make_template()
         source = '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode("cp1251")
@@ -2338,6 +2517,8 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertIn("Порядок осей", reason)
         self.assertEqual(suggestions, [])
 
+        service.replace_template_field_synonyms(self.db, field, ["Размеры в упаковке"])
+
         batch = service.create_batch_from_csv(
             self.db,
             template,
@@ -2499,6 +2680,7 @@ class AttributeAssistantTest(unittest.TestCase):
             brand=Brand(name="Manual URL donor", group_name="Test"),
             legacy_id="manual-url",
             site_url="https://example.com",
+            auto_connection_fallback=False,
         )
         self.db.add(donor)
         self.db.flush()
@@ -2866,6 +3048,12 @@ class AttributeAssistantTest(unittest.TestCase):
             self.assertEqual(color.proposed_value, colors[product.model])
             self.assertEqual(color.source_details["chatgpt"]["url"], f"https://example.com/{product.model}")
             self.assertEqual(color.source_details["chatgpt"]["evidence"], f"Цвет: {colors[product.model]}")
+            metrics = next(source for source in product.sources if source.role == 'chatgpt').parsed_data['analysis_metrics']
+            self.assertEqual(metrics['observed_facts'], 1)
+            self.assertGreater(metrics['prompt_chars'], 0)
+            self.assertGreater(metrics['response_chars'], 0)
+            self.assertGreaterEqual(metrics['preparation_ms'], 0)
+            self.assertGreaterEqual(metrics['request_ms'], 0)
 
     def test_chatgpt_batch_continues_after_preparation_model_and_json_errors(self):
         runtime, template, batch, product_ids = self._chatgpt_parallel_batch(count=5)

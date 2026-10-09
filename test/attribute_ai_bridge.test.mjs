@@ -40,7 +40,9 @@ test("duplicate job submission and polling never repeat the model call", async (
   assert.equal(calls, 1);
   finish({ text: "one answer" });
   await settle();
-  assert.deepEqual(jobs.get(requestId).result, { text: "one answer" });
+  assert.equal(jobs.get(requestId).result.text, "one answer");
+  assert.equal(jobs.get(requestId).result.metrics.prompt_chars, 12);
+  assert.equal(jobs.get(requestId).result.metrics.response_chars, 10);
   assert.equal(jobs.start(requestId, "all products").status, "completed");
   assert.equal(calls, 1);
 });
@@ -168,6 +170,17 @@ test("attribute analysis explicitly uses GPT-6 Astra with medium effort", async 
     threadId: "thread-1", input: [{ type: "text", text: "all products" }], effort: "medium", model: "gpt-6-astra",
   });
   assert.equal(requests.find(({ method }) => method === "thread/start").params.model, "gpt-6-astra");
+});
+
+test("only the final answer is returned, excluding progress and intermediate messages", async (t) => {
+  const { codex } = fakeCodex(t);
+  const analysis = codex.analyze("all products");
+  await settle();
+  event(codex, "item/completed", { threadId: "thread-1", item: { type: "agentMessage", text: "intermediate legacy message" } });
+  event(codex, "item/completed", { threadId: "thread-1", item: { type: "agentMessage", phase: "final_answer", text: '{"attributes":[]}' } });
+  event(codex, "item/completed", { threadId: "thread-1", item: { type: "agentMessage", phase: "commentary", text: "progress" } });
+  event(codex, "turn/completed", { threadId: "thread-1", turn: { status: "completed" } });
+  assert.equal((await analysis).text, '{"attributes":[]}');
 });
 
 test("effort can be adjusted for a quality comparison without changing the prompt", async (t) => {
@@ -303,7 +316,11 @@ test("HTTP submission returns immediately and the same result is retrievable lat
   finish({ text: "one answer" });
   await settle();
   const completed = await fetch(`${base}/analyses/${requestId}`, { headers });
-  assert.deepEqual((await completed.json()).result, { text: "one answer" });
+  const result = (await completed.json()).result;
+  assert.equal(result.text, "one answer");
+  assert.equal(result.metrics.response_chars, 10);
+  assert.ok(result.metrics.queue_ms >= 0);
+  assert.ok(result.metrics.analysis_ms >= 0);
   assert.equal(calls, 1);
   const release = await fetch(`${base}/analyses/${requestId}`, { method: "DELETE", headers });
   assert.equal(release.status, 200);
