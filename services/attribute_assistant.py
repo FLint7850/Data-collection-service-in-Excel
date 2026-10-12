@@ -65,6 +65,7 @@ from services.scraping.http import looks_blocked_or_empty
 
 SPACE_RE = re.compile(r"\s+")
 NUMBER_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
+NUMBER_RANGE_RE = re.compile(r"^([+-]?\d+(?:[.,]\d+)?)\s*[-–—−]\s*([+-]?\d+(?:[.,]\d+)?)$")
 DIMENSION_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?(?:\s*[xXхХ×]\s*[+-]?\d+(?:[.,]\d+)?){1,3}$")
 DIMENSION_AXIS_TOKEN_PATTERN = (
     r"(?:ширин[а-яё]*|высот[а-яё]*|глубин[а-яё]*|длин[а-яё]*|"
@@ -2976,6 +2977,17 @@ def _is_presence_marker(field: AttributeTemplateField, value: Any, source_name: 
     }
     return any(item_key and item_key not in boolean_keys for item_key in active_keys)
 
+def _numeric_range_bounds(
+    value: str, source_name: str = "", field_name: str = "",
+) -> tuple[Decimal, Decimal] | None:
+    centimeters = _centimeter_value(value, source_name, field_name)
+    match = NUMBER_RANGE_RE.fullmatch(centimeters if centimeters is not None else exact_value_key(value))
+    if not match:
+        return None
+    left, right = (Decimal(part.replace(",", ".")) for part in match.groups())
+    return min(left, right), max(left, right)
+
+
 def _allowed_match_single(
     field: AttributeTemplateField,
     value: str,
@@ -2997,6 +3009,22 @@ def _allowed_match_single(
         return value, 96, "Формат проверен", []
     if field.value_type == "text" and not allowed:
         return value, 95, "Текстовое значение проверено", []
+    bounds = _numeric_range_bounds(value)
+    if bounds is not None:
+        lower, upper = bounds
+        ranked = []
+        for item in allowed:
+            if not NUMBER_RE.fullmatch(item.value):
+                continue
+            number = Decimal(item.value.replace(",", "."))
+            distance = max(lower - number, number - upper, Decimal(0))
+            if distance > max(abs(lower), abs(upper), abs(number)) * Decimal("0.2"):
+                continue
+            # Prefer values inside the interval, then its exact endpoints.
+            boundary_distance = min(abs(number - lower), abs(number - upper))
+            ranked.append((distance, boundary_distance, number, item.sort_order, item.value))
+        ranked.sort()
+        return "", 0, "Точного диапазона нет в справочнике; варианты подобраны по числовой близости", [item[-1] for item in ranked[:3]]
     if NUMBER_RE.fullmatch(value):
         numeric_value = Decimal(value.replace(",", "."))
         numeric_allowed = []
@@ -3108,11 +3136,11 @@ def migrate_existing_attribute_suggestions(db: Session) -> int:
 
 
 def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
-    """Recheck stored false conflicts using source facts, without fetching a page."""
+    """Recheck stored facts and range suggestions without fetching a page."""
     field = target.template_field
     if not field or _has_confirmed_decision(target):
         return False
-    unknown = [item for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
+    unknown = [dict(item) for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown:
         return False
     groups: dict[tuple, list[dict]] = {}
@@ -3120,6 +3148,7 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         groups.setdefault((item.get("source"), item.get("url"), item.get("donor_id")), []).append(item)
     replacements = []
     consumed: set[int] = set()
+    suggestions_changed = False
     for facts in groups.values():
         axes = [item for item in facts if _dimension_component_axis(field, clean_text(item.get("source_name")))]
         combined = _assemble_dimension_value(field, axes)
@@ -3133,13 +3162,18 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         for item in facts:
             raw = exact_value_key(item.get("value"))
             name = clean_text(item.get("source_name"))
+            if _numeric_range_bounds(raw, name, field.name) is not None:
+                canonical, _, reason, suggestions = _allowed_match(field, raw, name)
+                if not canonical and (item.get("suggestions") != suggestions or item.get("reason") != reason):
+                    item.update(suggestions=suggestions, reason=reason)
+                    suggestions_changed = True
             if (raw.casefold() in BOOLEAN_TRUE_KEYS | BOOLEAN_FALSE_KEYS
                     and not _is_presence_marker(field, raw, name)):
                 canonical, confidence, reason, _ = _allowed_match(field, raw, name)
                 if canonical:
                     replacements.append((item, name, canonical, confidence, raw, reason))
                     consumed.add(id(item))
-    if not replacements:
+    if not replacements and not suggestions_changed:
         return False
     target.source_details = {**(target.source_details or {}),
                              "unknown_values": [item for item in unknown if id(item) not in consumed]}
@@ -3148,6 +3182,8 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
                         source=item.get("source", ""), reason=reason, priority=90 if item.get("source") == "ChatGPT" else 0,
                         source_name=name, source_url=item.get("url", ""), raw_value=raw,
                         source_role=item.get("role", ""), donor_id=item.get("donor_id"))
+    if suggestions_changed and not replacements:
+        _recalculate_candidate_state(target.product, target)
     return True
 
 

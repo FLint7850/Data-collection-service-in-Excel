@@ -27,6 +27,7 @@ from services.attribute_assistant import (
     apply_candidate,
     record_unknown_value,
     _allowed_match,
+    _numeric_range_bounds,
     _mapping_score,
     _name_tokens,
     _recalculate_candidate_state,
@@ -592,7 +593,7 @@ def validate_analysis(
             explanation = f"Семантически сопоставлено ChatGPT; {match_reason}"
         if not canonical:
             model_proposal = _canonical_allowed(field, item.get("allowed_value"))
-            if model_proposal and not presence_marker:
+            if model_proposal and not presence_marker and _numeric_range_bounds(value, name, field.name) is None:
                 alternatives = list(dict.fromkeys([model_proposal, *alternatives]))[:3]
             unmatched.append({
                 "template_field_id": field_id, "source_name": name, "value": value,

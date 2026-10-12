@@ -24,7 +24,8 @@ describe("attribute dictionary review", () => {
     expect(valueStatusColor(row)).toBe("error");
     expect(matchesAttributeStatus(row, "conflict")).toBe(true);
     expect(matchesAttributeStatus(row, "suggested")).toBe(false);
-    expect(matchesAttributeStatus(row, "no_suggestion")).toBe(false);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(false);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(false);
   });
 
   it("keeps suggestions visibly separate from an accepted final value", () => {
@@ -33,7 +34,8 @@ describe("attribute dictionary review", () => {
     expect(valueStatusColor(row)).toBe("warning");
     expect(matchesAttributeStatus(row, "suggested")).toBe(true);
     expect(matchesAttributeStatus(row, "conflict")).toBe(false);
-    expect(matchesAttributeStatus(row, "no_suggestion")).toBe(false);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(false);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(false);
     expect(hasPendingProposal(row)).toBe(true);
     expect(row.final_value).toBe("");
     expect(displayedProposal(row)).toBe("A++");
@@ -50,7 +52,7 @@ describe("attribute dictionary review", () => {
     row.source_details.unknown_values![0] = { ...unknown, suggestions: [] };
     expect(matchesAttributeStatus(row, "conflict")).toBe(true);
     expect(valueStatusColor(row)).toBe("error");
-    expect(matchesAttributeStatus(value({ status: "missing", current_value: "" }), "no_suggestion")).toBe(true);
+    expect(matchesAttributeStatus(value({ status: "missing", current_value: "" }), "unfilled")).toBe(true);
     expect(hasPendingProposal(value({ status: "rejected", proposed_value: "A++" }))).toBe(false);
     expect(matchesAttributeStatus(value({ is_in_template: false }), "conflict")).toBe(false);
   });
@@ -89,7 +91,8 @@ describe("attribute value letter case", () => {
     expect(valueStatusColor(row)).toBe("success");
     expect(hasPendingProposal(row)).toBe(false);
     expect(matchesAttributeStatus(row, "suggested")).toBe(false);
-    expect(matchesAttributeStatus(row, "no_suggestion")).toBe(true);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(true);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(false);
   });
 
   it("retains a real disagreement even when one candidate confirms the original", () => {
@@ -156,5 +159,49 @@ describe("attribute value letter case", () => {
       expect(attributeValuesMatch(left!, right!)).toBe(false);
       expect(hasPendingProposal(value({ status: "suggested", proposed_value: left, final_value: right }))).toBe(true);
     }
+  });
+});
+
+describe("filled and unfilled attribute filters", () => {
+  it.each([
+    { status: "kept", current_value: "85", final_value: "85", source: "current_csv" },
+    { status: "kept", current_value: "Нет", final_value: "Нет", source: "current_site" },
+    { status: "kept", current_value: "0", final_value: "0" },
+    { status: "kept", current_value: "600", final_value: "60" },
+    { status: "approved", current_value: "", final_value: "85" },
+    { status: "rejected", current_value: "85", final_value: "85", proposed_value: "86.5" },
+  ])("includes a filled $status value only in the source filter", (overrides) => {
+    const row = value(overrides);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(true);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(false);
+    expect(matchesAttributeStatus(row, "conflict")).toBe(false);
+    expect(matchesAttributeStatus(row, "suggested")).toBe(false);
+  });
+
+  it.each([
+    { status: "missing", current_value: "", final_value: "" },
+    { status: "missing", current_value: "  ", final_value: "  " },
+    { status: "rejected", current_value: "", final_value: "", proposed_value: "85" },
+    { status: "dash", current_value: "", final_value: "-" },
+    { status: "dash", current_value: "85", final_value: "—" },
+  ])("includes an empty $status value only in the unfilled filter", (overrides) => {
+    const row = value(overrides);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(true);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(false);
+    expect(matchesAttributeStatus(row, "conflict")).toBe(false);
+    expect(matchesAttributeStatus(row, "suggested")).toBe(false);
+  });
+
+  it.each([
+    { status: "conflict", current_value: "85", final_value: "85" },
+    { status: "conflict", current_value: "", final_value: "" },
+    { status: "unknown", current_value: "", final_value: "" },
+    { status: "suggested", current_value: "", proposed_value: "85" },
+    { status: "kept", current_value: "", final_value: "85", is_in_template: false },
+    { status: "missing", current_value: "", final_value: "", is_in_template: false },
+  ])("keeps $status rows in their own review filters", (overrides) => {
+    const row = value(overrides);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(false);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(false);
   });
 });

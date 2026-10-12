@@ -198,6 +198,12 @@ const {
   exportBatch,
 } = reviewState;
 
+watch(() => selectedProduct.value?.id, (productId, previousProductId) => {
+  if (import.meta.client && productId && productId !== previousProductId) {
+    window.scrollTo({ top: 0, behavior: "instant" });
+  }
+}, { flush: "post" });
+
 /**
  * Поиск и lazy-loading значений справочника.
  */
@@ -246,7 +252,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div>
+  <div class="aa-assistant">
     <SectionHeader
       eyebrow="АВТОМАТИЧЕСКОЕ ЗАПОЛНЕНИЕ"
       title="Атрибуты"

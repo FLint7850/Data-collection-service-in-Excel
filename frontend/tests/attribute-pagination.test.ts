@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import { useAttributeReview } from "../app/composables/useAttributeReview";
 import type { AttributeAssistantContext } from "../app/composables/useAttributeAssistant";
 import type { AttributeAllowedValuesContext } from "../app/composables/useAttributeAllowedValues";
+import type { AttributeValue } from "../app/types/attribute-assistant";
 
 const api = vi.hoisted(() => ({
   batch: vi.fn(), products: vi.fn(), product: vi.fn(), batchOperation: vi.fn(),
@@ -16,6 +17,16 @@ const page = (offset = 0) => ({ items: Array.from({ length: 80 }, (_, index) => 
   total: 4000, matched: 4000, offset, limit: 80, has_more: offset < 3920,
   counts: { all: 4000, needs_review: 4000, ready: 0, conflict: 0, missing: 4000, outside_template: 0 } });
 const batch = (id: number) => ({ id, summary: { products: 4000 }, template: { id: 1 } });
+
+function attribute(id: number, overrides: Partial<AttributeValue> = {}): AttributeValue {
+  return {
+    id, field_id: id, group_name: "Основные", name: `Атрибут ${id}`, current_value: "",
+    proposed_value: "", final_value: "", source: "current_csv", confidence: 0,
+    status: "missing", reason: "", dash_reason: "", is_in_template: true,
+    is_extra: false, value_type: "text", is_composite: false, allowed_values_count: 0,
+    allowed_values: [], source_details: {}, sort_order: id, ...overrides,
+  };
+}
 
 function setup() {
   const assistant = {
@@ -70,6 +81,42 @@ describe("large attribute batches", () => {
     expect(review.selectedProduct.value?.id).toBe(3999);
     expect(api.product).toHaveBeenCalledTimes(1);
     expect(review.filteredProducts.value).toHaveLength(80);
+  });
+
+  it("counts and filters source values separately from unfilled attributes", async () => {
+    const values = [
+      attribute(1, { status: "kept", current_value: "85", final_value: "85" }),
+      attribute(2, { status: "suggested", current_value: "60", final_value: "60", proposed_value: "60" }),
+      attribute(3),
+      attribute(4, { status: "dash", final_value: "-" }),
+      attribute(5, { status: "conflict", current_value: "A+++" }),
+      attribute(6, { status: "suggested", proposed_value: "86.5" }),
+      attribute(7, { is_in_template: false }),
+    ];
+    api.product.mockResolvedValueOnce({ ...summary(4), batch_id: 1, values, sources: [] });
+    await review.openBatch(1, 4);
+    expect(review.attributeStatusItems.value).toEqual([
+      { label: "Все атрибуты (7)", value: "all" },
+      { label: "Вне шаблона (1)", value: "outside_template" },
+      { label: "Конфликт (1)", value: "conflict" },
+      { label: "Предложения (1)", value: "suggested" },
+      { label: "Из источника (2)", value: "from_source" },
+      { label: "Не заполнено (2)", value: "unfilled" },
+    ]);
+    review.attributeStatusFilter.value = "from_source";
+    expect(review.filteredAttributeValues.value.map((row) => row.id)).toEqual([1, 2]);
+    review.attributeStatusFilter.value = "unfilled";
+    expect(review.filteredAttributeValues.value.map((row) => row.id)).toEqual([3, 4]);
+  });
+
+  it.each([
+    ["from_source", "from_source"],
+    ["unfilled", "unfilled"],
+    ["no_suggestion", "unfilled"],
+  ])("restores the %s route filter when opening a product", async (status, expected) => {
+    review.setRouteFilters({ attributeStatus: status });
+    await review.openBatch(1, 4, { resetFilters: false, syncRoute: false });
+    expect(review.attributeStatusFilter.value).toBe(expected);
   });
 
   it("pages the sidebar without discarding the selected product", async () => {

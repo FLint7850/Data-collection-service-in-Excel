@@ -1,5 +1,9 @@
-.aa-page {
+.aa-page,
+.aa-assistant {
   --aa-sticky-top: 76px;
+}
+
+.aa-page {
   max-width: 1540px;
   margin: 0 auto;
   padding: 28px 32px 64px;
@@ -182,7 +186,8 @@ font-size: 22px;
 }
 
 @media (max-width: 640px) {
-  .aa-page {
+  .aa-page,
+  .aa-assistant {
     --aa-sticky-top: 64px;
   }
 }

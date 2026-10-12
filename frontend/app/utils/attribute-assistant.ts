@@ -7,7 +7,7 @@ import type {
 
 export const ALL_FILTER_VALUE = "all";
 export const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
-export const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "no_suggestion"]);
+export const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "from_source", "unfilled"]);
 export const ALLOWED_OPTIONS_PAGE_SIZE = 40;
 
 export const processingModeItems: Array<{ label: string; value: AttributeProcessingMode }> = [
@@ -123,7 +123,12 @@ export function matchesAttributeStatus(value: AttributeValue, status: string): b
     if (status === "conflict") return effectiveStatus === "conflict";
     if (status === "suggested") return !value.current_value.trim()
         && (effectiveStatus === "suggested" || (effectiveStatus !== "conflict" && hasPendingProposal(value)));
-    if (status === "no_suggestion") return !["conflict", "suggested"].includes(effectiveStatus) && !hasPendingProposal(value);
+    if (status === "from_source" || status === "unfilled") {
+        if (["conflict", "suggested"].includes(effectiveStatus) || hasPendingProposal(value)) return false;
+        const selectedValue = value.final_value.trim() || value.current_value.trim();
+        const filled = Boolean(selectedValue) && !isTechnicalDash(selectedValue);
+        return status === "from_source" ? filled : !filled;
+    }
     return true;
 }
 

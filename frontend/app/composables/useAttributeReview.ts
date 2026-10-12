@@ -109,7 +109,8 @@ export function useAttributeReview(
             { label: `Вне шаблона (${count("outside_template")})`, value: "outside_template" },
             { label: `Конфликт (${count("conflict")})`, value: "conflict" },
             { label: `Предложения (${count("suggested")})`, value: "suggested" },
-            { label: `Нет предложения (${count("no_suggestion")})`, value: "no_suggestion" },
+            { label: `Из источника (${count("from_source")})`, value: "from_source" },
+            { label: `Не заполнено (${count("unfilled")})`, value: "unfilled" },
         ];
     });
 
@@ -178,8 +179,9 @@ export function useAttributeReview(
                 : ALL_FILTER_VALUE;
         }
         if (filters.attributeStatus !== undefined) {
-            attributeStatusFilter.value = ATTRIBUTE_STATUS_VALUES.has(filters.attributeStatus)
-                ? filters.attributeStatus
+            const status = filters.attributeStatus === "no_suggestion" ? "unfilled" : filters.attributeStatus;
+            attributeStatusFilter.value = ATTRIBUTE_STATUS_VALUES.has(status)
+                ? status
                 : ALL_FILTER_VALUE;
         }
     }

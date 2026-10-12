@@ -281,6 +281,69 @@ class AttributeReviewRulesTest(unittest.TestCase):
             self.assertEqual(suggestions, [])
         self.assertEqual(svc._allowed_match(field, "180 см", "Ширина, мм")[0], "180")
 
+    def test_numeric_ranges_suggest_endpoints_before_other_values(self):
+        field = self.template("Высота, см", ("88.5", "86", "85.5", "86.5", "85", "84.9")).fields[0]
+        for raw, source in [
+            ("85-86.5", "Высота, см"),
+            ("85 – 86,5 см", "Высота"),
+            ("85 см — 86.5 см", "Высота"),
+            ("850-865", "Высота, мм"),
+            ("0.85−0.865 м", "Высота"),
+            ("86.5-85", "Высота, см"),
+        ]:
+            with self.subTest(raw=raw):
+                canonical, confidence, _, suggestions = svc._allowed_match(field, raw, source)
+                self.assertEqual((canonical, confidence), ("", 0))
+                self.assertEqual(suggestions, ["85", "86.5", "85.5"])
+
+        for item in field.allowed_values:
+            if item.value in {"85", "86.5"}:
+                item.is_active = False
+        self.assertEqual(svc._allowed_match(field, "85-86.5", field.name)[3], ["85.5", "86", "84.9"])
+
+    def test_numeric_ranges_do_not_suggest_distant_or_textually_similar_values(self):
+        field = self.template("Высота, см", ("850", "865", "Высота 85-86.5")).fields[0]
+        self.assertEqual(svc._allowed_match(field, "85-86.5", field.name)[3], [])
+
+    def test_parser_and_gpt_numeric_range_suggestions_require_manual_choice(self):
+        template = self.template("Высота, см", ("88.5", "86", "85.5", "86.5", "85"))
+        for method in ["parser", "gpt"]:
+            for current in ["", "85"]:
+                with self.subTest(method=method, current=current):
+                    product = self.product(template, current, mode="auto_all")
+                    if method == "parser":
+                        svc.apply_parsed_attributes(self.db, product, [{"name": "Высота, см", "value": "85-86.5"}], source="Bosch", priority=0)
+                    else:
+                        analysis = self.analyze(product, "Высота, см", "85-86.5", allowed="88.5")
+                        self.assertEqual(analysis["suggestions"], [])
+                        ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+                    value = product.values[0]
+                    self.assertEqual(value.source_details["unknown_values"][0]["suggestions"], ["85", "86.5", "85.5"])
+                    self.assertEqual(value.status, "conflict" if current else "suggested")
+                    self.assertEqual(value.final_value, current)
+                    self.assertEqual(value.proposed_value, "86.5" if current else "85")
+
+    def test_saved_numeric_range_suggestions_are_repaired_on_read(self):
+        template = self.template("Высота, см", ("88.5", "85.5", "86.5", "85"))
+        product = self.product(template, "85")
+        value = product.values[0]
+        value.status = "conflict"
+        value.proposed_value = "88.5"
+        value.source_details = {"unknown_values": [
+            {"source": source, "source_name": "Высота, см", "value": "85-86.5", "suggestions": ["88.5", "86.5", "85.5"], "reason": "Старое сопоставление"}
+            for source in ["Bosch", "ChatGPT"]
+        ]}
+        self.db.commit()
+        serialized = svc.serialize_product(product, detailed=True)["values"][0]
+        self.assertEqual(serialized["proposed_value"], "86.5")
+        self.assertEqual(serialized["final_value"], "85")
+        self.assertTrue(all(item["suggestions"] == ["85", "86.5", "85.5"] for item in serialized["source_details"]["unknown_values"]))
+        self.db.commit()
+        self.db.expire_all()
+        self.assertEqual(value.proposed_value, "86.5")
+        self.assertEqual(value.source_details["unknown_values"][0]["suggestions"], ["85", "86.5", "85.5"])
+        self.assertFalse(svc._repair_confirming_evidence(value))
+
     def test_non_length_values_are_not_scaled(self):
         for value, name in [("60", "Площадь, м²"), ("60", "Расход, м³/ч"), ("60", "Скорость, м/с"), ("60/65", "Класс")]:
             self.assertIsNone(svc._centimeter_value(value, name, name))
