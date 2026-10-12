@@ -1,3 +1,8 @@
+import {
+  ATTRIBUTE_ASSISTANT_API_BASE,
+  ATTRIBUTE_ASSISTANT_UI,
+} from "~/config/attribute-assistant";
+
 export interface ShopSyncReport {
   created: number;
   updated: number;
@@ -29,13 +34,15 @@ export interface AttributeShopForm {
   language_code: string;
   enabled: boolean;
 }
-const base = "/api/attribute-assistant/shops";
+
+const base = `${ATTRIBUTE_ASSISTANT_API_BASE}/shops`;
 export const opencartApi = {
   list: () => $fetch<AttributeShop[]>(base),
   save: (body: AttributeShopForm, id: number | null) =>
     $fetch<AttributeShop>(id ? base + "/" + id : base, { method: id ? "PATCH" : "POST", body }),
   remove: (id: number) => $fetch(base + "/" + id, { method: "DELETE" }),
   sync: (id: number) => $fetch<{ shop: AttributeShop; report: ShopSyncReport }>(
-    base + "/" + id + "/sync", { method: "POST", timeout: 180000 },
+    base + "/" + id + "/sync",
+    { method: "POST", timeout: ATTRIBUTE_ASSISTANT_UI.shopSyncTimeoutMs },
   ),
 };

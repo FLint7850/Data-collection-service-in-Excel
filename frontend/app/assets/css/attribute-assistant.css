@@ -1923,6 +1923,11 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
   min-width: 0;
 }
 
+.aa-product small.aa-product-name {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
 .aa-priority-row > b {
   width: 28px;
   height: 30px;

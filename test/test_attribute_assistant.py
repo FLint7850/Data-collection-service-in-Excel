@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import Session, raiseload
 
 from models import (
     AttributeAllowedValue,
@@ -722,6 +722,57 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(value.final_value, "Белый")
         self.assertEqual(value.status, "approved")
 
+    def test_value_mutation_returns_complete_client_context(self):
+        from flask import g
+        from app import app
+        from routes import attribute_assistant as routes
+
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM-101;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        value = next(
+            item for item in batch.products[0].values
+            if item.attribute_name == "Цвет"
+        )
+        with app.test_request_context(
+            f"/api/attribute-assistant/values/{value.id}",
+            method="PATCH",
+            json={"action": "accept", "value": "Белый"},
+        ), patch.object(routes, "ensure_storage"):
+            g.db = self.db
+            payload = routes.api_attribute_value_update(value.id).get_json()
+
+        self.assertEqual(payload["value"]["final_value"], "Белый")
+        self.assertEqual(payload["product"]["counts"]["missing"], 3)
+        self.assertNotIn("values", payload["product"])
+        self.assertEqual(payload["batch"]["id"], batch.id)
+        self.assertEqual(len(payload["history"]), 1)
+
+    def test_workspace_dashboard_is_not_limited_to_recent_batches(self):
+        template = self.make_template()
+        for index in range(3):
+            service.create_batch_from_csv(
+                self.db,
+                template,
+                f'_MODEL_;_ATTRIBUTES_\r\nWM-{index};""\r\n'.encode("cp1251"),
+                filename=f"products-{index}.csv",
+            )
+
+        with patch.object(service, "WORKSPACE_BATCH_LIMIT", 2):
+            payload = service.workspace(self.db)
+
+        self.assertEqual(len(payload["batches"]), 2)
+        self.assertEqual(payload["dashboard"]["batches"], 3)
+        self.assertEqual(payload["dashboard"]["products"], 3)
+        self.assertEqual(
+            payload["settings"]["product_page_size"],
+            service.PRODUCT_PAGE_SIZE,
+        )
+
     def test_allowed_value_options_support_stable_lazy_pages(self):
         values = [f"Значение {index:03d}" for index in range(105)]
         template = service.import_template_csv(
@@ -749,6 +800,33 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(filtered["matched"], 5)
         self.assertEqual([item["value"] for item in filtered["values"]], ["Значение 104"])
         self.assertFalse(filtered["has_more"])
+
+    def test_allowed_value_options_page_without_loading_full_dictionary(self):
+        values = [f"Значение {index:03d}" for index in range(250)]
+        template = service.import_template_csv(
+            self.db,
+            ("Большой справочник (Основные)\r\n" + "\r\n".join(values) + "\r\n").encode("cp1251"),
+            name="SQL-справочник",
+            category="Тест > SQL-справочник",
+        )
+        field_id = template.fields[0].id
+        self.db.flush()
+        self.db.expunge_all()
+
+        field = self.db.scalar(
+            select(AttributeTemplateField)
+            .where(AttributeTemplateField.id == field_id)
+            .options(raiseload(AttributeTemplateField.allowed_values))
+        )
+        result = service.allowed_value_options(field, "значение", limit=30)
+
+        self.assertEqual(result["total"], 250)
+        self.assertEqual(result["matched"], 250)
+        self.assertEqual(len(result["values"]), 30)
+        self.assertLessEqual(
+            sum(isinstance(item, AttributeAllowedValue) for item in self.db.identity_map.values()),
+            30,
+        )
 
     def test_allowed_value_synonyms_can_be_replaced_and_removed(self):
         template = self.make_template()
@@ -2953,6 +3031,36 @@ class AttributeAssistantTest(unittest.TestCase):
         }
         self.addCleanup(runtime._JOBS.pop, batch.id, None)
         return runtime, template, batch, [product.id for product in batch.products]
+
+    def test_donor_batch_uses_bounded_product_parallelism(self):
+        runtime, _template, batch, product_ids = self._chatgpt_parallel_batch()
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def process(_db, _product, _donor_ids, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                barrier.wait(5)
+                return {"reports": [{"status": "parsed", "attributes_found": 1}]}
+            finally:
+                with lock:
+                    active -= 1
+
+        fetcher = type("Fetcher", (), {"max_pages": 2})()
+        with patch.object(runtime, "DONOR_PRODUCT_CONCURRENCY", 2), \
+                patch.object(runtime, "SessionLocal", side_effect=lambda: Session(self.engine, expire_on_commit=False)), \
+                patch.object(runtime, "snapshot_product"), \
+                patch.object(runtime, "process_product_donors", side_effect=process):
+            runtime._run_donor_products(batch.id, product_ids, [7], {}, fetcher)
+
+        state = runtime.get_attribute_batch_operation(batch.id)
+        self.assertEqual(max_active, 2)
+        self.assertEqual((state["processed"], state["succeeded"], state["failed"]), (4, 4, 0))
 
     def test_chatgpt_batch_runs_bounded_parallel_requests_and_saves_out_of_order(self):
         runtime, template, batch, product_ids = self._chatgpt_parallel_batch()

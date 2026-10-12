@@ -6,10 +6,11 @@ from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from models import AttributeProduct, AttributeProductValue
+from services.attribute_settings import (
+    MAX_PAGE_SIZE,
+    PRODUCT_PAGE_SIZE,
+)
 from query_utils import normalize_search_text
-
-
-PRODUCT_PAGE_SIZE = 80
 
 
 def _sum(condition):
@@ -37,7 +38,7 @@ def product_page(
     db: Session, batch_id: int, *, query: str = "", status: str = "all",
     offset: int = 0, limit: int = PRODUCT_PAGE_SIZE,
 ) -> dict[str, Any]:
-    limit = max(1, min(200, limit))
+    limit = max(1, min(MAX_PAGE_SIZE, limit))
     offset = max(0, offset)
     value, product = AttributeProductValue, AttributeProduct
     counters = select(

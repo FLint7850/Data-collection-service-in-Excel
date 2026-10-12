@@ -30,11 +30,24 @@ from urllib.parse import urljoin, urlparse
 import chardet
 import requests
 from bs4 import BeautifulSoup
-from sqlalchemy import delete, func, inspect, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, inspect, or_, select, update
 from sqlalchemy.orm.attributes import NO_VALUE
 from sqlalchemy.orm import Session, object_session, selectinload
 
-from config import ATTRIBUTE_ASSISTANT_DIR, ATTRIBUTE_ASSISTANT_MAX_URLS, REQUEST_TIMEOUT
+from config import (
+    ATTRIBUTE_ASSISTANT_DIR,
+    ATTRIBUTE_ASSISTANT_MAX_URLS,
+    REQUEST_TIMEOUT,
+)
+from services.attribute_settings import (
+    ALLOWED_VALUE_PAGE_SIZE,
+    BULK_CONFIDENCE,
+    HISTORY_LIMIT,
+    MAX_PAGE_SIZE,
+    PRODUCT_PAGE_SIZE,
+    TEMPLATE_VALUE_PAGE_SIZE,
+    WORKSPACE_BATCH_LIMIT,
+)
 from services.attribute_programs import is_program_list, match_programs
 from services.attribute_listing import batch_summary, product_page
 from models import (
@@ -401,41 +414,118 @@ def serialize_template(
 def allowed_value_options(
     field: AttributeTemplateField,
     query: str = "",
-    limit: int = 80,
+    limit: int = ALLOWED_VALUE_PAGE_SIZE,
     offset: int = 0,
     include_inactive: bool = False,
 ) -> dict[str, Any]:
-    available = [item for item in field.allowed_values if include_inactive or item.is_active]
-    query_key = exact_value_key(query).casefold()
-    if query_key:
-        ranked: list[tuple[int, int, AttributeAllowedValue]] = []
-        for item in available:
-            # Search may ignore case; it never merges entries or accepts a value.
-            searchable = [exact_value_key(item.value).casefold(), *(
-                exact_value_key(synonym.synonym).casefold() for synonym in item.synonyms
-            )]
-            matching = [text for text in searchable if query_key in text]
-            if not matching:
-                continue
-            quality = min(
-                0 if text == query_key else 1 if text.startswith(query_key) else 2
-                for text in matching
-            )
-            ranked.append((quality, item.sort_order, item))
-        ranked.sort(key=lambda row: (row[0], row[1], row[2].value.casefold()))
-        matches = [item for _quality, _order, item in ranked]
-    else:
-        matches = available
-    safe_limit = max(1, min(int(limit or 80), 200))
+    safe_limit = max(1, min(int(limit or ALLOWED_VALUE_PAGE_SIZE), MAX_PAGE_SIZE))
     safe_offset = max(0, int(offset or 0))
-    page = matches[safe_offset:safe_offset + safe_limit]
+    query_key = exact_value_key(query).casefold()
+    db = object_session(field)
+
+    # Detached/transient fields are used by a few pure domain callers. Persisted
+    # fields always use the bounded SQL path below, so large dictionaries never
+    # become one ORM collection merely to render a single page.
+    if db is None or field.id is None:
+        available = [item for item in field.allowed_values if include_inactive or item.is_active]
+        if query_key:
+            ranked: list[tuple[int, int, AttributeAllowedValue]] = []
+            for item in available:
+                searchable = [exact_value_key(item.value).casefold(), *(
+                    exact_value_key(synonym.synonym).casefold() for synonym in item.synonyms
+                )]
+                matching = [text for text in searchable if query_key in text]
+                if matching:
+                    quality = min(
+                        0 if text == query_key else 1 if text.startswith(query_key) else 2
+                        for text in matching
+                    )
+                    ranked.append((quality, item.sort_order, item))
+            ranked.sort(key=lambda row: (row[0], row[1], row[2].value.casefold()))
+            matches = [item for _quality, _order, item in ranked]
+        else:
+            matches = available
+        total = len(available)
+        matched = len(matches)
+        page = matches[safe_offset:safe_offset + safe_limit]
+    else:
+        db.flush()
+        allowed = AttributeAllowedValue
+        synonym = AttributeValueSynonym
+        base_conditions = [allowed.field_id == field.id]
+        if not include_inactive:
+            base_conditions.append(allowed.is_active.is_(True))
+
+        if db.bind is not None and db.bind.dialect.name == "sqlite":
+            connection = db.connection().connection.driver_connection
+            connection.create_function(
+                "attribute_casefold",
+                1,
+                lambda value: exact_value_key(value).casefold(),
+                deterministic=True,
+            )
+            search_key = func.attribute_casefold
+        else:
+            search_key = func.lower
+
+        total = int(db.scalar(
+            select(func.count(allowed.id)).where(*base_conditions)
+        ) or 0)
+        match_condition = None
+        quality = None
+        if query_key:
+            value_key = search_key(allowed.value)
+            synonym_key = search_key(synonym.synonym)
+
+            def synonym_exists(condition):
+                return exists(select(synonym.id).where(
+                    synonym.allowed_value_id == allowed.id,
+                    condition,
+                ))
+
+            exact_match = or_(
+                value_key == query_key,
+                synonym_exists(synonym_key == query_key),
+            )
+            prefix_match = or_(
+                value_key.startswith(query_key, autoescape=True),
+                synonym_exists(synonym_key.startswith(query_key, autoescape=True)),
+            )
+            match_condition = or_(
+                value_key.contains(query_key, autoescape=True),
+                synonym_exists(synonym_key.contains(query_key, autoescape=True)),
+            )
+            quality = case((exact_match, 0), (prefix_match, 1), else_=2)
+
+        page_conditions = list(base_conditions)
+        if match_condition is not None:
+            page_conditions.append(match_condition)
+            matched = int(db.scalar(
+                select(func.count(allowed.id)).where(*page_conditions)
+            ) or 0)
+        else:
+            matched = total
+
+        ordering = [allowed.sort_order]
+        if quality is not None:
+            ordering.insert(0, quality)
+        ordering.extend((search_key(allowed.value), allowed.id))
+        page = list(db.scalars(
+            select(allowed)
+            .where(*page_conditions)
+            .options(selectinload(allowed.synonyms))
+            .order_by(*ordering)
+            .offset(safe_offset)
+            .limit(safe_limit)
+        ))
+
     return {
         "field_id": field.id,
-        "total": len(available),
-        "matched": len(matches),
+        "total": total,
+        "matched": matched,
         "offset": safe_offset,
         "limit": safe_limit,
-        "has_more": safe_offset + len(page) < len(matches),
+        "has_more": safe_offset + len(page) < matched,
         "values": [
             {
                 "id": item.id,
@@ -2051,7 +2141,12 @@ def serialize_donor(donor: Donor) -> dict[str, Any]:
 
 
 def list_donors(db: Session, brand: str = "") -> list[dict[str, Any]]:
-    statement = select(Donor).join(Brand, Donor.brand_id == Brand.id).order_by(Brand.name, Donor.id)
+    statement = (
+        select(Donor)
+        .join(Brand, Donor.brand_id == Brand.id)
+        .options(selectinload(Donor.brand), selectinload(Donor.connection_method_row))
+        .order_by(Brand.name, Donor.id)
+    )
     rows = list(db.scalars(statement))
     brand_key = normalize_key(brand)
     if brand_key:
@@ -4024,25 +4119,75 @@ def serialize_batch(batch: AttributeBatch, detailed: bool = False) -> dict[str, 
     }
     if detailed:
         session = object_session(batch)
-        result["products"] = product_page(session, batch.id)["items"] if session else [serialize_product(product) for product in batch.products[:80]]
+        result["products"] = (
+            product_page(session, batch.id)["items"]
+            if session
+            else [
+                serialize_product(product)
+                for product in batch.products[:PRODUCT_PAGE_SIZE]
+            ]
+        )
     return result
 
 
 def workspace(db: Session) -> dict[str, Any]:
-    templates = list(db.scalars(select(AttributeTemplate).order_by(AttributeTemplate.updated_at.desc())))
-    batches = list(db.scalars(select(AttributeBatch).order_by(AttributeBatch.updated_at.desc()).limit(30)))
+    templates = list(db.scalars(
+        select(AttributeTemplate)
+        .options(
+            selectinload(AttributeTemplate.category),
+            selectinload(AttributeTemplate.fields),
+        )
+        .order_by(AttributeTemplate.updated_at.desc())
+    ))
+    batches = list(db.scalars(
+        select(AttributeBatch)
+        .order_by(AttributeBatch.updated_at.desc())
+        .limit(WORKSPACE_BATCH_LIMIT)
+    ))
     batch_rows = [serialize_batch(batch) for batch in batches]
+    # Dashboard totals must describe the whole workspace, not only the bounded
+    # recent-batch list sent to the client. Fetching scalar JSON summaries avoids
+    # materializing old batch/product ORM graphs.
+    all_batch_summaries = list(db.scalars(select(AttributeBatch.summary)))
+    if all(summary for summary in all_batch_summaries):
+        dashboard_totals = {
+            key: sum(int((summary or {}).get(key) or 0) for summary in all_batch_summaries)
+            for key in ("products", "ready", "conflicts", "missing")
+        }
+    else:
+        # Legacy databases may contain batches created before summaries were
+        # persisted. Fall back to two aggregate queries instead of reporting a
+        # deceptively empty dashboard or materializing product collections.
+        products = db.execute(select(
+            func.count(AttributeProduct.id).label("products"),
+            func.coalesce(func.sum(case((AttributeProduct.status == "ready", 1), else_=0)), 0).label("ready"),
+        )).mappings().one()
+        values = db.execute(select(
+            func.coalesce(func.sum(case((AttributeProductValue.status == "conflict", 1), else_=0)), 0).label("conflicts"),
+            func.coalesce(func.sum(case((and_(
+                AttributeProductValue.is_in_template.is_(True),
+                AttributeProductValue.final_value == "",
+            ), 1), else_=0)), 0).label("missing"),
+        )).mappings().one()
+        dashboard_totals = {
+            key: int(value)
+            for key, value in {**products, **values}.items()
+        }
     return {
         "templates": [serialize_template(template) for template in templates],
         "donors": list_donors(db),
         "batches": batch_rows,
+        "settings": {
+            "product_page_size": PRODUCT_PAGE_SIZE,
+            "allowed_value_page_size": ALLOWED_VALUE_PAGE_SIZE,
+            "template_value_page_size": TEMPLATE_VALUE_PAGE_SIZE,
+            "bulk_confidence": BULK_CONFIDENCE,
+            "max_urls": ATTRIBUTE_ASSISTANT_MAX_URLS,
+        },
         "dashboard": {
             "active_templates": sum(template.is_active for template in templates),
-            "batches": len(batch_rows),
-            "products": sum(int((item.get("summary") or {}).get("products") or 0) for item in batch_rows),
-            "ready": sum(int((item.get("summary") or {}).get("ready") or 0) for item in batch_rows),
-            "conflicts": sum(int((item.get("summary") or {}).get("conflicts") or 0) for item in batch_rows),
-            "missing": sum(int((item.get("summary") or {}).get("missing") or 0) for item in batch_rows),
+            "batches": len(all_batch_summaries),
+            **dashboard_totals,
         },
     }
 
@@ -4138,7 +4283,12 @@ def delete_extra_product_value(db: Session, value: AttributeProductValue) -> Att
     return product
 
 
-def bulk_action(batch: AttributeBatch, action: str, minimum_confidence: int = 90, dash_reason: str = "") -> int:
+def bulk_action(
+    batch: AttributeBatch,
+    action: str,
+    minimum_confidence: int = BULK_CONFIDENCE,
+    dash_reason: str = "",
+) -> int:
     changed = 0
     for product in batch.products:
         for value in product.values:
@@ -5523,7 +5673,7 @@ def product_history(db: Session, product: AttributeProduct) -> list[dict[str, An
     rows = list(db.scalars(
         select(AttributeProductRevision).where(
             AttributeProductRevision.product_id == product.id,
-        ).order_by(AttributeProductRevision.created_at.desc()).limit(50)
+        ).order_by(AttributeProductRevision.created_at.desc()).limit(HISTORY_LIMIT)
     ))
 
     current_names = {

@@ -12,22 +12,24 @@ import type {
   AttributeProcessingMode,
   AttributeProcessReport,
   AttributeProduct,
+  AttributeProductMutation,
   AttributeProductPage,
   AttributeTemplate,
   AttributeTemplatePreview,
-  AttributeValue,
+  AttributeValueMutation,
   AttributeWorkspace,
   ChatGptLogin,
   ChatGptStatus,
 } from "~/types/attribute-assistant";
+import { ATTRIBUTE_ASSISTANT_API_BASE } from "~/config/attribute-assistant";
 
-const base = "/api/attribute-assistant";
+const base = ATTRIBUTE_ASSISTANT_API_BASE;
 
 export const attributeAssistantService = {
-  workspace: () => $fetch<AttributeWorkspace>(base),
+  workspace: (signal?: AbortSignal) => $fetch<AttributeWorkspace>(base, { signal }),
 
-  template: (id: number) =>
-    $fetch<AttributeTemplate>(`${base}/templates/${id}`, { query: { lazy: 1 } }),
+  template: (id: number, signal?: AbortSignal) =>
+    $fetch<AttributeTemplate>(`${base}/templates/${id}`, { query: { lazy: 1 }, signal }),
 
   importTemplate: (file: File, data: {
     name: string;
@@ -50,9 +52,17 @@ export const attributeAssistantService = {
       body: { value, synonym },
     }),
 
-  allowedValues: (fieldId: number, query = "", editor = false, offset = 0, limit = 80) =>
+  allowedValues: (
+    fieldId: number,
+    query = "",
+    editor = false,
+    offset = 0,
+    limit?: number,
+    signal?: AbortSignal,
+  ) =>
     $fetch<AttributeAllowedValueOptions>(`${base}/fields/${fieldId}/allowed-values`, {
       query: { q: query, limit, offset, editor: editor ? 1 : 0 },
+      signal,
     }),
 
   importBatch: (
@@ -88,13 +98,22 @@ export const attributeAssistantService = {
       },
     }),
 
-  batch: (id: number) => $fetch<AttributeBatch>(`${base}/batches/${id}`),
-  products: (id: number, query = "", status = "all", offset = 0, limit = 80) =>
+  batch: (id: number, signal?: AbortSignal) =>
+    $fetch<AttributeBatch>(`${base}/batches/${id}`, { signal }),
+  products: (
+    id: number,
+    query = "",
+    status = "all",
+    offset = 0,
+    limit?: number,
+    signal?: AbortSignal,
+  ) =>
     $fetch<AttributeProductPage>(`${base}/batches/${id}/products`, {
       query: { q: query, status, offset, limit },
+      signal,
     }),
-  batchOperation: (id: number) =>
-    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation`),
+  batchOperation: (id: number, signal?: AbortSignal) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation`, { signal }),
   processBatch: (
     id: number,
     donorIds: number[],
@@ -119,17 +138,17 @@ export const attributeAssistantService = {
       { method: "DELETE" },
     ),
 
-  product: (id: number) =>
-    $fetch<AttributeProduct>(`${base}/products/${id}`),
+  product: (id: number, signal?: AbortSignal) =>
+    $fetch<AttributeProduct>(`${base}/products/${id}`, { signal }),
 
   processProduct: (id: number, donorIds: number[], urlOverrides: Record<string, string> = {}) =>
-    $fetch<{ report: AttributeProcessReport; product: AttributeProduct }>(
+    $fetch<AttributeProductMutation & { report: AttributeProcessReport }>(
       `${base}/products/${id}/process`,
       { method: "POST", body: { donor_ids: donorIds, url_overrides: urlOverrides } },
     ),
 
   useSimilar: (id: number) =>
-    $fetch<{ changed: number; product: AttributeProduct }>(
+    $fetch<AttributeProductMutation & { changed: number }>(
       `${base}/products/${id}/similar`,
       { method: "POST" },
     ),
@@ -148,13 +167,13 @@ export const attributeAssistantService = {
     id: number,
     body: { action: "accept" | "reject" | "dash"; value?: string; dash_reason?: string },
   ) =>
-    $fetch<AttributeValue>(`${base}/values/${id}`, {
+    $fetch<AttributeValueMutation>(`${base}/values/${id}`, {
       method: "PATCH",
       body,
     }),
 
   removeExtraValue: (id: number) =>
-    $fetch<{ deleted_id: number; product: AttributeProduct }>(`${base}/values/${id}`, {
+    $fetch<AttributeProductMutation & { deleted_id: number }>(`${base}/values/${id}`, {
       method: "DELETE",
     }),
 
@@ -191,8 +210,8 @@ export const attributeAssistantService = {
     $fetch<{ ok: boolean; deleted_id: number }>(`${base}/templates/${id}`, { method: "DELETE" }),
   copyTemplate: (id: number, name: string, category = "") =>
     $fetch<AttributeTemplate>(`${base}/templates/${id}/copy`, { method: "POST", body: { name, category } }),
-  templateRevisions: (id: number) =>
-    $fetch<{ items: Array<{ id: number; version: number; action: string; report: Record<string, unknown>; created_at: string }> }>(`${base}/templates/${id}/revisions`),
+  templateRevisions: (id: number, signal?: AbortSignal) =>
+    $fetch<{ items: Array<{ id: number; version: number; action: string; report: Record<string, unknown>; created_at: string }> }>(`${base}/templates/${id}/revisions`, { signal }),
   restoreTemplate: (id: number, revisionId: number) =>
     $fetch<AttributeTemplate>(`${base}/templates/${id}/revisions/${revisionId}/restore`, { method: "POST" }),
   updateField: (id: number, body: Record<string, unknown>) =>
@@ -204,31 +223,35 @@ export const attributeAssistantService = {
   removeField: (id: number) =>
     $fetch<{ deleted_id: number }>(`${base}/fields/${id}`, { method: "DELETE" }),
   assignTemplate: (productId: number, templateId: number) =>
-    $fetch<AttributeProduct>(`${base}/products/${productId}/template`, { method: "PATCH", body: { template_id: templateId } }),
-  donorRecommendations: (productId: number) =>
-    $fetch<{ items: AttributeDonor[] }>(`${base}/products/${productId}/donor-recommendations`),
+    $fetch<AttributeProductMutation>(`${base}/products/${productId}/template`, { method: "PATCH", body: { template_id: templateId } }),
+  donorRecommendations: (productId: number, signal?: AbortSignal) =>
+    $fetch<{ items: AttributeDonor[] }>(`${base}/products/${productId}/donor-recommendations`, { signal }),
   mapAttribute: (productId: number, body: Record<string, unknown>) =>
-    $fetch<{ stats: Record<string, number>; product: AttributeProduct }>(`${base}/products/${productId}/map-attribute`, { method: "POST", body }),
-  mappingRules: (templateId?: number) =>
-    $fetch<{ items: AttributeMappingRule[] }>(`${base}/mapping-rules`, { query: templateId ? { template_id: templateId } : {} }),
+    $fetch<AttributeProductMutation & { stats: Record<string, number> }>(`${base}/products/${productId}/map-attribute`, { method: "POST", body }),
+  mappingRules: (templateId?: number, signal?: AbortSignal) =>
+    $fetch<{ items: AttributeMappingRule[] }>(`${base}/mapping-rules`, { query: templateId ? { template_id: templateId } : {}, signal }),
   removeMappingRule: (id: number) =>
     $fetch(`${base}/mapping-rules/${id}`, { method: "DELETE" }),
   rememberValueMapping: (valueId: number, body: { donor_id: number; raw_value: string; allowed_value_id: number }) =>
-    $fetch<{ rule_id: number; value: AttributeValue }>(`${base}/values/${valueId}/mapping-rule`, { method: "POST", body }),
-  valueMappingRules: (templateId?: number) =>
-    $fetch<{ items: AttributeValueMappingRule[] }>(`${base}/value-mapping-rules`, { query: templateId ? { template_id: templateId } : {} }),
+    $fetch<AttributeValueMutation & { rule_id: number }>(`${base}/values/${valueId}/mapping-rule`, { method: "POST", body }),
+  valueMappingRules: (templateId?: number, signal?: AbortSignal) =>
+    $fetch<{ items: AttributeValueMappingRule[] }>(`${base}/value-mapping-rules`, { query: templateId ? { template_id: templateId } : {}, signal }),
   removeValueMappingRule: (id: number) =>
     $fetch(`${base}/value-mapping-rules/${id}`, { method: "DELETE" }),
-  productHistory: (id: number) =>
-    $fetch<{ items: AttributeHistoryItem[] }>(`${base}/products/${id}/history`),
+  productHistory: (id: number, signal?: AbortSignal) =>
+    $fetch<{ items: AttributeHistoryItem[] }>(`${base}/products/${id}/history`, { signal }),
   restoreProduct: (id: number, historyId: number) =>
-    $fetch<AttributeProduct>(`${base}/products/${id}/history/${historyId}/restore`, { method: "POST" }),
+    $fetch<AttributeProductMutation>(`${base}/products/${id}/history/${historyId}/restore`, { method: "POST" }),
   batchReport: (id: number) => $fetch<AttributeBatchReport>(`${base}/batches/${id}/report`),
 
-  chatGptStatus: () =>
-    $fetch<ChatGptStatus>(`${base}/chatgpt/status`),
+  chatGptStatus: (signal?: AbortSignal) =>
+    $fetch<ChatGptStatus>(`${base}/chatgpt/status`, { signal }),
   chatGptLogin: () =>
     $fetch<ChatGptLogin>(`${base}/chatgpt/login`, { method: "POST" }),
   chatGptLogout: () =>
     $fetch(`${base}/chatgpt/logout`, { method: "POST" }),
+
+  batchDownloadUrl: (batchId: number) => `${base}/batches/${batchId}/download`,
+  batchReportDownloadUrl: (batchId: number) => `${base}/batches/${batchId}/report/download`,
+  batchOriginalDownloadUrl: (batchId: number) => `${base}/batches/${batchId}/original/download`,
 };

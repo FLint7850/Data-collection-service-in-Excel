@@ -236,10 +236,19 @@ export interface AttributeBatchOperation {
   error: string;
 }
 
+export interface AttributeAssistantSettings {
+  product_page_size: number;
+  allowed_value_page_size: number;
+  template_value_page_size: number;
+  bulk_confidence: number;
+  max_urls: number;
+}
+
 export interface AttributeWorkspace {
   templates: AttributeTemplate[];
   donors: AttributeDonor[];
   batches: AttributeBatch[];
+  settings: AttributeAssistantSettings | null;
   dashboard: {
     active_templates: number;
     batches: number;
@@ -248,6 +257,16 @@ export interface AttributeWorkspace {
     conflicts: number;
     missing: number;
   };
+}
+
+export interface AttributeProductMutation {
+  product: AttributeProduct;
+  batch: AttributeBatch;
+  history: AttributeHistoryItem[];
+}
+
+export interface AttributeValueMutation extends AttributeProductMutation {
+  value: AttributeValue;
 }
 
 export interface AttributeTemplatePreview {
@@ -329,11 +348,10 @@ export interface AttributeChatGptAnalysis {
   prompt_version: string;
 }
 
-export interface AttributeChatGptAnalyzeResult {
+export interface AttributeChatGptAnalyzeResult extends AttributeProductMutation {
   changed: number;
   source_url: string;
   analysis: AttributeChatGptAnalysis;
-  product: AttributeProduct;
 }
 
 export type AttributeProcessingMode = "check" | "suggest" | "auto" | "auto_exact" | "auto_primary" | "auto_confident" | "auto_all";

@@ -8,8 +8,6 @@ import type {
 export const ALL_FILTER_VALUE = "all";
 export const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
 export const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "from_source", "unfilled"]);
-export const ALLOWED_OPTIONS_PAGE_SIZE = 40;
-
 export const processingModeItems: Array<{ label: string; value: AttributeProcessingMode }> = [
     { label: "Только проверить, без предложений в итог", value: "check" },
     { label: "Показать предложения, решение вручную", value: "suggest" },
@@ -46,7 +44,10 @@ export function positiveRouteId(value: string | undefined): number | null {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-export function matchesProductStatus(product: AttributeProduct, status: string): boolean {
+export function matchesProductStatus(
+    product: Pick<AttributeProduct, "status" | "counts">,
+    status: string,
+): boolean {
     if (status === ALL_FILTER_VALUE) return true;
     if (status === "conflict") return product.status === status || product.counts.conflicts > 0;
     if (status === "missing") return product.status === status || product.counts.missing > 0;

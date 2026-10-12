@@ -1,15 +1,16 @@
 import { attributeAssistantService as api } from "~/services/attribute-assistant.service";
 import type { AttributeValue } from "~/types/attribute-assistant";
-import {
-    ALLOWED_OPTIONS_PAGE_SIZE,
-    displayedProposal,
-} from "~/utils/attribute-assistant";
+import { displayedProposal } from "~/utils/attribute-assistant";
+import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
+import { createLatestRequestCoordinator } from "~/utils/latest-request";
 
 type AllowedSelectInstance = {
     viewportRef?: HTMLElement | { value?: HTMLElement | null } | null;
 };
 
-export function useAttributeAllowedValues() {
+export function useAttributeAllowedValues(
+    pageSize: () => number | undefined = () => undefined,
+) {
     const allowedOptionCache = ref<Record<number, Array<{ id: number; value: string }>>>({});
     const allowedSearchQueries = ref<Record<number, string>>({});
     const searchingAllowedValueIds = ref<Set<number>>(new Set());
@@ -29,6 +30,7 @@ export function useAttributeAllowedValues() {
         check: () => void;
         cleanup: () => void;
     }>();
+    const requests = createLatestRequestCoordinator();
 
     function optionsFor(value: AttributeValue) {
         const loaded = allowedOptionCache.value[value.id] || value.allowed_values;
@@ -59,14 +61,18 @@ export function useAttributeAllowedValues() {
         const token = (allowedRequestTokens.get(value.id) || 0) + 1;
         allowedRequestTokens.set(value.id, token);
         setAllowedSearchLoading(value.id, true);
+        const requestKey = `allowed-${value.id}`;
+        const signal = requests.start(requestKey);
 
         const result = await api.allowedValues(
             value.field_id,
             normalizedQuery,
             false,
             0,
-            ALLOWED_OPTIONS_PAGE_SIZE,
+            pageSize(),
+            signal,
         ).catch(() => null);
+        requests.finish(requestKey, signal);
 
         if (
             result
@@ -103,6 +109,8 @@ export function useAttributeAllowedValues() {
         const token = (allowedRequestTokens.get(value.id) || 0) + 1;
         allowedRequestTokens.set(value.id, token);
         setAllowedSearchLoading(value.id, true);
+        const requestKey = `allowed-${value.id}`;
+        const signal = requests.start(requestKey);
 
         const loaded = allowedOptionCache.value[value.id] || [];
         const result = await api.allowedValues(
@@ -110,8 +118,10 @@ export function useAttributeAllowedValues() {
             page.query,
             false,
             loaded.length,
-            ALLOWED_OPTIONS_PAGE_SIZE,
+            pageSize(),
+            signal,
         ).catch(() => null);
+        requests.finish(requestKey, signal);
 
         if (
             result
@@ -151,6 +161,11 @@ export function useAttributeAllowedValues() {
             ...allowedSearchQueries.value,
             [value.id]: normalizedQuery,
         };
+        allowedRequestTokens.set(
+            value.id,
+            (allowedRequestTokens.get(value.id) || 0) + 1,
+        );
+        requests.cancel(`allowed-${value.id}`);
 
         const previous = allowedSearchTimers.get(value.id);
         if (previous) clearTimeout(previous);
@@ -158,7 +173,7 @@ export function useAttributeAllowedValues() {
         allowedSearchTimers.set(value.id, setTimeout(() => {
             allowedSearchTimers.delete(value.id);
             void searchAllowed(value, normalizedQuery);
-        }, 250));
+        }, ATTRIBUTE_ASSISTANT_UI.searchDebounceMs));
     }
 
     async function ensureAllowedOptions(value: AttributeValue, open: boolean) {
@@ -223,7 +238,10 @@ export function useAttributeAllowedValues() {
         if (!viewport) return;
 
         const check = () => {
-            if (viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 48) {
+            if (
+                viewport.scrollTop + viewport.clientHeight
+                >= viewport.scrollHeight - ATTRIBUTE_ASSISTANT_UI.infiniteScrollThresholdPx
+            ) {
                 void loadMoreAllowed(value);
             }
         };
@@ -247,6 +265,7 @@ export function useAttributeAllowedValues() {
         allowedSearchQueries.value = {};
         searchingAllowedValueIds.value = new Set();
         allowedRequestTokens.clear();
+        requests.dispose();
         for (const timer of allowedSearchTimers.values()) clearTimeout(timer);
         allowedSearchTimers.clear();
     }

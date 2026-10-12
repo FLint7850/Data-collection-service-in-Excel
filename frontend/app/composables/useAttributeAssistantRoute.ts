@@ -10,6 +10,13 @@ import {
     positiveRouteId,
     routeQueryValue,
 } from "~/utils/attribute-assistant";
+import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
+
+const ATTRIBUTE_ASSISTANT_TABS = new Set<AttributeAssistantTab>([
+    "start",
+    "templates",
+    "review",
+]);
 
 export function useAttributeAssistantRoute(
     assistant: AttributeAssistantContext,
@@ -140,7 +147,7 @@ export function useAttributeAssistantRoute(
 
     async function changeMainTab(value: string | number) {
         const next = String(value) as AttributeAssistantTab;
-        if (!(new Set<AttributeAssistantTab>(["start", "templates", "review"])).has(next)) return;
+        if (!ATTRIBUTE_ASSISTANT_TABS.has(next)) return;
         if (next === "review" && !review.selectedBatch.value) return;
 
         assistant.tab.value = next;
@@ -163,7 +170,7 @@ export function useAttributeAssistantRoute(
                 filterRouteTimer = null;
                 if (!routeStateReady || applyingRouteState || assistant.tab.value !== "review") return;
                 void writeAssistantRoute("replace");
-            }, 180);
+            }, ATTRIBUTE_ASSISTANT_UI.routeSyncDebounceMs);
         },
     );
 

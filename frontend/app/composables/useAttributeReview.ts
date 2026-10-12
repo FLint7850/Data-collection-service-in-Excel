@@ -5,6 +5,7 @@ import type {
     AttributeDonor,
     AttributeHistoryItem,
     AttributeProduct,
+    AttributeProductMutation,
     AttributeProductPage,
     AttributeProductSummary,
     AttributeValue,
@@ -16,10 +17,27 @@ import {
     ATTRIBUTE_STATUS_VALUES,
     PRODUCT_STATUS_VALUES,
     matchesAttributeStatus,
+    matchesProductStatus,
     sourceKind,
     unknownSelectionKey,
 } from "~/utils/attribute-assistant";
 import { errorMessage } from "~/utils/format";
+import {
+    ATTRIBUTE_ASSISTANT_UI,
+    DEFAULT_DASH_REASON,
+} from "~/config/attribute-assistant";
+import {
+    createLatestRequestCoordinator,
+    isAbortError,
+} from "~/utils/latest-request";
+
+function productSearchKey(value: string): string {
+    return value
+        .normalize("NFKC")
+        .toLocaleLowerCase("ru-RU")
+        .trim()
+        .replace(/\s+/g, " ");
+}
 
 export function useAttributeReview(
     assistant: AttributeAssistantContext,
@@ -27,7 +45,7 @@ export function useAttributeReview(
 ) {
     const toast = useToast();
     const {
-        busy,
+        isBusy,
         error,
         tab,
         inputMode,
@@ -69,6 +87,7 @@ export function useAttributeReview(
     let batchOperationPoll: ReturnType<typeof setTimeout> | null = null;
     let openingBatch = false;
     let disposed = false;
+    const requests = createLatestRequestCoordinator();
 
     const displayedDonors = computed(() =>
         donorRecommendations.value.length ? donorRecommendations.value : donors.value,
@@ -137,7 +156,7 @@ export function useAttributeReview(
     );
 
     const batchChatGptLoading = computed(() =>
-        busy.value === "chatgpt-all"
+        isBusy("chatgpt-all")
         || (batchOperationRunning.value && batchOperation.value?.kind === "chatgpt"),
     );
 
@@ -165,6 +184,81 @@ export function useAttributeReview(
         return selectedBatch.value?.input_mode === "urls"
             ? "На странице не найдено"
             : "В файле не заполнено";
+    }
+
+    function productSummary(product: AttributeProduct): AttributeProductSummary {
+        return {
+            id: product.id,
+            model: product.model,
+            name: product.name,
+            brand: product.brand,
+            status: product.status,
+            counts: { ...product.counts },
+        };
+    }
+
+    function matchesProductQuery(product: AttributeProductSummary): boolean {
+        const query = productSearchKey(productQuery.value);
+        if (!query) return true;
+        return [product.model, product.name, product.brand]
+            .some((item) => productSearchKey(item).includes(query));
+    }
+
+    function patchProductPage(
+        previous: AttributeProductSummary | null,
+        next: AttributeProductSummary,
+    ) {
+        const page = productPage.value;
+        if (!page || !previous || previous.id !== next.id) return;
+
+        const countStatuses = [ALL_FILTER_VALUE, ...PRODUCT_STATUS_VALUES];
+        for (const status of countStatuses) {
+            const before = matchesProductStatus(previous, status);
+            const after = matchesProductStatus(next, status);
+            if (before !== after) {
+                page.counts[status] = Math.max(0, (page.counts[status] || 0) + (after ? 1 : -1));
+            }
+        }
+
+        const beforeMatched = matchesProductQuery(previous)
+            && matchesProductStatus(previous, productStatusFilter.value);
+        const afterMatched = matchesProductQuery(next)
+            && matchesProductStatus(next, productStatusFilter.value);
+        if (beforeMatched !== afterMatched) {
+            page.matched = Math.max(0, page.matched + (afterMatched ? 1 : -1));
+        }
+
+        const index = page.items.findIndex((item) => item.id === next.id);
+        if (index >= 0) {
+            if (afterMatched) page.items[index] = next;
+            else page.items.splice(index, 1);
+        }
+        page.has_more = page.offset + page.items.length < page.matched;
+    }
+
+    function applyProductMutation(result: AttributeProductMutation) {
+        const current = selectedProduct.value;
+        const previous = current?.id === result.product.id
+            ? productSummary(current)
+            : productPage.value?.items.find((item) => item.id === result.product.id) || null;
+        const next = productSummary(result.product);
+
+        patchProductPage(previous, next);
+        if (current?.id === result.product.id) {
+            selectedProduct.value = result.product.values !== undefined
+                ? result.product
+                : {
+                    ...current,
+                    ...result.product,
+                    values: current.values,
+                    sources: current.sources,
+                };
+            historyItems.value = result.history;
+        }
+        if (selectedBatch.value?.id === result.batch.id) selectedBatch.value = result.batch;
+
+        const batchIndex = workspace.value.batches.findIndex((item) => item.id === result.batch.id);
+        if (batchIndex >= 0) workspace.value.batches[batchIndex] = result.batch;
     }
 
     function setRouteFilters(filters: {
@@ -204,6 +298,11 @@ export function useAttributeReview(
             error.value = "Вставьте хотя бы одну ссылку.";
             return;
         }
+        const maxUrls = workspace.value.settings?.max_urls;
+        if (maxUrls && urls.length > maxUrls) {
+            error.value = `За одну обработку можно передать не больше ${maxUrls} ссылок.`;
+            return;
+        }
 
         const batch = await run("url-import", () =>
             api.importUrls(urls, selectedTemplateId.value, processingMode.value),
@@ -221,16 +320,20 @@ export function useAttributeReview(
         return { [String(selectedProduct.value.id)]: { ...donorUrlOverrides.value } };
     }
 
-    function scheduleBatchOperationPoll(batchId: number, delay = 1400) {
+    function scheduleBatchOperationPoll(
+        batchId: number,
+        delay: number = ATTRIBUTE_ASSISTANT_UI.operationPollMs,
+    ) {
         clearBatchOperationPoll();
         if (disposed) return;
         batchOperationPoll = setTimeout(() => void loadBatchOperation(batchId), delay);
     }
 
     async function loadBatchOperation(batchId: number) {
+        const signal = requests.start("batch-operation");
         try {
             const previous = batchOperation.value;
-            const operation = await api.batchOperation(batchId);
+            const operation = await api.batchOperation(batchId, signal);
             if (disposed || selectedBatch.value?.id !== batchId) return;
             batchOperation.value = operation;
 
@@ -272,11 +375,14 @@ export function useAttributeReview(
             }
         } catch (caught) {
             if (disposed || selectedBatch.value?.id !== batchId) return;
+            if (isAbortError(caught)) return;
             clearBatchOperationPoll();
             error.value = errorMessage(caught);
             if (!batchOperation.value || batchOperationRunning.value) {
-                scheduleBatchOperationPoll(batchId, 5000);
+                scheduleBatchOperationPoll(batchId, ATTRIBUTE_ASSISTANT_UI.operationRetryMs);
             }
+        } finally {
+            requests.finish("batch-operation", signal);
         }
     }
 
@@ -337,9 +443,12 @@ export function useAttributeReview(
         const batchChanged = selectedBatch.value?.id !== id;
         const token = ++batchRequestToken;
         openingBatch = true;
+        requests.cancel("batch-operation");
         if (productFilterTimer) clearTimeout(productFilterTimer);
         productFilterTimer = null;
         if (batchChanged) {
+            requests.cancel("product");
+            requests.cancel("product-related");
             productRequestToken += 1;
             listRequestToken += 1;
             selectedProduct.value = null;
@@ -358,7 +467,9 @@ export function useAttributeReview(
             attributeStatusFilter.value = ALL_FILTER_VALUE;
         }
 
-        const batch = await run("batch", () => api.batch(id));
+        const batchSignal = requests.start("batch");
+        const batch = await run("batch", () => api.batch(id, batchSignal));
+        requests.finish("batch", batchSignal);
         if (token !== batchRequestToken) return false;
         openingBatch = false;
         if (!batch) return false;
@@ -388,9 +499,17 @@ export function useAttributeReview(
         const batchId = selectedBatch.value?.id;
         if (!batchId) return;
         const token = ++listRequestToken;
+        const signal = requests.start("products");
         loadingProducts.value = true;
         try {
-            const page = await api.products(batchId, productQuery.value, productStatusFilter.value, offset);
+            const page = await api.products(
+                batchId,
+                productQuery.value,
+                productStatusFilter.value,
+                offset,
+                workspace.value.settings?.product_page_size,
+                signal,
+            );
             if (token === listRequestToken && selectedBatch.value?.id === batchId) {
                 productPage.value = page;
                 const current = page.items.find((item) => item.id === selectedProduct.value?.id);
@@ -400,8 +519,9 @@ export function useAttributeReview(
                 }
             }
         } catch (caught) {
-            if (token === listRequestToken) error.value = errorMessage(caught);
+            if (token === listRequestToken && !isAbortError(caught)) error.value = errorMessage(caught);
         } finally {
+            requests.finish("products", signal);
             if (token === listRequestToken) loadingProducts.value = false;
         }
     }
@@ -414,7 +534,7 @@ export function useAttributeReview(
         productFilterTimer = setTimeout(() => {
             productFilterTimer = null;
             void loadProducts(0);
-        }, 250);
+        }, ATTRIBUTE_ASSISTANT_UI.searchDebounceMs);
     });
 
     function changeProductPage(direction: number) {
@@ -424,7 +544,7 @@ export function useAttributeReview(
 
     async function removeBatch(batch: AttributeBatch) {
         const requestKey = `batch-remove-${batch.id}`;
-        if (busy.value === requestKey) return;
+        if (isBusy(requestKey)) return;
         if (!await confirmAction({
             title: `Удалить обработку «${batch.name}»?`,
             description: "Будут удалены загруженный CSV, отчёты, страницы доноров и все результаты этой обработки. Шаблон останется.",
@@ -458,11 +578,14 @@ export function useAttributeReview(
             historyItems.value = [];
             return;
         }
+        const signal = requests.start("history");
         try {
-            const history = await api.productHistory(productId);
+            const history = await api.productHistory(productId, signal);
             if (selectedProduct.value?.id === productId) historyItems.value = history.items;
-        } catch {
-            error.value = "Не удалось обновить историю изменений товара.";
+        } catch (caught) {
+            if (!isAbortError(caught)) error.value = "Не удалось обновить историю изменений товара.";
+        } finally {
+            requests.finish("history", signal);
         }
     }
 
@@ -477,16 +600,19 @@ export function useAttributeReview(
         }
 
         const token = ++productRequestToken;
+        const signal = requests.start("product");
+        requests.cancel("product-related");
         loadingProductId.value = id;
         error.value = "";
 
         let product: AttributeProduct;
         try {
-            product = await api.product(id);
+            product = await api.product(id, signal);
         } catch (caught) {
-            if (token === productRequestToken) error.value = errorMessage(caught);
+            if (token === productRequestToken && !isAbortError(caught)) error.value = errorMessage(caught);
             return false;
         } finally {
+            requests.finish("product", signal);
             if (token === productRequestToken) loadingProductId.value = null;
         }
 
@@ -509,9 +635,10 @@ export function useAttributeReview(
         donorUrlOverrides.value = { ...(product.donor_url_overrides || {}) };
         allowedValues.resetAllowedOptionState();
 
+        const relatedSignal = requests.start("product-related");
         void Promise.all([
-            api.donorRecommendations(id).catch(() => ({ items: [] })),
-            api.productHistory(id).catch(() => ({ items: [] })),
+            api.donorRecommendations(id, relatedSignal).catch(() => ({ items: [] })),
+            api.productHistory(id, relatedSignal).catch(() => ({ items: [] })),
         ]).then(([recommendations, history]) => {
             if (token !== productRequestToken) return;
             donorRecommendations.value = recommendations.items;
@@ -519,9 +646,11 @@ export function useAttributeReview(
             if (!selectedDonors.value.length) {
                 selectedDonors.value = recommendations.items
                     .filter((item) => item.recommended)
-                    .slice(0, 4)
+                    .slice(0, ATTRIBUTE_ASSISTANT_UI.recommendedDonorCount)
                     .map((item) => item.id);
             }
+        }).finally(() => {
+            requests.finish("product-related", relatedSignal);
         });
 
         if (syncRoute) await writeRoute("push");
@@ -559,8 +688,7 @@ export function useAttributeReview(
         );
         if (!result) return;
 
-        selectedProduct.value = result.product;
-        await refreshBatch();
+        applyProductMutation(result);
 
         const reports = result.report.reports || [];
         const opened = reports.filter((item) => ["parsed", "no_attributes"].includes(item.status)).length;
@@ -584,8 +712,7 @@ export function useAttributeReview(
         if (!selectedProduct.value) return;
         const result = await run("similar", () => api.useSimilar(selectedProduct.value!.id));
         if (result) {
-            selectedProduct.value = result.product;
-            await refreshBatch();
+            applyProductMutation(result);
             notify(`Добавлено предложений: ${result.changed}`);
         }
     }
@@ -606,8 +733,7 @@ export function useAttributeReview(
         );
         if (!result) return;
 
-        selectedProduct.value = result.product;
-        await refreshBatch();
+        applyProductMutation(result);
         const warnings = result.analysis.warnings.length;
         notify(
             warnings
@@ -626,8 +752,7 @@ export function useAttributeReview(
             () => api.assignTemplate(selectedProduct.value!.id, templateId),
         );
         if (result) {
-            selectedProduct.value = result;
-            await refreshBatch();
+            applyProductMutation(result);
         }
     }
 
@@ -635,7 +760,7 @@ export function useAttributeReview(
         if (!selectedBatch.value) return;
         const result = await run("export-ready", () => api.export(selectedBatch.value!.id, true));
         if (result) {
-            window.location.href = `/api/attribute-assistant/batches/${selectedBatch.value.id}/download`;
+            window.location.href = api.batchDownloadUrl(selectedBatch.value.id);
         }
     }
 
@@ -651,9 +776,7 @@ export function useAttributeReview(
             () => api.restoreProduct(selectedProduct.value!.id, id),
         );
         if (product) {
-            selectedProduct.value = product;
-            await openProduct(product.id);
-            await refreshBatch();
+            applyProductMutation(product);
         }
     }
 
@@ -666,7 +789,7 @@ export function useAttributeReview(
             ? await promptValue({
             title: "Технический пропуск",
             label: "Причина",
-            defaultValue: "Не найдено после проверки источников",
+            defaultValue: DEFAULT_DASH_REASON,
             confirmLabel: "Поставить «-»",
         }) || ""
             : "";
@@ -678,9 +801,9 @@ export function useAttributeReview(
         );
         if (!updated || !selectedProduct.value?.values) return;
 
-        const index = selectedProduct.value.values.findIndex((item) => item.id === updated.id);
-        if (index >= 0) selectedProduct.value.values[index] = updated;
-        await refreshBatch();
+        const index = selectedProduct.value.values.findIndex((item) => item.id === updated.value.id);
+        if (index >= 0) selectedProduct.value.values[index] = updated.value;
+        applyProductMutation(updated);
     }
 
     async function removeOutsideTemplateValue(value: AttributeValue) {
@@ -695,8 +818,7 @@ export function useAttributeReview(
         const result = await run(`value-remove-${value.id}`, () => api.removeExtraValue(value.id));
         if (!result) return;
 
-        selectedProduct.value = result.product;
-        await refreshBatch();
+        applyProductMutation(result);
         notify("Атрибут вне шаблона удалён");
     }
 
@@ -730,9 +852,9 @@ export function useAttributeReview(
         });
 
         if (result && selectedProduct.value?.values) {
-            const index = selectedProduct.value.values.findIndex((item) => item.id === result.id);
-            if (index >= 0) selectedProduct.value.values[index] = result;
-            await refreshBatch();
+            const index = selectedProduct.value.values.findIndex((item) => item.id === result.value.id);
+            if (index >= 0) selectedProduct.value.values[index] = result.value;
+            applyProductMutation(result);
             notify("Значение добавлено в справочник");
         }
     }
@@ -761,7 +883,7 @@ export function useAttributeReview(
         const valueIndex = selectedProduct.value.values.findIndex((item) => item.id === result.value.id);
         if (valueIndex >= 0) selectedProduct.value.values[valueIndex] = result.value;
         delete unknownSelections.value[key];
-        await refreshBatch();
+        applyProductMutation(result);
         notify("Значение применено и запомнено для донора");
     }
 
@@ -778,10 +900,13 @@ export function useAttributeReview(
 
     async function bulk(action: "accept_high" | "fill_dashes") {
         if (!selectedBatch.value) return;
+        const minimumConfidence = workspace.value.settings?.bulk_confidence;
         const confirmed = await confirmAction({
             title: action === "accept_high" ? "Принять уверенные предложения?" : "Заполнить технические пропуски?",
             description: action === "accept_high"
-                ? "Будут подтверждены все предложения с уверенностью от 90%."
+                ? minimumConfidence === undefined
+                    ? "Будут подтверждены все предложения, прошедшие серверный порог уверенности."
+                    : `Будут подтверждены все предложения с уверенностью от ${minimumConfidence}%.`
                 : "Во все оставшиеся неконфликтные поля будет поставлен технический пропуск.",
             confirmLabel: action === "accept_high" ? "Принять" : "Заполнить",
         });
@@ -790,8 +915,8 @@ export function useAttributeReview(
         const result = await run("bulk", () =>
             api.bulk(selectedBatch.value!.id, {
                 action,
-                minimum_confidence: 90,
-                dash_reason: "Не найдено после проверки источников",
+                minimum_confidence: minimumConfidence,
+                dash_reason: DEFAULT_DASH_REASON,
             }),
         );
         if (result) {
@@ -806,7 +931,7 @@ export function useAttributeReview(
         if (!selectedBatch.value) return;
         const result = await run("export", () => api.export(selectedBatch.value!.id));
         if (!result) return;
-        window.location.href = `/api/attribute-assistant/batches/${selectedBatch.value.id}/download`;
+        window.location.href = api.batchDownloadUrl(selectedBatch.value.id);
     }
 
     function dispose() {
@@ -816,6 +941,7 @@ export function useAttributeReview(
         batchRequestToken += 1;
         listRequestToken += 1;
         if (productFilterTimer) clearTimeout(productFilterTimer);
+        requests.dispose();
         stopProductFilters();
     }
 

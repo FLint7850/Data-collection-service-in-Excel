@@ -13,6 +13,11 @@ from config import (
     ATTRIBUTE_ASSISTANT_MAX_URLS,
     ATTRIBUTE_ASSISTANT_UPLOAD_MAX_BYTES,
 )
+from services.attribute_settings import (
+    ALLOWED_VALUE_PAGE_SIZE,
+    BULK_CONFIDENCE,
+    PRODUCT_PAGE_SIZE,
+)
 
 from models import (
     AttributeAllowedValue,
@@ -83,6 +88,18 @@ from services.attribute_listing import product_page
 bp = Blueprint("routes_attribute_assistant", __name__)
 
 
+def _integer_query(name: str, default: int) -> int:
+    """Parse one integer query parameter and report client errors consistently."""
+
+    value = request.args.get(name)
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Параметр {name} должен быть целым числом") from error
+
+
 def _json_body() -> dict:
     if (
         request.content_length is not None
@@ -137,6 +154,23 @@ def _product(product_id: int) -> AttributeProduct:
     if not row:
         raise ValueError("Товар не найден")
     return row
+
+
+def _product_mutation_payload(
+    product: AttributeProduct,
+    *,
+    detailed: bool = True,
+    **payload,
+) -> dict:
+    """Return all client state invalidated by a product mutation in one response."""
+
+    g.db.flush()
+    return {
+        **payload,
+        "product": serialize_product(product, detailed=detailed),
+        "batch": serialize_batch(product.batch),
+        "history": product_history(g.db, product),
+    }
 
 
 @bp.get("/api/attribute-assistant")
@@ -235,17 +269,15 @@ def api_attribute_allowed_values(field_id: int):
     if not field:
         return jsonify({"error": "Атрибут не найден"}), 404
     try:
-        limit = int(request.args.get("limit", "80"))
-    except ValueError:
-        limit = 80
-    try:
-        offset = int(request.args.get("offset", "0"))
-    except ValueError:
-        offset = 0
-    return jsonify(allowed_value_options(
-        field, request.args.get("q", ""), limit, offset,
-        include_inactive=request.args.get("editor", "").lower() in {"1", "true", "yes"},
-    ))
+        return jsonify(allowed_value_options(
+            field,
+            request.args.get("q", ""),
+            _integer_query("limit", ALLOWED_VALUE_PAGE_SIZE),
+            _integer_query("offset", 0),
+            include_inactive=request.args.get("editor", "").lower() in {"1", "true", "yes"},
+        ))
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
 
 
 @bp.post("/api/attribute-assistant/fields/<int:field_id>/allowed-values")
@@ -356,7 +388,8 @@ def api_attribute_batch_products(batch_id: int):
     try:
         return jsonify(product_page(
             g.db, batch_id, query=request.args.get("q", ""), status=request.args.get("status", "all"),
-            offset=int(request.args.get("offset", 0)), limit=int(request.args.get("limit", 80)),
+            offset=_integer_query("offset", 0),
+            limit=_integer_query("limit", PRODUCT_PAGE_SIZE),
         ))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
@@ -386,7 +419,7 @@ def api_attribute_product_process(product_id: int):
             url_overrides=payload.get("url_overrides") or {},
         )
         g.db.flush()
-        return jsonify({"report": report, "product": serialize_product(product, detailed=True)})
+        return jsonify(_product_mutation_payload(product, report=report))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
 
@@ -478,7 +511,7 @@ def api_attribute_product_similar(product_id: int):
         product = _product(product_id)
         snapshot_product(g.db, product, "Перед поиском по похожим товарам")
         changed = apply_similar_products(g.db, product)
-        return jsonify({"changed": changed, "product": serialize_product(product, detailed=True)})
+        return jsonify(_product_mutation_payload(product, changed=changed))
     except ValueError as error:
         return jsonify({"error": str(error)}), 404
 
@@ -498,7 +531,11 @@ def api_attribute_value_update(value_id: int):
             manual_value=payload.get("value", ""),
             dash_reason=payload.get("dash_reason", ""),
         )
-        return jsonify(serialize_value(value))
+        return jsonify(_product_mutation_payload(
+            value.product,
+            detailed=False,
+            value=serialize_value(value),
+        ))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
 
@@ -511,7 +548,7 @@ def api_attribute_value_delete(value_id: int):
         return jsonify({"error": "Значение не найдено"}), 404
     try:
         product = delete_extra_product_value(g.db, value)
-        return jsonify({"deleted_id": value_id, "product": serialize_product(product, detailed=True)})
+        return jsonify(_product_mutation_payload(product, deleted_id=value_id))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
 
@@ -544,7 +581,12 @@ def api_attribute_value_mapping_rule(value_id: int):
         ]
         value.source_details = details
         g.db.flush()
-        return jsonify({"rule_id": rule.id, "value": serialize_value(value)}), 201
+        return jsonify(_product_mutation_payload(
+            value.product,
+            detailed=False,
+            rule_id=rule.id,
+            value=serialize_value(value),
+        )), 201
     except (TypeError, ValueError) as error:
         return jsonify({"error": str(error)}), 400
 
@@ -560,7 +602,7 @@ def api_attribute_batch_bulk(batch_id: int):
         changed = bulk_action(
             batch,
             clean_text(payload.get("action")),
-            int(payload.get("minimum_confidence") or 90),
+            int(payload.get("minimum_confidence") or BULK_CONFIDENCE),
             payload.get("dash_reason", ""),
         )
         return jsonify({"changed": changed, "batch": serialize_batch(batch)})
@@ -629,12 +671,12 @@ def api_attribute_product_chatgpt_analyze(product_id: int):
             payload.get("donor_ids"),
             url_overrides=payload.get("url_overrides"),
         )
-        return jsonify({
-            "changed": result["changed"],
-            "analysis": result["analysis"],
-            "source_url": result["source_url"],
-            "product": serialize_product(result["product"], detailed=True),
-        })
+        return jsonify(_product_mutation_payload(
+            result["product"],
+            changed=result["changed"],
+            analysis=result["analysis"],
+            source_url=result["source_url"],
+        ))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except RuntimeError as error:
@@ -913,7 +955,7 @@ def api_attribute_product_template(product_id: int):
         product = _product(product_id)
         template = _template(int(payload.get("template_id") or 0))
         assign_product_template(g.db, product, template)
-        return jsonify(serialize_product(product, detailed=True))
+        return jsonify(_product_mutation_payload(product))
     except (TypeError, ValueError) as error:
         return jsonify({"error": str(error)}), 400
 
@@ -954,7 +996,7 @@ def api_attribute_product_map_attribute(product_id: int):
             donor_id=donor_id,
             source_url=payload.get("source_url", ""),
         )
-        return jsonify({"stats": stats, "product": serialize_product(product, detailed=True)})
+        return jsonify(_product_mutation_payload(product, stats=stats))
     except (TypeError, ValueError) as error:
         return jsonify({"error": str(error)}), 400
 
@@ -1018,7 +1060,7 @@ def api_attribute_product_history_restore(product_id: int, revision_id: int):
         if not revision:
             raise ValueError("Снимок не найден")
         restore_product_snapshot(g.db, product, revision)
-        return jsonify(serialize_product(product, detailed=True))
+        return jsonify(_product_mutation_payload(product))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
 

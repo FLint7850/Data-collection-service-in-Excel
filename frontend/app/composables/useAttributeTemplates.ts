@@ -8,10 +8,17 @@ import type {
 } from "~/types/attribute-assistant";
 import type { AttributeAssistantContext } from "~/composables/useAttributeAssistant";
 import { errorMessage } from "~/utils/format";
+import {
+    ATTRIBUTE_ASSISTANT_UI,
+} from "~/config/attribute-assistant";
+import {
+    createLatestRequestCoordinator,
+    isAbortError,
+} from "~/utils/latest-request";
 
 export function useAttributeTemplates(assistant: AttributeAssistantContext) {
     const {
-        busy,
+        isBusy,
         error,
         workspace,
         selectedTemplateId,
@@ -38,6 +45,11 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
     const loadingTemplateFieldIds = ref<Set<number>>(new Set());
     const templateFieldQueries = ref<Record<number, string>>({});
     const templateFieldMatchedCounts = ref<Record<number, number>>({});
+    const templateFieldPages = ref<Record<number, {
+        query: string;
+        matched: number;
+        hasMore: boolean;
+    }>>({});
     const showNewTemplateField = ref(false);
 
     const allowedValueEditor = ref<{
@@ -84,7 +96,8 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
 
     const templateFieldSearchTimers = new Map<number, ReturnType<typeof setTimeout>>();
     const templateFieldSearchTokens = new Map<number, number>();
-
+    const requests = createLatestRequestCoordinator();
+    let templateRequestToken = 0;
     async function previewNewTemplate() {
         if (!templateFile.value) {
             error.value = "Выберите CSV-файл шаблона.";
@@ -115,20 +128,25 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
 
     async function openTemplate(id: number, syncRoute = true) {
         const requestKey = `template-open-${id}`;
-        if (busy.value === requestKey) return;
+        if (isBusy(requestKey)) return;
+        const token = ++templateRequestToken;
+        requests.dispose();
+        const signal = requests.start("template");
         selectedTemplateId.value = id;
         const result = await run(requestKey, () => Promise.all([
-            api.template(id),
-            api.mappingRules(id).catch(() => ({ items: [] })),
-            api.valueMappingRules(id).catch(() => ({ items: [] })),
+            api.template(id, signal),
+            api.mappingRules(id, signal).catch(() => ({ items: [] })),
+            api.valueMappingRules(id, signal).catch(() => ({ items: [] })),
         ]));
-        if (!result) return;
+        requests.finish("template", signal);
+        if (!result || token !== templateRequestToken) return;
 
         const [details, rules, valueRules] = result;
         templateDetails.value = details;
         loadedTemplateFieldIds.value = new Set();
         templateFieldQueries.value = {};
         templateFieldMatchedCounts.value = {};
+        templateFieldPages.value = {};
         templateFieldSearchTimers.forEach((timer) => clearTimeout(timer));
         templateFieldSearchTimers.clear();
         templateFieldSearchTokens.clear();
@@ -150,14 +168,16 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         const templateId = templateDetails.value?.id;
         if (!templateId || templateRevisionsLoaded.value || templateRevisionsLoading.value) return;
         templateRevisionsLoading.value = true;
+        const signal = requests.start("template-revisions");
         try {
-            const result = await api.templateRevisions(templateId);
+            const result = await api.templateRevisions(templateId, signal);
             if (templateDetails.value?.id !== templateId) return;
             templateRevisions.value = result.items;
             templateRevisionsLoaded.value = true;
         } catch (caught) {
-            error.value = errorMessage(caught);
+            if (!isAbortError(caught)) error.value = errorMessage(caught);
         } finally {
+            requests.finish("template-revisions", signal);
             templateRevisionsLoading.value = false;
         }
     }
@@ -173,29 +193,87 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         loadingTemplateFieldIds.value = next;
     }
 
+    async function requestTemplateFieldValues(
+        fieldId: number,
+        query: string,
+        offset = 0,
+        append = false,
+    ) {
+        const token = (templateFieldSearchTokens.get(fieldId) || 0) + 1;
+        templateFieldSearchTokens.set(fieldId, token);
+        const requestKey = `template-field-${fieldId}`;
+        const signal = requests.start(requestKey);
+        setTemplateFieldLoading(fieldId, true);
+
+        try {
+            const result = await api.allowedValues(
+                fieldId,
+                query,
+                true,
+                offset,
+                workspace.value.settings?.template_value_page_size,
+                signal,
+            );
+            if (
+                templateFieldSearchTokens.get(fieldId) !== token
+                || !templateDetails.value?.fields
+            ) return;
+
+            templateDetails.value = {
+                ...templateDetails.value,
+                fields: templateDetails.value.fields.map((field) => {
+                    if (field.id !== fieldId) return field;
+                    const values = append ? [...field.allowed_values] : [];
+                    const known = new Set(values.map((item) => item.id));
+                    for (const item of result.values) {
+                        if (!known.has(item.id)) values.push(item);
+                    }
+                    return {
+                        ...field,
+                        allowed_values: values,
+                        allowed_values_count: result.total,
+                    };
+                }),
+            };
+            templateFieldMatchedCounts.value = {
+                ...templateFieldMatchedCounts.value,
+                [fieldId]: result.matched,
+            };
+            templateFieldPages.value = {
+                ...templateFieldPages.value,
+                [fieldId]: {
+                    query,
+                    matched: result.matched,
+                    hasMore: result.has_more,
+                },
+            };
+            loadedTemplateFieldIds.value = new Set([...loadedTemplateFieldIds.value, fieldId]);
+        } catch (caught) {
+            if (templateFieldSearchTokens.get(fieldId) === token && !isAbortError(caught)) {
+                error.value = errorMessage(caught);
+            }
+        } finally {
+            requests.finish(requestKey, signal);
+            if (templateFieldSearchTokens.get(fieldId) === token) {
+                setTemplateFieldLoading(fieldId, false);
+            }
+        }
+    }
+
     async function loadTemplateFieldValues(fieldId: number) {
         if (
             loadedTemplateFieldIds.value.has(fieldId)
             || loadingTemplateFieldIds.value.has(fieldId)
         ) return;
+        await requestTemplateFieldValues(fieldId, "");
+    }
 
-        setTemplateFieldLoading(fieldId, true);
-        try {
-            const result = await api.allowedValues(fieldId, "", true);
-            if (templateDetails.value?.fields) {
-                templateDetails.value = {
-                    ...templateDetails.value,
-                    fields: templateDetails.value.fields.map((field) => field.id === fieldId
-                        ? { ...field, allowed_values: result.values, allowed_values_count: result.total }
-                        : field),
-                };
-            }
-            loadedTemplateFieldIds.value = new Set([...loadedTemplateFieldIds.value, fieldId]);
-        } catch (caught) {
-            error.value = errorMessage(caught);
-        } finally {
-            setTemplateFieldLoading(fieldId, false);
-        }
+    async function loadMoreTemplateFieldValues(fieldId: number) {
+        if (loadingTemplateFieldIds.value.has(fieldId)) return;
+        const page = templateFieldPages.value[fieldId];
+        const field = templateDetails.value?.fields?.find((item) => item.id === fieldId);
+        if (!page?.hasMore || !field) return;
+        await requestTemplateFieldValues(fieldId, page.query, field.allowed_values.length, true);
     }
 
     function handleTemplateFieldOpen(open: boolean, fieldId: number) {
@@ -203,34 +281,20 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
     }
 
     function queueTemplateFieldValueSearch(fieldId: number, event: Event) {
-        const query = (event.target as HTMLInputElement).value;
+        const query = (event.target as HTMLInputElement).value.trim();
         templateFieldQueries.value = { ...templateFieldQueries.value, [fieldId]: query };
+        templateFieldSearchTokens.set(
+            fieldId,
+            (templateFieldSearchTokens.get(fieldId) || 0) + 1,
+        );
+        requests.cancel(`template-field-${fieldId}`);
         const previousTimer = templateFieldSearchTimers.get(fieldId);
         if (previousTimer) clearTimeout(previousTimer);
 
-        const token = (templateFieldSearchTokens.get(fieldId) || 0) + 1;
-        templateFieldSearchTokens.set(fieldId, token);
-        templateFieldSearchTimers.set(fieldId, setTimeout(async () => {
-            setTemplateFieldLoading(fieldId, true);
-            try {
-                const result = await api.allowedValues(fieldId, query, true);
-                if (templateFieldSearchTokens.get(fieldId) !== token || !templateDetails.value?.fields) return;
-                templateDetails.value = {
-                    ...templateDetails.value,
-                    fields: templateDetails.value.fields.map((field) => field.id === fieldId
-                        ? { ...field, allowed_values: result.values, allowed_values_count: result.total }
-                        : field),
-                };
-                templateFieldMatchedCounts.value = {
-                    ...templateFieldMatchedCounts.value,
-                    [fieldId]: result.matched,
-                };
-            } catch (caught) {
-                if (templateFieldSearchTokens.get(fieldId) === token) error.value = errorMessage(caught);
-            } finally {
-                if (templateFieldSearchTokens.get(fieldId) === token) setTemplateFieldLoading(fieldId, false);
-            }
-        }, 250));
+        templateFieldSearchTimers.set(fieldId, setTimeout(() => {
+            templateFieldSearchTimers.delete(fieldId);
+            void requestTemplateFieldValues(fieldId, query);
+        }, ATTRIBUTE_ASSISTANT_UI.searchDebounceMs));
     }
 
     async function updateTemplateCsv() {
@@ -292,7 +356,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
 
     async function removeTemplate(template: AttributeTemplate) {
         const requestKey = `template-remove-${template.id}`;
-        if (busy.value === requestKey) return;
+        if (isBusy(requestKey)) return;
         if (!await confirmAction({
             title: `Удалить шаблон «${template.name}»?`,
             description: "Будут удалены атрибуты, значения, синонимы и история шаблона. Используемый шаблон сервер удалить не позволит.",
@@ -366,7 +430,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
 
     async function removeTemplateField(field: NonNullable<AttributeTemplate["fields"]>[number]) {
         const requestKey = `field-remove-${field.id}`;
-        if (!templateDetails.value || busy.value === requestKey) return;
+        if (!templateDetails.value || isBusy(requestKey)) return;
         if (!await confirmAction({
             title: `Удалить атрибут «${field.name}»?`,
             description: "Заполненные значения товаров сохранятся как дополнительные атрибуты.",
@@ -528,7 +592,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
 
     function closeAllowedValueEditor() {
         const editor = allowedValueEditor.value;
-        if (editor && busy.value === `allowed-${editor.id}`) return;
+        if (editor && isBusy(`allowed-${editor.id}`)) return;
         allowedValueEditor.value = null;
     }
 
@@ -617,7 +681,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
             {
                 label: allowed.is_active ? "Отключить" : "Включить",
                 icon: allowed.is_active ? "i-lucide-circle-off" : "i-lucide-circle-check",
-                disabled: busy.value === `allowed-${allowed.id}`,
+                disabled: isBusy(`allowed-${allowed.id}`),
                 onSelect: () => void toggleAllowedValue(allowed.id, allowed.is_active),
             },
         ];
@@ -650,6 +714,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         templateFieldSearchTimers.forEach((timer) => clearTimeout(timer));
         templateFieldSearchTimers.clear();
         templateFieldSearchTokens.clear();
+        requests.dispose();
     }
 
     return {
@@ -667,6 +732,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         loadingTemplateFieldIds,
         templateFieldQueries,
         templateFieldMatchedCounts,
+        templateFieldPages,
         showNewTemplateField,
         allowedValueEditor,
         templateFieldEditor,
@@ -680,6 +746,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         loadTemplateRevisions,
         handleTemplateHistoryOpen,
         loadTemplateFieldValues,
+        loadMoreTemplateFieldValues,
         handleTemplateFieldOpen,
         queueTemplateFieldValueSearch,
         updateTemplateCsv,

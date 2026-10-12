@@ -14,6 +14,10 @@ from typing import Any
 from sqlalchemy import select
 
 from config import env_int
+from services.attribute_settings import (
+    DONOR_PRODUCT_CONCURRENCY,
+    OPERATION_ERROR_LIMIT,
+)
 from database import SessionLocal
 from models import AttributeProduct, Donor
 from services.attribute_assistant import (
@@ -71,7 +75,7 @@ def _append_error(batch_id: int, product: AttributeProduct | None, error: object
             "product": (product.model or product.name) if product is not None else "",
             "error": str(error),
         })
-        state["errors"] = errors[-50:]
+        state["errors"] = errors[-OPERATION_ERROR_LIMIT:]
 
 
 def get_attribute_batch_operation(batch_id: int) -> dict[str, Any]:
@@ -186,7 +190,16 @@ def _run_donor_products(
     fetcher: DonorPageFetcher,
 ) -> None:
     _update(batch_id, stage="donors")
-    for product_id in product_ids:
+    workers = max(
+        1,
+        min(
+            DONOR_PRODUCT_CONCURRENCY,
+            int(getattr(fetcher, "max_pages", DONOR_PRODUCT_CONCURRENCY)),
+            len(product_ids),
+        ),
+    )
+
+    def process_one(product_id: int) -> None:
         db = SessionLocal()
         product: AttributeProduct | None = None
         product_failed = False
@@ -230,6 +243,35 @@ def _run_donor_products(
                 failed=product_failed,
                 attributes_found=attributes_found if not product_failed else 0,
             )
+
+    if workers == 1:
+        for product_id in product_ids:
+            process_one(product_id)
+        return
+
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="attribute-donor",
+    ) as pool:
+        product_iterator = iter(product_ids)
+        pending: set[Future] = set()
+        for _ in range(workers):
+            try:
+                product_id = next(product_iterator)
+            except StopIteration:
+                break
+            pending.add(pool.submit(process_one, product_id))
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                # process_one records expected per-product failures itself.
+                # result() still surfaces coordinator/programming failures.
+                future.result()
+                try:
+                    product_id = next(product_iterator)
+                except StopIteration:
+                    continue
+                pending.add(pool.submit(process_one, product_id))
 
 
 def _prepare_chatgpt_product(

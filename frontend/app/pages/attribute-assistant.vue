@@ -26,6 +26,8 @@ import {
   valueStatusColor,
   valueStatusLabel,
 } from "~/utils/attribute-assistant";
+import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
+import { attributeAssistantService as attributeApi } from "~/services/attribute-assistant.service";
 
 definePageMeta({
   title: "Атрибуты",
@@ -34,7 +36,9 @@ definePageMeta({
 
 const assistant = useAttributeAssistant();
 
-const allowedValuesState = useAttributeAllowedValues();
+const allowedValuesState = useAttributeAllowedValues(
+  () => assistant.workspace.value.settings?.allowed_value_page_size,
+);
 
 const templatesState = useAttributeTemplates(assistant);
 
@@ -70,7 +74,8 @@ onBeforeUnmount(() => attributeHeadObserver?.disconnect());
  */
 const {
   loading,
-  busy,
+  hasBusy,
+  isBusy,
   error,
   tab,
   inputMode,
@@ -108,6 +113,7 @@ const {
   loadingTemplateFieldIds,
   templateFieldQueries,
   templateFieldMatchedCounts,
+  templateFieldPages,
   showNewTemplateField,
   allowedValueEditor,
   templateFieldEditor,
@@ -121,6 +127,7 @@ const {
   handleTemplateHistoryOpen,
   handleTemplateFieldOpen,
   queueTemplateFieldValueSearch,
+  loadMoreTemplateFieldValues,
   updateTemplateCsv,
   copyCurrentTemplate,
   toggleTemplateActive,
@@ -143,6 +150,10 @@ const {
   saveAllowedValue,
   allowedValueMenuItems,
 } = templatesState;
+
+const recentBatches = computed(() =>
+  workspace.value.batches.slice(0, ATTRIBUTE_ASSISTANT_UI.recentBatchCount),
+);
 
 /**
  * Проверка товаров / batch / доноры / атрибуты.
@@ -352,8 +363,8 @@ onBeforeUnmount(() => {
             size="lg"
             trailing-icon="i-lucide-arrow-right"
             class="aa-create-action"
-            :loading="busy === 'batch-import' || busy === 'url-import'"
-            :disabled="Boolean(busy)"
+            :loading="isBusy('batch-import') || isBusy('url-import')"
+            :disabled="hasBusy"
             @click="createBatch"
           >
             Создать обработку
@@ -378,7 +389,7 @@ onBeforeUnmount(() => {
             </template>
             <template v-else>
               <p class="aa-muted">Авторизация через код устройства. Ключ API не нужен.</p>
-              <UButton color="neutral" variant="soft" :disabled="busy === 'chatgpt-login'" @click="loginChatGpt">
+              <UButton color="neutral" variant="soft" :disabled="isBusy('chatgpt-login')" @click="loginChatGpt">
                 Подключить ChatGPT
               </UButton>
             </template>
@@ -393,7 +404,7 @@ onBeforeUnmount(() => {
           <UCard as="section" variant="outline" class="aa-card">
             <div class="aa-card-head"><h2>Последние обработки</h2></div>
             <article
-              v-for="batch in workspace.batches.slice(0, 5)"
+              v-for="batch in recentBatches"
               :key="batch.id"
               class="aa-history-entry"
             >
@@ -407,7 +418,7 @@ onBeforeUnmount(() => {
                 icon="i-lucide-trash-2"
                 square
 
-                :loading="busy === `batch-remove-${batch.id}`"
+                :loading="isBusy(`batch-remove-${batch.id}`)"
                 :title="`Удалить обработку «${batch.name}»`"
                 :aria-label="`Удалить обработку «${batch.name}»`"
                 @click="removeBatch(batch)"
@@ -453,8 +464,8 @@ onBeforeUnmount(() => {
             </UFormField>
           </div>
           <div class="aa-inline-actions">
-            <UButton color="neutral" variant="soft" icon="i-lucide-file-search" :loading="busy === 'template-preview'" :disabled="Boolean(busy)" @click="previewNewTemplate">Проверить файл</UButton>
-            <UButton color="primary" icon="i-lucide-file-plus-2" :loading="busy === 'template-import'" :disabled="Boolean(busy) || !templatePreview?.can_import" @click="importTemplate">
+            <UButton color="neutral" variant="soft" icon="i-lucide-file-search" :loading="isBusy('template-preview')" :disabled="hasBusy" @click="previewNewTemplate">Проверить файл</UButton>
+            <UButton color="primary" icon="i-lucide-file-plus-2" :loading="isBusy('template-import')" :disabled="hasBusy || !templatePreview?.can_import" @click="importTemplate">
               Подтвердить импорт
             </UButton>
           </div>
@@ -486,14 +497,14 @@ onBeforeUnmount(() => {
                   color="neutral"
                   variant="soft"
                   icon="i-lucide-folder-open"
-                  :loading="busy === `template-open-${item.id}`"
+                  :loading="isBusy(`template-open-${item.id}`)"
                   @click="openTemplate(item.id)"
                 />
                 <UButton
                   color="error"
                   variant="ghost"
                   icon="i-lucide-trash-2"
-                  :loading="busy === `template-remove-${item.id}`"
+                  :loading="isBusy(`template-remove-${item.id}`)"
                   @click="removeTemplate(item)"
                 />
               </span>
@@ -521,7 +532,7 @@ onBeforeUnmount(() => {
               :color="templateDetails.is_active ? 'error' : 'success'"
               variant="soft"
               :icon="templateDetails.is_active ? 'i-lucide-circle-off' : 'i-lucide-circle-check'"
-              :loading="busy === 'template-active'"
+              :loading="isBusy('template-active')"
               @click="toggleTemplateActive"
             >
               {{ templateDetails.is_active ? "Деактивировать" : "Активировать" }}
@@ -531,7 +542,7 @@ onBeforeUnmount(() => {
               color="error"
               variant="soft"
               icon="i-lucide-trash-2"
-              :loading="busy === `template-remove-${templateDetails.id}`"
+              :loading="isBusy(`template-remove-${templateDetails.id}`)"
               @click="removeTemplate(templateDetails)"
             >Удалить шаблон</UButton>
           </div>
@@ -550,7 +561,7 @@ onBeforeUnmount(() => {
           <UFormField label="Режим обновления">
             <USelect v-model="templateUpdateMode" :items="templateUpdateModeItems" class="w-full" />
           </UFormField>
-          <UButton color="primary" icon="i-lucide-refresh-cw" :loading="busy === 'template-update'" :disabled="!templateUpdateFile" @click="updateTemplateCsv">Проверить diff и обновить</UButton>
+          <UButton color="primary" icon="i-lucide-refresh-cw" :loading="isBusy('template-update')" :disabled="!templateUpdateFile" @click="updateTemplateCsv">Проверить diff и обновить</UButton>
         </div>
         <div class="aa-template-field-toolbar">
           <div>
@@ -570,7 +581,7 @@ onBeforeUnmount(() => {
           </UFormField>
           <UCheckbox v-model="newTemplateField.is_required" label="Обязательный" />
           <UCheckbox v-model="newTemplateField.is_composite" label="Составной через /" />
-          <UButton color="primary" icon="i-lucide-plus" type="submit" :loading="busy === 'field-create'">Добавить</UButton>
+          <UButton color="primary" icon="i-lucide-plus" type="submit" :loading="isBusy('field-create')">Добавить</UButton>
         </form>
 
 
@@ -602,7 +613,7 @@ onBeforeUnmount(() => {
                     color="error"
                     variant="soft"
                     icon="i-lucide-trash-2"
-                    :loading="busy === `field-remove-${field.id}`"
+                    :loading="isBusy(`field-remove-${field.id}`)"
                     @click="removeTemplateField(field)"
                   >Удалить</UButton>
                 </div>
@@ -616,14 +627,16 @@ onBeforeUnmount(() => {
                       class="w-full"
                       @input="queueTemplateFieldValueSearch(field.id, $event)"
                     />
-                    <small v-if="templateFieldQueries[field.id]">Найдено: {{ templateFieldMatchedCounts[field.id] ?? 0 }}</small>
-                    <small v-else>Показаны первые {{ Math.min(field.allowed_values.length, 80) }} из {{ field.allowed_values_count }}</small>
+                    <small v-if="templateFieldQueries[field.id]">
+                      Загружено {{ field.allowed_values.length }} из {{ templateFieldMatchedCounts[field.id] ?? 0 }} найденных
+                    </small>
+                    <small v-else>Загружено {{ field.allowed_values.length }} из {{ field.allowed_values_count }}</small>
                   </div>
                   <div v-if="loadingTemplateFieldIds.has(field.id)" class="aa-template-values-loading">
-                    <USkeleton v-for="index in 4" :key="index" class="h-8 w-28 rounded-full" />
+                    <USkeleton v-for="index in ATTRIBUTE_ASSISTANT_UI.skeletonItemCount" :key="index" class="h-8 w-28 rounded-full" />
                   </div>
                   <div
-                    v-for="allowed in field.allowed_values.slice(0, 80)"
+                    v-for="allowed in field.allowed_values"
                     :key="allowed.id"
                     :class="['aa-value-chip', { inactive: !allowed.is_active }]"
                   >
@@ -654,6 +667,14 @@ onBeforeUnmount(() => {
                     :title="templateFieldQueries[field.id] ? 'Совпадений не найдено' : 'Разрешённых значений пока нет'"
                     description="Измените запрос или добавьте новое значение в справочник."
                   />
+                  <UButton
+                    v-if="templateFieldPages[field.id]?.hasMore"
+                    color="neutral"
+                    variant="soft"
+                    icon="i-lucide-chevrons-down"
+                    :loading="loadingTemplateFieldIds.has(field.id)"
+                    @click="loadMoreTemplateFieldValues(field.id)"
+                  >Показать ещё</UButton>
                 </div>
               </div>
             </template>
@@ -666,7 +687,7 @@ onBeforeUnmount(() => {
           </template>
           <div v-for="rule in mappingRules" :key="rule.id" class="aa-history-row">
             <span><strong>{{ rule.donor_name }}: {{ rule.donor_attribute_name }}</strong><small>→ {{ rule.field_name }}</small></span>
-            <UButton color="error" variant="ghost" icon="i-lucide-trash-2" :loading="busy === `mapping-remove-${rule.id}`" @click="removeMapping(rule.id)">Удалить</UButton>
+            <UButton color="error" variant="ghost" icon="i-lucide-trash-2" :loading="isBusy(`mapping-remove-${rule.id}`)" @click="removeMapping(rule.id)">Удалить</UButton>
           </div>
           <EmptyState
             v-if="!mappingRules.length"
@@ -685,7 +706,7 @@ onBeforeUnmount(() => {
               <strong>{{ rule.donor_name }}: {{ rule.raw_value }} → {{ rule.allowed_value }}</strong>
               <small>{{ rule.field_name }}</small>
             </span>
-            <UButton color="error" variant="ghost" icon="i-lucide-trash-2" :loading="busy === `value-mapping-remove-${rule.id}`" @click="removeValueMapping(rule.id)">Удалить</UButton>
+            <UButton color="error" variant="ghost" icon="i-lucide-trash-2" :loading="isBusy(`value-mapping-remove-${rule.id}`)" @click="removeValueMapping(rule.id)">Удалить</UButton>
           </div>
           <EmptyState
             v-if="!valueMappingRules.length"
@@ -725,17 +746,17 @@ onBeforeUnmount(() => {
           <UButton color="neutral" variant="soft" @click="bulk('accept_high')">Принять уверенные</UButton>
           <UButton color="neutral" variant="soft" @click="bulk('fill_dashes')">Заполнить пропуски «-»</UButton>
 
-          <UButton v-if="selectedBatch.original_ready" :to="`/api/attribute-assistant/batches/${selectedBatch.id}/original/download`" external color="neutral" variant="soft" icon="i-lucide-file-spreadsheet">Исходный CSV</UButton>
-          <UButton :to="`/api/attribute-assistant/batches/${selectedBatch.id}/report/download`" external color="neutral" variant="soft" icon="i-lucide-file-text">Скачать отчёт</UButton>
-          <UButton color="neutral" variant="soft" :disabled="Boolean(busy)" @click="exportReadyOnly">Экспортировать готовые</UButton>
-          <UButton color="primary" :disabled="Boolean(busy)" @click="exportBatch">
+          <UButton v-if="selectedBatch.original_ready" :to="attributeApi.batchOriginalDownloadUrl(selectedBatch.id)" external color="neutral" variant="soft" icon="i-lucide-file-spreadsheet">Исходный CSV</UButton>
+          <UButton :to="attributeApi.batchReportDownloadUrl(selectedBatch.id)" external color="neutral" variant="soft" icon="i-lucide-file-text">Скачать отчёт</UButton>
+          <UButton color="neutral" variant="soft" :disabled="hasBusy" @click="exportReadyOnly">Экспортировать готовые</UButton>
+          <UButton color="primary" :disabled="hasBusy" @click="exportBatch">
             <UIcon name="i-lucide-download" /> Экспорт всех
           </UButton>
           <UButton
             color="error"
             variant="soft"
             icon="i-lucide-trash-2"
-            :loading="busy === `batch-remove-${selectedBatch.id}`"
+            :loading="isBusy(`batch-remove-${selectedBatch.id}`)"
             @click="removeBatch(selectedBatch)"
           >Удалить обработку</UButton>
         </div>
@@ -771,7 +792,7 @@ onBeforeUnmount(() => {
             >
               <span>
                 <strong>{{ product.model }}</strong>
-                <small style="text-wrap-mode: wrap">{{ product.name || "Без названия" }}</small>
+                <small class="aa-product-name">{{ product.name || "Без названия" }}</small>
               </span>
               <b :class="product.status">{{ productListIndicator(product) }}</b>
             </UButton>
@@ -816,7 +837,7 @@ onBeforeUnmount(() => {
                     <strong>{{ item.label }}</strong>
                     <small>{{ formatHistoryDate(item.created_at) }} · изменено: {{ item.changed_count }}</small>
                   </span>
-                  <UButton color="neutral" variant="soft" icon="i-lucide-undo-2" :loading="busy === 'history-restore'" @click="restoreHistory(item.id)">Вернуть</UButton>
+                  <UButton color="neutral" variant="soft" icon="i-lucide-undo-2" :loading="isBusy('history-restore')" @click="restoreHistory(item.id)">Вернуть</UButton>
                 </article>
                 <EmptyState
                   v-if="!historyItems.length"
@@ -860,19 +881,19 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-else class="aa-priority-empty">Выберите доноров слева. Ссылка на товар будет найдена по модели автоматически.</div>
                 <div class="aa-inline-actions">
-                  <UButton color="primary" :disabled="batchOperationRunning || busy === 'process' || !selectedDonors.length" @click="processDonors">
+                  <UButton color="primary" :disabled="batchOperationRunning || isBusy('process') || !selectedDonors.length" @click="processDonors">
                     <UIcon name="i-lucide-wand-sparkles" /> Найти и проверить
                   </UButton>
                   <UButton
                     color="primary"
                     variant="soft"
                     icon="i-lucide-sparkles"
-                    :loading="busy === 'chatgpt-product'"
+                    :loading="isBusy('chatgpt-product')"
                     :disabled="batchOperationRunning || !chatGpt?.authenticated"
                     :title="chatGpt?.authenticated ? 'Проанализировать страницу выбранного товара через ChatGPT' : 'Сначала подключите ChatGPT'"
                     @click="askChatGpt"
                   >Спросить ChatGPT</UButton>
-                  <UButton color="neutral" variant="soft" :disabled="batchOperationRunning || busy === 'similar'" @click="useSimilar">Похожие товары</UButton>
+                  <UButton color="neutral" variant="soft" :disabled="batchOperationRunning || isBusy('similar')" @click="useSimilar">Похожие товары</UButton>
                 </div>
               </div>
             </div>
@@ -887,7 +908,7 @@ onBeforeUnmount(() => {
                   <UButton
                     color="primary"
                     icon="i-lucide-scan-search"
-                    :loading="busy === 'process-all'"
+                    :loading="isBusy('process-all')"
                     :disabled="batchOperationRunning || !selectedDonors.length"
                     @click="processAllProducts"
                   >Найти и проверить (все товары)</UButton>
@@ -1016,7 +1037,7 @@ onBeforeUnmount(() => {
                       :ignore-filter="true"
                       :virtualize="true"
                       multiple
-                      :disabled="busy === `value-${value.id}`"
+                      :disabled="isBusy(`value-${value.id}`)"
                       @update:search-term="queueAllowedSearch(value, $event)"
                       @update:open="handleAllowedMenuOpen(value, finalAllowedMenuKey(value), $event)"
                       @update:model-value="selectFinalValue(value, $event)"
@@ -1035,7 +1056,7 @@ onBeforeUnmount(() => {
                       :reset-search-term-on-blur="true"
                       :ignore-filter="true"
                       :virtualize="true"
-                      :disabled="busy === `value-${value.id}`"
+                      :disabled="isBusy(`value-${value.id}`)"
                       @update:search-term="queueAllowedSearch(value, $event)"
                       @update:open="handleAllowedMenuOpen(value, finalAllowedMenuKey(value), $event)"
                       @update:model-value="selectFinalValue(value, $event)"
@@ -1057,7 +1078,7 @@ onBeforeUnmount(() => {
                     color="error"
                     variant="soft"
                     icon="i-lucide-trash-2"
-                    :loading="busy === `value-remove-${value.id}`"
+                    :loading="isBusy(`value-remove-${value.id}`)"
                     @click="removeOutsideTemplateValue(value)"
                   >Удалить атрибут</UButton>
                   <UButton
@@ -1065,7 +1086,7 @@ onBeforeUnmount(() => {
                     color="success"
                     variant="soft"
                     icon="i-lucide-check"
-                    :loading="busy === `value-${value.id}`"
+                    :loading="isBusy(`value-${value.id}`)"
                     @click="valueAction(value, 'accept', value.final_value)"
                   >Подтвердить итог</UButton>
                   <UButton
@@ -1073,7 +1094,7 @@ onBeforeUnmount(() => {
                     color="success"
                     variant="soft"
                     icon="i-lucide-check"
-                    :loading="busy === `value-${value.id}`"
+                    :loading="isBusy(`value-${value.id}`)"
                     @click="valueAction(value, 'accept', displayedProposal(value))"
                   >Принять</UButton>
                   <UButton
@@ -1081,7 +1102,7 @@ onBeforeUnmount(() => {
                     color="error"
                     variant="ghost"
                     icon="i-lucide-x"
-                    :disabled="busy === `value-${value.id}`"
+                    :disabled="isBusy(`value-${value.id}`)"
                     @click="valueAction(value, 'reject')"
                   >Отклонить</UButton>
                   <UButton
@@ -1089,7 +1110,7 @@ onBeforeUnmount(() => {
                     color="neutral"
                     variant="ghost"
                     icon="i-lucide-minus"
-                    :disabled="busy === `value-${value.id}`"
+                    :disabled="isBusy(`value-${value.id}`)"
                     @click="valueAction(value, 'dash')"
                   >Поставить «-»</UButton>
                 </div>
@@ -1130,7 +1151,7 @@ onBeforeUnmount(() => {
                         color="success"
                         variant="soft"
                         icon="i-lucide-check"
-                        :loading="busy === `value-${value.id}`"
+                        :loading="isBusy(`value-${value.id}`)"
                         @click="valueAction(value, 'accept', candidate.value)"
                       >Выбрать</UButton>
                     </div>
@@ -1164,12 +1185,12 @@ onBeforeUnmount(() => {
                       color="primary"
                       variant="soft"
                       icon="i-lucide-bookmark-check"
-                      :loading="busy === `value-mapping-${value.id}-${index}`"
+                      :loading="isBusy(`value-mapping-${value.id}-${index}`)"
                       :disabled="!unknownSelections[unknownSelectionKey(value, index)]"
                       @click="rememberUnknownValue(value, unknown, index)"
                     >Применить и запомнить</UButton>
                   </div>
-                  <UButton v-if="!value.current_value" color="warning" variant="soft" icon="i-lucide-book-plus" :loading="busy === `dictionary-${value.id}`" @click="addUnknown(value, unknown)">Добавить как новое значение</UButton>
+                  <UButton v-if="!value.current_value" color="warning" variant="soft" icon="i-lucide-book-plus" :loading="isBusy(`dictionary-${value.id}`)" @click="addUnknown(value, unknown)">Добавить как новое значение</UButton>
                 </div>
               </article>
             </div>
@@ -1185,7 +1206,7 @@ onBeforeUnmount(() => {
       :open="Boolean(templateFieldEditor)"
       title="Редактирование атрибута"
       description="Измените структуру поля и названия, встречающиеся у доноров."
-      :dismissible="busy !== `field-${templateFieldEditor?.id}`"
+      :dismissible="!isBusy(`field-${templateFieldEditor?.id}`)"
       :ui="{ content: 'sm:max-w-2xl' }"
       @update:open="(open) => { if (!open) templateFieldEditor = null }"
     >
@@ -1268,7 +1289,7 @@ onBeforeUnmount(() => {
           <UButton color="neutral" variant="soft" @click="templateFieldEditor = null">Отмена</UButton>
           <UButton
             color="primary"
-            :loading="busy === `field-${templateFieldEditor?.id}`"
+            :loading="isBusy(`field-${templateFieldEditor?.id}`)"
             :disabled="!templateFieldEditor?.name.trim()"
             @click="saveTemplateFieldEdit"
           >
@@ -1282,7 +1303,7 @@ onBeforeUnmount(() => {
       :open="Boolean(fieldValueEditor)"
       :title="`Добавить значение · ${fieldValueEditor?.fieldName || ''}`"
       description="Новое значение попадёт в справочник этого атрибута."
-      :dismissible="busy !== `field-value-${fieldValueEditor?.fieldId}`"
+      :dismissible="!isBusy(`field-value-${fieldValueEditor?.fieldId}`)"
       @update:open="(open) => { if (!open) fieldValueEditor = null }"
     >
       <template v-if="fieldValueEditor" #body>
@@ -1300,7 +1321,7 @@ onBeforeUnmount(() => {
           <UButton color="neutral" variant="soft" @click="fieldValueEditor = null">Отмена</UButton>
           <UButton
             color="primary"
-            :loading="busy === `field-value-${fieldValueEditor?.fieldId}`"
+            :loading="isBusy(`field-value-${fieldValueEditor?.fieldId}`)"
             :disabled="!fieldValueEditor?.value.trim()"
             @click="saveFieldValue"
           >
@@ -1314,7 +1335,7 @@ onBeforeUnmount(() => {
       :open="Boolean(allowedValueEditor)"
       :title="`Значение и синонимы · ${allowedValueEditor?.fieldName || ''}`"
       description="Синонимы помогают сопоставить формулировки доноров с точным значением шаблона."
-      :dismissible="busy !== `allowed-${allowedValueEditor?.id}`"
+      :dismissible="!isBusy(`allowed-${allowedValueEditor?.id}`)"
       :ui="{ content: 'sm:max-w-2xl' }"
       @update:open="(open) => { if (!open) closeAllowedValueEditor() }"
     >
@@ -1358,14 +1379,14 @@ onBeforeUnmount(() => {
           <UButton
             color="neutral"
             variant="soft"
-            :disabled="busy === `allowed-${allowedValueEditor?.id}`"
+            :disabled="isBusy(`allowed-${allowedValueEditor?.id}`)"
             @click="closeAllowedValueEditor"
           >
             Отмена
           </UButton>
           <UButton
             color="primary"
-            :loading="busy === `allowed-${allowedValueEditor?.id}`"
+            :loading="isBusy(`allowed-${allowedValueEditor?.id}`)"
             @click="saveAllowedValue"
           >
             Сохранить

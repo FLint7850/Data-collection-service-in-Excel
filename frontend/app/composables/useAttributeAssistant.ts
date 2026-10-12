@@ -6,6 +6,11 @@ import type {
     ChatGptStatus,
 } from "~/types/attribute-assistant";
 import { errorMessage } from "~/utils/format";
+import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
+import {
+    createLatestRequestCoordinator,
+    isAbortError,
+} from "~/utils/latest-request";
 
 export type AttributeAssistantTab = "start" | "templates" | "review";
 export type AttributeRouteWriteMode = "push" | "replace";
@@ -21,7 +26,9 @@ export function useAttributeAssistant() {
     const toast = useToast();
 
     const loading = ref(true);
-    const busy = ref("");
+    const activeOperations = ref<Record<string, number>>({});
+    const busy = computed(() => Object.keys(activeOperations.value)[0] || "");
+    const hasBusy = computed(() => Object.keys(activeOperations.value).length > 0);
     const error = ref("");
     const tab = ref<AttributeAssistantTab>("start");
     const inputMode = ref<"csv" | "urls">("csv");
@@ -29,6 +36,7 @@ export function useAttributeAssistant() {
         templates: [],
         donors: [],
         batches: [],
+        settings: null,
         dashboard: {
             active_templates: 0,
             batches: 0,
@@ -49,6 +57,7 @@ export function useAttributeAssistant() {
 
     let authPoll: ReturnType<typeof setInterval> | null = null;
     let routeWriter: RouteWriter | null = null;
+    const requests = createLatestRequestCoordinator();
 
     const templates = computed(() => workspace.value.templates);
     const donors = computed(() => workspace.value.donors);
@@ -71,16 +80,27 @@ export function useAttributeAssistant() {
     }
 
     async function run<T>(key: string, task: () => Promise<T>): Promise<T | null> {
-        busy.value = key;
+        activeOperations.value = {
+            ...activeOperations.value,
+            [key]: (activeOperations.value[key] || 0) + 1,
+        };
         error.value = "";
         try {
             return await task();
         } catch (caught) {
-            error.value = errorMessage(caught);
+            if (!isAbortError(caught)) error.value = errorMessage(caught);
             return null;
         } finally {
-            busy.value = "";
+            const next = { ...activeOperations.value };
+            const remaining = (next[key] || 1) - 1;
+            if (remaining > 0) next[key] = remaining;
+            else delete next[key];
+            activeOperations.value = next;
         }
+    }
+
+    function isBusy(key: string) {
+        return Boolean(activeOperations.value[key]);
     }
 
     async function confirmAction(options: Record<string, unknown>) {
@@ -92,14 +112,24 @@ export function useAttributeAssistant() {
     }
 
     async function loadWorkspace() {
-        const data = await run("load", () => api.workspace());
+        const signal = requests.start("workspace");
+        const data = await run("load", () => api.workspace(signal));
+        requests.finish("workspace", signal);
         if (!data) return;
         workspace.value = data;
         selectedTemplateId.value ||= data.templates[0]?.id || null;
     }
 
     async function loadChatGpt() {
-        chatGpt.value = await api.chatGptStatus();
+        const signal = requests.start("chatgpt-status");
+        try {
+            chatGpt.value = await api.chatGptStatus(signal);
+        } catch (caught) {
+            if (!isAbortError(caught)) error.value = errorMessage(caught);
+            return;
+        } finally {
+            requests.finish("chatgpt-status", signal);
+        }
         if (chatGpt.value.authenticated && authPoll) {
             clearInterval(authPoll);
             authPoll = null;
@@ -116,7 +146,7 @@ export function useAttributeAssistant() {
         await navigator.clipboard?.writeText(login.user_code).catch(() => undefined);
 
         if (authPoll) clearInterval(authPoll);
-        authPoll = setInterval(() => void loadChatGpt(), 3000);
+        authPoll = setInterval(() => void loadChatGpt(), ATTRIBUTE_ASSISTANT_UI.authPollMs);
     }
 
     async function logoutChatGpt() {
@@ -137,11 +167,14 @@ export function useAttributeAssistant() {
         if (authPoll) clearInterval(authPoll);
         authPoll = null;
         routeWriter = null;
+        requests.dispose();
     }
 
     return {
         loading,
         busy,
+        hasBusy,
+        isBusy,
         error,
         tab,
         inputMode,
