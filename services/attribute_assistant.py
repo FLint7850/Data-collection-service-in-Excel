@@ -13,10 +13,10 @@ import gzip
 import io
 import json
 import re
-import shutil
 import socket
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
@@ -29,6 +29,7 @@ from urllib.parse import urljoin, urlparse
 
 import chardet
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from sqlalchemy import and_, case, delete, exists, func, inspect, or_, select, update
 from sqlalchemy.orm.attributes import NO_VALUE
@@ -41,15 +42,32 @@ from config import (
 )
 from services.attribute_settings import (
     ALLOWED_VALUE_PAGE_SIZE,
+    AUTO_CONFIDENT_CONFIDENCE,
+    AUTO_PRIMARY_CONFIDENCE,
+    BULK_CHUNK_SIZE,
     BULK_CONFIDENCE,
+    EXACT_VALUE_CONFIDENCE,
+    DONOR_FAILURE_STATUSES,
+    DONOR_OPENED_STATUSES,
+    DONOR_SOURCE_ROLES,
     HISTORY_LIMIT,
     MAX_PAGE_SIZE,
+    PUBLIC_PROCESSING_MODES,
+    ProcessingMode,
+    PRODUCT_REVISION_RETENTION,
     PRODUCT_PAGE_SIZE,
+    REVIEW_VALUE_STATUSES,
+    TEMPLATE_REVISION_RETENTION,
     TEMPLATE_VALUE_PAGE_SIZE,
+    URL_IMPORT_CONCURRENCY,
     WORKSPACE_BATCH_LIMIT,
+    StaleProductError,
+    processing_mode as validated_processing_mode,
 )
+from services.attribute_files import delete_after_commit, file_ready, stage_bytes, stage_text, staged_path
 from services.attribute_programs import is_program_list, match_programs
 from services.attribute_listing import batch_summary, product_page
+from services.attribute_text import mapping_value_key, product_search_text
 from models import (
     AttributeAllowedValue,
     AttributeBatch,
@@ -165,11 +183,6 @@ LINEAR_UNIT_ALIASES = {
     "литр": "л", "литра": "л", "литров": "л",
     **{unit: unit for unit in LINEAR_UNIT_FACTORS},
 }
-PROCESSING_MODES = {
-    "check", "suggest", "auto", "auto_exact", "auto_primary",
-    "auto_confident", "auto_all",
-}
-
 MAX_PUBLIC_REDIRECTS = 8
 TEMPLATE_SNAPSHOT_SCHEMA = "attribute-template-snapshot"
 PRODUCT_SNAPSHOT_SCHEMA = "attribute-product-snapshot"
@@ -420,7 +433,7 @@ def allowed_value_options(
 ) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or ALLOWED_VALUE_PAGE_SIZE), MAX_PAGE_SIZE))
     safe_offset = max(0, int(offset or 0))
-    query_key = exact_value_key(query).casefold()
+    query_key = product_search_text(query)
     db = object_session(field)
 
     # Detached/transient fields are used by a few pure domain callers. Persisted
@@ -431,8 +444,8 @@ def allowed_value_options(
         if query_key:
             ranked: list[tuple[int, int, AttributeAllowedValue]] = []
             for item in available:
-                searchable = [exact_value_key(item.value).casefold(), *(
-                    exact_value_key(synonym.synonym).casefold() for synonym in item.synonyms
+                searchable = [product_search_text(item.value), *(
+                    product_search_text(synonym.synonym) for synonym in item.synonyms
                 )]
                 matching = [text for text in searchable if query_key in text]
                 if matching:
@@ -456,26 +469,14 @@ def allowed_value_options(
         if not include_inactive:
             base_conditions.append(allowed.is_active.is_(True))
 
-        if db.bind is not None and db.bind.dialect.name == "sqlite":
-            connection = db.connection().connection.driver_connection
-            connection.create_function(
-                "attribute_casefold",
-                1,
-                lambda value: exact_value_key(value).casefold(),
-                deterministic=True,
-            )
-            search_key = func.attribute_casefold
-        else:
-            search_key = func.lower
-
         total = int(db.scalar(
             select(func.count(allowed.id)).where(*base_conditions)
         ) or 0)
         match_condition = None
         quality = None
         if query_key:
-            value_key = search_key(allowed.value)
-            synonym_key = search_key(synonym.synonym)
+            value_key = allowed.search_value
+            synonym_key = synonym.search_synonym
 
             def synonym_exists(condition):
                 return exists(select(synonym.id).where(
@@ -509,7 +510,7 @@ def allowed_value_options(
         ordering = [allowed.sort_order]
         if quality is not None:
             ordering.insert(0, quality)
-        ordering.extend((search_key(allowed.value), allowed.id))
+        ordering.extend((allowed.search_value, allowed.id))
         page = list(db.scalars(
             select(allowed)
             .where(*page_conditions)
@@ -621,6 +622,7 @@ def import_template_csv(
                         field=field,
                         value=normalized,
                         normalized_value=key,
+                        search_value=product_search_text(normalized),
                         is_combination=is_combination,
                         sort_order=len(allowed_items) - 1,
                     )
@@ -652,6 +654,7 @@ def add_allowed_value(db: Session, field: AttributeTemplateField, value: str, sy
             field=field,
             value=normalized,
             normalized_value=key,
+            search_value=product_search_text(normalized),
             source="manual",
             sort_order=len(field.allowed_values),
         )
@@ -661,7 +664,12 @@ def add_allowed_value(db: Session, field: AttributeTemplateField, value: str, sy
     if len(clean_text(synonym)) > 1000:
         raise ValueError("Синоним не должен превышать 1000 символов")
     if synonym_key and not any(item.normalized_synonym == synonym_key for item in allowed.synonyms):
-        db.add(AttributeValueSynonym(allowed_value=allowed, synonym=exact_value_key(synonym), normalized_synonym=synonym_key))
+        db.add(AttributeValueSynonym(
+            allowed_value=allowed,
+            synonym=exact_value_key(synonym),
+            normalized_synonym=synonym_key,
+            search_synonym=product_search_text(synonym),
+        ))
     return allowed
 
 
@@ -693,9 +701,11 @@ def replace_allowed_value_synonyms(
                 allowed_value=allowed,
                 synonym=synonym,
                 normalized_synonym=synonym_key,
+                search_synonym=product_search_text(synonym),
             )
         else:
             item.synonym = synonym
+            item.search_synonym = product_search_text(synonym)
         replacement.append(item)
 
     allowed.synonyms = replacement
@@ -874,6 +884,8 @@ def refresh_batch_summary(batch: AttributeBatch) -> dict[str, int]:
                         refresh_product_status(product)
         session.flush()
         batch.summary = batch_summary(session, batch.id)
+        batch.products_count = batch.summary["products"]
+        batch.attributes_count = batch.summary["attributes"]
         return batch.summary
     products = list(batch.products)
     values = [value for product in products for value in product.values]
@@ -883,6 +895,7 @@ def refresh_batch_summary(batch: AttributeBatch) -> dict[str, int]:
             refresh_product_status(product)
     summary = {
         "products": len(products),
+        "attributes": len(values),
         "ready": sum(product.status == "ready" for product in products),
         "needs_review": sum(product.status != "ready" for product in products),
         "filled": sum(bool(value.final_value and value.final_value != "-") for value in values if value.is_in_template),
@@ -891,6 +904,8 @@ def refresh_batch_summary(batch: AttributeBatch) -> dict[str, int]:
         "suggestions": sum(value.status == "suggested" for value in values),
     }
     batch.summary = summary
+    batch.products_count = summary["products"]
+    batch.attributes_count = summary["attributes"]
     return summary
 
 
@@ -899,13 +914,24 @@ def refresh_product_status(product: AttributeProduct) -> str:
         _repair_existing_value_status(value)
     review = any(
         value.is_in_template and (
-            value.status in {"missing", "suggested", "conflict", "unknown", "ambiguous"}
+            value.status in REVIEW_VALUE_STATUSES
             or not value.final_value
         )
         for value in product.values
     )
     product.status = "needs_review" if review else "ready"
     return product.status
+
+
+def touch_product(product: AttributeProduct) -> None:
+    product.version = max(1, int(product.version or 1)) + 1
+    product.search_text = product_search_text(
+        product.external_id,
+        product.model,
+        product.name,
+        product.brand,
+        product.category_name,
+    )
 
 
 def create_batch_from_csv(
@@ -924,7 +950,7 @@ def create_batch_from_csv(
         template=template,
         name=clean_text(name) or Path(filename).stem,
         input_mode="csv",
-        processing_mode=processing_mode if processing_mode in PROCESSING_MODES else "suggest",
+        processing_mode=validated_processing_mode(processing_mode).value,
         source_filename=clean_text(filename),
     )
     db.add(batch)
@@ -932,7 +958,7 @@ def create_batch_from_csv(
     input_dir = ATTRIBUTE_ASSISTANT_DIR / "inputs"
     input_dir.mkdir(parents=True, exist_ok=True)
     stored = input_dir / f"{batch.id}_{uuid.uuid4().hex[:8]}.csv"
-    stored.write_bytes(data)
+    stage_bytes(db, stored, data)
     batch.original_path = str(stored)
     # Only this import reuses matches. The cache cannot outlive template edits
     # or syncs, and each product receives its own evidence/suggestion objects.
@@ -943,14 +969,18 @@ def create_batch_from_csv(
         model = _row_value(row, "_MODEL_", "MODEL", "Модель")
         if not model:
             continue
+        external_id = _row_value(row, "_ID_", "ID")
+        name = _row_value(row, "_NAME_", "NAME", "Название")
+        brand = _row_value(row, "_BRAND_", "BRAND", "Бренд")
         product = AttributeProduct(
             template_id=template.id,
             batch_id=batch.id,
             sort_order=index - 1,
-            external_id=_row_value(row, "_ID_", "ID"),
+            external_id=external_id,
             model=model,
-            name=_row_value(row, "_NAME_", "NAME", "Название"),
-            brand=_row_value(row, "_BRAND_", "BRAND", "Бренд"),
+            name=name,
+            brand=brand,
+            search_text=product_search_text(external_id, model, name, brand),
         )
         db.add(product)
         _make_product_values(product, template, parse_attribute_stack(_row_value(row, "_ATTRIBUTES_", "ATTRIBUTES", "Атрибуты")), match_cache=match_cache)
@@ -972,17 +1002,80 @@ def create_batch_from_csv(
     return batch
 
 
+def _public_addresses(hostname: str, port: int) -> tuple[str, ...]:
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        }
+    except (OSError, ValueError):
+        return ()
+    if not addresses or any(not ip_address(address).is_global for address in addresses):
+        return ()
+    return tuple(sorted(addresses))
+
+
 def _is_public_url(url: str) -> bool:
     parsed = urlparse(clean_text(url))
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
     if parsed.username or parsed.password:
         return False
-    try:
-        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
-        return bool(addresses) and all(ip_address(address).is_global for address in addresses)
-    except (OSError, ValueError):
-        return False
+    return bool(_public_addresses(
+        parsed.hostname,
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+    ))
+
+
+class _PinnedPublicAdapter(HTTPAdapter):
+    """Connect only to an address validated for the requested public host."""
+
+    @staticmethod
+    def _destination(url: str) -> tuple[Any, int, str]:
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addresses = _public_addresses(parsed.hostname or "", port)
+        if not addresses:
+            raise ValueError("Разрешены только публичные HTTP(S)-адреса")
+        return parsed, port, addresses[0]
+
+    def add_headers(self, request, **kwargs):
+        super().add_headers(request, **kwargs)
+        parsed = urlparse(request.url)
+        request.headers["Host"] = parsed.netloc
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        parsed, _port, address = self._destination(request.url)
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(
+            request,
+            verify,
+            cert,
+        )
+        host_params["host"] = address
+        if parsed.scheme == "https":
+            pool_kwargs["assert_hostname"] = parsed.hostname
+            pool_kwargs["server_hostname"] = parsed.hostname
+        return self.poolmanager.connection_from_host(
+            **host_params,
+            pool_kwargs=pool_kwargs,
+        )
+
+    def get_connection(self, url, proxies=None):
+        """Compatibility path for Requests 2.31."""
+
+        parsed, port, address = self._destination(url)
+        pool_kwargs = {}
+        if parsed.scheme == "https":
+            pool_kwargs = {
+                "assert_hostname": parsed.hostname,
+                "server_hostname": parsed.hostname,
+            }
+        return self.poolmanager.connection_from_host(
+            scheme=parsed.scheme,
+            host=address,
+            port=port,
+            pool_kwargs=pool_kwargs,
+        )
 
 
 def _open_public_response(
@@ -995,6 +1088,9 @@ def _open_public_response(
 
     current_url = clean_text(url)
     visited: set[str] = set()
+    adapter = _PinnedPublicAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     for _redirect in range(MAX_PUBLIC_REDIRECTS + 1):
         if not _is_public_url(current_url):
             raise ValueError("Разрешены только публичные HTTP(S)-адреса")
@@ -1765,6 +1861,7 @@ def create_batch_from_urls(
     name: str = "",
     processing_mode: str = "suggest",
 ) -> AttributeBatch:
+    template_id = template.id if template is not None else None
     cleaned_urls = list(dict.fromkeys(clean_text(url) for url in urls if clean_text(url)))
     if not cleaned_urls:
         raise ValueError("Добавьте хотя бы одну ссылку")
@@ -1774,37 +1871,53 @@ def create_batch_from_urls(
         )
     if any(len(url) > 2048 for url in cleaned_urls):
         raise ValueError("Длина одной ссылки не должна превышать 2048 символов")
-    parsed_pages: list[dict[str, Any]] = []
-    discovered_templates: list[AttributeTemplate] = []
-    for url in cleaned_urls:
+    # Do not retain the template lookup transaction during bounded network I/O.
+    db.rollback()
+    template = db.get(AttributeTemplate, template_id) if template_id is not None else None
+    if template_id is not None and template is None:
+        raise ValueError("Шаблон был удалён до начала импорта")
+
+    def load_page(url: str) -> dict[str, Any]:
         try:
             html, final_url = fetch_public_html(url)
             page = parse_product_html(html, final_url)
-            page["_input_url"] = url
-            page["_status"] = "parsed"
-            page["_error"] = ""
-            page["_template"] = template or find_template_for_category(
-                db,
-                page["category"],
-                page["attributes"],
-            )
-            if page["_template"] is not None:
-                discovered_templates.append(page["_template"])
+            page.update(_input_url=url, _status="parsed", _error="")
+            return page
         except Exception as error:
-            slug = Path(urlparse(url).path.rstrip("/")).name
-            page = {
+            return {
                 "url": url,
                 "_input_url": url,
                 "_status": "error",
                 "_error": clean_text(error),
-                "_template": template,
                 "name": "",
-                "model": slug,
+                "model": Path(urlparse(url).path.rstrip("/")).name,
                 "brand": "",
                 "category": "",
                 "attributes": [],
             }
-        parsed_pages.append(page)
+
+    parsed_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(URL_IMPORT_CONCURRENCY, len(cleaned_urls)),
+        thread_name_prefix="attribute-url-import",
+    ) as executor:
+        futures = {
+            executor.submit(load_page, url): index
+            for index, url in enumerate(cleaned_urls)
+        }
+        for future in as_completed(futures):
+            parsed_by_index[futures[future]] = future.result()
+
+    parsed_pages = [parsed_by_index[index] for index in range(len(cleaned_urls))]
+    discovered_templates: list[AttributeTemplate] = []
+    for page in parsed_pages:
+        page["_template"] = template or find_template_for_category(
+            db,
+            page["category"],
+            page["attributes"],
+        )
+        if page["_template"] is not None:
+            discovered_templates.append(page["_template"])
     batch_template = template or next(iter(discovered_templates), None)
     if batch_template is None:
         batch_template = db.scalar(
@@ -1828,7 +1941,7 @@ def create_batch_from_urls(
         template=batch_template,
         name=clean_text(name) or f"Ссылки {len(cleaned_urls)}",
         input_mode="urls",
-        processing_mode=processing_mode if processing_mode in PROCESSING_MODES else "suggest",
+        processing_mode=validated_processing_mode(processing_mode).value,
         source_urls=[
             {
                 "url": page["_input_url"],
@@ -1858,6 +1971,12 @@ def create_batch_from_urls(
             brand=page["brand"],
             category_name=page["category"],
             source_url=page["url"],
+            search_text=product_search_text(
+                model,
+                page["name"],
+                page["brand"],
+                page["category"],
+            ),
             sort_order=index - 1,
             processing_state={"template_unresolved": selected_template is None},
             status="needs_template" if selected_template is None else "needs_review",
@@ -2159,8 +2278,9 @@ def list_donors(db: Session, brand: str = "") -> list[dict[str, Any]]:
     return [serialize_donor(donor) for donor in rows]
 
 
-def _cached_product_url(donor: Donor, model: str) -> str:
+def _donor_catalog_match(donor: Donor, model: str) -> tuple[str, bool]:
     wanted = normalize_model(model)
+    mentioned = False
     for key, raw_record in (donor.known_new_products or {}).items():
         record = raw_record if isinstance(raw_record, dict) else {"url": raw_record}
         candidates = [
@@ -2169,11 +2289,17 @@ def _cached_product_url(donor: Donor, model: str) -> str:
             record.get("sku"),
             record.get("name"),
         ]
-        if any(normalize_model(candidate) == wanted for candidate in candidates if candidate):
+        normalized = [normalize_model(candidate) for candidate in candidates if candidate]
+        mentioned = mentioned or bool(wanted and any(wanted in candidate for candidate in normalized))
+        if wanted and wanted in normalized:
             url = clean_text(record.get("url") or record.get("link"))
             if url:
-                return urljoin(donor.site_url or (donor.start_urls or [""])[0], url)
-    return ""
+                return urljoin(donor.site_url or (donor.start_urls or [""])[0], url), True
+    return "", mentioned
+
+
+def _cached_product_url(donor: Donor, model: str) -> str:
+    return _donor_catalog_match(donor, model)[0]
 
 
 def _host_key(url: str) -> str:
@@ -3226,7 +3352,12 @@ def migrate_existing_attribute_suggestions(db: Session) -> int:
         db.execute(update(product).where(product.id.in_(ids[offset:offset + 500])).values(status="ready"))
         db.execute(update(product).where(product.id.in_(ids[offset:offset + 500]), pending).values(status="needs_review"))
     for batch_id in batches:
-        db.execute(update(AttributeBatch).where(AttributeBatch.id == batch_id).values(summary=batch_summary(db, batch_id)))
+        summary = batch_summary(db, batch_id)
+        db.execute(update(AttributeBatch).where(AttributeBatch.id == batch_id).values(
+            summary=summary,
+            products_count=summary["products"],
+            attributes_count=summary["attributes"],
+        ))
     return changed
 
 
@@ -3411,12 +3542,19 @@ def _recalculate_candidate_state(
     target.reason = clean_text(best.get("reason"))
     if corroboration_bonus:
         target.reason += f"; подтверждено источниками: {len(supporting_sources)}"
-    mode = product.batch.processing_mode
+    mode = validated_processing_mode(product.batch.processing_mode)
     auto = (
-        (mode == "auto_exact" and target.confidence == 100)
-        or (mode == "auto_primary" and int(best.get("priority") or 0) == 0 and target.confidence >= 85)
-        or (mode in {"auto", "auto_confident"} and target.confidence >= 95)
-        or mode == "auto_all"
+        (mode is ProcessingMode.AUTO_EXACT and target.confidence == EXACT_VALUE_CONFIDENCE)
+        or (
+            mode is ProcessingMode.AUTO_PRIMARY
+            and int(best.get("priority") or 0) == 0
+            and target.confidence >= AUTO_PRIMARY_CONFIDENCE
+        )
+        or (
+            mode in {ProcessingMode.AUTO, ProcessingMode.AUTO_CONFIDENT}
+            and target.confidence >= AUTO_CONFIDENT_CONFIDENCE
+        )
+        or mode is ProcessingMode.AUTO_ALL
     )
     target.final_value = best["value"] if auto else ""
     target.status = "approved" if auto else "suggested"
@@ -3594,16 +3732,19 @@ def apply_parsed_attributes(
     return stats
 
 
-def _clear_donor_evidence(product: AttributeProduct) -> None:
+def _clear_donor_evidence(db: Session, product: AttributeProduct) -> None:
     """Remove only donor-derived evidence before applying a fresh donor run."""
 
-    donor_roles = {"primary", "verification"}
+    donor_roles = DONOR_SOURCE_ROLES
     donor_candidate_roles = {"Основной донор", "Дополнительный донор"}
     donor_sources = {
         clean_text(item.donor.brand.name)
         for item in product.sources
         if item.role in donor_roles and item.donor is not None
     }
+    for source in product.sources:
+        if source.role in donor_roles and clean_text(source.raw_html_path):
+            delete_after_commit(db, source.raw_html_path, root=ATTRIBUTE_ASSISTANT_DIR)
     product.sources[:] = [
         item for item in product.sources
         if item.role not in donor_roles
@@ -3648,6 +3789,11 @@ def process_product_donors(
     *,
     url_overrides: dict[str, str] | None = None,
     fetcher: DonorPageFetcher | None = None,
+    expected_version: int | None = None,
+    refresh_summary: bool = True,
+    write_lock: threading.RLock | None = None,
+    commit_result: bool = False,
+    require_opened: bool = False,
 ) -> dict[str, Any]:
     donor_ids = list(dict.fromkeys(int(item) for item in donor_ids))
     if not donor_ids:
@@ -3657,20 +3803,35 @@ def process_product_donors(
         for key, value in (url_overrides or {}).items()
         if clean_text(value)
     }
-    donors = {donor.id: donor for donor in db.scalars(
-        select(Donor).where(Donor.id.in_(donor_ids))
-    )}
+    donor_rows = list(db.scalars(
+        select(Donor)
+        .where(Donor.id.in_(donor_ids))
+        .options(selectinload(Donor.brand), selectinload(Donor.connection_method_row))
+    ))
+    donors = {
+        donor.id: SimpleNamespace(
+            **{column.key: getattr(donor, column.key) for column in inspect(Donor).columns},
+            brand=SimpleNamespace(name=donor.brand.name),
+            connection_method_row=(
+                SimpleNamespace(code=donor.connection_method_row.code)
+                if donor.connection_method_row is not None
+                else None
+            ),
+        )
+        for donor in donor_rows
+    }
     product_id = product.id
+    expected_version = product.version if expected_version is None else expected_version
     template = product_template(product)
+    expected_template_id = template.id if template else None
+    expected_template_version = template.version if template else None
     model = product.model
     product_name = product.name
     category_name = product.category_name or (template.category.full_path if template else "")
-    # End any pending read/write transaction before URL discovery and page loading.
-    db.commit()
-
+    # Network I/O must not keep a SQLite transaction open. The immutable donor
+    # DTOs above contain everything the fetch phase needs.
+    db.rollback()
     collected: list[dict[str, Any]] = []
-    raw_dir = ATTRIBUTE_ASSISTANT_DIR / "raw" / str(product.batch_id) / str(product.id)
-    raw_dir.mkdir(parents=True, exist_ok=True)
     max_pages = max((donor.thread_count for donor in donors.values()), default=1)
     fetcher_context = nullcontext(fetcher) if fetcher is not None else DonorPageFetcher(max_pages=max_pages)
     with fetcher_context as active_fetcher:
@@ -3712,7 +3873,11 @@ def process_product_donors(
                 })
                 continue
             try:
-                html, final_url = fetch_donor_product_html(donor, url, fetcher=active_fetcher)
+                html, final_url = (
+                    fetch_public_html(url)
+                    if manual_url
+                    else fetch_donor_product_html(donor, url, fetcher=active_fetcher)
+                )
                 parsed = parse_product_html_for_donor(html, final_url, donor)
                 attribute_count = len(parsed["attributes"])
                 source_status = "parsed" if attribute_count else "no_attributes"
@@ -3720,15 +3885,13 @@ def process_product_donors(
                     resolved_by if attribute_count
                     else f"{resolved_by}; страница открыта, характеристики не распознаны"
                 )
-                raw_path = raw_dir / f"{priority}_{donor.id}.html"
-                raw_path.write_text(html, encoding="utf-8")
                 collected.append({
                     **base,
                     "status": source_status,
                     "message": source_message,
                     "url": final_url,
                     "parsed": parsed,
-                    "raw_path": str(raw_path),
+                    "raw_html": html,
                     "attributes_found": attribute_count,
                 })
             except Exception as error:
@@ -3738,11 +3901,62 @@ def process_product_donors(
                     "message": str(error),
                 })
 
-    db.expire_all()
+    with write_lock or nullcontext():
+        result = _apply_donor_results(
+            db,
+            product_id=product_id,
+            donor_ids=donor_ids,
+            url_overrides=url_overrides,
+            collected=collected,
+            expected_version=expected_version,
+            expected_template_id=expected_template_id,
+            expected_template_version=expected_template_version,
+            refresh_summary=refresh_summary,
+        )
+        if require_opened and not any(
+            report.get("status") in DONOR_OPENED_STATUSES
+            for report in result["reports"]
+        ):
+            messages = [
+                clean_text(report.get("message"))
+                for report in result["reports"]
+                if clean_text(report.get("message"))
+            ]
+            raise ValueError("; ".join(messages) or "Ни один донор не был обработан")
+        if commit_result:
+            db.commit()
+        return result
+
+
+def _apply_donor_results(
+    db: Session,
+    *,
+    product_id: int,
+    donor_ids: list[int],
+    url_overrides: dict[str, str],
+    collected: list[dict[str, Any]],
+    expected_version: int,
+    expected_template_id: int | None,
+    expected_template_version: int | None,
+    refresh_summary: bool,
+) -> dict[str, Any]:
     product = db.get(AttributeProduct, product_id)
     if product is None:
         raise ValueError("Товар был удалён во время обработки")
-    _clear_donor_evidence(product)
+    if product.version != expected_version:
+        raise StaleProductError(
+            "Товар изменился во время обработки. Результат не применён; запустите обработку повторно"
+        )
+    template = product_template(product)
+    if (
+        (template.id if template else None) != expected_template_id
+        or (template.version if template else None) != expected_template_version
+    ):
+        raise StaleProductError(
+            "Шаблон изменился во время обработки. Результат не применён; запустите обработку повторно"
+        )
+    snapshot_product(db, product, "Обработка доноров")
+    _clear_donor_evidence(db, product)
     # DELETE must reach SQLite before rows with the same unique key are inserted again.
     db.flush()
     product.selected_donor_ids = donor_ids
@@ -3750,8 +3964,8 @@ def process_product_donors(
     reports: list[dict[str, Any]] = []
     for item in collected:
         donor_id = int(item.get("donor_id") or 0)
-        donor = donors.get(donor_id)
-        if not donor:
+        donor = db.get(Donor, donor_id)
+        if donor is None:
             reports.append({
                 "donor_id": donor_id,
                 "status": "error",
@@ -3761,10 +3975,10 @@ def process_product_donors(
         priority = int(item.get("priority") or 0)
         role = clean_text(item.get("role"))
         status = clean_text(item.get("status"))
-        if status in {"not_found", "error"}:
+        if status in DONOR_FAILURE_STATUSES:
             db.add(AttributeProductSource(
                 product=product,
-                donor=donor,
+                donor_id=donor.id,
                 url=clean_text(item.get("source_url") or item.get("url")),
                 priority=priority,
                 role=role,
@@ -3780,6 +3994,9 @@ def process_product_donors(
             continue
         parsed = dict(item.get("parsed") or {})
         final_url = clean_text(item.get("url"))
+        raw_dir = ATTRIBUTE_ASSISTANT_DIR / "raw" / str(product.batch_id) / str(product.id)
+        raw_path = raw_dir / f"{priority}_{donor.id}_{uuid.uuid4().hex[:8]}.html"
+        stage_text(db, raw_path, str(item.get("raw_html") or ""))
         stats = apply_parsed_attributes(
             db,
             product,
@@ -3793,12 +4010,12 @@ def process_product_donors(
         parsed["processing_stats"] = stats
         db.add(AttributeProductSource(
             product=product,
-            donor=donor,
+            donor_id=donor.id,
             url=final_url,
             priority=priority,
             role=role,
             status=status,
-            raw_html_path=clean_text(item.get("raw_path")),
+            raw_html_path=str(raw_path),
             parsed_data=parsed,
         ))
         reports.append({
@@ -3814,14 +4031,16 @@ def process_product_donors(
     state["donors_processed"] = True
     state["donor_reports"] = reports
     state["last_processing_complete"] = all(
-        report.get("status") not in {"error", "not_found"} for report in reports
+        report.get("status") not in DONOR_FAILURE_STATUSES for report in reports
     )
     product.processing_state = state
     product.donor_urls = [
         report.get("url", "") for report in reports if report.get("url")
     ]
+    product.version += 1
     refresh_product_status(product)
-    refresh_batch_summary(product.batch)
+    if refresh_summary:
+        refresh_batch_summary(product.batch)
     return {"product_id": product.id, "reports": reports}
 
 
@@ -3868,23 +4087,15 @@ def _saved_value_mapping(
 ) -> str:
     if not donor_id:
         return ""
-    rule = db.scalar(
+    rules = list(db.scalars(
         select(AttributeValueMappingRule).where(
             AttributeValueMappingRule.donor_id == donor_id,
             AttributeValueMappingRule.template_field_id == field.id,
-            AttributeValueMappingRule.normalized_raw_value == dictionary_value_key(raw_value, field.value_type),
+            AttributeValueMappingRule.match_raw_value == mapping_value_key(raw_value),
             AttributeValueMappingRule.is_active.is_(True),
         )
-    )
-    if rule and rule.allowed_value.is_active:
-        return rule.allowed_value.value
-    matches = [candidate.allowed_value.value for candidate in db.scalars(
-        select(AttributeValueMappingRule).where(
-            AttributeValueMappingRule.donor_id == donor_id,
-            AttributeValueMappingRule.template_field_id == field.id,
-            AttributeValueMappingRule.is_active.is_(True),
-        ).order_by(AttributeValueMappingRule.id)
-    ) if candidate.allowed_value.is_active and value_match_key(candidate.raw_value) == value_match_key(raw_value)]
+    ))
+    matches = [rule.allowed_value.value for rule in rules if rule.allowed_value.is_active]
     # Older case variants may point to conflicting rules; do not choose one arbitrarily.
     if matches and len({value_match_key(value) for value in matches}) == 1:
         return matches[0]
@@ -3922,11 +4133,13 @@ def save_value_mapping_rule(
             allowed_value=allowed,
             raw_value=raw,
             normalized_raw_value=key,
+            match_raw_value=mapping_value_key(raw),
         )
         db.add(rule)
     else:
         rule.allowed_value = allowed
         rule.raw_value = raw
+        rule.match_raw_value = mapping_value_key(raw)
         rule.is_active = True
     return rule
 
@@ -3965,9 +4178,6 @@ def serialize_value(
     include_allowed_values: bool = True,
     allowed_values_count: int | None = None,
 ) -> dict[str, Any]:
-    if value.product is not None:
-        _repair_confirming_evidence(value)
-    _repair_existing_value_status(value)
     field = value.template_field
     active_allowed = None
     if field and (include_allowed_values or allowed_values_count is None):
@@ -4006,10 +4216,6 @@ def serialize_value(
     }
 
 def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict[str, Any]:
-    repaired = [_repair_confirming_evidence(value) or _repair_existing_value_status(value) for value in product.values]
-    if any(repaired):
-        refresh_product_status(product)
-        refresh_batch_summary(product.batch)
     result = {
         "id": product.id,
         "batch_id": product.batch_id,
@@ -4019,6 +4225,7 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
         "category_name": product.category_name,
         "source_url": product.source_url,
         "status": product.status,
+        "version": product.version,
         "template": serialize_template(product_template(product)) if product_template(product) else None,
         "selected_donor_ids": list(product.selected_donor_ids or []),
         "donor_url_overrides": dict(product.donor_url_overrides or {}),
@@ -4103,6 +4310,22 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
 
 
 def serialize_batch(batch: AttributeBatch, detailed: bool = False) -> dict[str, Any]:
+    session = object_session(batch)
+    summary = dict(batch.summary) if batch.summary else (
+        batch_summary(session, batch.id)
+        if session is not None and batch.id is not None
+        else {
+            "products": batch.products_count,
+            "attributes": batch.attributes_count,
+            "ready": 0,
+            "needs_review": batch.products_count,
+            "filled": 0,
+            "missing": 0,
+            "conflicts": 0,
+            "suggestions": 0,
+        }
+    )
+    summary.setdefault("attributes", batch.attributes_count)
     result = {
         "id": batch.id,
         "name": batch.name,
@@ -4111,14 +4334,13 @@ def serialize_batch(batch: AttributeBatch, detailed: bool = False) -> dict[str, 
         "status": batch.status,
         "source_filename": batch.source_filename,
         "source_urls": list(batch.source_urls or []),
-        "original_ready": bool(batch.original_path and Path(batch.original_path).is_file()),
-        "summary": refresh_batch_summary(batch) if not batch.summary else dict(batch.summary),
+        "original_ready": bool(batch.original_path and file_ready(session, batch.original_path)),
+        "summary": summary,
         "template": serialize_template(batch.template),
-        "export_ready": bool(batch.export_path and Path(batch.export_path).is_file()),
+        "export_ready": bool(batch.export_path and file_ready(session, batch.export_path)),
         "created_at": batch.created_at.isoformat(timespec="seconds") if batch.created_at else "",
     }
     if detailed:
-        session = object_session(batch)
         result["products"] = (
             product_page(session, batch.id)["items"]
             if session
@@ -4183,6 +4405,10 @@ def workspace(db: Session) -> dict[str, Any]:
             "template_value_page_size": TEMPLATE_VALUE_PAGE_SIZE,
             "bulk_confidence": BULK_CONFIDENCE,
             "max_urls": ATTRIBUTE_ASSISTANT_MAX_URLS,
+            "processing_modes": list(PUBLIC_PROCESSING_MODES),
+            "auto_primary_confidence": AUTO_PRIMARY_CONFIDENCE,
+            "auto_confident_confidence": AUTO_CONFIDENT_CONFIDENCE,
+            "exact_value_confidence": EXACT_VALUE_CONFIDENCE,
         },
         "dashboard": {
             "active_templates": sum(template.is_active for template in templates),
@@ -4284,33 +4510,89 @@ def delete_extra_product_value(db: Session, value: AttributeProductValue) -> Att
 
 
 def bulk_action(
+    db: Session,
     batch: AttributeBatch,
     action: str,
     minimum_confidence: int = BULK_CONFIDENCE,
     dash_reason: str = "",
 ) -> int:
+    if action not in {"accept_high", "fill_dashes"}:
+        raise ValueError("Неизвестное массовое действие")
+    if not 0 <= minimum_confidence <= 100:
+        raise ValueError("Порог уверенности должен быть от 0 до 100")
+    reason = clean_text(dash_reason) or "Не найдено после проверки источников"
+    value = AttributeProductValue
+    condition = (
+        and_(
+            value.is_in_template.is_(True),
+            value.current_value == "",
+            value.status == "suggested",
+            value.confidence >= minimum_confidence,
+        )
+        if action == "accept_high"
+        else and_(
+            value.is_in_template.is_(True),
+            value.final_value == "",
+            value.status != "conflict",
+            or_(value.current_value == "", value.current_value.in_(["-", "–", "—", "−"])),
+        )
+    )
     changed = 0
-    for product in batch.products:
-        for value in product.values:
-            if not value.is_in_template:
+    last_product_id = 0
+    while True:
+        product_ids = list(db.scalars(
+            select(AttributeProduct.id)
+            .join(AttributeProductValue)
+            .where(
+                AttributeProduct.batch_id == batch.id,
+                AttributeProduct.id > last_product_id,
+                condition,
+            )
+            .distinct()
+            .order_by(AttributeProduct.id)
+            .limit(BULK_CHUNK_SIZE)
+        ))
+        if not product_ids:
+            break
+        products = list(db.scalars(
+            select(AttributeProduct)
+            .where(AttributeProduct.id.in_(product_ids))
+            .options(selectinload(AttributeProduct.values))
+            .order_by(AttributeProduct.id)
+        ))
+        for product in products:
+            candidates = [item for item in product.values if (
+                item.is_in_template
+                and (
+                    (
+                        action == "accept_high"
+                        and not item.current_value
+                        and item.status == "suggested"
+                        and item.confidence >= minimum_confidence
+                    )
+                    or (
+                        action == "fill_dashes"
+                        and not item.final_value
+                        and item.status != "conflict"
+                        and (not item.current_value or is_technical_dash(item.current_value))
+                    )
+                )
+            )]
+            if not candidates:
                 continue
-            if (
-                action == "accept_high"
-                and not value.current_value
-                and value.status == "suggested"
-                and value.confidence >= minimum_confidence
-            ):
-                update_product_value(value, action="accept", refresh_summary=False)
+            snapshot_product(db, product, f"Перед массовым действием {action}")
+            for item in candidates:
+                update_product_value(
+                    item,
+                    action="accept" if action == "accept_high" else "dash",
+                    dash_reason=reason,
+                    refresh_summary=False,
+                )
                 changed += 1
-            elif (
-                action == "fill_dashes"
-                and not value.final_value
-                and value.status != "conflict"
-                and (not value.current_value or is_technical_dash(value.current_value))
-            ):
-                update_product_value(value, action="dash", dash_reason=dash_reason or "Не найдено после проверки источников", refresh_summary=False)
-                changed += 1
-        refresh_product_status(product)
+            refresh_product_status(product)
+            touch_product(product)
+        db.flush()
+        last_product_id = product_ids[-1]
     refresh_batch_summary(batch)
     return changed
 
@@ -4419,6 +4701,9 @@ def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
 
 
 def export_batch_csv(batch: AttributeBatch, *, ready_only: bool = False) -> Path:
+    db = object_session(batch)
+    if db is None:
+        raise ValueError("Пакет не привязан к сессии")
     rows = _batch_export_rows(batch, ready_only)
     first = next(rows, None)
     if first is None:
@@ -4427,8 +4712,10 @@ def export_batch_csv(batch: AttributeBatch, *, ready_only: bool = False) -> Path
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = f"attributes_{batch.id}_{uuid.uuid4().hex[:8]}.csv"
     path = output_dir / filename
+    previous_path = resolve_export_path(batch)
+    temporary_path = staged_path(db, path)
     try:
-        with path.open("w", encoding="cp1251", errors="replace", newline="") as stream:
+        with temporary_path.open("w", encoding="cp1251", errors="replace", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=["_MODEL_", "_ATTRIBUTES_"], delimiter=";", lineterminator="\r\n")
             writer.writeheader()
             writer.writerow(first)
@@ -4436,6 +4723,8 @@ def export_batch_csv(batch: AttributeBatch, *, ready_only: bool = False) -> Path
     finally:
         rows.close()
     batch.export_path = str(path)
+    if previous_path and previous_path != path.resolve():
+        delete_after_commit(db, previous_path)
     batch.status = "completed"
     refresh_batch_summary(batch)
     return path
@@ -4449,7 +4738,7 @@ def resolve_export_path(batch: AttributeBatch) -> Path | None:
     return path if path.is_file() and root in path.parents else None
 
 
-def delete_batch_files(batch: AttributeBatch) -> int:
+def delete_batch_files(db: Session, batch: AttributeBatch) -> int:
     """Remove every file owned by a processing batch from attribute storage."""
 
     storage_root = ATTRIBUTE_ASSISTANT_DIR.resolve()
@@ -4483,7 +4772,7 @@ def delete_batch_files(batch: AttributeBatch) -> int:
             resolved = path.resolve()
             if storage_root not in resolved.parents or not resolved.is_file():
                 continue
-            resolved.unlink()
+            delete_after_commit(db, resolved)
             removed += 1
         except OSError:
             continue
@@ -4492,7 +4781,7 @@ def delete_batch_files(batch: AttributeBatch) -> int:
     try:
         if storage_root in raw_directory.parents and raw_directory.is_dir():
             removed += sum(path.is_file() for path in raw_directory.rglob("*"))
-            shutil.rmtree(raw_directory)
+            delete_after_commit(db, raw_directory)
     except OSError:
         pass
     return removed
@@ -4508,7 +4797,7 @@ def delete_attribute_batch(db: Session, batch: AttributeBatch) -> dict[str, int]
                 AttributeProductRevision.product_id.in_(product_ids)
             )
         )
-    removed_files = delete_batch_files(batch)
+    removed_files = delete_batch_files(db, batch)
     products = len(batch.products)
     db.delete(batch)
     db.flush()
@@ -4656,6 +4945,8 @@ def save_template_revision(
         report=report or {},
     )
     db.add(revision)
+    db.flush()
+    _prune_template_revisions(db, template.id)
     return revision
 
 
@@ -4687,7 +4978,24 @@ def save_allowed_value_revision(
         report=details,
     )
     db.add(revision)
+    db.flush()
+    _prune_template_revisions(db, template.id)
     return revision
+
+
+def _prune_template_revisions(db: Session, template_id: int) -> None:
+    retained = (
+        select(AttributeTemplateRevision.id)
+        .where(AttributeTemplateRevision.template_id == template_id)
+        .order_by(AttributeTemplateRevision.created_at.desc(), AttributeTemplateRevision.id.desc())
+        .limit(TEMPLATE_REVISION_RETENTION)
+    )
+    db.execute(
+        delete(AttributeTemplateRevision).where(
+            AttributeTemplateRevision.template_id == template_id,
+            AttributeTemplateRevision.id.not_in(retained),
+        )
+    )
 
 
 TEMPLATE_FIELD_TYPES = {"select", "select_exact", "text", "number", "dimensions", "boolean"}
@@ -5290,6 +5598,7 @@ def copy_template(
                 field=field,
                 value=source_value.value,
                 normalized_value=source_value.normalized_value,
+                search_value=product_search_text(source_value.value),
                 is_combination=source_value.is_combination,
                 is_active=source_value.is_active,
                 sort_order=source_value.sort_order,
@@ -5302,6 +5611,7 @@ def copy_template(
                     allowed_value=value,
                     synonym=source_synonym.synonym,
                     normalized_synonym=source_synonym.normalized_synonym,
+                    search_synonym=product_search_text(source_synonym.synonym),
                 ))
     save_template_revision(db, result, "copy")
     return result
@@ -5334,6 +5644,7 @@ def restore_template_revision(
         save_allowed_value_revision(db, allowed, "before_restore", {"revision_id": revision.id})
         allowed.value = normalized
         allowed.normalized_value = normalized_key
+        allowed.search_value = product_search_text(normalized)
         allowed.is_combination = bool(value_data.get("is_combination"))
         allowed.is_active = bool(value_data.get("is_active", True))
         allowed.sort_order = int(value_data.get("sort_order") or 0)
@@ -5435,6 +5746,7 @@ def restore_template_revision(
                 allowed = add_allowed_value(db, field, normalized_value)
             allowed.value = normalized_value
             allowed.normalized_value = dictionary_value_key(normalized_value, field.value_type)
+            allowed.search_value = product_search_text(normalized_value)
             allowed.is_combination = bool(value_data.get("is_combination"))
             allowed.is_active = bool(value_data.get("is_active", True))
             allowed.sort_order = int(value_data.get("sort_order") or 0)
@@ -5555,6 +5867,18 @@ def save_product_snapshot(
     )
     db.add(revision)
     db.flush()
+    retained = (
+        select(AttributeProductRevision.id)
+        .where(AttributeProductRevision.product_id == product.id)
+        .order_by(AttributeProductRevision.created_at.desc(), AttributeProductRevision.id.desc())
+        .limit(PRODUCT_REVISION_RETENTION)
+    )
+    db.execute(
+        delete(AttributeProductRevision).where(
+            AttributeProductRevision.product_id == product.id,
+            AttributeProductRevision.id.not_in(retained),
+        )
+    )
     return revision
 
 
@@ -5669,11 +5993,16 @@ def restore_product_snapshot(
     refresh_batch_summary(product.batch)
 
 
-def product_history(db: Session, product: AttributeProduct) -> list[dict[str, Any]]:
+def product_history(
+    db: Session,
+    product: AttributeProduct,
+    *,
+    limit: int = HISTORY_LIMIT,
+) -> list[dict[str, Any]]:
     rows = list(db.scalars(
         select(AttributeProductRevision).where(
             AttributeProductRevision.product_id == product.id,
-        ).order_by(AttributeProductRevision.created_at.desc()).limit(HISTORY_LIMIT)
+        ).order_by(AttributeProductRevision.created_at.desc()).limit(max(1, min(HISTORY_LIMIT, limit)))
     ))
 
     current_names = {
@@ -5830,10 +6159,14 @@ def resolve_original_path(batch: AttributeBatch) -> Path | None:
     return path if path.is_file() and (path == root or root in path.parents) else None
 
 def export_batch_report_csv(batch: AttributeBatch) -> Path:
+    db = object_session(batch)
+    if db is None:
+        raise ValueError("Пакет не привязан к сессии")
     report = batch_report(batch)
     output_dir = ATTRIBUTE_ASSISTANT_DIR / "reports"
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"attribute_report_{batch.id}_{uuid.uuid4().hex[:8]}.csv"
+    previous_path = resolve_report_path(batch)
     stream = io.StringIO(newline="")
     writer = csv.DictWriter(
         stream,
@@ -5853,8 +6186,10 @@ def export_batch_report_csv(batch: AttributeBatch) -> Path:
             "Нет в справочнике": item["unknown"],
             "Технические пропуски": item["dashes"],
         })
-    path.write_bytes(stream.getvalue().encode("utf-8-sig"))
+    stage_bytes(db, path, stream.getvalue().encode("utf-8-sig"))
     batch.report_filename = str(path)
+    if previous_path and previous_path != path.resolve():
+        delete_after_commit(db, previous_path)
     return path
 
 
@@ -5887,8 +6222,11 @@ def assign_product_template(
 
 
 def recommend_donors(db: Session, product: AttributeProduct) -> list[dict[str, Any]]:
-    rows = list(db.scalars(select(Donor).join(Brand, Donor.brand_id == Brand.id)))
-    model_key = normalize_model(product.model)
+    rows = list(db.scalars(
+        select(Donor)
+        .join(Brand, Donor.brand_id == Brand.id)
+        .options(selectinload(Donor.brand), selectinload(Donor.connection_method_row))
+    ))
     brand_key = normalize_key(product.brand)
     ranked: list[tuple[int, Donor, list[str]]] = []
     for donor in rows:
@@ -5898,10 +6236,11 @@ def recommend_donors(db: Session, product: AttributeProduct) -> list[dict[str, A
         if brand_key and (brand_key == donor_brand or brand_key in donor_brand or donor_brand in brand_key):
             score += 55
             reasons.append("совпадает бренд")
-        if _cached_product_url(donor, product.model):
+        cached_url, catalog_match = _donor_catalog_match(donor, product.model)
+        if cached_url:
             score += 30
             reasons.append("модель есть в кэше донора")
-        if model_key and model_key in normalize_key(json.dumps(donor.known_new_products or {}, ensure_ascii=False)):
+        elif catalog_match:
             score += 15
             reasons.append("модель встречается в каталоге")
         if donor.brand.primary_donor_id == donor.id:

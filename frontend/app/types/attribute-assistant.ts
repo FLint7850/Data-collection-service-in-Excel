@@ -150,6 +150,7 @@ export interface AttributeAllowedValueOptions {
 
 export interface AttributeProduct {
   id: number;
+  version: number;
   batch_id?: number;
   model: string;
   name: string;
@@ -195,6 +196,7 @@ export interface AttributeBatch {
   original_ready: boolean;
   summary: {
     products: number;
+    attributes: number;
     ready: number;
     needs_review: number;
     filled: number;
@@ -242,6 +244,10 @@ export interface AttributeAssistantSettings {
   template_value_page_size: number;
   bulk_confidence: number;
   max_urls: number;
+  processing_modes: AttributeProcessingMode[];
+  auto_primary_confidence: number;
+  auto_confident_confidence: number;
+  exact_value_confidence: number;
 }
 
 export interface AttributeWorkspace {
@@ -262,7 +268,8 @@ export interface AttributeWorkspace {
 export interface AttributeProductMutation {
   product: AttributeProduct;
   batch: AttributeBatch;
-  history: AttributeHistoryItem[];
+  history_item: AttributeHistoryItem | null;
+  history?: AttributeHistoryItem[];
 }
 
 export interface AttributeValueMutation extends AttributeProductMutation {
@@ -355,3 +362,45 @@ export interface AttributeChatGptAnalyzeResult extends AttributeProductMutation 
 }
 
 export type AttributeProcessingMode = "check" | "suggest" | "auto" | "auto_exact" | "auto_primary" | "auto_confident" | "auto_all";
+
+export interface AttributeVersionedRequest {
+  expected_version: number;
+}
+
+export interface AttributeValueUpdateRequest extends AttributeVersionedRequest {
+  action: "accept" | "reject" | "dash";
+  value?: string;
+  dash_reason?: string;
+}
+
+export interface AttributeMapRequest extends AttributeVersionedRequest {
+  field_id: number;
+  donor_id: number;
+  donor_attribute_name: string;
+  value: string;
+  source?: string;
+  priority?: number;
+  source_url?: string;
+}
+
+export interface AttributeTemplateUpdateRequest {
+  name?: string;
+  category?: string;
+  product_type?: string;
+  description?: string;
+  is_default?: boolean;
+  is_active?: boolean;
+}
+
+export interface AttributeFieldUpdateRequest {
+  name?: string;
+  synonyms?: string[];
+  group_name?: string;
+  value_type?: string;
+  is_composite?: boolean;
+  is_required?: boolean;
+  separator?: string;
+  use_dash_if_empty?: boolean;
+  sort_order?: number;
+  conversion_rules?: Array<Record<string, unknown>>;
+}

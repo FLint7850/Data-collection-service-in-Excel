@@ -6,7 +6,7 @@ from flask import Blueprint, g, request, send_file
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 from config import (
     ATTRIBUTE_ASSISTANT_JSON_MAX_BYTES,
@@ -17,6 +17,7 @@ from services.attribute_settings import (
     ALLOWED_VALUE_PAGE_SIZE,
     BULK_CONFIDENCE,
     PRODUCT_PAGE_SIZE,
+    StaleProductError,
 )
 
 from models import (
@@ -76,6 +77,7 @@ from services.attribute_assistant import (
     serialize_product,
     serialize_template,
     serialize_value,
+    touch_product,
     update_product_value,
     update_template_from_csv,
     validate_template_field_update,
@@ -83,9 +85,31 @@ from services.attribute_assistant import (
 )
 from services.normalization import jsonify
 from services.attribute_listing import product_page
+from services.attribute_text import product_search_text
 
 
 bp = Blueprint("routes_attribute_assistant", __name__)
+
+
+@bp.after_request
+def _rollback_failed_attribute_request(response):
+    """A handled 4xx/5xx must never commit partial Attribute Assistant work."""
+
+    db = g.get("db")
+    if response.status_code >= 400 and db is not None and db.in_transaction():
+        db.rollback()
+    return response
+
+
+@bp.errorhandler(StaleProductError)
+def _stale_attribute_product(error):
+    return jsonify({"error": str(error), "code": "stale_product"}), 409
+
+
+@bp.errorhandler(BadRequest)
+@bp.errorhandler(RequestEntityTooLarge)
+def _attribute_http_error(error):
+    return jsonify({"error": error.description}), error.code
 
 
 def _integer_query(name: str, default: int) -> int:
@@ -108,7 +132,84 @@ def _json_body() -> dict:
         raise RequestEntityTooLarge(
             description="JSON-запрос для модуля атрибутов превышает допустимый размер"
         )
-    return request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise BadRequest(description="JSON-запрос должен быть объектом")
+    return payload
+
+
+def _required_int(payload: dict, name: str) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool):
+        raise ValueError(f"Поле {name} должно быть целым числом")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Поле {name} должно быть целым числом") from error
+    if parsed <= 0:
+        raise ValueError(f"Поле {name} должно быть положительным числом")
+    return parsed
+
+
+def _integer_list(payload: dict, name: str, *, required: bool = False) -> list[int]:
+    value = payload.get(name)
+    if value is None and not required:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"Поле {name} должно быть массивом")
+    result: list[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            raise ValueError(f"Поле {name} должно содержать целые числа")
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Поле {name} должно содержать целые числа") from error
+        if parsed <= 0:
+            raise ValueError(f"Поле {name} должно содержать положительные числа")
+        if parsed not in result:
+            result.append(parsed)
+    if required and not result:
+        raise ValueError(f"Поле {name} не должно быть пустым")
+    return result
+
+
+def _string_mapping(payload: dict, name: str) -> dict[str, str]:
+    value = payload.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"Поле {name} должно быть объектом")
+    return {str(key): str(item or "").strip() for key, item in value.items() if str(item or "").strip()}
+
+
+def _nested_string_mapping(payload: dict, name: str) -> dict[str, dict[str, str]]:
+    value = payload.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"Поле {name} должно быть объектом")
+    result: dict[str, dict[str, str]] = {}
+    for key, item in value.items():
+        if not isinstance(item, dict):
+            raise ValueError(f"Значения поля {name} должны быть объектами")
+        result[str(key)] = {
+            str(inner_key): str(inner_value or "").strip()
+            for inner_key, inner_value in item.items()
+            if str(inner_value or "").strip()
+        }
+    return result
+
+
+def _assert_product_version(product: AttributeProduct, payload: dict) -> int:
+    if "expected_version" not in payload:
+        raise ValueError("Поле expected_version обязательно для изменения товара")
+    expected = _required_int(payload, "expected_version")
+    if product.version != expected:
+        raise StaleProductError("Товар уже изменён в другой операции. Обновите данные и повторите действие")
+    return expected
 
 
 def _read_csv_upload(upload) -> bytes:
@@ -160,16 +261,20 @@ def _product_mutation_payload(
     product: AttributeProduct,
     *,
     detailed: bool = True,
+    version_touched: bool = False,
     **payload,
 ) -> dict:
     """Return all client state invalidated by a product mutation in one response."""
 
+    if not version_touched:
+        touch_product(product)
     g.db.flush()
+    recent_history = product_history(g.db, product, limit=1)
     return {
         **payload,
         "product": serialize_product(product, detailed=detailed),
         "batch": serialize_batch(product.batch),
-        "history": product_history(g.db, product),
+        "history_item": recent_history[0] if recent_history else None,
     }
 
 
@@ -289,11 +394,15 @@ def api_attribute_allowed_value(field_id: int):
     payload = _json_body()
     try:
         allowed = add_allowed_value(g.db, field, payload.get("value", ""), payload.get("synonym", ""))
+        field.template.version += 1
         g.db.flush()
         return jsonify({
             "id": allowed.id,
             "value": allowed.value,
             "synonyms": [item.synonym for item in allowed.synonyms],
+            "is_active": allowed.is_active,
+            "is_combination": allowed.is_combination,
+            "template_version": field.template.version,
         }), 201
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
@@ -329,7 +438,7 @@ def api_attribute_batch_urls():
     ensure_storage()
     payload = _json_body()
     try:
-        template_id = int(payload.get("template_id") or 0)
+        template_id = _required_int(payload, "template_id") if payload.get("template_id") else 0
         template = _template(template_id) if template_id else None
         urls = payload.get("urls") or []
         if isinstance(urls, str):
@@ -411,15 +520,16 @@ def api_attribute_product_process(product_id: int):
     payload = _json_body()
     try:
         product = _product(product_id)
-        snapshot_product(g.db, product, "Перед обработкой доноров")
+        expected_version = _assert_product_version(product, payload)
         report = process_product_donors(
             g.db,
             product,
-            payload.get("donor_ids") or [],
-            url_overrides=payload.get("url_overrides") or {},
+            _integer_list(payload, "donor_ids", required=True),
+            url_overrides=_string_mapping(payload, "url_overrides"),
+            expected_version=expected_version,
         )
         g.db.flush()
-        return jsonify(_product_mutation_payload(product, report=report))
+        return jsonify(_product_mutation_payload(product, report=report, version_touched=True))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
 
@@ -442,17 +552,13 @@ def api_attribute_batch_process_all(batch_id: int):
     payload = _json_body()
     try:
         _batch(batch_id)
-        donor_ids = list(dict.fromkeys(int(item) for item in (payload.get("donor_ids") or [])))
-        if not donor_ids:
-            raise ValueError("Выберите хотя бы одного донора")
+        donor_ids = _integer_list(payload, "donor_ids", required=True)
         product_ids = list(g.db.scalars(
             select(AttributeProduct.id)
             .where(AttributeProduct.batch_id == batch_id)
             .order_by(AttributeProduct.sort_order, AttributeProduct.id)
         ))
-        overrides = payload.get("url_overrides_by_product") or {}
-        if not isinstance(overrides, dict):
-            raise ValueError("Некорректный список ссылок товаров")
+        overrides = _nested_string_mapping(payload, "url_overrides_by_product")
         from runtime.attribute_batch_operations import start_attribute_batch_operation
 
         state = start_attribute_batch_operation(
@@ -479,15 +585,13 @@ def api_attribute_batch_chatgpt_analyze_all(batch_id: int):
 
         if not chatgpt_status().get("authenticated"):
             raise RuntimeError("Сначала подключите ChatGPT")
-        donor_ids = list(dict.fromkeys(int(item) for item in (payload.get("donor_ids") or [])))
+        donor_ids = _integer_list(payload, "donor_ids")
         product_ids = list(g.db.scalars(
             select(AttributeProduct.id)
             .where(AttributeProduct.batch_id == batch_id)
             .order_by(AttributeProduct.sort_order, AttributeProduct.id)
         ))
-        overrides = payload.get("url_overrides_by_product") or {}
-        if not isinstance(overrides, dict):
-            raise ValueError("Некорректный список ссылок товаров")
+        overrides = _nested_string_mapping(payload, "url_overrides_by_product")
         from runtime.attribute_batch_operations import start_attribute_batch_operation
 
         state = start_attribute_batch_operation(
@@ -507,8 +611,10 @@ def api_attribute_batch_chatgpt_analyze_all(batch_id: int):
 @bp.post("/api/attribute-assistant/products/<int:product_id>/similar")
 def api_attribute_product_similar(product_id: int):
     ensure_storage()
+    payload = _json_body()
     try:
         product = _product(product_id)
+        _assert_product_version(product, payload)
         snapshot_product(g.db, product, "Перед поиском по похожим товарам")
         changed = apply_similar_products(g.db, product)
         return jsonify(_product_mutation_payload(product, changed=changed))
@@ -524,6 +630,7 @@ def api_attribute_value_update(value_id: int):
         return jsonify({"error": "Значение не найдено"}), 404
     payload = _json_body()
     try:
+        _assert_product_version(value.product, payload)
         snapshot_product(g.db, value.product, f"Перед изменением {value.attribute_name}")
         update_product_value(
             value,
@@ -546,7 +653,10 @@ def api_attribute_value_delete(value_id: int):
     value = g.db.get(AttributeProductValue, value_id)
     if not value:
         return jsonify({"error": "Значение не найдено"}), 404
+    payload = _json_body()
     try:
+        _assert_product_version(value.product, payload)
+        snapshot_product(g.db, value.product, f"Перед удалением {value.attribute_name}")
         product = delete_extra_product_value(g.db, value)
         return jsonify(_product_mutation_payload(product, deleted_id=value_id))
     except ValueError as error:
@@ -561,13 +671,14 @@ def api_attribute_value_mapping_rule(value_id: int):
         return jsonify({"error": "Значение атрибута не найдено"}), 404
     payload = _json_body()
     try:
+        _assert_product_version(value.product, payload)
         snapshot_product(g.db, value.product, f"Перед сохранением значения {value.attribute_name}")
         rule = save_value_mapping_rule(
             g.db,
-            donor_id=int(payload.get("donor_id") or 0),
+            donor_id=_required_int(payload, "donor_id"),
             field=value.template_field,
             raw_value=payload.get("raw_value", ""),
-            allowed_value_id=int(payload.get("allowed_value_id") or 0),
+            allowed_value_id=_required_int(payload, "allowed_value_id"),
         )
         update_product_value(value, action="accept", manual_value=rule.allowed_value.value)
         details = dict(value.source_details or {})
@@ -596,10 +707,13 @@ def api_attribute_batch_bulk(batch_id: int):
     ensure_storage()
     payload = _json_body()
     try:
+        from runtime.attribute_batch_operations import is_attribute_batch_operation_active
+
+        if is_attribute_batch_operation_active(batch_id):
+            return jsonify({"error": "Дождитесь завершения массовой обработки товаров"}), 409
         batch = _batch(batch_id)
-        for product in batch.products:
-            snapshot_product(g.db, product, f"Перед массовым действием {clean_text(payload.get('action'))}")
         changed = bulk_action(
+            g.db,
             batch,
             clean_text(payload.get("action")),
             int(payload.get("minimum_confidence") or BULK_CONFIDENCE),
@@ -615,13 +729,13 @@ def api_attribute_mapping_rule():
     ensure_storage()
     payload = _json_body()
     try:
-        template = _template(int(payload.get("template_id") or 0))
-        field = g.db.get(AttributeTemplateField, int(payload.get("field_id") or 0))
+        template = _template(_required_int(payload, "template_id"))
+        field = g.db.get(AttributeTemplateField, _required_int(payload, "field_id"))
         if not field or field.template_id != template.id:
             raise ValueError("Атрибут шаблона не найден")
         rule = save_mapping_rule(
             g.db,
-            donor_id=int(payload.get("donor_id") or 0),
+            donor_id=_required_int(payload, "donor_id"),
             template=template,
             field=field,
             donor_attribute_name=payload.get("donor_attribute_name", ""),
@@ -665,6 +779,7 @@ def api_attribute_product_chatgpt_analyze(product_id: int):
         from services.attribute_ai import analyze_product_with_chatgpt
 
         product = _product(product_id)
+        _assert_product_version(product, payload)
         result = analyze_product_with_chatgpt(
             g.db,
             product,
@@ -673,6 +788,7 @@ def api_attribute_product_chatgpt_analyze(product_id: int):
         )
         return jsonify(_product_mutation_payload(
             result["product"],
+            version_touched=True,
             changed=result["changed"],
             analysis=result["analysis"],
             source_url=result["source_url"],
@@ -921,6 +1037,7 @@ def api_attribute_allowed_update(allowed_id: int):
                 raise ValueError("Такое значение уже есть в справочнике")
             allowed.value = normalized
             allowed.normalized_value = key
+            allowed.search_value = product_search_text(normalized)
         for key in ("is_active", "is_combination"):
             if key in payload:
                 setattr(allowed, key, bool(payload.get(key)))
@@ -953,7 +1070,8 @@ def api_attribute_product_template(product_id: int):
     payload = _json_body()
     try:
         product = _product(product_id)
-        template = _template(int(payload.get("template_id") or 0))
+        _assert_product_version(product, payload)
+        template = _template(_required_int(payload, "template_id"))
         assign_product_template(g.db, product, template)
         return jsonify(_product_mutation_payload(product))
     except (TypeError, ValueError) as error:
@@ -975,8 +1093,9 @@ def api_attribute_product_map_attribute(product_id: int):
     payload = _json_body()
     try:
         product = _product(product_id)
-        field = g.db.get(AttributeTemplateField, int(payload.get("field_id") or 0))
-        donor_id = int(payload.get("donor_id") or 0)
+        _assert_product_version(product, payload)
+        field = g.db.get(AttributeTemplateField, _required_int(payload, "field_id"))
+        donor_id = _required_int(payload, "donor_id")
         if not field or not product.template or field.template_id != product.template.id:
             raise ValueError("Атрибут шаблона не найден")
         snapshot_product(g.db, product, "Перед ручным сопоставлением атрибута")
@@ -1054,8 +1173,10 @@ def api_attribute_product_history(product_id: int):
 @bp.post("/api/attribute-assistant/products/<int:product_id>/history/<int:revision_id>/restore")
 def api_attribute_product_history_restore(product_id: int, revision_id: int):
     ensure_storage()
+    payload = _json_body()
     try:
         product = _product(product_id)
+        _assert_product_version(product, payload)
         revision = g.db.get(AttributeProductRevision, revision_id)
         if not revision:
             raise ValueError("Снимок не найден")
@@ -1080,6 +1201,7 @@ def api_attribute_batch_report_download(batch_id: int):
     try:
         batch = _batch(batch_id)
         path = export_batch_report_csv(batch)
+        g.db.commit()
         return send_file(path, as_attachment=True, download_name=path.name, mimetype="text/csv")
     except ValueError as error:
         return jsonify({"error": str(error)}), 404

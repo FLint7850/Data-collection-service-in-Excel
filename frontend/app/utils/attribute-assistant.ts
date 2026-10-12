@@ -1,5 +1,6 @@
 import type {
     AttributeProcessingMode,
+    AttributeAssistantSettings,
     AttributeProduct,
     AttributeSource,
     AttributeValue,
@@ -8,14 +9,31 @@ import type {
 export const ALL_FILTER_VALUE = "all";
 export const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
 export const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "from_source", "unfilled"]);
-export const processingModeItems: Array<{ label: string; value: AttributeProcessingMode }> = [
-    { label: "Только проверить, без предложений в итог", value: "check" },
-    { label: "Показать предложения, решение вручную", value: "suggest" },
-    { label: "Автопринять только точные 100%", value: "auto_exact" },
-    { label: "Автопринять уверенное от главного донора", value: "auto_primary" },
-    { label: "Автопринять подтверждённое от 95%", value: "auto_confident" },
-    { label: "Автопринять всё найденное в справочнике", value: "auto_all" },
-];
+export function processingModeItems(
+    settings: AttributeAssistantSettings | null,
+): Array<{ label: string; value: AttributeProcessingMode }> {
+    const exact = settings?.exact_value_confidence ?? 100;
+    const primary = settings?.auto_primary_confidence ?? 85;
+    const confident = settings?.auto_confident_confidence ?? 95;
+    const labels: Record<AttributeProcessingMode, string> = {
+        check: "Только проверить, без предложений в итог",
+        suggest: "Показать предложения, решение вручную",
+        auto: `Автопринять подтверждённое от ${confident}%`,
+        auto_exact: `Автопринять только точные ${exact}%`,
+        auto_primary: `Автопринять от главного донора от ${primary}%`,
+        auto_confident: `Автопринять подтверждённое от ${confident}%`,
+        auto_all: "Автопринять всё найденное в справочнике",
+    };
+    const modes = settings?.processing_modes || [
+        "check",
+        "suggest",
+        "auto_exact",
+        "auto_primary",
+        "auto_confident",
+        "auto_all",
+    ];
+    return modes.map((value) => ({ value, label: labels[value] }));
+}
 
 export const templateUpdateModeItems = [
     { label: "Объединить", value: "merge" },

@@ -691,6 +691,13 @@ def migrate_attribute_assistant_tables(connection) -> None:
         },
         "attribute_allowed_values": {
             "is_combination": "BOOLEAN NOT NULL DEFAULT 0",
+            "search_value": "VARCHAR(1000) NOT NULL DEFAULT ''",
+        },
+        "attribute_value_synonyms": {
+            "search_synonym": "VARCHAR(1000) NOT NULL DEFAULT ''",
+        },
+        "attribute_value_mapping_rules": {
+            "match_raw_value": "VARCHAR(1000) NOT NULL DEFAULT ''",
         },
         "attribute_template_revisions": {
             "version": "INTEGER NOT NULL DEFAULT 1",
@@ -713,6 +720,8 @@ def migrate_attribute_assistant_tables(connection) -> None:
         "attribute_products": {
             "sort_order": "INTEGER NOT NULL DEFAULT 0",
             "template_id": "INTEGER",
+            "search_text": "TEXT NOT NULL DEFAULT ''",
+            "version": "INTEGER NOT NULL DEFAULT 1",
             "donor_urls": "JSON NOT NULL DEFAULT '[]'",
             "selected_donor_ids": "JSON NOT NULL DEFAULT '[]'",
             "donor_url_overrides": "JSON NOT NULL DEFAULT '{}'",
@@ -731,6 +740,51 @@ def migrate_attribute_assistant_tables(connection) -> None:
 
     migrate_attribute_legacy_defaults(connection)
 
+    from services.attribute_text import mapping_value_key, product_search_text
+
+    if table_columns(connection, "attribute_allowed_values"):
+        if "search_value" not in original_columns.get("attribute_allowed_values", {}):
+            rows = list(connection.execute(
+                text("SELECT id, value FROM attribute_allowed_values")
+            ).mappings())
+            for row in rows:
+                connection.execute(
+                    text("UPDATE attribute_allowed_values SET search_value = :value WHERE id = :id"),
+                    {"id": row["id"], "value": product_search_text(row["value"])},
+                )
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_attribute_allowed_values_field_search "
+            "ON attribute_allowed_values (field_id, is_active, search_value)"
+        ))
+    if table_columns(connection, "attribute_value_synonyms"):
+        if "search_synonym" not in original_columns.get("attribute_value_synonyms", {}):
+            rows = list(connection.execute(
+                text("SELECT id, synonym FROM attribute_value_synonyms")
+            ).mappings())
+            for row in rows:
+                connection.execute(
+                    text("UPDATE attribute_value_synonyms SET search_synonym = :value WHERE id = :id"),
+                    {"id": row["id"], "value": product_search_text(row["synonym"])},
+                )
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_attribute_value_synonyms_search "
+            "ON attribute_value_synonyms (allowed_value_id, search_synonym)"
+        ))
+    if table_columns(connection, "attribute_value_mapping_rules"):
+        if "match_raw_value" not in original_columns.get("attribute_value_mapping_rules", {}):
+            rows = list(connection.execute(
+                text("SELECT id, raw_value FROM attribute_value_mapping_rules")
+            ).mappings())
+            for row in rows:
+                connection.execute(
+                    text("UPDATE attribute_value_mapping_rules SET match_raw_value = :value WHERE id = :id"),
+                    {"id": row["id"], "value": mapping_value_key(row["raw_value"])},
+                )
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_attribute_value_mapping_rules_match "
+            "ON attribute_value_mapping_rules (donor_id, template_field_id, match_raw_value)"
+        ))
+
     allowed_value_columns = table_columns(connection, "attribute_allowed_values")
     for obsolete_column in ("is_global", "is_recommended"):
         if obsolete_column in allowed_value_columns:
@@ -740,6 +794,7 @@ def migrate_attribute_assistant_tables(connection) -> None:
     product_columns = original_columns.get("attribute_products", {})
     for table, index_name, columns in (
         ("attribute_products", "ix_attribute_products_batch_sort", "batch_id, sort_order, id"),
+        ("attribute_products", "ix_attribute_products_batch_search", "batch_id, search_text"),
         ("attribute_product_values", "ix_attribute_product_values_product_id", "product_id"),
     ):
         if {column.strip() for column in columns.split(",")} <= set(table_columns(connection, table)):
@@ -752,6 +807,18 @@ def migrate_attribute_assistant_tables(connection) -> None:
                 "WHERE attribute_batches.id = attribute_products.batch_id)"
             )
         )
+    if product_columns and "search_text" not in product_columns:
+        products = list(connection.execute(
+            text("SELECT id, external_id, model, name, brand, category_name FROM attribute_products")
+        ).mappings())
+        for product in products:
+            search_text = product_search_text(
+                *(product[column] for column in ("external_id", "model", "name", "brand", "category_name"))
+            )
+            connection.execute(
+                text("UPDATE attribute_products SET search_text = :search_text WHERE id = :id"),
+                {"id": product["id"], "search_text": search_text},
+            )
 
     batch_columns = original_columns.get("attribute_batches", {})
     if batch_columns:

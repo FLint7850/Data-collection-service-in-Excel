@@ -10,7 +10,7 @@ from services.attribute_settings import (
     MAX_PAGE_SIZE,
     PRODUCT_PAGE_SIZE,
 )
-from query_utils import normalize_search_text
+from services.attribute_text import product_search_text
 
 
 def _sum(condition):
@@ -25,6 +25,7 @@ def batch_summary(db: Session, batch_id: int) -> dict[str, int]:
     ).where(AttributeProduct.batch_id == batch_id)).mappings().one()
     value = AttributeProductValue
     values = db.execute(select(
+        func.count(value.id).label("attributes"),
         _sum(and_(value.is_in_template.is_(True), value.final_value != "", value.final_value != "-")).label("filled"),
         _sum(and_(value.is_in_template.is_(True), value.final_value == "")).label("missing"),
         _sum(value.status == "conflict").label("conflicts"),
@@ -50,7 +51,7 @@ def product_page(
     ).join(product, product.id == value.product_id).where(product.batch_id == batch_id)
     counters = counters.group_by(value.product_id).cte("attribute_product_counts")
     statement = select(
-        product.id, product.model, product.name, product.brand, product.status,
+        product.id, product.model, product.name, product.brand, product.status, product.search_text,
         *(func.coalesce(counters.c[key], 0).label(key)
           for key in ("missing", "conflicts", "suggestions", "outside_template")),
     ).outerjoin(counters, counters.c.product_id == product.id).where(product.batch_id == batch_id)
@@ -71,20 +72,9 @@ def product_page(
     filtered = select(rows)
     if status != "all":
         filtered = filtered.where(conditions[status])
-    query = normalize_search_text(query)
+    query = product_search_text(query)
     if query:
-        # SQLite lower() folds only ASCII. A per-connection Unicode function
-        # also works with isolated test sessions and existing databases.
-        if db.bind.dialect.name == "sqlite":
-            db.connection().connection.driver_connection.create_function(
-                "attribute_search_key", 1, normalize_search_text, deterministic=True,
-            )
-            search_key = func.attribute_search_key
-        else:
-            search_key = func.lower
-        filtered = filtered.where(or_(
-            *(search_key(rows.c[key]).contains(query, autoescape=True) for key in ("model", "name", "brand")),
-        ))
+        filtered = filtered.where(rows.c.search_text.contains(query, autoescape=True))
         matched = int(db.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
     else:
         matched = int(counts[status])

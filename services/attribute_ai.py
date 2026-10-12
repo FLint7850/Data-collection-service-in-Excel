@@ -20,11 +20,14 @@ from sqlalchemy.orm import Session
 from config import ATTRIBUTE_ASSISTANT_DIR
 from models import AttributeProduct, AttributeProductSource, Donor
 from services.attribute_programs import is_program_list, match_programs, program_dictionary
+from services.attribute_files import delete_after_commit, stage_text
+from services.attribute_settings import StaleProductError
 from services.attribute_assistant import (
     _is_presence_marker,
     _candidate_value_key,
     _has_confirmed_decision,
     apply_candidate,
+    capture_product_snapshot,
     record_unknown_value,
     _allowed_match,
     _numeric_range_bounds,
@@ -47,7 +50,8 @@ from services.attribute_assistant import (
     refresh_batch_summary,
     refresh_product_status,
     resolve_donor_url,
-    snapshot_product,
+    save_product_snapshot,
+    touch_product,
 )
 
 
@@ -678,7 +682,14 @@ def record_analysis_metrics(
     }
 
 
-def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, Any], *, source_url: str) -> int:
+def apply_analysis(
+    db: Session,
+    product: AttributeProduct,
+    analysis: dict[str, Any],
+    *,
+    source_url: str,
+    refresh_summary: bool = True,
+) -> int:
     _clear_replaceable_chatgpt_evidence(product)
     values = {
         item.template_field_id: item
@@ -784,7 +795,8 @@ def apply_analysis(db: Session, product: AttributeProduct, analysis: dict[str, A
     }
 
     refresh_product_status(product)
-    refresh_batch_summary(product.batch)
+    if refresh_summary:
+        refresh_batch_summary(product.batch)
     return changed
 
 
@@ -836,6 +848,7 @@ def prepare_product_source(
     *,
     url_overrides: dict[str, str] | None = None,
     fetcher: Any | None = None,
+    persist: bool = True,
 ) -> tuple[str, str, dict[str, Any], str]:
     """Resolve one exact product URL and, where possible, download its page for ChatGPT."""
 
@@ -848,8 +861,9 @@ def prepare_product_source(
         ).items()
         if clean_text(value)
     }
-    product.selected_donor_ids = selected
-    product.donor_url_overrides = effective_overrides
+    if persist:
+        product.selected_donor_ids = selected
+        product.donor_url_overrides = effective_overrides
     selected_order = {donor_id: index for index, donor_id in enumerate(selected)}
 
     def source_donor_id(source: AttributeProductSource) -> int | None:
@@ -859,6 +873,7 @@ def prepare_product_source(
     donor: Donor | None = None
     source_url = ""
     resolved_by = ""
+    user_supplied_url = False
 
     # The URL currently entered in the interface is authoritative even when an
     # older parser snapshot exists for the same donor.
@@ -871,6 +886,7 @@ def prepare_product_source(
             continue
         donor = candidate
         source_url = manual_url
+        user_supplied_url = True
         resolved_by = "Ссылка задана пользователем"
         existing = next(
             (
@@ -881,7 +897,7 @@ def prepare_product_source(
             ),
             None,
         )
-        if existing is None:
+        if existing is None and persist:
             existing = _upsert_source(
                 product,
                 donor,
@@ -891,7 +907,7 @@ def prepare_product_source(
                 status="resolved",
                 message=resolved_by,
             )
-        else:
+        elif existing is not None and persist:
             existing.priority = priority
             existing.role = "primary" if priority == 0 else "verification"
             payload = dict(existing.parsed_data or {})
@@ -940,15 +956,16 @@ def prepare_product_source(
                 donor = candidate
                 source_url = found
                 resolved_by = reason
-                _upsert_source(
-                    product,
-                    donor,
-                    url=source_url,
-                    priority=priority,
-                    role="primary" if priority == 0 else "verification",
-                    status="resolved",
-                    message=resolved_by,
-                )
+                if persist:
+                    _upsert_source(
+                        product,
+                        donor,
+                        url=source_url,
+                        priority=priority,
+                        role="primary" if priority == 0 else "verification",
+                        status="resolved",
+                        message=resolved_by,
+                    )
                 break
             errors.append(f"{candidate.brand.name}: {reason}")
         if not source_url and errors:
@@ -980,9 +997,9 @@ def prepare_product_source(
     parsed: dict[str, Any] = stored_parsed
     try:
         downloaded_html, final_url = (
-            fetch_donor_product_html(donor, source_url, fetcher=fetcher)
-            if donor
-            else fetch_public_html(source_url)
+            fetch_public_html(source_url)
+            if user_supplied_url or donor is None
+            else fetch_donor_product_html(donor, source_url, fetcher=fetcher)
         )
         source_url = final_url
         downloaded_parsed = (
@@ -993,28 +1010,30 @@ def prepare_product_source(
         html = downloaded_html
         if downloaded_parsed.get("attributes") or not parsed.get("attributes"):
             parsed = downloaded_parsed
-        raw_dir = ATTRIBUTE_ASSISTANT_DIR / "raw" / str(product.batch_id) / str(product.id)
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        donor_part = donor.id if donor else "own"
-        raw_path = raw_dir / f"chatgpt_{donor_part}.html"
-        raw_path.write_text(html, encoding="utf-8")
         attribute_count = len(parsed.get("attributes") or [])
         source_status = "parsed" if attribute_count else "no_attributes"
         source_message = f"{resolved_by or 'Страница товара загружена'}; извлечено характеристик: {attribute_count}"
-        _upsert_source(
-            product,
-            donor,
-            url=source_url,
-            priority=existing.priority if existing else 0,
-            role=existing.role if existing else ("primary" if donor else "own_site"),
-            status=source_status,
-            message=source_message,
-            raw_html_path=str(raw_path),
-            parsed=parsed,
-        )
+        if persist:
+            raw_dir = ATTRIBUTE_ASSISTANT_DIR / "raw" / str(product.batch_id) / str(product.id)
+            donor_part = donor.id if donor else "own"
+            raw_path = raw_dir / f"chatgpt_{donor_part}_{int(time.time_ns())}.html"
+            stage_text(db, raw_path, html)
+            if existing and clean_text(existing.raw_html_path):
+                delete_after_commit(db, existing.raw_html_path, root=ATTRIBUTE_ASSISTANT_DIR)
+            _upsert_source(
+                product,
+                donor,
+                url=source_url,
+                priority=existing.priority if existing else 0,
+                role=existing.role if existing else ("primary" if donor else "own_site"),
+                status=source_status,
+                message=source_message,
+                raw_html_path=str(raw_path),
+                parsed=parsed,
+            )
     except Exception as error:
         # The bridge can still open the exact public URL itself (useful for anti-bot pages).
-        if donor and not parsed.get("attributes"):
+        if persist and donor and not parsed.get("attributes"):
             _upsert_source(
                 product,
                 donor,
@@ -1024,7 +1043,8 @@ def prepare_product_source(
                 status="resolved",
                 message=f"{resolved_by or 'Ссылка найдена'}; локальная загрузка: {clean_text(error)}",
             )
-    db.flush()
+    if persist:
+        db.flush()
     return source_url, html, parsed, resolved_by
 
 
@@ -1042,13 +1062,20 @@ def analyze_product_with_chatgpt(
 
     preparation_started = time.perf_counter()
     product_id = product.id
-    snapshot_product(db, product, "Перед анализом ChatGPT")
+    expected_version = product.version
+    initial_snapshot = capture_product_snapshot(product)
+    template = product_template(product)
+    template_id = template.id if template else None
+    template_version = template.version if template else None
+    selected_donor_ids = list(product.selected_donor_ids or []) if donor_ids is None else list(donor_ids)
+    effective_overrides = dict(product.donor_url_overrides or {}) if url_overrides is None else dict(url_overrides)
     source_url, html, parsed, _resolved_by = prepare_product_source(
         db,
         product,
         donor_ids,
         url_overrides=url_overrides,
         fetcher=fetcher,
+        persist=False,
     )
     prompt, page_evidence = build_product_prompt(
         product,
@@ -1056,14 +1083,21 @@ def analyze_product_with_chatgpt(
         html=html,
         parsed=parsed,
     )
-    db.commit()
+    db.rollback()
     request_started = time.perf_counter()
     response = analyze_with_chatgpt(prompt)
     response_received = time.perf_counter()
-    db.expire_all()
     product = db.get(AttributeProduct, product_id)
     if product is None:
         raise ValueError("Товар был удалён во время анализа ChatGPT")
+    current_template = product_template(product)
+    if product.version != expected_version:
+        raise StaleProductError("Товар изменился во время анализа ChatGPT. Результат не применён")
+    if (
+        (current_template.id if current_template else None) != template_id
+        or (current_template.version if current_template else None) != template_version
+    ):
+        raise ValueError("Шаблон изменился во время анализа ChatGPT. Повторите анализ")
     analysis = validate_analysis(
         product,
         response.get("text", ""),
@@ -1076,7 +1110,15 @@ def analyze_product_with_chatgpt(
         request_seconds=response_received - request_started,
         validation_seconds=time.perf_counter() - response_received,
     )
+    save_product_snapshot(db, product, "Перед анализом ChatGPT", initial_snapshot)
+    product.selected_donor_ids = list(dict.fromkeys(int(item) for item in selected_donor_ids))
+    product.donor_url_overrides = {
+        str(key): clean_text(value)
+        for key, value in effective_overrides.items()
+        if clean_text(value)
+    }
     changed = apply_analysis(db, product, analysis, source_url=source_url)
+    touch_product(product)
     db.flush()
     return {
         "changed": changed,

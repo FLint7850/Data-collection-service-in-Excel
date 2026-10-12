@@ -2,7 +2,7 @@ import { attributeAssistantService as api } from "~/services/attribute-assistant
 import type { AttributeValue } from "~/types/attribute-assistant";
 import { displayedProposal } from "~/utils/attribute-assistant";
 import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
-import { createLatestRequestCoordinator } from "~/utils/latest-request";
+import { createLatestRequestCoordinator, isAbortError } from "~/utils/latest-request";
 
 type AllowedSelectInstance = {
     viewportRef?: HTMLElement | { value?: HTMLElement | null } | null;
@@ -10,6 +10,7 @@ type AllowedSelectInstance = {
 
 export function useAttributeAllowedValues(
     pageSize: () => number | undefined = () => undefined,
+    reportError: (error: unknown) => void = () => undefined,
 ) {
     const allowedOptionCache = ref<Record<number, Array<{ id: number; value: string }>>>({});
     const allowedSearchQueries = ref<Record<number, string>>({});
@@ -64,15 +65,21 @@ export function useAttributeAllowedValues(
         const requestKey = `allowed-${value.id}`;
         const signal = requests.start(requestKey);
 
-        const result = await api.allowedValues(
-            value.field_id,
-            normalizedQuery,
-            false,
-            0,
-            pageSize(),
-            signal,
-        ).catch(() => null);
-        requests.finish(requestKey, signal);
+        let result;
+        try {
+            result = await api.allowedValues(
+                value.field_id,
+                normalizedQuery,
+                false,
+                0,
+                pageSize(),
+                signal,
+            );
+        } catch (caught) {
+            if (!isAbortError(caught)) reportError(caught);
+        } finally {
+            requests.finish(requestKey, signal);
+        }
 
         if (
             result
@@ -113,15 +120,21 @@ export function useAttributeAllowedValues(
         const signal = requests.start(requestKey);
 
         const loaded = allowedOptionCache.value[value.id] || [];
-        const result = await api.allowedValues(
-            value.field_id,
-            page.query,
-            false,
-            loaded.length,
-            pageSize(),
-            signal,
-        ).catch(() => null);
-        requests.finish(requestKey, signal);
+        let result;
+        try {
+            result = await api.allowedValues(
+                value.field_id,
+                page.query,
+                false,
+                loaded.length,
+                pageSize(),
+                signal,
+            );
+        } catch (caught) {
+            if (!isAbortError(caught)) reportError(caught);
+        } finally {
+            requests.finish(requestKey, signal);
+        }
 
         if (
             result

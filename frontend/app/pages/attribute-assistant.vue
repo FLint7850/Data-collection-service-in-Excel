@@ -28,6 +28,7 @@ import {
 } from "~/utils/attribute-assistant";
 import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
 import { attributeAssistantService as attributeApi } from "~/services/attribute-assistant.service";
+import { errorMessage } from "~/utils/format";
 
 definePageMeta({
   title: "Атрибуты",
@@ -38,6 +39,7 @@ const assistant = useAttributeAssistant();
 
 const allowedValuesState = useAttributeAllowedValues(
   () => assistant.workspace.value.settings?.allowed_value_page_size,
+  (caught) => { assistant.error.value = errorMessage(caught); },
 );
 
 const templatesState = useAttributeTemplates(assistant);
@@ -354,7 +356,7 @@ onBeforeUnmount(() => {
               <USelect v-model="selectedTemplateId" :items="templateSelectItems" class="w-full" />
             </UFormField>
             <UFormField label="Режим обработки">
-              <USelect v-model="processingMode" :items="processingModeItems" class="w-full" />
+              <USelect v-model="processingMode" :items="processingModeItems(workspace.settings)" class="w-full" />
             </UFormField>
           </div>
 

@@ -304,6 +304,7 @@ class AttributeAllowedValue(Base):
     field_id: Mapped[int] = mapped_column(ForeignKey("attribute_template_fields.id", ondelete="CASCADE"), nullable=False)
     value: Mapped[str] = mapped_column(String(1000), nullable=False)
     normalized_value: Mapped[str] = mapped_column(String(1000), nullable=False)
+    search_value: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_combination: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -319,6 +320,7 @@ class AttributeAllowedValue(Base):
     __table_args__ = (
         UniqueConstraint("field_id", "normalized_value", name="uq_attribute_allowed_values_normalized"),
         Index("ix_attribute_allowed_values_field_active", "field_id", "is_active"),
+        Index("ix_attribute_allowed_values_field_search", "field_id", "is_active", "search_value"),
     )
 
 
@@ -329,11 +331,15 @@ class AttributeValueSynonym(Base):
     allowed_value_id: Mapped[int] = mapped_column(ForeignKey("attribute_allowed_values.id", ondelete="CASCADE"), nullable=False)
     synonym: Mapped[str] = mapped_column(String(1000), nullable=False)
     normalized_synonym: Mapped[str] = mapped_column(String(1000), nullable=False)
+    search_synonym: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
     allowed_value: Mapped[AttributeAllowedValue] = relationship("AttributeAllowedValue", back_populates="synonyms")
 
-    __table_args__ = (UniqueConstraint("allowed_value_id", "normalized_synonym", name="uq_attribute_value_synonyms_normalized"),)
+    __table_args__ = (
+        UniqueConstraint("allowed_value_id", "normalized_synonym", name="uq_attribute_value_synonyms_normalized"),
+        Index("ix_attribute_value_synonyms_search", "allowed_value_id", "search_synonym"),
+    )
 
 
 class AttributeTemplateRevision(Base):
@@ -390,12 +396,14 @@ class AttributeProduct(Base):
     brand: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     category_name: Mapped[str] = mapped_column(String(500), default="", nullable=False)
     source_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    search_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     donor_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     selected_donor_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     donor_url_overrides: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     processing_state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="needs_review", nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -412,6 +420,7 @@ class AttributeProduct(Base):
 
     __table_args__ = (
         Index("ix_attribute_products_batch_model", "batch_id", "model"),
+        Index("ix_attribute_products_batch_search", "batch_id", "search_text"),
         Index("ix_attribute_products_batch_sort", "batch_id", "sort_order", "id"),
     )
 
@@ -511,6 +520,7 @@ class AttributeValueMappingRule(Base):
     allowed_value_id: Mapped[int] = mapped_column(ForeignKey("attribute_allowed_values.id", ondelete="CASCADE"), nullable=False)
     raw_value: Mapped[str] = mapped_column(String(1000), nullable=False)
     normalized_raw_value: Mapped[str] = mapped_column(String(1000), nullable=False)
+    match_raw_value: Mapped[str] = mapped_column(String(1000), default="", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
@@ -527,6 +537,10 @@ class AttributeValueMappingRule(Base):
         Index(
             "ix_attribute_value_mapping_rules_lookup",
             "donor_id", "template_field_id", "normalized_raw_value",
+        ),
+        Index(
+            "ix_attribute_value_mapping_rules_match",
+            "donor_id", "template_field_id", "match_raw_value",
         ),
     )
 

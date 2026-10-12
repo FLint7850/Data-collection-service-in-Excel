@@ -253,7 +253,13 @@ export function useAttributeReview(
                     values: current.values,
                     sources: current.sources,
                 };
-            historyItems.value = result.history;
+            const historyItem = result.history_item ?? result.history?.[0];
+            if (historyItem) {
+                historyItems.value = [
+                    historyItem,
+                    ...historyItems.value.filter((item) => item.id !== historyItem.id),
+                ];
+            }
         }
         if (selectedBatch.value?.id === result.batch.id) selectedBatch.value = result.batch;
 
@@ -637,8 +643,8 @@ export function useAttributeReview(
 
         const relatedSignal = requests.start("product-related");
         void Promise.all([
-            api.donorRecommendations(id, relatedSignal).catch(() => ({ items: [] })),
-            api.productHistory(id, relatedSignal).catch(() => ({ items: [] })),
+            api.donorRecommendations(id, relatedSignal),
+            api.productHistory(id, relatedSignal),
         ]).then(([recommendations, history]) => {
             if (token !== productRequestToken) return;
             donorRecommendations.value = recommendations.items;
@@ -648,6 +654,10 @@ export function useAttributeReview(
                     .filter((item) => item.recommended)
                     .slice(0, ATTRIBUTE_ASSISTANT_UI.recommendedDonorCount)
                     .map((item) => item.id);
+            }
+        }).catch((caught) => {
+            if (token === productRequestToken && !isAbortError(caught)) {
+                error.value = errorMessage(caught);
             }
         }).finally(() => {
             requests.finish("product-related", relatedSignal);
@@ -684,7 +694,12 @@ export function useAttributeReview(
         }
 
         const result = await run("process", () =>
-            api.processProduct(selectedProduct.value!.id, selectedDonors.value, donorUrlOverrides.value),
+            api.processProduct(
+                selectedProduct.value!.id,
+                selectedProduct.value!.version,
+                selectedDonors.value,
+                donorUrlOverrides.value,
+            ),
         );
         if (!result) return;
 
@@ -710,7 +725,10 @@ export function useAttributeReview(
 
     async function useSimilar() {
         if (!selectedProduct.value) return;
-        const result = await run("similar", () => api.useSimilar(selectedProduct.value!.id));
+        const result = await run("similar", () => api.useSimilar(
+            selectedProduct.value!.id,
+            selectedProduct.value!.version,
+        ));
         if (result) {
             applyProductMutation(result);
             notify(`Добавлено предложений: ${result.changed}`);
@@ -727,6 +745,7 @@ export function useAttributeReview(
         const result = await run("chatgpt-product", () =>
             api.analyzeProductWithChatGpt(
                 selectedProduct.value!.id,
+                selectedProduct.value!.version,
                 selectedDonors.value,
                 donorUrlOverrides.value,
             ),
@@ -749,7 +768,11 @@ export function useAttributeReview(
 
         const result = await run(
             "assign-template",
-            () => api.assignTemplate(selectedProduct.value!.id, templateId),
+            () => api.assignTemplate(
+                selectedProduct.value!.id,
+                selectedProduct.value!.version,
+                templateId,
+            ),
         );
         if (result) {
             applyProductMutation(result);
@@ -773,7 +796,11 @@ export function useAttributeReview(
 
         const product = await run(
             "history-restore",
-            () => api.restoreProduct(selectedProduct.value!.id, id),
+            () => api.restoreProduct(
+                selectedProduct.value!.id,
+                selectedProduct.value!.version,
+                id,
+            ),
         );
         if (product) {
             applyProductMutation(product);
@@ -797,7 +824,12 @@ export function useAttributeReview(
         if (action === "dash" && !dashReason) return;
 
         const updated = await run(`value-${value.id}`, () =>
-            api.updateValue(value.id, { action, value: manual, dash_reason: dashReason }),
+            api.updateValue(value.id, {
+                expected_version: selectedProduct.value!.version,
+                action,
+                value: manual,
+                dash_reason: dashReason,
+            }),
         );
         if (!updated || !selectedProduct.value?.values) return;
 
@@ -815,7 +847,10 @@ export function useAttributeReview(
             color: "error",
         })) return;
 
-        const result = await run(`value-remove-${value.id}`, () => api.removeExtraValue(value.id));
+        const result = await run(`value-remove-${value.id}`, () => api.removeExtraValue(
+            value.id,
+            selectedProduct.value!.version,
+        ));
         if (!result) return;
 
         applyProductMutation(result);
@@ -848,7 +883,11 @@ export function useAttributeReview(
 
         const result = await run(`dictionary-${value.id}`, async () => {
             await api.addAllowedValue(value.field_id!, unknown.value);
-            return api.updateValue(value.id, { action: "accept", value: unknown.value });
+            return api.updateValue(value.id, {
+                expected_version: selectedProduct.value!.version,
+                action: "accept",
+                value: unknown.value,
+            });
         });
 
         if (result && selectedProduct.value?.values) {
@@ -873,6 +912,7 @@ export function useAttributeReview(
 
         const result = await run(`value-mapping-${value.id}-${index}`, () =>
             api.rememberValueMapping(value.id, {
+                expected_version: selectedProduct.value!.version,
                 donor_id: unknown.donor_id!,
                 raw_value: unknown.value,
                 allowed_value_id: allowedValueId,

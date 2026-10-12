@@ -35,7 +35,7 @@ RUN pip install pyflakes==3.4.0 \
     && python -m compileall -q app.py config.py database routes runtime services
 
 FROM base AS runtime
-COPY --from=test /app /app
+COPY . .
 RUN addgroup --system --gid 10001 app \
     && adduser --system --uid 10001 --ingroup app --home /app app \
     && mkdir -p data exports feeds storage/file-import storage/price-converter profiles/projects \

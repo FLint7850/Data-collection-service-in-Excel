@@ -98,6 +98,39 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
     const templateFieldSearchTokens = new Map<number, number>();
     const requests = createLatestRequestCoordinator();
     let templateRequestToken = 0;
+
+    function upsertWorkspaceTemplate(template: AttributeTemplate) {
+        const { fields: _fields, ...summary } = template;
+        const templates = [...workspace.value.templates];
+        const index = templates.findIndex((item) => item.id === template.id);
+        const previous = index >= 0 ? templates[index] : null;
+        if (index >= 0) templates[index] = summary;
+        else templates.unshift(summary);
+        const activeDelta = Number(template.is_active) - Number(previous?.is_active || false);
+        workspace.value = {
+            ...workspace.value,
+            templates,
+            dashboard: {
+                ...workspace.value.dashboard,
+                active_templates: Math.max(0, workspace.value.dashboard.active_templates + activeDelta),
+            },
+        };
+    }
+
+    function removeWorkspaceTemplate(template: AttributeTemplate) {
+        workspace.value = {
+            ...workspace.value,
+            templates: workspace.value.templates.filter((item) => item.id !== template.id),
+            dashboard: {
+                ...workspace.value.dashboard,
+                active_templates: Math.max(
+                    0,
+                    workspace.value.dashboard.active_templates - Number(template.is_active),
+                ),
+            },
+        };
+    }
+
     async function previewNewTemplate() {
         if (!templateFile.value) {
             error.value = "Выберите CSV-файл шаблона.";
@@ -119,7 +152,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         const result = await run("template-import", () => api.importTemplate(templateFile.value!, templateForm));
         if (!result) return;
         notify("Шаблон импортирован");
-        await loadWorkspace();
+        upsertWorkspaceTemplate(result);
         selectedTemplateId.value = result.id;
         templateFile.value = null;
         templatePreview.value = null;
@@ -135,14 +168,15 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         selectedTemplateId.value = id;
         const result = await run(requestKey, () => Promise.all([
             api.template(id, signal),
-            api.mappingRules(id, signal).catch(() => ({ items: [] })),
-            api.valueMappingRules(id, signal).catch(() => ({ items: [] })),
+            api.mappingRules(id, signal),
+            api.valueMappingRules(id, signal),
         ]));
         requests.finish("template", signal);
         if (!result || token !== templateRequestToken) return;
 
         const [details, rules, valueRules] = result;
         templateDetails.value = details;
+        upsertWorkspaceTemplate(details);
         loadedTemplateFieldIds.value = new Set();
         templateFieldQueries.value = {};
         templateFieldMatchedCounts.value = {};
@@ -319,8 +353,8 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         if (!result) return;
 
         templateDetails.value = result.template;
+        upsertWorkspaceTemplate(result.template);
         templateUpdateFile.value = null;
-        await loadWorkspace();
         notify("Шаблон обновлён");
     }
 
@@ -336,7 +370,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
 
         const result = await run("template-copy", () => api.copyTemplate(templateDetails.value!.id, name));
         if (result) {
-            await loadWorkspace();
+            upsertWorkspaceTemplate(result);
             await openTemplate(result.id);
             notify("Копия шаблона создана");
         }
@@ -350,7 +384,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         );
         if (result) {
             templateDetails.value = result;
-            await loadWorkspace();
+            upsertWorkspaceTemplate(result);
         }
     }
 
@@ -379,7 +413,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
             selectedTemplateId.value = remaining[0]?.id || null;
         }
 
-        await loadWorkspace();
+        removeWorkspaceTemplate(template);
         if (tab.value === "templates") await writeRoute("replace");
         notify("Шаблон удалён");
     }
@@ -422,9 +456,9 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         if (!result) return;
 
         templateDetails.value = result;
+        upsertWorkspaceTemplate(result);
         newTemplateField.name = "";
         showNewTemplateField.value = false;
-        await loadWorkspace();
         notify("Атрибут добавлен");
     }
 
@@ -464,8 +498,12 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
             return;
         }
 
-        const revisions = await api.templateRevisions(previous.id).catch(() => null);
-        if (revisions) templateRevisions.value = revisions.items;
+        try {
+            const revisions = await api.templateRevisions(previous.id);
+            templateRevisions.value = revisions.items;
+        } catch (caught) {
+            if (!isAbortError(caught)) error.value = errorMessage(caught);
+        }
         notify("Атрибут удалён");
     }
 
@@ -551,6 +589,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         if (!result) return;
 
         templateDetails.value = result;
+        upsertWorkspaceTemplate(result);
         templateFieldEditor.value = null;
         notify("Атрибут и синонимы обновлены");
     }
@@ -575,7 +614,24 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
         if (!result || !templateDetails.value) return;
 
         fieldValueEditor.value = null;
-        await openTemplate(templateDetails.value.id);
+        const fields = (templateDetails.value.fields || []).map((field) => {
+            if (field.id !== editor.fieldId) return field;
+            const existing = field.allowed_values.findIndex((item) => item.id === result.id);
+            const allowedValues = [...field.allowed_values];
+            if (existing >= 0) allowedValues[existing] = result;
+            else allowedValues.push(result);
+            return {
+                ...field,
+                allowed_values: allowedValues,
+                allowed_values_count: Math.max(field.allowed_values_count, allowedValues.length),
+            };
+        });
+        templateDetails.value = {
+            ...templateDetails.value,
+            fields,
+            version: result.template_version,
+        };
+        upsertWorkspaceTemplate(templateDetails.value);
         notify("Значение добавлено");
     }
 
@@ -645,6 +701,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
                 ...templateDetails.value,
                 version: result.template_version,
             };
+            upsertWorkspaceTemplate(templateDetails.value);
         }
         allowedValueEditor.value = null;
         notify("Значение и синонимы сохранены");
@@ -706,6 +763,7 @@ export function useAttributeTemplates(assistant: AttributeAssistantContext) {
                 ...templateDetails.value,
                 version: result.template_version,
             };
+            upsertWorkspaceTemplate(templateDetails.value);
         }
         notify(nextActive ? "Значение включено" : "Значение отключено");
     }

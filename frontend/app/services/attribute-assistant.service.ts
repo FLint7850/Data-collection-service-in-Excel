@@ -10,12 +10,16 @@ import type {
   AttributeMappingRule,
   AttributeValueMappingRule,
   AttributeProcessingMode,
+  AttributeFieldUpdateRequest,
+  AttributeMapRequest,
   AttributeProcessReport,
   AttributeProduct,
   AttributeProductMutation,
   AttributeProductPage,
   AttributeTemplate,
   AttributeTemplatePreview,
+  AttributeTemplateUpdateRequest,
+  AttributeValueUpdateRequest,
   AttributeValueMutation,
   AttributeWorkspace,
   ChatGptLogin,
@@ -47,7 +51,7 @@ export const attributeAssistantService = {
   },
 
   addAllowedValue: (fieldId: number, value: string, synonym = "") =>
-    $fetch(`${base}/fields/${fieldId}/allowed-values`, {
+    $fetch<AttributeAllowedValue & { template_version: number }>(`${base}/fields/${fieldId}/allowed-values`, {
       method: "POST",
       body: { value, synonym },
     }),
@@ -141,40 +145,42 @@ export const attributeAssistantService = {
   product: (id: number, signal?: AbortSignal) =>
     $fetch<AttributeProduct>(`${base}/products/${id}`, { signal }),
 
-  processProduct: (id: number, donorIds: number[], urlOverrides: Record<string, string> = {}) =>
+  processProduct: (id: number, expectedVersion: number, donorIds: number[], urlOverrides: Record<string, string> = {}) =>
     $fetch<AttributeProductMutation & { report: AttributeProcessReport }>(
       `${base}/products/${id}/process`,
-      { method: "POST", body: { donor_ids: donorIds, url_overrides: urlOverrides } },
+      { method: "POST", body: { expected_version: expectedVersion, donor_ids: donorIds, url_overrides: urlOverrides } },
     ),
 
-  useSimilar: (id: number) =>
+  useSimilar: (id: number, expectedVersion: number) =>
     $fetch<AttributeProductMutation & { changed: number }>(
       `${base}/products/${id}/similar`,
-      { method: "POST" },
+      { method: "POST", body: { expected_version: expectedVersion } },
     ),
 
   analyzeProductWithChatGpt: (
     id: number,
+    expectedVersion: number,
     donorIds: number[],
     urlOverrides: Record<string, string> = {},
   ) =>
     $fetch<AttributeChatGptAnalyzeResult>(
       `${base}/products/${id}/chatgpt/analyze`,
-      { method: "POST", body: { donor_ids: donorIds, url_overrides: urlOverrides } },
+      { method: "POST", body: { expected_version: expectedVersion, donor_ids: donorIds, url_overrides: urlOverrides } },
     ),
 
   updateValue: (
     id: number,
-    body: { action: "accept" | "reject" | "dash"; value?: string; dash_reason?: string },
+    body: AttributeValueUpdateRequest,
   ) =>
     $fetch<AttributeValueMutation>(`${base}/values/${id}`, {
       method: "PATCH",
       body,
     }),
 
-  removeExtraValue: (id: number) =>
+  removeExtraValue: (id: number, expectedVersion: number) =>
     $fetch<AttributeProductMutation & { deleted_id: number }>(`${base}/values/${id}`, {
       method: "DELETE",
+      body: { expected_version: expectedVersion },
     }),
 
   bulk: (
@@ -204,7 +210,7 @@ export const attributeAssistantService = {
     form.append("mode", mode);
     return $fetch<{ preview: AttributeTemplatePreview; template: AttributeTemplate }>(`${base}/templates/${id}/update-csv`, { method: "POST", body: form });
   },
-  updateTemplate: (id: number, body: Record<string, unknown>) =>
+  updateTemplate: (id: number, body: AttributeTemplateUpdateRequest) =>
     $fetch<AttributeTemplate>(`${base}/templates/${id}`, { method: "PATCH", body }),
   removeTemplate: (id: number) =>
     $fetch<{ ok: boolean; deleted_id: number }>(`${base}/templates/${id}`, { method: "DELETE" }),
@@ -214,25 +220,25 @@ export const attributeAssistantService = {
     $fetch<{ items: Array<{ id: number; version: number; action: string; report: Record<string, unknown>; created_at: string }> }>(`${base}/templates/${id}/revisions`, { signal }),
   restoreTemplate: (id: number, revisionId: number) =>
     $fetch<AttributeTemplate>(`${base}/templates/${id}/revisions/${revisionId}/restore`, { method: "POST" }),
-  updateField: (id: number, body: Record<string, unknown>) =>
+  updateField: (id: number, body: AttributeFieldUpdateRequest) =>
     $fetch<AttributeTemplate>(`${base}/fields/${id}`, { method: "PATCH", body }),
   updateAllowedValue: (id: number, body: Record<string, unknown>) =>
     $fetch<{ value: AttributeAllowedValue; template_version: number }>(`${base}/allowed-values/${id}`, { method: "PATCH", body }),
-  createField: (templateId: number, body: Record<string, unknown>) =>
+  createField: (templateId: number, body: AttributeFieldUpdateRequest) =>
     $fetch<AttributeTemplate>(`${base}/templates/${templateId}/fields`, { method: "POST", body }),
   removeField: (id: number) =>
     $fetch<{ deleted_id: number }>(`${base}/fields/${id}`, { method: "DELETE" }),
-  assignTemplate: (productId: number, templateId: number) =>
-    $fetch<AttributeProductMutation>(`${base}/products/${productId}/template`, { method: "PATCH", body: { template_id: templateId } }),
+  assignTemplate: (productId: number, expectedVersion: number, templateId: number) =>
+    $fetch<AttributeProductMutation>(`${base}/products/${productId}/template`, { method: "PATCH", body: { expected_version: expectedVersion, template_id: templateId } }),
   donorRecommendations: (productId: number, signal?: AbortSignal) =>
     $fetch<{ items: AttributeDonor[] }>(`${base}/products/${productId}/donor-recommendations`, { signal }),
-  mapAttribute: (productId: number, body: Record<string, unknown>) =>
+  mapAttribute: (productId: number, body: AttributeMapRequest) =>
     $fetch<AttributeProductMutation & { stats: Record<string, number> }>(`${base}/products/${productId}/map-attribute`, { method: "POST", body }),
   mappingRules: (templateId?: number, signal?: AbortSignal) =>
     $fetch<{ items: AttributeMappingRule[] }>(`${base}/mapping-rules`, { query: templateId ? { template_id: templateId } : {}, signal }),
   removeMappingRule: (id: number) =>
     $fetch(`${base}/mapping-rules/${id}`, { method: "DELETE" }),
-  rememberValueMapping: (valueId: number, body: { donor_id: number; raw_value: string; allowed_value_id: number }) =>
+  rememberValueMapping: (valueId: number, body: { expected_version: number; donor_id: number; raw_value: string; allowed_value_id: number }) =>
     $fetch<AttributeValueMutation & { rule_id: number }>(`${base}/values/${valueId}/mapping-rule`, { method: "POST", body }),
   valueMappingRules: (templateId?: number, signal?: AbortSignal) =>
     $fetch<{ items: AttributeValueMappingRule[] }>(`${base}/value-mapping-rules`, { query: templateId ? { template_id: templateId } : {}, signal }),
@@ -240,8 +246,8 @@ export const attributeAssistantService = {
     $fetch(`${base}/value-mapping-rules/${id}`, { method: "DELETE" }),
   productHistory: (id: number, signal?: AbortSignal) =>
     $fetch<{ items: AttributeHistoryItem[] }>(`${base}/products/${id}/history`, { signal }),
-  restoreProduct: (id: number, historyId: number) =>
-    $fetch<AttributeProductMutation>(`${base}/products/${id}/history/${historyId}/restore`, { method: "POST" }),
+  restoreProduct: (id: number, expectedVersion: number, historyId: number) =>
+    $fetch<AttributeProductMutation>(`${base}/products/${id}/history/${historyId}/restore`, { method: "POST", body: { expected_version: expectedVersion } }),
   batchReport: (id: number) => $fetch<AttributeBatchReport>(`${base}/batches/${id}/report`),
 
   chatGptStatus: (signal?: AbortSignal) =>

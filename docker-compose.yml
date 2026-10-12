@@ -31,7 +31,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: 3000
-      NUXT_BACKEND_URL: ${NUXT_BACKEND_URL:-http://parser:5000}
+      NUXT_BACKEND_URL: http://parser:5000
     depends_on:
       parser:
         condition: service_healthy

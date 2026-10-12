@@ -17,15 +17,18 @@ from config import env_int
 from services.attribute_settings import (
     DONOR_PRODUCT_CONCURRENCY,
     OPERATION_ERROR_LIMIT,
+    StaleProductError,
 )
 from database import SessionLocal
-from models import AttributeProduct, Donor
+from models import AttributeBatch, AttributeProduct, Donor
 from services.attribute_assistant import (
     DonorPageFetcher,
     capture_product_snapshot,
     process_product_donors,
+    product_template,
+    refresh_batch_summary,
     save_product_snapshot,
-    snapshot_product,
+    touch_product,
 )
 from services.attribute_ai import (
     apply_analysis,
@@ -39,6 +42,7 @@ from services.attribute_chatgpt_control import analyze_with_chatgpt
 
 
 _LOCK = threading.RLock()
+_DB_WRITE_LOCK = threading.RLock()
 _JOBS: dict[int, dict[str, Any]] = {}
 _THREADS: dict[int, threading.Thread] = {}
 _ACTIVE_STATUSES = {"queued", "running"}
@@ -217,21 +221,19 @@ def _run_donor_products(
                 str(product.id),
                 dict(product.donor_url_overrides or {}),
             )
-            snapshot_product(db, product, "Перед обработкой доноров")
             report = process_product_donors(
                 db,
                 product,
                 donor_ids,
                 url_overrides=overrides,
                 fetcher=fetcher,
+                refresh_summary=False,
+                write_lock=_DB_WRITE_LOCK,
+                commit_result=True,
+                require_opened=True,
             )
             reports = list(report.get("reports") or [])
             attributes_found = sum(int(item.get("attributes_found") or 0) for item in reports)
-            opened = any(item.get("status") in {"parsed", "no_attributes"} for item in reports)
-            if not opened:
-                messages = [str(item.get("message") or "") for item in reports if item.get("message")]
-                raise ValueError("; ".join(messages) or "Ни один донор не был обработан")
-            db.commit()
         except Exception as error:
             product_failed = True
             db.rollback()
@@ -291,15 +293,28 @@ def _prepare_chatgpt_product(
             raise ValueError("Товар обработки не найден")
         overrides = url_overrides_by_product.get(str(product.id), dict(product.donor_url_overrides or {}))
         initial_snapshot = capture_product_snapshot(product)
+        expected_version = product.version
+        template = product_template(product)
+        template_id = template.id if template else None
+        template_version = template.version if template else None
+        selected_donor_ids = list(donor_ids or product.selected_donor_ids or [])
         source_url, html, parsed, _resolved_by = prepare_product_source(
-            db, product, donor_ids or None, url_overrides=overrides, fetcher=fetcher,
+            db,
+            product,
+            donor_ids or None,
+            url_overrides=overrides,
+            fetcher=fetcher,
+            persist=False,
         )
         prompt, evidence = build_product_prompt(product, source_url=source_url, html=html, parsed=parsed)
-        template_id = product.template_id or product.batch.template_id
-        db.commit()
+        db.rollback()
         return {
             "product_id": product_id,
+            "product_version": expected_version,
             "template_id": template_id,
+            "template_version": template_version,
+            "selected_donor_ids": selected_donor_ids,
+            "url_overrides": overrides,
             "source_url": source_url,
             "prompt": prompt,
             "prompt_chars": len(prompt),
@@ -324,6 +339,11 @@ def _analyze_prepared_product(prompt: str) -> dict[str, Any]:
 
 
 def _apply_chatgpt_result(batch_id: int, prepared: dict[str, Any], future: Future) -> None:
+    with _DB_WRITE_LOCK:
+        _apply_chatgpt_result_locked(batch_id, prepared, future)
+
+
+def _apply_chatgpt_result_locked(batch_id: int, prepared: dict[str, Any], future: Future) -> None:
     """Save each completed response serially, in its own short transaction."""
     db = SessionLocal()
     product: AttributeProduct | None = None
@@ -334,7 +354,13 @@ def _apply_chatgpt_result(batch_id: int, prepared: dict[str, Any], future: Futur
         product = db.get(AttributeProduct, prepared["product_id"])
         if product is None or product.batch_id != batch_id:
             raise ValueError("Товар обработки не найден")
-        if (product.template_id or product.batch.template_id) != prepared["template_id"]:
+        template = product_template(product)
+        if product.version != prepared["product_version"]:
+            raise StaleProductError("Товар изменился во время анализа ChatGPT. Результат не применён")
+        if (
+            (template.id if template else None) != prepared["template_id"]
+            or (template.version if template else None) != prepared["template_version"]
+        ):
             raise ValueError("Шаблон товара изменился во время анализа ChatGPT. Повторите анализ")
         response = future.result()  # Already completed: no network wait inside the transaction.
         validation_started = time.perf_counter()
@@ -356,7 +382,16 @@ def _apply_chatgpt_result(batch_id: int, prepared: dict[str, Any], future: Futur
             "Перед анализом ChatGPT",
             prepared["initial_snapshot"],
         )
-        changed = apply_analysis(db, product, analysis, source_url=prepared["source_url"])
+        product.selected_donor_ids = list(prepared["selected_donor_ids"])
+        product.donor_url_overrides = dict(prepared["url_overrides"])
+        changed = apply_analysis(
+            db,
+            product,
+            analysis,
+            source_url=prepared["source_url"],
+            refresh_summary=False,
+        )
+        touch_product(product)
         attributes_found = len(analysis["observed_attributes"])
         db.commit()
     except Exception as error:
@@ -487,6 +522,18 @@ def _run_operation(
                     url_overrides_by_product,
                     fetcher,
                 )
+        with _DB_WRITE_LOCK:
+            summary_db = SessionLocal()
+            try:
+                batch = summary_db.get(AttributeBatch, batch_id)
+                if batch is not None:
+                    refresh_batch_summary(batch)
+                    summary_db.commit()
+            except Exception:
+                summary_db.rollback()
+                raise
+            finally:
+                summary_db.close()
         _update(
             batch_id,
             status="completed",
