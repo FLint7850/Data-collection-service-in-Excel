@@ -97,8 +97,10 @@ class AttributePaginationTest(unittest.TestCase):
     def test_batch_metadata_and_summary_never_open_product_relationships(self):
         batch = self.db.scalar(select(AttributeBatch).where(AttributeBatch.id == self.batch_id)
                                .options(raiseload(AttributeBatch.products)))
+        batch.selected_donor_ids = [8, 7]
         payload = svc.serialize_batch(batch)
         self.assertNotIn('products', payload)
+        self.assertEqual(payload['selected_donor_ids'], [8, 7])
         self.assertEqual(svc.refresh_batch_summary(batch)['products'], 4000)
         self.assertFalse(any(isinstance(item, AttributeProductValue) for item in self.db.identity_map.values()))
 

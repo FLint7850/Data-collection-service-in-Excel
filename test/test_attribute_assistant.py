@@ -869,6 +869,77 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(url, "https://example.com/product/lwr98165xe")
         self.assertIn("Кэш", reason)
 
+    def test_related_cached_model_pattern_builds_exact_product_url(self):
+        donor = Donor(
+            brand=Brand(name="Haier", group_name="Тест"),
+            legacy_id="related-model-donor",
+            site_url="https://haieronline.ru/",
+            known_new_products={
+                "HVX-BI664GB": {
+                    "model": "HVX-BI664GB",
+                    "url": "/catalog/built-in/hoods/HVX-BI664GB/",
+                },
+            },
+        )
+        self.db.add(donor)
+        self.db.flush()
+
+        expected = "https://haieronline.ru/catalog/built-in/hoods/HVX-BI652GB/"
+        url, reason = service.resolve_donor_url(donor, "HVX-BI652GB")
+
+        self.assertEqual(url, expected)
+        self.assertIn("той же серии", reason)
+
+    def test_related_model_validation_rejects_non_product_page(self):
+        donor = Donor(
+            brand=Brand(name="Haier", group_name="Тест"),
+            legacy_id="missing-related-model",
+            site_url="https://haieronline.ru/",
+            known_new_products={
+                "HVX-T662BB": {"url": "/catalog/built-in/hoods/HVX-T662BB/"},
+            },
+        )
+        self.db.add(donor)
+        self.db.flush()
+
+        self.assertTrue(service._parsed_product_matches_model(
+            {"model": "Вытяжка Haier HVX-T999XX", "name": ""},
+            "HVX-T999XX",
+        ))
+        self.assertFalse(service._parsed_product_matches_model(
+            {"model": "", "name": "Каталог вытяжек"},
+            "HVX-T999XX",
+        ))
+
+    def test_donor_processing_rejects_wrong_page_at_inferred_series_url(self):
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nHVX-T999XX;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        donor = Donor(
+            brand=Brand(name="Haier", group_name="Тест"),
+            legacy_id="wrong-related-page",
+            site_url="https://haieronline.ru/",
+            known_new_products={
+                "HVX-T662BB": {"url": "/catalog/built-in/hoods/HVX-T662BB/"},
+            },
+        )
+        self.db.add(donor)
+        self.db.commit()
+
+        with patch.object(
+            service,
+            "fetch_donor_product_html",
+            return_value=("<html><h1>Каталог вытяжек</h1></html>", "https://haieronline.ru/catalog/"),
+        ):
+            report = service.process_product_donors(self.db, batch.products[0], [donor.id])
+
+        self.assertEqual(report["reports"][0]["status"], "error")
+        self.assertIn("не карточка модели", report["reports"][0]["message"])
+
     def test_list_donors_joins_through_the_owning_brand(self):
         donor = Donor(
             brand=Brand(name="AEG", group_name="Test"),
@@ -1051,6 +1122,44 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(parsed["attributes"], [
             {"name": "Хлопок", "value": "Да", "group": ""},
             {"name": "Особенности", "value": "Автоматическое взвешивание Самоочистка", "group": ""},
+        ])
+
+    def test_characteristic_list_ignores_payment_modal_questions(self):
+        html = """
+        <h1>ВЫТЯЖКА HAIER HVQ-B2534G</h1>
+        <div class="bnpl-modal">
+          <dl class="bnpl-modal__questions">
+            <dt>Что такое оплата Плайт?</dt><dd>Это короткая рассрочка.</dd>
+          </dl>
+        </div>
+        <div class="characteristic-list__group">
+          <span class="characteristic-list__caption">Технические характеристики</span>
+          <div class="characteristic-list__items">
+            <div class="characteristic-list__item">
+              <span class="characteristic-list__key">Тип управления</span>
+              <span class="characteristic-list__val">Утапливаемый регулятор</span>
+            </div>
+            <div class="characteristic-list__item">
+              <span class="characteristic-list__key">Количество скоростей</span>
+              <span class="characteristic-list__val">3</span>
+            </div>
+          </div>
+        </div>
+        """
+
+        parsed = service.parse_product_html(html, "https://haieronline.ru/product")
+
+        self.assertEqual(parsed["attributes"], [
+            {
+                "name": "Тип управления",
+                "value": "Утапливаемый регулятор",
+                "group": "Технические характеристики",
+            },
+            {
+                "name": "Количество скоростей",
+                "value": "3",
+                "group": "Технические характеристики",
+            },
         ])
 
     def test_donor_selectors_do_not_collect_rows_inside_tooltips(self):

@@ -16,7 +16,12 @@ const summary = (id: number) => ({ id, model: `WM-${id}`, name: `Товар ${id
 const page = (offset = 0) => ({ items: Array.from({ length: 80 }, (_, index) => summary(offset + index + 1)),
   total: 4000, matched: 4000, offset, limit: 80, has_more: offset < 3920,
   counts: { all: 4000, needs_review: 4000, ready: 0, conflict: 0, missing: 4000, outside_template: 0 } });
-const batch = (id: number) => ({ id, summary: { products: 4000 }, template: { id: 1 } });
+const batch = (id: number, selectedDonorIds: number[] = []) => ({
+  id,
+  selected_donor_ids: selectedDonorIds,
+  summary: { products: 4000 },
+  template: { id: 1 },
+});
 
 function attribute(id: number, overrides: Partial<AttributeValue> = {}): AttributeValue {
   return {
@@ -236,6 +241,22 @@ describe("large attribute batches", () => {
     expect(api.products).toHaveBeenLastCalledWith(2, "", "all", 0, 80, expect.any(AbortSignal));
     expect(review.selectedDonors.value).toEqual([]);
     expect(review.donorUrlOverrides.value).toEqual({});
+  });
+
+  it("keeps the batch donor priority while products and results are reloaded", async () => {
+    api.batch.mockImplementation(async (id) => batch(id, [8, 7]));
+    api.product.mockImplementation(async (id) => ({
+      ...summary(id), batch_id: 1, selected_donor_ids: [], values: [{ id: 11 }], sources: [],
+    }));
+
+    await review.openBatch(1, 4);
+    expect(review.selectedDonors.value).toEqual([8, 7]);
+
+    await review.openProduct(5);
+    await review.refreshBatch();
+    await review.openProduct(4);
+
+    expect(review.selectedDonors.value).toEqual([8, 7]);
   });
 
   it("does not resume polling after leaving the page during a request", async () => {

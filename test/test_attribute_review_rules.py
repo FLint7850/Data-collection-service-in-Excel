@@ -63,6 +63,114 @@ class AttributeReviewRulesTest(unittest.TestCase):
         self.assertEqual(product.values[0].proposed_value, "")
         self.assertEqual(product.values[0].final_value, "Есть")
 
+    def test_nearest_dictionary_value_equal_to_original_is_not_a_conflict(self):
+        template = self.template("Тип освещения", ("Светодиодное (LED)", "Галогенное"))
+        for method in ["parser", "gpt"]:
+            with self.subTest(method=method):
+                product = self.product(template, "Светодиодное (LED)")
+                if method == "parser":
+                    svc.apply_parsed_attributes(
+                        self.db,
+                        product,
+                        [{"name": "Тип освещения", "value": "Светодиодное"}],
+                        source="Haier",
+                        priority=0,
+                        source_url="https://donor.example/product",
+                    )
+                else:
+                    analysis = self.analyze(product, "Тип освещения", "Светодиодное")
+                    ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+                value = product.values[0]
+                self.assertEqual(value.source_details["unknown_values"][0]["suggestions"][0], "Светодиодное (LED)")
+                self.assertEqual(value.status, "kept")
+                self.assertEqual(value.final_value, "Светодиодное (LED)")
+                self.assertEqual(value.proposed_value, "")
+
+    def test_canonical_candidate_resolves_same_raw_donor_observation(self):
+        template = self.template("Таймер", ("Есть", "Нет", "До 15 минут"))
+        product = self.product(template, "Есть")
+        source_url = "https://donor.example/product"
+
+        stats = svc.apply_parsed_attributes(
+            self.db,
+            product,
+            [{"name": "Таймер", "value": "Да"}],
+            source="Haier",
+            priority=0,
+            source_url=source_url,
+        )
+        self.assertEqual(stats["unknown"], 1)
+        self.assertEqual(product.values[0].status, "conflict")
+
+        analysis = self.analyze(product, "Таймер", "Да", allowed="Есть")
+        ai.apply_analysis(self.db, product, analysis, source_url=source_url)
+
+        value = product.values[0]
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.final_value, "Есть")
+        self.assertEqual(value.proposed_value, "")
+        self.assertEqual(value.source_details["unknown_values"], [])
+        self.assertEqual(value.source_details["candidates"][0]["raw_value"], "Да")
+
+    def test_saved_duplicate_raw_observation_is_repaired(self):
+        template = self.template("Таймер", ("Есть", "Нет", "До 15 минут"))
+        product = self.product(template, "Есть")
+        value = product.values[0]
+        source_url = "https://donor.example/product"
+        value.status = "conflict"
+        value.source = "ChatGPT"
+        value.reason = "Атрибут соответствует шаблону, но его значение отсутствует в справочнике"
+        value.source_details = {
+            "candidates": [{
+                "value": "Есть",
+                "raw_value": "Да",
+                "confidence": 85,
+                "source": "ChatGPT",
+                "source_name": "Таймер",
+                "url": source_url,
+                "priority": 90,
+            }],
+            "unknown_values": [{
+                "value": "Да",
+                "source": "Haier",
+                "source_name": "Таймер",
+                "url": source_url,
+                "suggestions": [],
+                "reason": "Логическое значение описывает наличие характеристики",
+            }],
+        }
+        self.db.commit()
+
+        self.assertEqual(svc.migrate_existing_attribute_suggestions(self.db), 1)
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.final_value, "Есть")
+        self.assertEqual(value.source_details["unknown_values"], [])
+        self.assertEqual(product.status, "ready")
+        self.assertEqual(product.batch.summary["conflicts"], 0)
+
+    def test_saved_nearest_match_is_repaired_by_migration(self):
+        template = self.template("Тип освещения", ("Светодиодное (LED)", "Галогенное"))
+        product = self.product(template, "Светодиодное (LED)")
+        value = product.values[0]
+        value.status = "conflict"
+        value.reason = "Атрибут соответствует шаблону, но его значение отсутствует в справочнике"
+        value.source_details = {"candidates": [], "unknown_values": [{
+            "value": "Светодиодное",
+            "source": "Haier",
+            "source_name": "Тип освещения",
+            "url": "https://donor.example/product",
+            "suggestions": ["Светодиодное (LED)"],
+            "reason": "Значения нет в справочнике",
+        }]}
+        self.db.commit()
+
+        self.assertEqual(svc.migrate_existing_attribute_suggestions(self.db), 1)
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.final_value, "Светодиодное (LED)")
+        self.assertEqual(value.proposed_value, "")
+        self.assertEqual(product.status, "ready")
+        self.assertEqual(product.batch.summary["conflicts"], 0)
+
     def test_separate_dimensions_confirm_tuple_for_parser_and_chatgpt(self):
         facts = [{"name": "Ширина упаковки, см", "value": "65"},
                  {"name": "Глубина упаковки, м", "value": "0.65"},
@@ -305,7 +413,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
         field = self.template("Высота, см", ("850", "865", "Высота 85-86.5")).fields[0]
         self.assertEqual(svc._allowed_match(field, "85-86.5", field.name)[3], [])
 
-    def test_parser_and_gpt_numeric_range_suggestions_require_manual_choice(self):
+    def test_numeric_range_nearest_match_confirms_existing_value(self):
         template = self.template("Высота, см", ("88.5", "86", "85.5", "86.5", "85"))
         for method in ["parser", "gpt"]:
             for current in ["", "85"]:
@@ -319,9 +427,9 @@ class AttributeReviewRulesTest(unittest.TestCase):
                         ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
                     value = product.values[0]
                     self.assertEqual(value.source_details["unknown_values"][0]["suggestions"], ["85", "86.5", "85.5"])
-                    self.assertEqual(value.status, "conflict" if current else "suggested")
+                    self.assertEqual(value.status, "kept" if current else "suggested")
                     self.assertEqual(value.final_value, current)
-                    self.assertEqual(value.proposed_value, "86.5" if current else "85")
+                    self.assertEqual(value.proposed_value, "" if current else "85")
 
     def test_saved_numeric_range_suggestions_are_repaired_on_read(self):
         template = self.template("Высота, см", ("88.5", "85.5", "86.5", "85"))
@@ -335,12 +443,13 @@ class AttributeReviewRulesTest(unittest.TestCase):
         ]}
         self.db.commit()
         serialized = svc.serialize_product(product, detailed=True)["values"][0]
-        self.assertEqual(serialized["proposed_value"], "86.5")
+        self.assertEqual(serialized["proposed_value"], "")
         self.assertEqual(serialized["final_value"], "85")
+        self.assertEqual(serialized["status"], "kept")
         self.assertTrue(all(item["suggestions"] == ["85", "86.5", "85.5"] for item in serialized["source_details"]["unknown_values"]))
         self.db.commit()
         self.db.expire_all()
-        self.assertEqual(value.proposed_value, "86.5")
+        self.assertEqual(value.proposed_value, "")
         self.assertEqual(value.source_details["unknown_values"][0]["suggestions"], ["85", "86.5", "85.5"])
         self.assertFalse(svc._repair_confirming_evidence(value))
 
@@ -497,7 +606,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
 
     def test_invalid_donor_value_is_visible_even_with_valid_original(self):
         template = self.template()
-        for raw, status in [("совершенно другое", "conflict"), ("A+++", "conflict")]:
+        for raw, status in [("совершенно другое", "conflict"), ("A+++", "kept")]:
             for method in ["parser", "gpt"]:
                 with self.subTest(raw=raw, method=method):
                     product = self.product(template, "A++", mode="auto_all")

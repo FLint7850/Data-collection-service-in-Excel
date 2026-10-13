@@ -193,6 +193,7 @@ export interface AttributeBatch {
   status: string;
   source_filename: string;
   source_urls: Array<Record<string, unknown>>;
+  selected_donor_ids: number[];
   original_ready: boolean;
   summary: {
     products: number;

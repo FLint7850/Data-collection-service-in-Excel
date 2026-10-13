@@ -713,6 +713,7 @@ def migrate_attribute_assistant_tables(connection) -> None:
             "products_count": "INTEGER NOT NULL DEFAULT 0",
             "attributes_count": "INTEGER NOT NULL DEFAULT 0",
             "source_urls": "JSON NOT NULL DEFAULT '[]'",
+            "selected_donor_ids": "JSON NOT NULL DEFAULT '[]'",
         },
         "attribute_product_values": {
             "dash_reason": "VARCHAR(64) NOT NULL DEFAULT ''",
@@ -737,6 +738,20 @@ def migrate_attribute_assistant_tables(connection) -> None:
         for column_name, definition in table_additions.items():
             if column_name not in columns:
                 connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+
+    if (
+        "selected_donor_ids" not in original_columns.get("attribute_batches", {})
+        and table_columns(connection, "attribute_products")
+    ):
+        connection.execute(text(
+            "UPDATE attribute_batches SET selected_donor_ids = COALESCE(("
+            "SELECT p.selected_donor_ids FROM attribute_products p "
+            "WHERE p.batch_id = attribute_batches.id "
+            "AND json_valid(p.selected_donor_ids) "
+            "AND json_array_length(p.selected_donor_ids) > 0 "
+            "ORDER BY p.updated_at DESC, p.id DESC LIMIT 1"
+            "), json('[]'))"
+        ))
 
     migrate_attribute_legacy_defaults(connection)
 

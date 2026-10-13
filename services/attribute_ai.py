@@ -46,6 +46,8 @@ from services.attribute_assistant import (
     exact_value_key,
     parse_product_html,
     parse_product_html_for_donor,
+    _parsed_product_matches_model,
+    RELATED_MODEL_URL_REASON,
     product_template,
     refresh_batch_summary,
     refresh_product_status,
@@ -1007,6 +1009,13 @@ def prepare_product_source(
             if donor
             else parse_product_html(downloaded_html, final_url)
         )
+        if (
+            resolved_by == RELATED_MODEL_URL_REASON
+            and not _parsed_product_matches_model(downloaded_parsed, product.model)
+        ):
+            raise ValueError(
+                f"По предполагаемому адресу открылась не карточка модели {product.model}"
+            )
         html = downloaded_html
         if downloaded_parsed.get("attributes") or not parsed.get("attributes"):
             parsed = downloaded_parsed
@@ -1032,6 +1041,10 @@ def prepare_product_source(
                 parsed=parsed,
             )
     except Exception as error:
+        if resolved_by == RELATED_MODEL_URL_REASON:
+            raise ValueError(
+                f"Не удалось подтвердить карточку модели {product.model}: {clean_text(error)}"
+            ) from error
         # The bridge can still open the exact public URL itself (useful for anti-bot pages).
         if persist and donor and not parsed.get("attributes"):
             _upsert_source(

@@ -374,6 +374,7 @@ class AttributeBatch(Base):
     products_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     attributes_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     source_urls: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    selected_donor_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     summary: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)

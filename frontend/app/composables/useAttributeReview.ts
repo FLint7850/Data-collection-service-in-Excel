@@ -483,6 +483,9 @@ export function useAttributeReview(
         clearBatchOperationPoll();
         batchOperation.value = null;
         selectedBatch.value = batch;
+        if (batchChanged) {
+            selectedDonors.value = [...(batch.selected_donor_ids || [])];
+        }
         void loadBatchOperation(id);
         tab.value = "review";
 
@@ -637,7 +640,6 @@ export function useAttributeReview(
         }
         donorRecommendations.value = [];
         historyItems.value = [];
-        selectedDonors.value = [...(product.selected_donor_ids || [])];
         donorUrlOverrides.value = { ...(product.donor_url_overrides || {}) };
         allowedValues.resetAllowedOptionState();
 

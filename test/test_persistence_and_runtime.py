@@ -464,6 +464,7 @@ class AttributeAssistantMigrationTests(unittest.TestCase):
                     "stored_filename",
                     "products_count",
                     "source_urls",
+                    "selected_donor_ids",
                 }.issubset(batch_columns)
             )
             self.assertIn("normalized_donor_attribute", mapping_columns)

@@ -25,7 +25,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import chardet
 import requests
@@ -123,8 +123,10 @@ SPECIFICATION_HEADING_RE = re.compile(
 )
 UI_NOISE_SELECTOR = (
     "script,style,svg,canvas,noscript,.glossary-tooltip,.tooltip,.popover,"
-    ".tooltip-popper,[data-tooltip-content],[role='tooltip']"
+    ".tooltip-popper,[data-tooltip-content],[role='tooltip'],dialog,[role='dialog'],"
+    "[class*='modal']"
 )
+RELATED_MODEL_URL_REASON = "Адрес построен по товару той же серии"
 IGNORED_NAME_TOKENS = {
     "максимальная", "максимальный", "макс", "мин", "об", "минуту", "ед",
     "значение", "характеристика", "параметр", "тип",
@@ -1618,6 +1620,7 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
     # Keep the selectors structural so this works across categories without domain-specific code.
     semantic_rows = (
         (".detail-properties__field", ".detail-properties__name", ".detail-properties__value"),
+        (".characteristic-list__item", ".characteristic-list__key", ".characteristic-list__val"),
         (".characteristics__row", ".characteristics__name", ".characteristics__property"),
         (".characteristic__row", ".characteristic__name", ".characteristic__value"),
         (".specifications__row", ".specifications__name", ".specifications__value"),
@@ -1640,7 +1643,7 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
             )
             if block:
                 heading = block.select_one(
-                    ".characteristics__title,.characteristic__title,.specifications__title,"
+                    ".characteristic-list__caption,.characteristics__title,.characteristic__title,.specifications__title,"
                     ".specification__title,.properties__title,.parameters__title,h2,h3,h4"
                 )
                 group = _text_without_ui_noise(heading) if heading else ""
@@ -2302,6 +2305,66 @@ def _cached_product_url(donor: Donor, model: str) -> str:
     return _donor_catalog_match(donor, model)[0]
 
 
+def _related_catalog_model_url(donor: Donor, model: str) -> str:
+    """Build a likely URL only when cached products prove a same-series URL pattern."""
+
+    model_text = clean_text(model)
+    wanted = normalize_model(model_text)
+    series_match = re.match(r"[A-ZА-ЯЁ]+", model_text.upper())
+    series = normalize_model(series_match.group(0) if series_match else "")
+    if not wanted or len(series) < 2:
+        return ""
+
+    def common_prefix_length(left: str, right: str) -> int:
+        return next(
+            (index for index, pair in enumerate(zip(left, right)) if pair[0] != pair[1]),
+            min(len(left), len(right)),
+        )
+
+    ranked: list[tuple[int, str]] = []
+    for key, raw_record in (donor.known_new_products or {}).items():
+        record = raw_record if isinstance(raw_record, dict) else {"url": raw_record}
+        cached_url = clean_text(record.get("url") or record.get("link"))
+        if not cached_url:
+            continue
+        normalized = [
+            normalize_model(candidate)
+            for candidate in (key, record.get("model"), record.get("sku"), record.get("name"))
+            if candidate
+        ]
+        related = [candidate for candidate in normalized if candidate.startswith(series)]
+        if not related:
+            continue
+        common_prefix = max(common_prefix_length(wanted, candidate) for candidate in related)
+        if common_prefix < len(series):
+            continue
+
+        absolute = urljoin(donor.site_url or (donor.start_urls or [""])[0], cached_url)
+        parsed = urlparse(absolute)
+        old_path = parsed.path
+        old_segment = old_path.rstrip("/").rsplit("/", 1)[-1]
+        suffix = Path(old_segment).suffix if not old_path.endswith("/") else ""
+        segment = quote(model_text, safe="-_.~")
+        if suffix and not segment.casefold().endswith(suffix.casefold()):
+            segment += suffix
+        parent_path = old_path.rstrip("/").rsplit("/", 1)[0]
+        candidate_path = f"{parent_path}/{segment}" + ("/" if old_path.endswith("/") else "")
+        ranked.append((
+            common_prefix,
+            parsed._replace(path=candidate_path, query="", fragment="").geturl(),
+        ))
+    return max(ranked, default=(0, ""))[1]
+
+
+def _parsed_product_matches_model(parsed: dict[str, Any], model: str) -> bool:
+    wanted = normalize_model(model)
+    identity = normalize_model(" ".join((
+        clean_text(parsed.get("model")),
+        clean_text(parsed.get("name")),
+    )))
+    return bool(wanted and wanted in identity)
+
+
 def _host_key(url: str) -> str:
     host = (urlparse(clean_text(url)).hostname or "").casefold()
     return host[4:] if host.startswith("www.") else host
@@ -2460,6 +2523,10 @@ def resolve_donor_url(
     cached = _cached_product_url(donor, model)
     if cached:
         return cached, "Кэш ранее найденных товаров"
+
+    related = _related_catalog_model_url(donor, model)
+    if related:
+        return related, RELATED_MODEL_URL_REASON
 
     roots: list[str] = []
     # The main site must be first: donor.start_urls can point to a completely different category.
@@ -3328,15 +3395,55 @@ def _repair_existing_value_status(target: AttributeProductValue) -> bool:
     return False
 
 
+def _same_source_observation(unknown: dict, candidate: dict) -> bool:
+    """Return whether two records describe the same raw fact from one page."""
+
+    raw_value = value_match_key(unknown.get("value"))
+    candidate_raw = value_match_key(candidate.get("raw_value"))
+    if not raw_value or raw_value != candidate_raw:
+        return False
+    if normalize_key(unknown.get("source_name")) != normalize_key(candidate.get("source_name")):
+        return False
+    unknown_url = clean_text(unknown.get("url"))
+    candidate_url = clean_text(candidate.get("url"))
+    same_url = bool(unknown_url and candidate_url and unknown_url == candidate_url)
+    unknown_source = clean_text(unknown.get("source")).casefold()
+    candidate_source = clean_text(candidate.get("source")).casefold()
+    same_source = bool(unknown_source and unknown_source == candidate_source)
+    return same_url or same_source
+
+
+def _clear_resolved_unknown_values(target: AttributeProductValue) -> bool:
+    """Remove a raw fact once a canonical candidate resolves that exact fact."""
+
+    details = dict(target.source_details or {})
+    candidates = [item for item in details.get("candidates", []) if isinstance(item, dict)]
+    unknown = [item for item in details.get("unknown_values", []) if isinstance(item, dict)]
+    if not candidates or not unknown:
+        return False
+    unresolved = [
+        item for item in unknown
+        if not any(_same_source_observation(item, candidate) for candidate in candidates)
+    ]
+    if len(unresolved) == len(unknown):
+        return False
+    details["unknown_values"] = unresolved
+    target.source_details = details
+    return True
+
+
 def migrate_existing_attribute_suggestions(db: Session) -> int:
-    """Repair saved statuses in bounded rows without opening batch.products."""
+    """Repair saved review statuses in bounded rows without opening batch.products."""
     value, product = AttributeProductValue, AttributeProduct
     statement = select(value, product.batch_id).join(product, product.id == value.product_id).where(
-        value.status.in_(["suggested", "unknown"]), func.trim(value.current_value) != "",
+        or_(
+            and_(value.status.in_(["suggested", "unknown"]), func.trim(value.current_value) != ""),
+            value.status == "conflict",
+        ),
     ).execution_options(yield_per=100)
     products, batches, changed = set(), set(), 0
     for target, batch_id in db.execute(statement):
-        if _repair_existing_value_status(target):
+        if _repair_confirming_evidence(target) or _repair_existing_value_status(target):
             products.add(target.product_id)
             batches.add(batch_id)
             changed += 1
@@ -3366,15 +3473,27 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
     field = target.template_field
     if not field or _has_confirmed_decision(target):
         return False
+    before = (
+        target.proposed_value,
+        target.final_value,
+        target.source,
+        target.confidence,
+        target.status,
+        target.reason,
+        target.source_details or {},
+    )
+    resolved_unknown = _clear_resolved_unknown_values(target)
     unknown = [dict(item) for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown:
-        return False
+        if resolved_unknown:
+            _recalculate_candidate_state(target.product, target)
+        return resolved_unknown
     groups: dict[tuple, list[dict]] = {}
     for item in unknown:
         groups.setdefault((item.get("source"), item.get("url"), item.get("donor_id")), []).append(item)
     replacements = []
     consumed: set[int] = set()
-    suggestions_changed = False
+    suggestions_changed = resolved_unknown
     for facts in groups.values():
         axes = [item for item in facts if _dimension_component_axis(field, clean_text(item.get("source_name")))]
         combined = _assemble_dimension_value(field, axes)
@@ -3399,18 +3518,26 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
                 if canonical:
                     replacements.append((item, name, canonical, confidence, raw, reason))
                     consumed.add(id(item))
-    if not replacements and not suggestions_changed:
-        return False
-    target.source_details = {**(target.source_details or {}),
-                             "unknown_values": [item for item in unknown if id(item) not in consumed]}
+    if replacements or suggestions_changed:
+        target.source_details = {**(target.source_details or {}),
+                                 "unknown_values": [item for item in unknown if id(item) not in consumed]}
     for item, name, canonical, confidence, raw, reason in replacements:
         apply_candidate(target.product, target, value=canonical, confidence=min(confidence, 85) if item.get("source") == "ChatGPT" else confidence,
                         source=item.get("source", ""), reason=reason, priority=90 if item.get("source") == "ChatGPT" else 0,
                         source_name=name, source_url=item.get("url", ""), raw_value=raw,
                         source_role=item.get("role", ""), donor_id=item.get("donor_id"))
-    if suggestions_changed and not replacements:
+    if not replacements:
         _recalculate_candidate_state(target.product, target)
-    return True
+    after = (
+        target.proposed_value,
+        target.final_value,
+        target.source,
+        target.confidence,
+        target.status,
+        target.reason,
+        target.source_details or {},
+    )
+    return bool(replacements) or before != after
 
 
 def record_unknown_value(
@@ -3444,6 +3571,24 @@ def record_unknown_value(
         _recalculate_candidate_state(product, target)
 
 
+def _unknown_value_confirms_reference(
+    target: AttributeProductValue,
+    item: dict,
+    reference: str,
+) -> bool:
+    """Treat the first dictionary match as confirmation of an existing value."""
+
+    reference_key = _candidate_value_key(target, reference)
+    raw_key = _candidate_value_key(target, item.get("value"))
+    if raw_key == reference_key:
+        return True
+    suggestions = [value for value in item.get("suggestions", []) if exact_value_key(value)]
+    return bool(
+        suggestions
+        and _candidate_value_key(target, suggestions[0]) == reference_key
+    )
+
+
 def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dict]) -> bool:
     unknown = [item for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown or _has_confirmed_decision(target):
@@ -3458,19 +3603,19 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
         for value in distinct
     )):
         return False
+    if valid_original and all(
+        _unknown_value_confirms_reference(target, item, target.final_value)
+        for item in unknown
+    ):
+        target.proposed_value = ""
+        target.status = "kept"
+        target.reason = "Значения источников после сопоставления совпадают с исходным значением; изменений нет"
+        return True
     alternatives = list(dict.fromkeys(value for item in unknown for value in item.get("suggestions", [])))
     proposals = alternatives if valid_original else (distinct or alternatives)
     if valid_original and proposals:
         proposals = [value for value in proposals
                      if _candidate_value_key(target, value) != _candidate_value_key(target, target.final_value)]
-        if not proposals and all(
-            _candidate_value_key(target, item.get("value")) == _candidate_value_key(target, target.final_value)
-            for item in unknown
-        ):
-            target.proposed_value = ""
-            target.status = "kept"
-            target.reason = "Источники подтверждают исходное значение; изменений нет"
-            return True
     target.proposed_value = proposals[0] if proposals else ""
     if not valid_original:
         target.final_value = ""
@@ -3618,6 +3763,7 @@ def apply_candidate(
     candidates.append(candidate)
     details["candidates"] = candidates
     target.source_details = details
+    _clear_resolved_unknown_values(target)
     _recalculate_candidate_state(product, target)
 
 
@@ -3879,6 +4025,13 @@ def process_product_donors(
                     else fetch_donor_product_html(donor, url, fetcher=active_fetcher)
                 )
                 parsed = parse_product_html_for_donor(html, final_url, donor)
+                if (
+                    resolved_by == RELATED_MODEL_URL_REASON
+                    and not _parsed_product_matches_model(parsed, model)
+                ):
+                    raise ValueError(
+                        f"По предполагаемому адресу открылась не карточка модели {model}"
+                    )
                 attribute_count = len(parsed["attributes"])
                 source_status = "parsed" if attribute_count else "no_attributes"
                 source_message = (
@@ -4216,6 +4369,12 @@ def serialize_value(
     }
 
 def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict[str, Any]:
+    repaired = [
+        _repair_confirming_evidence(value) or _repair_existing_value_status(value)
+        for value in product.values
+    ]
+    if any(repaired):
+        refresh_product_status(product)
     result = {
         "id": product.id,
         "batch_id": product.batch_id,
@@ -4334,6 +4493,7 @@ def serialize_batch(batch: AttributeBatch, detailed: bool = False) -> dict[str, 
         "status": batch.status,
         "source_filename": batch.source_filename,
         "source_urls": list(batch.source_urls or []),
+        "selected_donor_ids": list(batch.selected_donor_ids or []),
         "original_ready": bool(batch.original_path and file_ready(session, batch.original_path)),
         "summary": summary,
         "template": serialize_template(batch.template),

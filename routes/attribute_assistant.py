@@ -176,6 +176,13 @@ def _integer_list(payload: dict, name: str, *, required: bool = False) -> list[i
     return result
 
 
+def _remember_batch_donor_selection(batch: AttributeBatch, donor_ids: list[int]) -> None:
+    """Persist the priority order before a potentially failing long-running action."""
+
+    batch.selected_donor_ids = list(donor_ids)
+    g.db.commit()
+
+
 def _string_mapping(payload: dict, name: str) -> dict[str, str]:
     value = payload.get(name)
     if value is None:
@@ -521,10 +528,12 @@ def api_attribute_product_process(product_id: int):
     try:
         product = _product(product_id)
         expected_version = _assert_product_version(product, payload)
+        donor_ids = _integer_list(payload, "donor_ids", required=True)
+        _remember_batch_donor_selection(product.batch, donor_ids)
         report = process_product_donors(
             g.db,
             product,
-            _integer_list(payload, "donor_ids", required=True),
+            donor_ids,
             url_overrides=_string_mapping(payload, "url_overrides"),
             expected_version=expected_version,
         )
@@ -551,8 +560,9 @@ def api_attribute_batch_process_all(batch_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        _batch(batch_id)
+        batch = _batch(batch_id)
         donor_ids = _integer_list(payload, "donor_ids", required=True)
+        _remember_batch_donor_selection(batch, donor_ids)
         product_ids = list(g.db.scalars(
             select(AttributeProduct.id)
             .where(AttributeProduct.batch_id == batch_id)
@@ -580,12 +590,13 @@ def api_attribute_batch_chatgpt_analyze_all(batch_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        _batch(batch_id)
+        batch = _batch(batch_id)
         from services.attribute_chatgpt_control import chatgpt_status
 
         if not chatgpt_status().get("authenticated"):
             raise RuntimeError("Сначала подключите ChatGPT")
         donor_ids = _integer_list(payload, "donor_ids")
+        _remember_batch_donor_selection(batch, donor_ids)
         product_ids = list(g.db.scalars(
             select(AttributeProduct.id)
             .where(AttributeProduct.batch_id == batch_id)
@@ -780,10 +791,17 @@ def api_attribute_product_chatgpt_analyze(product_id: int):
 
         product = _product(product_id)
         _assert_product_version(product, payload)
+        donor_ids = (
+            _integer_list(payload, "donor_ids")
+            if "donor_ids" in payload
+            else None
+        )
+        if donor_ids is not None:
+            _remember_batch_donor_selection(product.batch, donor_ids)
         result = analyze_product_with_chatgpt(
             g.db,
             product,
-            payload.get("donor_ids"),
+            donor_ids,
             url_overrides=payload.get("url_overrides"),
         )
         return jsonify(_product_mutation_payload(
