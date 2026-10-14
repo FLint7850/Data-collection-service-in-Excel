@@ -238,24 +238,65 @@ def _path(categories: dict, category: dict) -> str:
     return " > ".join(reversed(parts))
 
 
+def _attribute_ancestor_id(categories: dict, category: dict) -> int | None:
+    """Return the nearest ancestor already suitable for its own template."""
+    parent_id = category["parent_id"]
+    while parent_id:
+        parent = categories[parent_id]
+        if parent["attribute_ids"]:
+            return parent["id"]
+        parent_id = parent["parent_id"]
+    return None
+
+
 def import_snapshot(db: Session, shop: AttributeShopConnection, data: dict) -> dict:
     categories, attributes = validate_snapshot(data, shop.language_code)
     if shop.remote_source_id and shop.remote_source_id != data["source_id"]:
         raise ValueError("URL отвечает от другой установки магазина. Создайте отдельное подключение.")
     report = dict(created=0, updated=0, unchanged=0, fields_added=0, values_added=0,
                   categories_missing=0, fields_missing=0, values_missing=0,
-                  local_changes_preserved=0, normalized_duplicates=0)
+                  local_changes_preserved=0, normalized_duplicates=0,
+                  child_categories_skipped=0, child_templates_deactivated=0)
     links = {link.remote_category_id: link for link in db.scalars(
         select(AttributeShopTemplateLink).where(
             AttributeShopTemplateLink.connection_id == shop.id,
             AttributeShopTemplateLink.language_code == shop.language_code,
         )
     )}
-    present = set()
-    for cid, category in sorted(categories.items()):
+    primary_categories, child_categories = {}, {}
+    for cid, category in categories.items():
         if not category["attribute_ids"]:
             continue
-        present.add(cid)
+        ancestor_id = _attribute_ancestor_id(categories, category)
+        if ancestor_id is None:
+            primary_categories[cid] = category
+        else:
+            child_categories[cid] = ancestor_id
+    report["child_categories_skipped"] = len(child_categories)
+
+    # Older versions imported every attribute-bearing descendant. Keep those
+    # templates for referential integrity, but hide them from further use.
+    for cid, ancestor_id in child_categories.items():
+        link = links.get(cid)
+        template = db.get(AttributeTemplate, link.template_id) if link and link.template_id else None
+        if template is None:
+            continue
+        state = dict(link.state or {})
+        if not state.get("hierarchy_suppressed"):
+            source_active = state.get("template", {}).get("is_active", template.is_active)
+            state["hierarchy_active_was_managed"] = template.is_active == source_active
+            state["hierarchy_previous_is_active"] = template.is_active
+        state["hierarchy_suppressed"] = True
+        state["hierarchy_suppressed_by"] = ancestor_id
+        link.state = state
+        if template.is_active:
+            save_template_revision(db, template, "before_opencart_sync", {"connection_id": shop.id})
+            template.is_active = False
+            template.version += 1
+            report["child_templates_deactivated"] += 1
+
+    present = set(primary_categories) | set(child_categories)
+    for cid, category in sorted(primary_categories.items()):
         ordered = sorted((attributes[aid] for aid in category["attribute_ids"]),
                          key=lambda a: (a["group_sort_order"], a["group_id"], a["sort_order"], a["id"]))
         source = {"category": category, "path": _path(categories, category),
@@ -264,10 +305,14 @@ def import_snapshot(db: Session, shop: AttributeShopConnection, data: dict) -> d
         digest = hashlib.sha256(json.dumps(source, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         link = links.get(cid)
         template = db.get(AttributeTemplate, link.template_id) if link and link.template_id else None
-        if template is not None and link.source_hash == digest and link.state.get("dictionary_version") == 3:
+        if (template is not None and link.source_hash == digest
+                and link.state.get("dictionary_version") == 3
+                and not link.state.get("hierarchy_suppressed")):
             report["unchanged"] += 1
             continue
         previous = link.state if link and template is not None else {}
+        hierarchy_suppressed = bool(previous.get("hierarchy_suppressed"))
+        hierarchy_active_was_managed = previous.get("hierarchy_active_was_managed", True)
         old_attrs = {a["id"]: a for a in previous.get("source", {}).get("attributes", [])}
         field_ids = dict(previous.get("field_ids", {}))
         old_applied = previous.get("applied", {})
@@ -291,6 +336,12 @@ def import_snapshot(db: Session, shop: AttributeShopConnection, data: dict) -> d
         else:
             save_template_revision(db, template, "before_opencart_sync", {"connection_id": shop.id})
             for key, desired in (("name", clean_text(category["name"])), ("is_active", category["enabled"])):
+                if key == "is_active" and hierarchy_suppressed:
+                    restored = desired if hierarchy_active_was_managed else previous.get(
+                        "hierarchy_previous_is_active", getattr(template, key)
+                    )
+                    setattr(template, key, restored)
+                    continue
                 old = previous.get("template", {}).get(key, getattr(template, key))
                 if getattr(template, key) == old:
                     setattr(template, key, desired)

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AttributeValue } from "../app/types/attribute-assistant";
 import {
-  attributeValuesMatch, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
-  valueStatusColor, valueStatusLabel,
+  addableUnknownProposal, attributeValuesMatch, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
+  sourceEvidenceCount, unknownSourceMatchesSelected, valueStatusColor, valueStatusLabel,
 } from "../app/utils/attribute-assistant";
 
 function value(overrides: Partial<AttributeValue> = {}): AttributeValue {
@@ -18,6 +18,20 @@ function value(overrides: Partial<AttributeValue> = {}): AttributeValue {
 const unknown = { value: "A+++", source: "Donor", source_name: "Класс", suggestions: ["A++"], reason: "Нет в справочнике" };
 
 describe("attribute dictionary review", () => {
+  it("counts mapped and unmatched facts in one source list", () => {
+    const row = value({ current_value: "Светодиодное (LED)", final_value: "Светодиодное (LED)", status: "kept",
+      source_details: {
+        candidates: [{ value: "Сенсорное", raw_value: "Да", source: "ChatGPT", confidence: 85,
+          reason: "Сопоставлено", priority: 90, source_name: "Сенсорная панель управления" }],
+        unknown_values: [{ value: "Светодиодное", source: "Haier", source_name: "Тип освещения",
+          suggestions: ["Светодиодное (LED)"], reason: "Ближайшее значение" }],
+      } });
+    expect(sourceEvidenceCount(row)).toBe(2);
+    expect(unknownSourceMatchesSelected(row, row.source_details.unknown_values![0]!)).toBe(true);
+    row.source_details.unknown_values![0]!.suggestions = ["Галогенное"];
+    expect(unknownSourceMatchesSelected(row, row.source_details.unknown_values![0]!)).toBe(false);
+  });
+
   it("shows a bad original as conflict and includes it only in the conflict filter", () => {
     const row = value();
     expect(valueStatusLabel(row)).toBe("Конфликт");
@@ -50,11 +64,31 @@ describe("attribute dictionary review", () => {
     expect(valueStatusLabel(row)).toBe("Есть предложение");
     expect(matchesAttributeStatus(row, "suggested")).toBe(true);
     row.source_details.unknown_values![0] = { ...unknown, suggestions: [] };
-    expect(matchesAttributeStatus(row, "conflict")).toBe(true);
-    expect(valueStatusColor(row)).toBe("error");
+    expect(displayedProposal(row)).toBe("A+++");
+    expect(matchesAttributeStatus(row, "suggested")).toBe(true);
+    expect(matchesAttributeStatus(row, "conflict")).toBe(false);
+    expect(valueStatusColor(row)).toBe("warning");
     expect(matchesAttributeStatus(value({ status: "missing", current_value: "" }), "unfilled")).toBe(true);
     expect(hasPendingProposal(value({ status: "rejected", proposed_value: "A++" }))).toBe(false);
     expect(matchesAttributeStatus(value({ is_in_template: false }), "conflict")).toBe(false);
+  });
+
+  it.each(["", "-"])("puts an add-new proposal into Suggestions when the original is %j", (current) => {
+    const row = value({
+      current_value: current,
+      final_value: "-",
+      status: "dash",
+      dash_reason: "Не найдено после проверки источников",
+      source_details: { unknown_values: [{ ...unknown, value: "Встраиваемая" }] },
+    });
+    expect(addableUnknownProposal(row)).toBe("Встраиваемая");
+    expect(displayedProposal(row)).toBe("Встраиваемая");
+    expect(valueStatusLabel(row)).toBe("Есть предложение");
+    expect(valueStatusColor(row)).toBe("warning");
+    expect(matchesAttributeStatus(row, "suggested")).toBe(true);
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(false);
+    // It must be added to the dictionary first, so the regular Accept action stays hidden.
+    expect(hasPendingProposal(row)).toBe(false);
   });
 
   it("retains the raw source and conversion explanation under the original value", () => {

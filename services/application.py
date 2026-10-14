@@ -83,6 +83,20 @@ def run_data_migrations() -> None:
                 {"name": resolved_observations_migration, "details": f'{{"changed":{changed}}}'},
             )
 
+    new_values_migration = "20261014_attribute_new_values_as_suggestions_v1"
+    with session_scope() as db_session:
+        if not db_session.scalar(
+            text("SELECT name FROM app_data_migrations WHERE name = :name"),
+            {"name": new_values_migration},
+        ):
+            from services.attribute_assistant import migrate_existing_attribute_suggestions
+
+            changed = migrate_existing_attribute_suggestions(db_session)
+            db_session.execute(
+                text("INSERT INTO app_data_migrations (name, details, applied_at) VALUES (:name, json(:details), CURRENT_TIMESTAMP)"),
+                {"name": new_values_migration, "details": f'{{"changed":{changed}}}'},
+            )
+
     migration_name = "20260904_attribute_url_current_values_v2"
     with session_scope() as db_session:
         applied = db_session.scalar(

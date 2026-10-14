@@ -76,6 +76,62 @@ class OpenCartSyncTest(unittest.TestCase):
         links = list(self.db.scalars(select(AttributeShopTemplateLink)))
         self.assertIn(" красный ", links[0].state["source"]["attributes"][0]["values"])
 
+    def test_import_keeps_first_attribute_category_and_skips_its_children(self):
+        data = snapshot()
+        data["categories"].append({
+            "id": 205, "parent_id": 199, "name": "Автоматические",
+            "enabled": True, "sort_order": 1, "attribute_ids": [18],
+        })
+
+        report = svc.import_snapshot(self.db, self.shop, recount(data))
+        self.db.commit()
+
+        self.assertEqual(report["created"], 2)
+        self.assertEqual(report["child_categories_skipped"], 1)
+        self.assertEqual({template.name for template in self.templates()}, {"Кофемашины"})
+        links = list(self.db.scalars(select(AttributeShopTemplateLink)))
+        self.assertEqual({link.remote_category_id for link in links}, {199, 204})
+
+    def test_existing_child_template_is_deactivated_and_can_be_restored(self):
+        data = snapshot()
+        data["categories"][1]["attribute_ids"] = []
+        data["categories"].append({
+            "id": 205, "parent_id": 199, "name": "Автоматические",
+            "enabled": True, "sort_order": 1, "attribute_ids": [18],
+        })
+        svc.import_snapshot(self.db, self.shop, recount(data))
+        self.db.commit()
+        child_link = self.db.scalar(select(AttributeShopTemplateLink).where(
+            AttributeShopTemplateLink.remote_category_id == 205
+        ))
+        child_template_id = child_link.template_id
+
+        data["categories"][1]["attribute_ids"] = [18]
+        report = svc.import_snapshot(self.db, self.shop, recount(data))
+        self.db.commit()
+        child_link = self.db.scalar(select(AttributeShopTemplateLink).where(
+            AttributeShopTemplateLink.remote_category_id == 205
+        ))
+        child_template = self.db.get(AttributeTemplate, child_template_id)
+        self.assertEqual(report["child_templates_deactivated"], 1)
+        self.assertFalse(child_template.is_active)
+        self.assertTrue(child_link.state["hierarchy_suppressed"])
+        self.assertEqual(child_link.state["hierarchy_suppressed_by"], 199)
+        repeated = svc.import_snapshot(self.db, self.shop, recount(data))
+        self.assertEqual(repeated["child_templates_deactivated"], 0)
+        self.assertEqual(repeated["categories_missing"], 0)
+
+        data["categories"][1]["attribute_ids"] = []
+        restored = svc.import_snapshot(self.db, self.shop, recount(data))
+        self.db.commit()
+        self.db.refresh(child_template)
+        child_link = self.db.scalar(select(AttributeShopTemplateLink).where(
+            AttributeShopTemplateLink.remote_category_id == 205
+        ))
+        self.assertTrue(child_template.is_active)
+        self.assertFalse(child_link.state.get("hierarchy_suppressed", False))
+        self.assertEqual(restored["updated"], 1)
+
     def test_program_matching_tracks_synchronized_dictionary_changes(self):
         from services.attribute_assistant import replace_allowed_value_synonyms
 

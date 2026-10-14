@@ -86,6 +86,70 @@ class AttributeReviewRulesTest(unittest.TestCase):
                 self.assertEqual(value.final_value, "Светодиодное (LED)")
                 self.assertEqual(value.proposed_value, "")
 
+    def test_new_dictionary_value_is_a_suggestion_for_parser_and_chatgpt(self):
+        template = self.template("Тип установки", ("Подвесной", "Островной"))
+        for current in ("", "-"):
+            for method in ("parser", "gpt"):
+                with self.subTest(current=current, method=method):
+                    product = self.product(template, current)
+                    if method == "parser":
+                        svc.apply_parsed_attributes(
+                            self.db,
+                            product,
+                            [{"name": "Тип установки", "value": "Встраиваемая"}],
+                            source="Donor",
+                            priority=0,
+                        )
+                    else:
+                        analysis = self.analyze(product, "Тип установки", "Встраиваемая")
+                        ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+                    value = product.values[0]
+                    self.assertEqual(value.status, "suggested")
+                    self.assertTrue(value.proposed_value)
+                    self.assertEqual(value.final_value, "")
+                    self.assertEqual(value.dash_reason, "")
+                    self.assertEqual(value.source_details["unknown_values"][0]["value"], "Встраиваемая")
+
+    def test_saved_technical_gap_with_new_value_is_repaired_by_migration(self):
+        template = self.template("Тип установки", ("Подвесной", "Островной"))
+        product = self.product(template)
+        value = product.values[0]
+        value.status = "dash"
+        value.final_value = "-"
+        value.dash_reason = "Не найдено после проверки источников"
+        value.source_details = {"unknown_values": [{
+            "value": "Встраиваемая",
+            "source": "ChatGPT",
+            "source_name": "Тип вытяжки",
+            "url": product.source_url,
+            "suggestions": ["Подвесной"],
+            "reason": "Значения нет в справочнике",
+        }]}
+        self.db.commit()
+
+        self.assertEqual(svc.migrate_existing_attribute_suggestions(self.db), 1)
+        self.assertEqual(value.status, "suggested")
+        self.assertEqual(value.proposed_value, "Подвесной")
+        self.assertEqual(value.final_value, "")
+        self.assertEqual(value.dash_reason, "")
+        self.assertEqual(product.batch.summary["suggestions"], 1)
+
+    def test_different_new_values_from_sources_remain_a_conflict(self):
+        template = self.template("Тип установки", ("Подвесной", "Островной"))
+        product = self.product(template)
+        for source, raw in (("Donor A", "Встраиваемая"), ("Donor B", "Настольная")):
+            svc.apply_parsed_attributes(
+                self.db,
+                product,
+                [{"name": "Тип установки", "value": raw}],
+                source=source,
+                priority=0,
+            )
+        value = product.values[0]
+        self.assertEqual(value.status, "conflict")
+        self.assertEqual(value.proposed_value, "")
+        self.assertEqual(value.final_value, "")
+
     def test_canonical_candidate_resolves_same_raw_donor_observation(self):
         template = self.template("Таймер", ("Есть", "Нет", "До 15 минут"))
         product = self.product(template, "Есть")
@@ -513,7 +577,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
 
     def test_parser_and_gpt_keep_mapped_bad_values_and_same_status(self):
         template = self.template()
-        for raw, status in [("совершенно другое", "conflict"), ("A+++", "suggested")]:
+        for raw, status in [("совершенно другое", "suggested"), ("A+++", "suggested")]:
             for method in ["parser", "gpt"]:
                 with self.subTest(raw=raw, method=method):
                     product = self.product(template, mode="auto_all")
@@ -667,7 +731,8 @@ class AttributeReviewRulesTest(unittest.TestCase):
         ai.apply_analysis(self.db, product, self.analyze(product, "Класс", "A++"), source_url=product.source_url)
         self.assertEqual(product.values[0].status, "approved")
         ai.apply_analysis(self.db, product, self.analyze(product, "Класс", "совершенно другое"), source_url=product.source_url)
-        self.assertEqual(product.values[0].status, "conflict")
+        self.assertEqual(product.values[0].status, "suggested")
+        self.assertEqual(product.values[0].proposed_value, "совершенно другое")
         self.assertEqual(product.values[0].final_value, "")
         self.assertFalse(product.values[0].source_details.get("candidates"))
 

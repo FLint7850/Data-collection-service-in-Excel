@@ -17,11 +17,13 @@ import {
   selectedFinalValue,
   sourceKind,
   sourceKindLabel,
+  sourceEvidenceCount,
   sourceStatusText,
   sourceTitle,
   templateFieldTypeItems,
   templateUpdateModeItems,
   unknownAllowedMenuKey,
+  unknownSourceMatchesSelected,
   unknownSelectionKey,
   valueStatusColor,
   valueStatusLabel,
@@ -1118,17 +1120,17 @@ onBeforeUnmount(() => {
                 </div>
 
                 <SettingsCollapsible
-                  v-if="value.source_details.candidates?.length"
+                  v-if="sourceEvidenceCount(value)"
                   class="aa-candidate-details"
                   content-class="aa-candidate-list"
                   :default-open="attributeReviewStatus(value) === 'conflict'"
                 >
                   <template #label>
                     <span>Все источники</span>
-                    <UBadge color="neutral" variant="subtle" size="sm">{{ value.source_details.candidates.length }}</UBadge>
+                    <UBadge color="neutral" variant="subtle" size="sm">{{ sourceEvidenceCount(value) }}</UBadge>
                   </template>
                     <div
-                      v-for="(candidate, index) in value.source_details.candidates"
+                      v-for="(candidate, index) in value.source_details.candidates || []"
                       :key="`${candidate.source}-${candidate.source_name}-${index}`"
                       :class="['aa-candidate', { 'is-match': candidate.matches_current, 'is-mismatch': value.current_value && !candidate.matches_current }]"
                     >
@@ -1157,43 +1159,60 @@ onBeforeUnmount(() => {
                         @click="valueAction(value, 'accept', candidate.value)"
                       >Выбрать</UButton>
                     </div>
+                    <div
+                      v-for="(unknown, index) in value.source_details.unknown_values || []"
+                      :key="`unknown-${unknown.source}-${unknown.source_name}-${index}`"
+                      :class="['aa-candidate', 'aa-candidate--unknown', {
+                        'is-match': unknownSourceMatchesSelected(value, unknown),
+                        'is-mismatch': (value.final_value || value.current_value) && !unknownSourceMatchesSelected(value, unknown),
+                      }]"
+                    >
+                      <div class="aa-candidate-source">
+                        <ULink v-if="unknown.url" :to="unknown.url" target="_blank">{{ sourceTitle(unknown.source) }}</ULink>
+                        <strong v-else>{{ sourceTitle(unknown.source) }}</strong>
+                        <small>{{ unknown.role || "Источник без точного совпадения" }}</small>
+                      </div>
+                      <div class="aa-candidate-values">
+                        <span><small>На странице · {{ unknown.source_name }}</small><strong>{{ unknown.value }}</strong></span>
+                        <span v-if="unknown.suggestions?.length"><small>Ближайшее в справочнике</small><strong>{{ unknown.suggestions.join(", ") }}</strong></span>
+                      </div>
+                      <div class="aa-candidate-result">
+                        <UBadge v-if="unknownSourceMatchesSelected(value, unknown)" color="success" variant="subtle">Совпадает</UBadge>
+                        <UBadge v-else-if="value.final_value || value.current_value" color="error" variant="subtle">Расхождение</UBadge>
+                        <UBadge v-else color="warning" variant="subtle">Нужно сопоставить</UBadge>
+                      </div>
+                      <small class="aa-candidate-reason">{{ unknown.reason }}</small>
+                      <div v-if="!value.current_value || isTechnicalDash(value.current_value)" class="aa-candidate-actions">
+                        <div v-if="unknown.donor_id && value.field_id" class="aa-unknown-map">
+                          <USelectMenu
+                            :ref="allowedSelectRef(unknownAllowedMenuKey(value, index))"
+                            v-model="unknownSelections[unknownSelectionKey(value, index)]"
+                            class="aa-unknown-select"
+                            :items="optionsFor(value)"
+                            value-key="id"
+                            label-key="value"
+                            placeholder="Выберите значение шаблона"
+                            :search-input="{ placeholder: 'Найти значение…' }"
+                            :loading="searchingAllowedValueIds.has(value.id)"
+                            :reset-search-term-on-blur="true"
+                            :ignore-filter="true"
+                            :virtualize="true"
+                            @update:search-term="queueAllowedSearch(value, $event)"
+                            @update:open="handleAllowedMenuOpen(value, unknownAllowedMenuKey(value, index), $event)"
+                          />
+                          <UButton
+                            color="primary"
+                            variant="soft"
+                            icon="i-lucide-bookmark-check"
+                            :loading="isBusy(`value-mapping-${value.id}-${index}`)"
+                            :disabled="!unknownSelections[unknownSelectionKey(value, index)]"
+                            @click="rememberUnknownValue(value, unknown, index)"
+                          >Применить и запомнить</UButton>
+                        </div>
+                        <UButton color="warning" variant="soft" icon="i-lucide-book-plus" :loading="isBusy(`dictionary-${value.id}`)" @click="addUnknown(value, unknown)">Добавить как новое значение</UButton>
+                      </div>
+                    </div>
                 </SettingsCollapsible>
-
-                <div v-for="(unknown, index) in value.source_details.unknown_values || []" :key="`unknown-${index}`" class="aa-detail-line aa-unknown-detail">
-                  <span>
-                    <ULink v-if="unknown.url" :to="unknown.url" target="_blank">{{ sourceTitle(unknown.source) }}</ULink>
-                    <strong v-else>{{ sourceTitle(unknown.source) }}</strong>
-                    · {{ unknown.source_name }}: <strong>{{ unknown.value }}</strong>
-                  </span>
-                  <span v-if="unknown.suggestions?.length">Ближайшее: {{ unknown.suggestions.join(", ") }}</span>
-                  <div v-if="unknown.donor_id && value.field_id && !value.current_value" class="aa-unknown-map">
-                    <USelectMenu
-                      :ref="allowedSelectRef(unknownAllowedMenuKey(value, index))"
-                      v-model="unknownSelections[unknownSelectionKey(value, index)]"
-                      class="aa-unknown-select"
-                      :items="optionsFor(value)"
-                      value-key="id"
-                      label-key="value"
-                      placeholder="Выберите значение шаблона"
-                      :search-input="{ placeholder: 'Найти значение…' }"
-                      :loading="searchingAllowedValueIds.has(value.id)"
-                      :reset-search-term-on-blur="true"
-                      :ignore-filter="true"
-                      :virtualize="true"
-                      @update:search-term="queueAllowedSearch(value, $event)"
-                      @update:open="handleAllowedMenuOpen(value, unknownAllowedMenuKey(value, index), $event)"
-                    />
-                    <UButton
-                      color="primary"
-                      variant="soft"
-                      icon="i-lucide-bookmark-check"
-                      :loading="isBusy(`value-mapping-${value.id}-${index}`)"
-                      :disabled="!unknownSelections[unknownSelectionKey(value, index)]"
-                      @click="rememberUnknownValue(value, unknown, index)"
-                    >Применить и запомнить</UButton>
-                  </div>
-                  <UButton v-if="!value.current_value" color="warning" variant="soft" icon="i-lucide-book-plus" :loading="isBusy(`dictionary-${value.id}`)" @click="addUnknown(value, unknown)">Добавить как новое значение</UButton>
-                </div>
               </article>
             </div>
           </UCard>

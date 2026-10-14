@@ -3362,8 +3362,15 @@ def _current_reference_value(target: AttributeProductValue) -> str:
 
 
 def _has_confirmed_decision(target: AttributeProductValue) -> bool:
-    return target.status in {"rejected", "dash"} or (
-        target.status == "approved" and not (target.source_details or {}).get("auto_accepted")
+    unknown_values = (target.source_details or {}).get("unknown_values") or []
+    has_new_value_proposal = any(
+        isinstance(item, dict) and exact_value_key(item.get("value"))
+        for item in unknown_values
+    )
+    return (
+        target.status == "rejected"
+        or (target.status == "dash" and not has_new_value_proposal)
+        or (target.status == "approved" and not (target.source_details or {}).get("auto_accepted"))
     )
 
 
@@ -3389,7 +3396,8 @@ def _clear_unchanged_proposal(target: AttributeProductValue) -> bool:
 def _repair_existing_value_status(target: AttributeProductValue) -> bool:
     if _clear_unchanged_proposal(target):
         return True
-    if exact_value_key(target.current_value) and target.status in {"suggested", "unknown"}:
+    if (exact_value_key(target.current_value) and not is_technical_dash(target.current_value)
+            and target.status in {"suggested", "unknown"}):
         target.status = "conflict"
         return True
     return False
@@ -3439,6 +3447,10 @@ def migrate_existing_attribute_suggestions(db: Session) -> int:
         or_(
             and_(value.status.in_(["suggested", "unknown"]), func.trim(value.current_value) != ""),
             value.status == "conflict",
+            and_(
+                value.status.in_(["dash", "missing"]),
+                func.json_array_length(value.source_details, "$.unknown_values") > 0,
+            ),
         ),
     ).execution_options(yield_per=100)
     products, batches, changed = set(), set(), 0
@@ -3593,9 +3605,12 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
     unknown = [item for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown or _has_confirmed_decision(target):
         return False
+    has_current = bool(exact_value_key(target.current_value)) and not is_technical_dash(target.current_value)
     current_unknown = any(item.get("value") == target.current_value
                           and item.get("source") in {"current_site", "current_csv"} for item in unknown)
-    valid_original = bool(target.current_value and target.final_value and not current_unknown)
+    valid_original = bool(
+        has_current and target.final_value and not is_technical_dash(target.final_value) and not current_unknown
+    )
     distinct = list({value_match_key(item["value"]): item["value"] for item in reversed(candidates)}.values())
     # Disagreement between known dictionary values remains a source conflict.
     if len(distinct) > 1 or (valid_original and any(
@@ -3612,18 +3627,33 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
         target.reason = "Значения источников после сопоставления совпадают с исходным значением; изменений нет"
         return True
     alternatives = list(dict.fromkeys(value for item in unknown for value in item.get("suggestions", [])))
-    proposals = alternatives if valid_original else (distinct or alternatives)
+    new_values = list({
+        value_match_key(item.get("value")): exact_value_key(item.get("value"))
+        for item in reversed(unknown)
+        if exact_value_key(item.get("value"))
+    }.values())
+    proposals = alternatives if valid_original else (
+        distinct or alternatives or (new_values if len(new_values) == 1 else [])
+    )
     if valid_original and proposals:
         proposals = [value for value in proposals
                      if _candidate_value_key(target, value) != _candidate_value_key(target, target.final_value)]
     target.proposed_value = proposals[0] if proposals else ""
     if not valid_original:
         target.final_value = ""
-    target.status = "conflict" if target.current_value else ("suggested" if proposals else "conflict")
+    target.status = "conflict" if has_current else ("suggested" if proposals else "conflict")
+    if target.status != "dash":
+        target.dash_reason = ""
     target.confidence = int(candidates[0].get("confidence", 0)) if candidates else 0
     target.source = candidates[0].get("source", "") if candidates else unknown[0].get("source", "")
-    target.reason = ("Значение отсутствует в справочнике; есть варианты для ручного выбора"
-                     if proposals else "Атрибут соответствует шаблону, но его значение отсутствует в справочнике")
+    if not distinct and len(new_values) == 1 and proposals == new_values:
+        target.reason = "Найдено новое значение; добавьте его в справочник или выберите существующее"
+    elif proposals:
+        target.reason = "Значение отсутствует в справочнике; есть варианты для ручного выбора"
+    elif len(new_values) > 1:
+        target.reason = "Источники предлагают разные значения вне справочника"
+    else:
+        target.reason = "Атрибут соответствует шаблону, но его значение отсутствует в справочнике"
     return True
 
 

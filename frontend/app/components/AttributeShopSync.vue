@@ -153,6 +153,9 @@ onMounted(load);
           <p v-if="shop.last_report.local_changes_preserved" class="mt-1 text-sm text-muted">
             Сохранено местных изменений: {{ shop.last_report.local_changes_preserved }}.
           </p>
+          <p v-if="shop.last_report.child_categories_skipped" class="mt-1 text-sm text-muted">
+            Дочерних категорий пропущено: {{ shop.last_report.child_categories_skipped }}<template v-if="shop.last_report.child_templates_deactivated"> · ранее созданных дочерних шаблонов деактивировано: {{ shop.last_report.child_templates_deactivated }}</template>.
+          </p>
           <p v-if="shop.last_error" class="mt-1 text-sm text-error">{{ shop.last_error }}</p>
         </div>
         <div class="flex flex-wrap gap-2">

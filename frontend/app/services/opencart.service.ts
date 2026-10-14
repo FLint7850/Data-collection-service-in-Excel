@@ -14,6 +14,8 @@ export interface ShopSyncReport {
   values_missing: number;
   local_changes_preserved: number;
   normalized_duplicates: number;
+  child_categories_skipped: number;
+  child_templates_deactivated: number;
 }
 export interface AttributeShop {
   id: number;
