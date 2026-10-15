@@ -96,6 +96,29 @@ class ProgramNormalizationTest(unittest.TestCase):
         programs = field(["Хлопок (стирка/сушка)/Шерсть"])
         self.assertEqual(match_programs(programs, "Хлопок (стирка/сушка)")[0], "Хлопок (стирка/сушка)")
 
+        cooking = field(["Конвекция", "Гриль"], name="Режимы приготовления", group="Основные")
+        self.assertTrue(is_program_list(cooking))
+        self.assertEqual(match_programs(cooking, "гриль / конвекция")[0], "Гриль/Конвекция")
+
+    def test_literal_slash_in_saved_synonym_is_not_a_list_separator(self):
+        programs = field(
+            ["Отжим и слив", "Хлопок"],
+            synonyms={"Отжим и слив": ["Слив/Отжим"]},
+        )
+        self.assertEqual(match_programs(programs, "Слив/Отжим")[0], "Отжим и слив")
+        self.assertEqual(
+            match_programs(programs, "Слив/Отжим / Хлопок")[0],
+            "Отжим и слив/Хлопок",
+        )
+
+    def test_numeric_slash_in_program_name_is_atomic(self):
+        programs = field(
+            ["Супер 15/30", "Хлопок"],
+            synonyms={"Супер 15/30": ["Супер 15-30"]},
+        )
+        self.assertEqual(match_programs(programs, "Супер 15/30")[0], "Супер 15/30")
+        self.assertEqual(match_programs(programs, "Супер 15-30 / Хлопок")[0], "Супер 15/30/Хлопок")
+
     def test_program_names_and_synonyms_come_only_from_current_dictionary(self):
         programs = field(["Детские вещи/Очистка барабана/Хлопок"])
         for raw in ["Детское белье", "Автоочистка", "Cotton", "Новая программа"]:
@@ -170,6 +193,78 @@ class ProgramAndProposalIntegrationTest(unittest.TestCase):
         self.assertEqual(target.final_value, "Детские вещи/Хлопок/Шерсть")
         self.assertEqual(target.proposed_value, "")
         self.assertTrue(target.source_details["candidates"][0]["matches_current"])
+
+    def test_positive_program_markers_are_validated_and_combined_per_source(self):
+        product = self.product(["Очистка барабана/Синтетика/Хлопок"])
+        field_id = product.template.fields[0].id
+        facts = [
+            {"source_id": 1, "name": "Синтетика", "value": "Да"},
+            {"source_id": 2, "name": "Очистка барабана", "value": "Да"},
+        ]
+        analysis = ai.validate_analysis(
+            product,
+            {"attributes": [
+                [1, field_id, 85, "Синтетика"],
+                [2, field_id, 84, "Очистка барабана"],
+            ]},
+            source_facts=facts,
+        )
+        self.assertEqual(
+            [item["proposed_value"] for item in analysis["suggestions"]],
+            ["Синтетика", "Очистка барабана"],
+        )
+
+        ai.apply_analysis(self.db, product, analysis, source_url="https://example.com/product")
+
+        target = product.values[0]
+        self.assertEqual(target.proposed_value, "Очистка барабана/Синтетика")
+        self.assertEqual(
+            [item["value"] for item in target.source_details["candidates"]],
+            ["Синтетика", "Очистка барабана"],
+        )
+
+    def test_program_presence_marker_cannot_substitute_an_unrelated_allowed_value(self):
+        product = self.product(["Освежить/Синтетика"])
+        field_id = product.template.fields[0].id
+        analysis = ai.validate_analysis(
+            product,
+            {"attributes": [[1, field_id, 85, "Освежить"]]},
+            source_facts=[{"source_id": 1, "name": "Синтетика", "value": "Да"}],
+        )
+
+        self.assertEqual(analysis["suggestions"], [])
+        self.assertEqual(analysis["unmatched_attributes"][0]["value"], "Синтетика")
+        self.assertIn("соответствует «Синтетика»", analysis["unmatched_attributes"][0]["reason"])
+
+    def test_negative_program_marker_never_adds_a_program(self):
+        product = self.product(["Быстрая/Хлопок"])
+        field_id = product.template.fields[0].id
+        analysis = ai.validate_analysis(
+            product,
+            {"attributes": [[1, field_id, 85, "Быстрая"]]},
+            source_facts=[{"source_id": 1, "name": "Быстрая", "value": "Нет"}],
+        )
+
+        self.assertEqual(analysis["suggestions"], [])
+        self.assertEqual(analysis["unmatched_attributes"], [])
+        self.assertTrue(any("не добавляет программу" in item for item in analysis["warnings"]))
+
+    def test_one_positive_marker_does_not_confirm_the_previous_whole_list(self):
+        product = self.product(
+            ["Отжим/Очистка барабана/Синтетика"],
+            current="Отжим/Очистка барабана",
+        )
+        field_id = product.template.fields[0].id
+        analysis = ai.validate_analysis(
+            product,
+            {"attributes": [[1, field_id, 85, "Очистка барабана"]]},
+            source_facts=[{"source_id": 1, "name": "Очистка барабана", "value": "Да"}],
+        )
+        ai.apply_analysis(self.db, product, analysis, source_url="https://example.com/product")
+
+        target = product.values[0]
+        self.assertEqual(target.source_details["candidates"][0]["value"], "Очистка барабана")
+        self.assertEqual(target.status, "conflict")
 
     def test_unmatched_source_with_same_nearest_alternative_requires_review_without_a_proposal(self):
         product = self.product(["Отдельностоящий", "Встраиваемый"], name="Тип установки", current="Отдельностоящий")

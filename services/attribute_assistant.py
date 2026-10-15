@@ -3703,6 +3703,70 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
     return True
 
 
+def _program_candidate_groups(
+    target: AttributeProductValue,
+    candidates: list[dict],
+) -> list[dict]:
+    """Combine program components reported by one source into one sorted list.
+
+    A source page commonly exposes programs as several ``Название: Да`` rows.
+    Those rows are parts of one list, not competing complete values. Different
+    pages/donors remain separate observations and can still conflict.
+    """
+
+    field = target.template_field
+    if not field or not is_program_list(field):
+        return candidates
+    groups: dict[tuple[str, str, int], list[dict]] = {}
+    for item in candidates:
+        key = (
+            clean_text(item.get("source")),
+            clean_text(item.get("url")),
+            int(item.get("donor_id") or 0),
+        )
+        groups.setdefault(key, []).append(item)
+
+    result: list[dict] = []
+    current = _current_reference_value(target)
+    current_key = _candidate_value_key(target, current) if current else ""
+    for items in groups.values():
+        combined_source = " / ".join(
+            exact_value_key(item.get("value"))
+            for item in items
+            if exact_value_key(item.get("value"))
+        )
+        canonical, confidence, reason, _ = match_programs(field, combined_source)
+        if not canonical:
+            continue
+        combined = dict(items[0])
+        combined["value"] = canonical
+        combined["raw_value"] = " / ".join(dict.fromkeys(
+            exact_value_key(item.get("raw_value"))
+            for item in items
+            if exact_value_key(item.get("raw_value"))
+        ))
+        combined["source_name"] = " / ".join(dict.fromkeys(
+            clean_text(item.get("source_name"))
+            for item in items
+            if clean_text(item.get("source_name"))
+        ))
+        combined["confidence"] = min(
+            [int(item.get("confidence") or 0) for item in items] + [confidence]
+        )
+        combined["priority"] = min(int(item.get("priority") or 0) for item in items)
+        reasons = list(dict.fromkeys(
+            clean_text(item.get("reason")) for item in items if clean_text(item.get("reason"))
+        ))
+        combined["reason"] = "; ".join(reasons + [reason])
+        combined["matches_current"] = bool(
+            current_key and _candidate_value_key(target, canonical) == current_key
+        )
+        for item in items:
+            item["matches_current"] = combined["matches_current"]
+        result.append(combined)
+    return result
+
+
 def _recalculate_candidate_state(
     product: AttributeProduct,
     target: AttributeProductValue,
@@ -3711,6 +3775,7 @@ def _recalculate_candidate_state(
         item for item in list((target.source_details or {}).get("candidates") or [])
         if isinstance(item, dict) and exact_value_key(item.get("value"))
     ]
+    candidates = _program_candidate_groups(target, candidates)
     if _apply_dictionary_review(target, candidates):
         return
     if target.current_value:

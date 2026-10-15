@@ -23,6 +23,7 @@ from services.attribute_programs import is_program_list, match_programs, program
 from services.attribute_files import delete_after_commit, stage_text
 from services.attribute_settings import StaleProductError
 from services.attribute_assistant import (
+    BOOLEAN_FALSE_KEYS,
     _is_presence_marker,
     _candidate_value_key,
     _has_confirmed_decision,
@@ -557,7 +558,8 @@ def validate_analysis(
         if field is None or target is None:
             warnings.append(f"Сопоставление «{name}» отклонено: поля нет в шаблоне товара")
             continue
-        if field_id in seen_fields:
+        program_field = is_program_list(field)
+        if field_id in seen_fields and not program_field:
             continue
         if source_id is None and (
             (page_evidence and not _evidence_present(quote, page_evidence, exact=True))
@@ -571,11 +573,33 @@ def validate_analysis(
             })
             continue
         presence_marker = _is_presence_marker(field, value, name)
+        presence_key = exact_value_key(value).casefold()
         canonical = ""
         explanation = ""
         alternatives: list[str] = []
         match_reason = "Логическое значение описывает наличие характеристики, а не значение справочника"
-        if presence_marker and item.get("allowed_value"):
+        if program_field and presence_marker and presence_key in BOOLEAN_FALSE_KEYS:
+            warnings.append(
+                f"Отрицательный маркер «{name}: {value}» не добавляет программу"
+            )
+            continue
+        if program_field and presence_marker:
+            named_program, _score, named_reason, _nearest = match_programs(field, name)
+            allowed_value = _canonical_allowed(field, item.get("allowed_value"))
+            if named_program and allowed_value and value_match_key(named_program) != value_match_key(allowed_value):
+                match_reason = (
+                    f"Название характеристики соответствует «{named_program}», "
+                    f"а ChatGPT указал «{allowed_value}»"
+                )
+            elif named_program:
+                canonical = named_program
+                explanation = (
+                    "Положительный маркер раскрыт названием характеристики; "
+                    + named_reason
+                )
+            else:
+                match_reason = "Название программы не найдено в полном справочнике и его синонимах"
+        elif presence_marker and item.get("allowed_value"):
             allowed_value = _canonical_allowed(field, item["allowed_value"])
             if allowed_value and not _is_presence_marker(field, allowed_value):
                 canonical = allowed_value
@@ -583,7 +607,7 @@ def validate_analysis(
                     "Название характеристики раскрыто ChatGPT; "
                     "значение проверено по справочнику"
                 )
-        if presence_marker and not canonical:
+        if presence_marker and not canonical and not program_field:
             canonical = _current_value_supported_by_source_name(field, target, name)
             if canonical:
                 explanation = (
@@ -602,7 +626,8 @@ def validate_analysis(
             if model_proposal and not presence_marker and _numeric_range_bounds(value, name, field.name) is None:
                 alternatives = list(dict.fromkeys([model_proposal, *alternatives]))[:3]
             unmatched.append({
-                "template_field_id": field_id, "source_name": name, "value": value,
+                "template_field_id": field_id, "source_name": name,
+                "value": name if program_field and presence_marker else value,
                 "suggestions": alternatives, "reason": match_reason, "evidence": quote,
             })
             warnings.append(

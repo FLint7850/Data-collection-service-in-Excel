@@ -27,7 +27,11 @@ def is_program_list(field: Any) -> bool:
     group = program_value_key(getattr(field, "group_name", ""))
     if re.search(r"количеств|число|сигнал|индикац|длительност|время|наличие", name):
         return False
-    if not (re.search(r"программ", name) or re.fullmatch(r"программы(?:\s+.*)?", group)):
+    if not (
+        re.search(r"программ", name)
+        or re.search(r"\bрежим(?:ы|ов)\b", name)
+        or re.fullmatch(r"(?:программы|режимы)(?:\s+.*)?", group)
+    ):
         return False
     values = [item.value for item in field.allowed_values if item.is_active]
     if values and all(program_value_key(value) in {"да", "нет", "есть", "yes", "no", "-"}
@@ -69,11 +73,57 @@ def _capitalize(value: str) -> str:
     return re.sub(r"[a-zа-яё]", lambda match: match.group().upper(), value, count=1, flags=re.IGNORECASE)
 
 
+def _registry_parts(field: Any, item: Any) -> list[str]:
+    """Read dictionary rows without breaking a slash inside one program name.
+
+    Historical program dictionaries stored complete lists in one row without
+    marking them as combinations, so they still need to be split. A numeric
+    slash (``Супер 15/30``) is a program name, unless the row is explicitly
+    marked as a combination.
+    """
+
+    value = str(item.value or "")
+    if getattr(item, "is_combination", False):
+        return _parts(field, value)
+    if re.search(r"\d\s*/\s*\d", value):
+        return [" ".join(value.split()).strip()]
+    return _parts(field, value)
+
+
+def _protected_parts(
+    field: Any,
+    raw: str,
+    aliases: dict[str, str],
+    whole: dict[str, set[str]],
+) -> list[str]:
+    """Split a source list while preserving saved aliases containing '/'."""
+
+    separator = getattr(field, "separator", "/") or "/"
+    protected = raw
+    replacements: dict[str, str] = {}
+    literal_keys = [
+        key for key in {*aliases, *whole}
+        if "/" in key or (separator != "/" and separator in key)
+    ]
+    for index, key in enumerate(sorted(literal_keys, key=lambda value: (-len(value), value))):
+        token = f"§program{index}§"
+        pattern = re.compile(r"(?<![\w+-])" + re.escape(key) + r"(?![\w+-])")
+        protected, count = pattern.subn(token, protected)
+        if count:
+            replacements[token] = key
+    result: list[str] = []
+    for part in _parts(field, protected):
+        for token, key in replacements.items():
+            part = part.replace(token, key)
+        result.append(part)
+    return result
+
+
 def _program_registry(field: Any):
     components: dict[str, str] = {}
     active = [item for item in field.allowed_values if item.is_active]
     for item in active:
-        for part in _parts(field, item.value):
+        for part in _registry_parts(field, item):
             components.setdefault(program_value_key(part), _capitalize(part))
     aliases = dict(components)
     # Allow the unit-less spelling of an explicitly allowed temperature program.
@@ -85,7 +135,7 @@ def _program_registry(field: Any):
     # Read synonyms from the current active records on every match. A sync,
     # rename, deactivation or synonym edit needs no code change or cache reset.
     for item in active:
-        parts = _parts(field, item.value)
+        parts = _registry_parts(field, item)
         canonical = "/".join(sorted({aliases[program_value_key(part)] for part in parts}, key=program_value_key))
         for synonym in item.synonyms:
             key = program_value_key(synonym.synonym)
@@ -138,6 +188,8 @@ def match_programs(field: Any, raw_value: Any) -> tuple[str, int, str, list[str]
         return next(iter(whole[raw])), 98, "Синоним списка программ; состав проверен по справочнику", []
     if (raw in whole and len(whole[raw]) > 1) or (raw in aliases and not aliases[raw]):
         return "", 0, "Неоднозначный синоним программы", []
+    if raw in aliases:
+        return aliases[raw], 100, "Программа проверена по справочнику", []
     if not aliases:
         return "", 0, "В шаблоне нет допустимых программ", []
     # Longest phrase wins: Полоскание и отжим must remain one component.
@@ -152,8 +204,14 @@ def match_programs(field: Any, raw_value: Any) -> tuple[str, int, str, list[str]
         patterns.append(phrase)
     pattern = re.compile(r"(?<![\w+-])(?:" + "|".join(patterns) + r")(?![\w+-])")
     values, unknown = set(), []
-    for part in _parts(field, raw):
+    for part in _protected_parts(field, raw, aliases, whole):
         # Preserve commas/parentheses inside an allowed compound name.
+        if part in whole:
+            if len(whole[part]) == 1:
+                values.update(_parts(field, next(iter(whole[part]))))
+            else:
+                unknown.append(part)
+            continue
         exact = aliases.get(part)
         if exact:
             values.add(exact)
