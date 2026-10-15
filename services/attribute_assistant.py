@@ -2756,9 +2756,30 @@ def _canonical_linear_unit(value: Any) -> str:
     return LINEAR_UNIT_ALIASES.get(normalize_key(value), "")
 
 
+def _is_area_measurement(value: Any) -> bool:
+    """Return whether a label/value describes an area rather than a length."""
+
+    text = clean_text(value).casefold().replace("ё", "е")
+    if re.search(r"\b(?:площад\w*|area)\b", text, re.IGNORECASE):
+        return True
+    if re.search(
+        r"(?:\bкв\.?\s*м\.?\b|\bквадратн\w*\s+метр\w*\b|"
+        r"\bsq\.?\s*m\b|\bsquare\s+met(?:er|re)s?\b|"
+        r"(?<!\w)(?:мм|см|м|mm|cm|m)\s*(?:²|\^\s*2|2)(?!\d))",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
 def _linear_unit_from_name(value: Any) -> str:
     # Units in donor tables are commonly stored in the attribute label rather
     # than repeated in every value (for example, "Длина кабеля, м" + "1.8").
+    # Area labels such as "Площадь, кв.м" must not expose their final "м" as a
+    # linear unit: all area values in templates and sources are square metres.
+    if _is_area_measurement(value):
+        return ""
     for token in reversed(WORD_RE.findall(normalize_key(value))):
         unit = _canonical_linear_unit(token)
         if unit:
@@ -2989,8 +3010,15 @@ def _centimeter_value(
         matches = list(re.finditer(r"(?<![\w/])(" + unit_pattern + r")(?![\w²³/])", name, re.I))
         return unit(matches[-1].group(1)) if matches else ""
 
-    # Area, volume and rates must never become linear centimeters.
-    if re.search(r"(?:мм|см|mm|cm|м|m)\s*(?:[²³]|[23]\b|\^|/)", source_name + " " + field_name, re.I):
+    # Area, volume and rates must never become linear centimeters. In
+    # particular, "кв.м" has no superscript marker and would otherwise be
+    # mistaken for plain metres.
+    if (
+        _is_area_measurement(raw_value)
+        or _is_area_measurement(source_name)
+        or _is_area_measurement(field_name)
+        or re.search(r"(?:мм|см|mm|cm|м|m)\s*(?:[²³]|[23]\b|\^|/)", source_name + " " + field_name, re.I)
+    ):
         return None
     part_re = re.compile(r"([+]?[0-9]+(?:[.,][0-9]+)?)\s*(" + unit_pattern + r")?(?=$|\s|[xXхХ×*/\-–—−])", re.I)
     parts = list(part_re.finditer(text))
@@ -3494,18 +3522,25 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         target.reason,
         target.source_details or {},
     )
+    details = dict(target.source_details or {})
+    area_field = _is_area_measurement(field.name)
+    if area_field and "current_value_hint" in details:
+        # Remove hints persisted by the old bug (for example, 23 -> 2300 cm).
+        details.pop("current_value_hint", None)
+        target.source_details = details
+    details_changed = details != before[-1]
     resolved_unknown = _clear_resolved_unknown_values(target)
     unknown = [dict(item) for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown:
-        if resolved_unknown:
+        if resolved_unknown or details_changed:
             _recalculate_candidate_state(target.product, target)
-        return resolved_unknown
+        return resolved_unknown or details_changed
     groups: dict[tuple, list[dict]] = {}
     for item in unknown:
         groups.setdefault((item.get("source"), item.get("url"), item.get("donor_id")), []).append(item)
     replacements = []
     consumed: set[int] = set()
-    suggestions_changed = resolved_unknown
+    suggestions_changed = resolved_unknown or details_changed
     for facts in groups.values():
         axes = [item for item in facts if _dimension_component_axis(field, clean_text(item.get("source_name")))]
         combined = _assemble_dimension_value(field, axes)
@@ -3519,6 +3554,12 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         for item in facts:
             raw = exact_value_key(item.get("value"))
             name = clean_text(item.get("source_name"))
+            if area_field or _is_area_measurement(name):
+                canonical, confidence, reason, _ = _allowed_match(field, raw, name)
+                if canonical:
+                    replacements.append((item, name, canonical, confidence, raw, reason))
+                    consumed.add(id(item))
+                    continue
             if _numeric_range_bounds(raw, name, field.name) is not None:
                 canonical, _, reason, suggestions = _allowed_match(field, raw, name)
                 if not canonical and (item.get("suggestions") != suggestions or item.get("reason") != reason):
@@ -3534,6 +3575,11 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         target.source_details = {**(target.source_details or {}),
                                  "unknown_values": [item for item in unknown if id(item) not in consumed]}
     for item, name, canonical, confidence, raw, reason in replacements:
+        if (
+            item.get("source") in {"current_site", "current_csv"}
+            and exact_value_key(raw) == exact_value_key(target.current_value)
+        ):
+            target.final_value = canonical
         apply_candidate(target.product, target, value=canonical, confidence=min(confidence, 85) if item.get("source") == "ChatGPT" else confidence,
                         source=item.get("source", ""), reason=reason, priority=90 if item.get("source") == "ChatGPT" else 0,
                         source_name=name, source_url=item.get("url", ""), raw_value=raw,

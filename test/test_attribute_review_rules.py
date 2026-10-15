@@ -523,6 +523,54 @@ class AttributeReviewRulesTest(unittest.TestCase):
         field = self.template("Мощность, Вт", ("1200",), "number").fields[0]
         self.assertEqual(svc._allowed_match(field, "1.2 кВт")[0], "1200")
 
+    def test_area_values_in_square_meters_are_never_converted_to_centimeters(self):
+        names = [
+            "Рекомендуемая площадь помещения, кв.м",
+            "Рекомендуемая площадь помещения, кв. м",
+            "Рекомендуемая площадь помещения, м²",
+            "Рекомендуемая площадь помещения, м2",
+            "Площадь помещения, м",
+        ]
+        for index, name in enumerate(names):
+            with self.subTest(name=name):
+                template = self.template(f"{name} {index}", ("23",))
+                field = template.fields[0]
+                self.assertIsNone(svc._centimeter_value("23", name, field.name))
+                self.assertEqual(svc._allowed_match(field, "23", name)[0], "23")
+
+                product = self.product(template, "23", name)
+                value = product.values[0]
+                self.assertEqual(value.status, "kept")
+                self.assertEqual(value.final_value, "23")
+                self.assertNotIn("current_value_hint", value.source_details)
+
+    def test_saved_area_conflict_from_centimeter_bug_is_repaired_on_read(self):
+        template = self.template("Рекомендуемая площадь помещения, кв.м", ("23",))
+        product = self.product(template, "23")
+        value = product.values[0]
+        value.final_value = ""
+        value.status = "conflict"
+        value.reason = "Значения 2300 см нет в справочнике"
+        value.source_details = {
+            "current_value_hint": "Рекомендуемая площадь помещения, кв.м: 23 → 2300 см",
+            "unknown_values": [{
+                "value": "23",
+                "source": "current_csv",
+                "source_name": "Рекомендуемая площадь помещения, кв.м",
+                "url": product.source_url,
+                "role": "Исходный CSV сайта",
+                "suggestions": [],
+                "reason": "Значения 2300 см нет в справочнике",
+            }],
+        }
+
+        serialized = svc.serialize_product(product, detailed=True)["values"][0]
+
+        self.assertEqual(serialized["status"], "kept")
+        self.assertEqual(serialized["final_value"], "23")
+        self.assertNotIn("current_value_hint", serialized["source_details"])
+        self.assertEqual(serialized["source_details"]["unknown_values"], [])
+
     def test_bad_original_is_conflict_even_with_dictionary_alternatives(self):
         template = self.template()
         for raw, status in [("совершенно другое", "conflict"), ("A+++", "conflict")]:
