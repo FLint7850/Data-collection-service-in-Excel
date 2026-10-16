@@ -122,9 +122,17 @@ SPECIFICATION_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 UI_NOISE_SELECTOR = (
-    "script,style,svg,canvas,noscript,.glossary-tooltip,.tooltip,.popover,"
+    "script,style,svg,canvas,noscript,template,.glossary-tooltip,.tooltip,.popover,"
     ".tooltip-popper,[data-tooltip-content],[role='tooltip'],dialog,[role='dialog'],"
     "[class*='modal']"
+)
+HIDDEN_UI_STYLE_RE = re.compile(
+    r"(?:^|;)\s*(?:"
+    r"display\s*:\s*none|"
+    r"visibility\s*:\s*(?:hidden|collapse)|"
+    r"content-visibility\s*:\s*hidden"
+    r")\s*(?:!important\s*)?(?=;|$)",
+    re.IGNORECASE,
 )
 RELATED_MODEL_URL_REASON = "Адрес построен по товару той же серии"
 IGNORED_NAME_TOKENS = {
@@ -185,6 +193,7 @@ LINEAR_UNIT_ALIASES = {
     "литр": "л", "литра": "л", "литров": "л",
     **{unit: unit for unit in LINEAR_UNIT_FACTORS},
 }
+UNITLESS_LINEAR_INFERENCE_REASON_PREFIX = "Единица источника не указана;"
 MAX_PUBLIC_REDIRECTS = 8
 TEMPLATE_SNAPSHOT_SCHEMA = "attribute-template-snapshot"
 PRODUCT_SNAPSHOT_SCHEMA = "attribute-product-snapshot"
@@ -1419,10 +1428,44 @@ def _jsonld_items(value: Any) -> Iterable[dict[str, Any]]:
             yield from _jsonld_items(item)
 
 
+def _is_semantically_hidden_ui(node: Any) -> bool:
+    """Recognize non-rendered and popup content without relying on site CSS."""
+
+    if not getattr(node, "name", None):
+        return False
+    if node.name == "template" or node.has_attr("hidden") or node.has_attr("popover"):
+        return True
+    aria_hidden = clean_text(node.get("aria-hidden")).casefold()
+    if aria_hidden in {"true", "1"}:
+        return True
+    aria_modal = clean_text(node.get("aria-modal")).casefold()
+    if aria_modal in {"true", "1"}:
+        return True
+    role = clean_text(node.get("role")).casefold()
+    if role in {"tooltip", "dialog", "alertdialog"}:
+        return True
+    return bool(HIDDEN_UI_STYLE_RE.search(str(node.get("style") or "")))
+
+
 def _remove_ui_noise(node: Any) -> None:
-    # Remove children first because tooltip containers may be nested.
+    """Remove content which a user cannot see as part of the specification.
+
+    Semantic HTML state is checked first, so inline tooltip templates such as
+    ``style="display:none"`` are excluded on any site. Known UI selectors stay
+    as a compatibility fallback for markup that has no accessibility metadata.
+    """
+
+    semantic_noise = [
+        candidate for candidate in node.find_all(True)
+        if _is_semantically_hidden_ui(candidate)
+    ]
+    # Remove children first because hidden/popup containers may be nested.
+    for noisy in reversed(semantic_noise):
+        if noisy.parent is not None:
+            noisy.decompose()
     for noisy in reversed(node.select(UI_NOISE_SELECTOR)):
-        noisy.decompose()
+        if noisy.parent is not None:
+            noisy.decompose()
 
 
 def _text_without_ui_noise(node: Any) -> str:
@@ -3068,6 +3111,79 @@ def _centimeter_value(
     return "".join(result)
 
 
+def _unitless_linear_dictionary_match(
+    field: AttributeTemplateField,
+    raw_value: str,
+    source_name: str,
+    allowed: list[AttributeAllowedValue],
+) -> tuple[str, int, str] | None:
+    """Infer a missing length unit only when one dictionary value proves it.
+
+    A bare ``850`` on a dimensions row may mean 850 mm, 850 cm or 850 m.
+    We must not pick one by magnitude alone. Trying the other supported length
+    units is safe only when exactly one interpretation lands on an existing
+    canonical dictionary value; the caller still keeps ``850`` for review.
+    """
+
+    text = exact_value_key(raw_value)
+    if (
+        not text
+        or not allowed
+        or _linear_unit_from_name(text)
+        or _linear_unit_from_name(source_name)
+        or _linear_unit_from_name(field.name) != "см"
+        or not re.search(
+            r"высот|ширин|глубин|длин|диаметр|габарит|размер|толщин|радиус|расстояни|"
+            r"height|width|depth|length|diameter|dimensions",
+            source_name + " " + field.name,
+            re.IGNORECASE,
+        )
+    ):
+        return None
+
+    matches: list[tuple[str, str, str]] = []
+    for assumed_unit in ("мм", "м"):
+        assumed_source_name = f"{source_name}, {assumed_unit}" if source_name else assumed_unit
+        converted = _centimeter_value(text, assumed_source_name, field.name)
+        formatted = _centimeter_value(
+            text,
+            assumed_source_name,
+            field.name,
+            preserve_format=True,
+        )
+        if converted is None:
+            continue
+        variants = list(dict.fromkeys([
+            formatted,
+            converted,
+            converted.replace(".", ","),
+            f"{converted} см",
+            f"{converted.replace('.', ',')} см",
+            f"{converted} cm",
+        ]))
+        canonical = next(
+            (
+                matched
+                for variant in variants
+                if (matched := _canonical_matching_value(allowed, variant))
+            ),
+            "",
+        )
+        if canonical:
+            matches.append((canonical, assumed_unit, converted))
+
+    canonical_values = {value_match_key(item[0]) for item in matches}
+    if len(canonical_values) != 1:
+        return None
+    canonical, assumed_unit, converted = matches[0]
+    return (
+        canonical,
+        92,
+        f"{UNITLESS_LINEAR_INFERENCE_REASON_PREFIX} {text} интерпретировано как "
+        f"{assumed_unit}, потому что {converted} см — точное значение справочника",
+    )
+
+
 def _duration_unit(value: str) -> str:
     key = value.casefold().rstrip(".")
     return "months" if key.startswith(("мес", "month", "mo")) else "years"
@@ -3216,6 +3332,15 @@ def _allowed_match(
             if canonical:
                 return canonical, confidence, order_reason + "Конвертация единиц в сантиметры; " + reason, []
             nearest_values.extend(nearest)
+        inferred = _unitless_linear_dictionary_match(field, ordered_value, source_name, allowed)
+        if inferred:
+            canonical, confidence, reason = inferred
+            return (
+                canonical,
+                confidence,
+                order_reason + reason,
+                list(dict.fromkeys(nearest_values))[:3],
+            )
         return "", 0, f"Значения {centimeters} см нет в справочнике", list(dict.fromkeys(nearest_values))[:3]
     if field.value_type not in {"number", "dimensions", "boolean"}:
         direct = _allowed_match_single(field, exact_value_key(raw_value), allowed, source_name)
@@ -3459,7 +3584,8 @@ def _clear_resolved_unknown_values(target: AttributeProductValue) -> bool:
         return False
     unresolved = [
         item for item in unknown
-        if not any(_same_source_observation(item, candidate) for candidate in candidates)
+        if item.get("preserve_for_review")
+        or not any(_same_source_observation(item, candidate) for candidate in candidates)
     ]
     if len(unresolved) == len(unknown):
         return False
@@ -3554,6 +3680,29 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         for item in facts:
             raw = exact_value_key(item.get("value"))
             name = clean_text(item.get("source_name"))
+            canonical, confidence, reason, suggestions = _allowed_match(field, raw, name)
+            if canonical and UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in reason:
+                if (
+                    item.get("suggestions") != suggestions
+                    or item.get("reason") != reason
+                    or not item.get("preserve_for_review")
+                ):
+                    item.update(
+                        suggestions=suggestions,
+                        reason=reason,
+                        preserve_for_review=True,
+                    )
+                    suggestions_changed = True
+                already_resolved = any(
+                    isinstance(candidate, dict)
+                    and _same_source_observation(item, candidate)
+                    and _candidate_value_key(target, candidate.get("value"))
+                    == _candidate_value_key(target, canonical)
+                    for candidate in (target.source_details or {}).get("candidates", [])
+                )
+                if not already_resolved:
+                    replacements.append((item, name, canonical, confidence, raw, reason))
+                continue
             if area_field or _is_area_measurement(name):
                 canonical, confidence, reason, _ = _allowed_match(field, raw, name)
                 if canonical:
@@ -3610,6 +3759,7 @@ def record_unknown_value(
     role: str = "",
     suggestions: list[str],
     reason: str,
+    preserve_for_review: bool = False,
 ) -> None:
     """Keep a mapped fact even when its value does not belong to the dictionary."""
     details = dict(target.source_details or {})
@@ -3618,11 +3768,14 @@ def record_unknown_value(
         return (isinstance(item, dict) and item.get("source") == source
                 and item.get("source_name") == source_name and item.get("url", "") == source_url)
 
-    details["unknown_values"] = [item for item in details.get("unknown_values", []) if not same_source(item)] + [{
+    unknown_item = {
         "value": exact_value_key(raw_value), "source": source, "source_name": source_name,
         "url": source_url, "donor_id": donor_id, "role": role,
         "suggestions": list(dict.fromkeys(suggestions)), "reason": reason,
-    }]
+    }
+    if preserve_for_review:
+        unknown_item["preserve_for_review"] = True
+    details["unknown_values"] = [item for item in details.get("unknown_values", []) if not same_source(item)] + [unknown_item]
     details["candidates"] = [item for item in details.get("candidates", []) if not same_source(item)]
     target.source_details = details
     if not _has_confirmed_decision(target):
@@ -3972,6 +4125,11 @@ def apply_parsed_attributes(
                 canonical, value_confidence, value_reason, suggestions = _allowed_match(
                     field, raw_value, source_name
                 )
+            preserve_unitless_original = bool(
+                not saved_value
+                and canonical
+                and UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in value_reason
+            )
             if not canonical:
                 stats["unknown"] += 1
                 record_unknown_value(
@@ -3997,6 +4155,25 @@ def apply_parsed_attributes(
             ]
             if details["unknown_values"] != previous_unknown:
                 target.source_details = details
+            source_role = "Основной донор" if priority == 0 else "Дополнительный донор"
+            if preserve_unitless_original:
+                stats["unknown"] += 1
+                record_unknown_value(
+                    product,
+                    target,
+                    raw_value=raw_value,
+                    source=source,
+                    source_name=source_name,
+                    source_url=source_url,
+                    donor_id=donor_id,
+                    role=source_role,
+                    suggestions=suggestions,
+                    reason=(
+                        value_reason
+                        + "; исходное значение сохранено для ручного сопоставления или добавления"
+                    ),
+                    preserve_for_review=True,
+                )
             confidence = min(mapping_confidence, value_confidence)
             apply_candidate(
                 product,
@@ -4009,7 +4186,7 @@ def apply_parsed_attributes(
                 source_name=source_name,
                 source_url=source_url,
                 raw_value=raw_value,
-                source_role="Основной донор" if priority == 0 else "Дополнительный донор",
+                source_role=source_role,
                 donor_id=donor_id,
             )
             stats["mapped"] += 1

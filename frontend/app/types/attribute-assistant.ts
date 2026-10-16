@@ -95,6 +95,7 @@ export interface AttributeValue {
       role?: string;
       suggestions: string[];
       reason: string;
+      preserve_for_review?: boolean;
     }>;
     chatgpt?: Record<string, unknown>;
   };

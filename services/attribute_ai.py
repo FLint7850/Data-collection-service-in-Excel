@@ -24,6 +24,7 @@ from services.attribute_files import delete_after_commit, stage_text
 from services.attribute_settings import StaleProductError
 from services.attribute_assistant import (
     BOOLEAN_FALSE_KEYS,
+    UNITLESS_LINEAR_INFERENCE_REASON_PREFIX,
     _is_presence_marker,
     _candidate_value_key,
     _has_confirmed_decision,
@@ -48,6 +49,7 @@ from services.attribute_assistant import (
     parse_product_html,
     parse_product_html_for_donor,
     _parsed_product_matches_model,
+    _remove_ui_noise,
     RELATED_MODEL_URL_REASON,
     product_template,
     refresh_batch_summary,
@@ -72,6 +74,7 @@ UNIVERSAL_ATTRIBUTE_PROMPT = (
 
 def _compact_visible_text(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
+    _remove_ui_noise(soup)
     for node in soup.select("script, style, svg, canvas, noscript, form, nav, footer, iframe"):
         node.decompose()
     # Repeated long paragraphs are often duplicated feature popups. Keep short
@@ -647,6 +650,14 @@ def validate_analysis(
                 "confidence": confidence,
                 "explanation": explanation,
                 "evidence": quote,
+                "preserve_raw_value": (
+                    UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in match_reason
+                ),
+                "raw_suggestions": (
+                    alternatives
+                    if UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in match_reason
+                    else []
+                ),
             }
         )
 
@@ -752,6 +763,22 @@ def apply_analysis(
             "confidence": target.confidence,
             "status": target.status,
         }
+        if suggestion.get("preserve_raw_value"):
+            record_unknown_value(
+                product,
+                target,
+                raw_value=exact_value_key(suggestion.get("raw_value")),
+                source="ChatGPT",
+                source_name=clean_text(suggestion.get("source_name")) or target.attribute_name,
+                source_url=source_url,
+                role="ChatGPT",
+                suggestions=suggestion.get("raw_suggestions") or [],
+                reason=(
+                    clean_text(suggestion.get("explanation"))
+                    + "; исходное значение сохранено для ручного сопоставления или добавления"
+                ),
+                preserve_for_review=True,
+            )
         apply_candidate(
             product,
             target,

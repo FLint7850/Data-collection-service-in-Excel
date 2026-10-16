@@ -1035,6 +1035,50 @@ class AttributeAssistantTest(unittest.TestCase):
             {"name": "Цвет", "value": "Белый", "group": ""}
         ])
 
+    def test_hidden_tooltip_templates_are_excluded_without_site_classes(self):
+        from services import attribute_ai as ai
+
+        html = """
+        <h1>DeLonghi BELVEDERO L 714 VI</h1>
+        <h2>Основные характеристики</h2>
+        <div class="arbitrary-list">
+          <div class="arbitrary-row">
+            <div class="arbitrary-name">
+              <div>Тип установки</div>
+              <span data-popup-trigger aria-expanded="false">
+                <svg><use href="#info"></use></svg>
+                <span style="DISPLAY : none !important">
+                  <div class="arbitrary-help-title">Установка</div>
+                  <div class="arbitrary-help-body">
+                    По типу установки все машины делятся на отдельностоящие и встраиваемые.
+                  </div>
+                </span>
+              </span>
+            </div>
+            <div class="arbitrary-value">Отдельностоящая</div>
+          </div>
+          <div class="arbitrary-row">
+            <div class="arbitrary-name">Тип двигателя</div>
+            <div class="arbitrary-value">
+              Инверторный
+              <span aria-hidden="true">Большая скрытая справка про разные типы двигателей.</span>
+            </div>
+          </div>
+        </div>
+        """
+
+        parsed = service.parse_product_html(html)
+        visible = ai._compact_visible_text(html)
+
+        self.assertEqual(parsed["attributes"], [
+            {"name": "Тип установки", "value": "Отдельностоящая", "group": ""},
+            {"name": "Тип двигателя", "value": "Инверторный", "group": ""},
+        ])
+        self.assertIn("Тип установки", visible)
+        self.assertIn("Отдельностоящая", visible)
+        self.assertNotIn("По типу установки", visible)
+        self.assertNotIn("скрытая справка", visible)
+
     def test_tooltip_panels_are_excluded_before_discovering_characteristic_rows(self):
         for marker in (
             'class="tooltip-popper tooltip-popper_large"',

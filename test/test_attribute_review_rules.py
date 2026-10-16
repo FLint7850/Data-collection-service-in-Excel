@@ -430,6 +430,141 @@ class AttributeReviewRulesTest(unittest.TestCase):
                     analysis = self.analyze(parsed, source_name, raw)
                     self.assertEqual(analysis["suggestions"][0]["proposed_value"], expected)
 
+    def test_unitless_dimensions_use_only_an_exact_converted_dictionary_value(self):
+        cases = [
+            ("Высота, см", "850", ("85", "815"), "85"),
+            ("Ширина, см", "595", ("59.5", "618", "657"), "59.5"),
+            ("Глубина, см", "470", ("47", "401"), "47"),
+        ]
+        for field_name, raw, allowed, expected in cases:
+            with self.subTest(field_name=field_name, raw=raw):
+                field = self.template(field_name, allowed).fields[0]
+                canonical, confidence, reason, suggestions = svc._allowed_match(
+                    field,
+                    raw,
+                    "Габариты (ШxГxВ)",
+                )
+                self.assertEqual(canonical, expected)
+                self.assertEqual(confidence, 92)
+                self.assertIn(svc.UNITLESS_LINEAR_INFERENCE_REASON_PREFIX, reason)
+                self.assertIsInstance(suggestions, list)
+
+        field = self.template("Высота, см без совпадения", ("85", "815")).fields[0]
+        self.assertEqual(svc._allowed_match(field, "851", "Габариты (ШxГxВ)")[0], "")
+        self.assertEqual(svc._allowed_match(field, "850", "Габариты (ШxГxВ), см")[0], "")
+        self.assertEqual(svc._allowed_match(field, "85", "Габариты (ШxГxВ)")[0], "85")
+
+        svc.add_allowed_value(self.db, field, "85000")
+        self.assertEqual(svc._allowed_match(field, "850", "Габариты (ШxГxВ)")[0], "")
+
+    def test_unitless_converted_candidate_keeps_raw_value_for_parser_and_chatgpt(self):
+        template = self.template("Высота, см", ("85", "815"))
+        field = template.fields[0]
+        for method in ("parser", "gpt"):
+            with self.subTest(method=method):
+                product = self.product(template)
+                if method == "parser":
+                    with patch.object(
+                        svc,
+                        "map_attribute",
+                        return_value=(field, 100, "Сопоставлено", []),
+                    ):
+                        stats = svc.apply_parsed_attributes(
+                            self.db,
+                            product,
+                            [{"name": "Габариты (ШxГxВ)", "value": "850"}],
+                            source="Delonghi",
+                            priority=0,
+                            donor_id=1,
+                            source_url="https://donor.example/product",
+                        )
+                    self.assertEqual(stats["mapped"], 1)
+                    self.assertEqual(stats["unknown"], 1)
+                else:
+                    analysis = self.analyze(product, "Габариты (ШxГxВ)", "850")
+                    self.assertTrue(analysis["suggestions"][0]["preserve_raw_value"])
+                    ai.apply_analysis(
+                        self.db,
+                        product,
+                        analysis,
+                        source_url="https://donor.example/product",
+                    )
+
+                value = product.values[0]
+                self.assertEqual(value.status, "suggested")
+                self.assertEqual(value.proposed_value, "85")
+                self.assertEqual(value.final_value, "")
+                self.assertEqual(len(value.source_details["candidates"]), 1)
+                self.assertEqual(value.source_details["candidates"][0]["value"], "85")
+                self.assertEqual(value.source_details["candidates"][0]["raw_value"], "850")
+                self.assertEqual(len(value.source_details["unknown_values"]), 1)
+                unknown = value.source_details["unknown_values"][0]
+                self.assertEqual(unknown["value"], "850")
+                self.assertTrue(unknown["preserve_for_review"])
+                self.assertIn("815", unknown["suggestions"])
+
+    def test_unitless_dimension_tuple_fills_each_axis_and_keeps_each_original(self):
+        template = svc.import_template_csv(
+            self.db,
+            (
+                "Ширина, см (Размеры);Глубина, см (Размеры);Высота, см (Размеры)\n"
+                "59.5;47;85\n"
+                "618;401;815\n"
+            ).encode("utf-8"),
+            name="Безразмерные габариты",
+            category="Тест > Безразмерные габариты",
+        )
+        product = self.product(template)
+
+        stats = svc.apply_parsed_attributes(
+            self.db,
+            product,
+            [{"name": "Габариты (ШxГxВ)", "value": "595 x 470 x 850"}],
+            source="Delonghi",
+            priority=0,
+            donor_id=1,
+            source_url="https://donor.example/product",
+        )
+
+        self.assertEqual(stats["mapped"], 3)
+        self.assertEqual(stats["unknown"], 3)
+        expected = {
+            "Ширина, см": ("59.5", "595"),
+            "Глубина, см": ("47", "470"),
+            "Высота, см": ("85", "850"),
+        }
+        for value in product.values:
+            with self.subTest(field=value.attribute_name):
+                canonical, raw = expected[value.attribute_name]
+                self.assertEqual(value.proposed_value, canonical)
+                self.assertEqual(value.source_details["candidates"][0]["raw_value"], raw)
+                self.assertEqual(value.source_details["unknown_values"][0]["value"], raw)
+                self.assertTrue(value.source_details["unknown_values"][0]["preserve_for_review"])
+
+    def test_saved_unitless_unknown_is_repaired_once_and_remains_addable(self):
+        template = self.template("Высота, см", ("85", "815"))
+        product = self.product(template)
+        value = product.values[0]
+        value.status = "conflict"
+        value.reason = "Значения 850 см нет в справочнике"
+        value.source_details = {"candidates": [], "unknown_values": [{
+            "value": "850",
+            "source": "Delonghi",
+            "source_name": "Габариты (ШxГxВ)",
+            "url": "https://donor.example/product",
+            "donor_id": 1,
+            "role": "Основной донор",
+            "suggestions": ["815"],
+            "reason": "Значения 850 см нет в справочнике",
+        }]}
+
+        self.assertTrue(svc._repair_confirming_evidence(value))
+        self.assertEqual(value.proposed_value, "85")
+        self.assertEqual(value.source_details["candidates"][0]["value"], "85")
+        self.assertEqual(value.source_details["unknown_values"][0]["value"], "850")
+        self.assertTrue(value.source_details["unknown_values"][0]["preserve_for_review"])
+        self.assertFalse(svc._repair_confirming_evidence(value))
+
     def test_dimension_tuples_and_ranges_keep_order_and_separators(self):
         template = self.template("Габариты, см", ("60x45x85", "60/65", "60-65"))
         field = template.fields[0]
