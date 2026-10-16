@@ -25,7 +25,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import chardet
 import requests
@@ -1840,11 +1840,19 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
                 result["model"] = value
                 break
     if not result["model"]:
-        result["model"] = _infer_product_model(
+        inferred_model = _infer_product_model(
             result["name"],
             url,
             result["brand"],
         )
+        result["model"] = inferred_model
+        if (
+            inferred_model
+            and normalize_model(inferred_model) not in normalize_model(result["name"])
+        ):
+            # The URL is useful for display/fallback parsing, but it cannot
+            # prove that an automatically generated URL opened the right page.
+            result["model_inferred_from_url"] = True
     crumbs = [clean_text(node.get_text(" ")) for node in soup.select('[itemprop="itemListElement"], .breadcrumb a, .breadcrumbs a')]
     if crumbs and not result["category"]:
         result["category"] = " > ".join(dict.fromkeys(item for item in crumbs if item))
@@ -2463,8 +2471,57 @@ def _cached_product_url(donor: Donor, model: str) -> str:
     return _donor_catalog_match(donor, model)[0]
 
 
-def _related_catalog_model_url(donor: Donor, model: str) -> str:
-    """Build a likely URL only when cached products prove a same-series URL pattern."""
+def _replace_model_inside_product_url(url: str, old_model: str, new_model: str) -> str:
+    """Replace only the model-shaped part of a product slug, preserving its URL template."""
+
+    parsed = urlparse(clean_text(url))
+    old_path = parsed.path
+    old_segment = old_path.rstrip("/").rsplit("/", 1)[-1]
+    decoded_segment = unquote(old_segment)
+    suffix_match = re.search(r"(\.[A-Za-z0-9]{1,8})$", decoded_segment)
+    suffix = suffix_match.group(1) if suffix_match else ""
+    stem = decoded_segment[:-len(suffix)] if suffix else decoded_segment
+    old_key = normalize_model(old_model)
+    if not stem or not old_key:
+        return ""
+
+    normalized_chars: list[str] = []
+    source_positions: list[int] = []
+    for index, char in enumerate(stem):
+        if char.isalnum():
+            normalized_chars.append(char.upper())
+            source_positions.append(index)
+    normalized_stem = "".join(normalized_chars)
+    normalized_start = normalized_stem.rfind(old_key)
+    if normalized_start < 0:
+        return ""
+    start = source_positions[normalized_start]
+    end = source_positions[normalized_start + len(old_key) - 1] + 1
+    old_slice = stem[start:end]
+    replacement = "-".join(
+        re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", clean_text(new_model))
+    )
+    if not replacement:
+        return ""
+    if old_slice.islower():
+        replacement = replacement.lower()
+    elif old_slice.isupper():
+        replacement = replacement.upper()
+
+    new_segment = quote(stem[:start] + replacement + stem[end:] + suffix, safe="-_.~")
+    parent_path = old_path.rstrip("/").rsplit("/", 1)[0]
+    candidate_path = f"{parent_path}/{new_segment}" + ("/" if old_path.endswith("/") else "")
+    return parsed._replace(path=candidate_path, query="", fragment="").geturl()
+
+
+def _related_catalog_model_url(
+    donor: Donor,
+    model: str,
+    *,
+    product_name: str = "",
+    category: str = "",
+) -> str:
+    """Build a last-resort URL from a proven same-site product URL template."""
 
     model_text = clean_text(model)
     wanted = normalize_model(model_text)
@@ -2479,7 +2536,12 @@ def _related_catalog_model_url(donor: Donor, model: str) -> str:
             min(len(left), len(right)),
         )
 
-    ranked: list[tuple[int, str]] = []
+    target_tokens = _search_tokens(product_name, category)
+    canonical_site = donor.site_url or next(
+        (clean_text(item) for item in (donor.start_urls or []) if clean_text(item)),
+        "",
+    )
+    ranked: list[tuple[int, int, int, str]] = []
     for key, raw_record in (donor.known_new_products or {}).items():
         record = raw_record if isinstance(raw_record, dict) else {"url": raw_record}
         cached_url = clean_text(record.get("url") or record.get("link"))
@@ -2498,29 +2560,64 @@ def _related_catalog_model_url(donor: Donor, model: str) -> str:
             continue
 
         absolute = urljoin(donor.site_url or (donor.start_urls or [""])[0], cached_url)
-        parsed = urlparse(absolute)
-        old_path = parsed.path
-        old_segment = old_path.rstrip("/").rsplit("/", 1)[-1]
-        suffix = Path(old_segment).suffix if not old_path.endswith("/") else ""
-        segment = quote(model_text, safe="-_.~")
-        if suffix and not segment.casefold().endswith(suffix.casefold()):
-            segment += suffix
-        parent_path = old_path.rstrip("/").rsplit("/", 1)[0]
-        candidate_path = f"{parent_path}/{segment}" + ("/" if old_path.endswith("/") else "")
+        if canonical_site and not _same_site(canonical_site, absolute):
+            continue
+        reference_model = next(
+            (
+                clean_text(candidate)
+                for candidate in (record.get("model"), record.get("sku"), key)
+                if normalize_model(candidate) in related
+            ),
+            "",
+        )
+        candidate_url = _replace_model_inside_product_url(
+            absolute,
+            reference_model,
+            model_text,
+        )
+        if not candidate_url:
+            continue
+        reference_tokens = _search_tokens(
+            clean_text(record.get("name")),
+            clean_text(record.get("category")),
+            clean_text(record.get("group")),
+        )
+        semantic_overlap = len(target_tokens & reference_tokens)
+        path_score = _catalog_link_score(
+            clean_text(record.get("name")),
+            candidate_url,
+            target_tokens,
+        )
         ranked.append((
+            semantic_overlap,
+            path_score,
             common_prefix,
-            parsed._replace(path=candidate_path, query="", fragment="").geturl(),
+            candidate_url,
         ))
-    return max(ranked, default=(0, ""))[1]
+    return max(ranked, default=(0, 0, 0, ""))[3]
 
 
 def _parsed_product_matches_model(parsed: dict[str, Any], model: str) -> bool:
-    wanted = normalize_model(model)
-    identity = normalize_model(" ".join((
-        clean_text(parsed.get("model")),
-        clean_text(parsed.get("name")),
-    )))
-    return bool(wanted and wanted in identity)
+    parts = re.findall(r"[A-Za-zА-Яа-яЁё]+|\d+", clean_text(model))
+    if not parts:
+        return False
+    alphanumeric = r"A-Za-zА-Яа-яЁё0-9"
+    pattern = re.compile(
+        rf"(?<![{alphanumeric}])"
+        + rf"[^{alphanumeric}]*".join(re.escape(part) for part in parts)
+        + rf"(?![{alphanumeric}])",
+        re.IGNORECASE,
+    )
+    parsed_model = (
+        ""
+        if parsed.get("model_inferred_from_url")
+        else clean_text(parsed.get("model"))
+    )
+    return any(
+        pattern.search(value) is not None
+        for value in (parsed_model, clean_text(parsed.get("name")))
+        if value
+    )
 
 
 def _host_key(url: str) -> str:
@@ -2584,14 +2681,23 @@ def _find_in_sitemaps(site_url: str, wanted: str, max_sitemaps: int = 12) -> str
 def _search_tokens(*values: str) -> set[str]:
     stop = {
         "товар", "купить", "цена", "модель", "бренд", "для", "или", "the",
-        "bosch", "maunfeld", "neff", "smeg", "evelux",
     }
     result: set[str] = set()
+    transliteration = str.maketrans({
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+        "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+        "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    })
     for value in values:
         for token in _name_tokens(value):
             if token in stop or len(token) < 4:
                 continue
             result.add(token[: min(len(token), 8)])
+            latin = token.translate(transliteration)
+            if latin and latin != token:
+                result.add(latin[: min(len(latin), 8)])
     return result
 
 
@@ -2604,7 +2710,7 @@ def _catalog_link_score(anchor_text: str, href: str, tokens: set[str]) -> int:
         elif len(token) >= 6 and token[:6] in haystack:
             score += 7
     path = urlparse(href).path.casefold()
-    if any(part in path for part in ("catalog", "product", "tovar", "holodil", "kholodil", "refriger")):
+    if any(part in path for part in ("catalog", "product", "tovar", "item", "goods", "shop")):
         score += 2
     if any(part in path for part in ("login", "account", "cart", "compare", "favorite", "delivery", "contact", "blog", "news")):
         score -= 20
@@ -2625,7 +2731,10 @@ def _find_by_catalog_crawl(
         return ""
     canonical_root = roots[0]
     tokens = _search_tokens(product_name, category)
-    queue: list[tuple[str, int, int]] = [(item, 0, 0) for item in roots]
+    queue: list[tuple[str, int, int]] = [
+        (item, 0, _catalog_link_score("", item, tokens))
+        for item in roots
+    ]
     queued = {item for item in roots}
     visited: set[str] = set()
     while queue and len(visited) < max_pages:
@@ -2668,23 +2777,23 @@ def _find_by_catalog_crawl(
     return ""
 
 
-def resolve_donor_url(
+def _donor_url_candidates(
     donor: Donor,
     model: str,
     product_name: str = "",
     category: str = "",
-) -> tuple[str, str]:
+) -> Iterable[tuple[str, str]]:
+    """Yield increasingly speculative URLs; callers may continue after a failed candidate."""
+
     wanted = normalize_model(model)
     if not wanted:
-        return "", "У товара не заполнена модель"
+        return
+    yielded: set[str] = set()
 
     cached = _cached_product_url(donor, model)
     if cached:
-        return cached, "Кэш ранее найденных товаров"
-
-    related = _related_catalog_model_url(donor, model)
-    if related:
-        return related, RELATED_MODEL_URL_REASON
+        yielded.add(cached)
+        yield cached, "Кэш ранее найденных товаров"
 
     roots: list[str] = []
     # The main site must be first: donor.start_urls can point to a completely different category.
@@ -2703,18 +2812,63 @@ def resolve_donor_url(
             continue
         seen_hosts.add(host)
         found = _find_in_sitemaps(root, wanted)
-        if found:
-            return found, "Найдена по модели в карте сайта"
+        if found and found not in yielded:
+            yielded.add(found)
+            yield found, "Найдена по модели в карте сайта"
 
     found = _find_by_catalog_crawl(
-        roots[:8],
+        roots,
         wanted,
         product_name=product_name,
         category=category,
     )
-    if found:
-        return found, "Найдена по модели при обходе каталога"
-    return "", "Ссылка на конкретный товар по модели не найдена на сайте донора"
+    if found and found not in yielded:
+        yielded.add(found)
+        yield found, "Найдена по модели при обходе каталога"
+
+    related = _related_catalog_model_url(
+        donor,
+        model,
+        product_name=product_name,
+        category=category,
+    )
+    if related and related not in yielded:
+        yield related, RELATED_MODEL_URL_REASON
+
+
+def resolve_donor_url(
+    donor: Donor,
+    model: str,
+    product_name: str = "",
+    category: str = "",
+) -> tuple[str, str]:
+    if not normalize_model(model):
+        return "", "У товара не заполнена модель"
+    return next(
+        iter(_donor_url_candidates(donor, model, product_name, category)),
+        ("", "Ссылка на конкретный товар по модели не найдена на сайте донора"),
+    )
+
+
+def _retryable_donor_url_candidates(
+    donor: Donor,
+    model: str,
+    product_name: str = "",
+    category: str = "",
+) -> Iterable[tuple[str, str]]:
+    """Keep the public resolver as the first choice, then continue after validation failure."""
+
+    first_url, first_reason = resolve_donor_url(
+        donor,
+        model,
+        product_name=product_name,
+        category=category,
+    )
+    if first_url:
+        yield first_url, first_reason
+    for url, reason in _donor_url_candidates(donor, model, product_name, category):
+        if url and url != first_url:
+            yield url, reason
 
 
 def _name_mapping_score(source_name: str, target_name: str) -> float:
@@ -4678,66 +4832,87 @@ def process_product_donors(
                 })
                 continue
             manual_url = url_overrides.get(str(donor.id), "")
-            if manual_url:
-                url, resolved_by = manual_url, "Ссылка задана пользователем"
-            else:
-                url, resolved_by = resolve_donor_url(
+            candidates: Iterable[tuple[str, str]] = (
+                [(manual_url, "Ссылка задана пользователем")]
+                if manual_url
+                else _retryable_donor_url_candidates(
                     donor,
                     model,
                     product_name=product_name,
                     category=category_name,
                 )
+            )
             role = "primary" if priority == 0 else "verification"
-            base = {
+            common = {
                 "donor_id": donor.id,
                 "donor_name": donor.brand.name,
                 "priority": priority,
                 "role": role,
-                "resolved_by": resolved_by,
-                "url": url,
             }
-            if not url:
-                collected.append({
-                    **base,
-                    "status": "not_found",
-                    "message": resolved_by,
-                    "source_url": donor.site_url or (donor.start_urls or [""])[0],
-                })
-                continue
-            try:
-                html, final_url = (
-                    fetch_public_html(url)
-                    if manual_url
-                    else fetch_donor_product_html(donor, url, fetcher=active_fetcher)
-                )
-                parsed = parse_product_html_for_donor(html, final_url, donor)
-                if (
-                    resolved_by == RELATED_MODEL_URL_REASON
-                    and not _parsed_product_matches_model(parsed, model)
-                ):
-                    raise ValueError(
-                        f"По предполагаемому адресу открылась не карточка модели {model}"
+            errors: list[str] = []
+            attempted = False
+            resolved = False
+            last_reason = ""
+            for url, resolved_by in candidates:
+                if not url:
+                    continue
+                attempted = True
+                last_reason = resolved_by
+                base = {**common, "resolved_by": resolved_by, "url": url}
+                try:
+                    html, final_url = (
+                        fetch_public_html(url)
+                        if manual_url
+                        else fetch_donor_product_html(donor, url, fetcher=active_fetcher)
                     )
-                attribute_count = len(parsed["attributes"])
-                source_status = "parsed" if attribute_count else "no_attributes"
-                source_message = (
-                    resolved_by if attribute_count
-                    else f"{resolved_by}; страница открыта, характеристики не распознаны"
-                )
+                    parsed = parse_product_html_for_donor(html, final_url, donor)
+                    if not manual_url and not _parsed_product_matches_model(parsed, model):
+                        raise ValueError(
+                            f"По найденному адресу открылась не карточка модели {model}"
+                        )
+                    attribute_count = len(parsed["attributes"])
+                    source_status = "parsed" if attribute_count else "no_attributes"
+                    source_message = (
+                        resolved_by if attribute_count
+                        else f"{resolved_by}; страница открыта, характеристики не распознаны"
+                    )
+                    collected.append({
+                        **base,
+                        "status": source_status,
+                        "message": source_message,
+                        "url": final_url,
+                        "parsed": parsed,
+                        "raw_html": html,
+                        "attributes_found": attribute_count,
+                    })
+                    resolved = True
+                    break
+                except Exception as error:
+                    errors.append(f"{resolved_by}: {error} ({url})")
+            if resolved:
+                continue
+            source_url = (
+                manual_url
+                if manual_url
+                else donor.site_url or (donor.start_urls or [""])[0]
+            )
+            if attempted:
                 collected.append({
-                    **base,
-                    "status": source_status,
-                    "message": source_message,
-                    "url": final_url,
-                    "parsed": parsed,
-                    "raw_html": html,
-                    "attributes_found": attribute_count,
-                })
-            except Exception as error:
-                collected.append({
-                    **base,
+                    **common,
                     "status": "error",
-                    "message": str(error),
+                    "url": "",
+                    "source_url": source_url,
+                    "resolved_by": last_reason,
+                    "message": "; ".join(errors[-4:]),
+                })
+            else:
+                collected.append({
+                    **common,
+                    "status": "not_found",
+                    "url": "",
+                    "source_url": source_url,
+                    "resolved_by": "",
+                    "message": "Ссылка на конкретный товар по модели не найдена на сайте донора",
                 })
 
     with write_lock or nullcontext():

@@ -1041,7 +1041,7 @@ def prepare_product_source(
                 donor = candidate
                 source_url = found
                 resolved_by = reason
-                if persist:
+                if persist and reason != RELATED_MODEL_URL_REASON:
                     _upsert_source(
                         product,
                         donor,
@@ -1114,11 +1114,12 @@ def prepare_product_source(
             else parse_product_html(downloaded_html, final_url)
         )
         if (
-            resolved_by == RELATED_MODEL_URL_REASON
+            donor is not None
+            and not user_supplied_url
             and not _parsed_product_matches_model(downloaded_parsed, product.model)
         ):
             raise ValueError(
-                f"По предполагаемому адресу открылась не карточка модели {product.model}"
+                f"По найденному адресу открылась не карточка модели {product.model}"
             )
         html = downloaded_html
         if downloaded_parsed.get("attributes") or not parsed.get("attributes"):

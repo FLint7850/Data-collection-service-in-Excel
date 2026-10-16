@@ -885,10 +885,64 @@ class AttributeAssistantTest(unittest.TestCase):
         self.db.flush()
 
         expected = "https://haieronline.ru/catalog/built-in/hoods/HVX-BI652GB/"
-        url, reason = service.resolve_donor_url(donor, "HVX-BI652GB")
+        with patch.object(service, "_find_in_sitemaps", return_value=""), patch.object(
+            service, "_find_by_catalog_crawl", return_value=""
+        ):
+            url, reason = service.resolve_donor_url(donor, "HVX-BI652GB")
 
         self.assertEqual(url, expected)
         self.assertIn("той же серии", reason)
+
+    def test_related_model_url_preserves_slug_template_instead_of_inserting_spaces(self):
+        source = (
+            "https://korting-dealer.ru/korting/kholodilniki/"
+            "kholodilnik-korting-ksi-1935.html"
+        )
+
+        result = service._replace_model_inside_product_url(
+            source,
+            "KSI 1935",
+            "KSI 17780 CVNF",
+        )
+
+        self.assertEqual(
+            result,
+            "https://korting-dealer.ru/korting/kholodilniki/"
+            "kholodilnik-korting-ksi-17780-cvnf.html",
+        )
+        self.assertNotIn("%20", result)
+
+    def test_real_sitemap_result_has_priority_over_related_model_guess(self):
+        donor = Donor(
+            brand=Brand(name="Korting", group_name="Тест"),
+            legacy_id="korting-safe-resolution",
+            site_url="https://korting-dealer.ru/",
+            known_new_products={
+                "KSI 1935": {
+                    "model": "KSI 1935",
+                    "name": "Холодильник Korting KSI 1935",
+                    "url": "/korting/kholodilniki/kholodilnik-korting-ksi-1935.html",
+                },
+            },
+        )
+        expected = (
+            "https://korting-dealer.ru/korting/kholodilniki/vstraivaemye/"
+            "kholodilnik-korting-ksi-17780-cvnf.html"
+        )
+
+        with patch.object(service, "_find_in_sitemaps", return_value=expected), patch.object(
+            service, "_find_by_catalog_crawl"
+        ) as crawl:
+            url, reason = service.resolve_donor_url(
+                donor,
+                "KSI 17780 CVNF",
+                product_name="Встраиваемый холодильник Korting KSI 17780 CVNF",
+                category="Встраиваемые холодильники",
+            )
+
+        self.assertEqual(url, expected)
+        self.assertIn("карте сайта", reason)
+        crawl.assert_not_called()
 
     def test_related_model_validation_rejects_non_product_page(self):
         donor = Donor(
@@ -910,6 +964,16 @@ class AttributeAssistantTest(unittest.TestCase):
             {"model": "", "name": "Каталог вытяжек"},
             "HVX-T999XX",
         ))
+        self.assertFalse(service._parsed_product_matches_model(
+            {"model": "HVX-T999XXZ", "name": "Вытяжка Haier HVX-T999XXZ"},
+            "HVX-T999XX",
+        ))
+        parsed_404 = service.parse_product_html(
+            "<h1>Страница не найдена</h1>",
+            "https://example.com/catalog/HVX-T999XX/",
+        )
+        self.assertTrue(parsed_404["model_inferred_from_url"])
+        self.assertFalse(service._parsed_product_matches_model(parsed_404, "HVX-T999XX"))
 
     def test_donor_processing_rejects_wrong_page_at_inferred_series_url(self):
         template = self.make_template()
@@ -939,6 +1003,63 @@ class AttributeAssistantTest(unittest.TestCase):
 
         self.assertEqual(report["reports"][0]["status"], "error")
         self.assertIn("не карточка модели", report["reports"][0]["message"])
+        failed_source = next(source for source in batch.products[0].sources if source.donor_id == donor.id)
+        self.assertEqual(failed_source.url, donor.site_url)
+
+    def test_donor_processing_continues_after_stale_cached_url(self):
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        donor = Donor(
+            brand=Brand(name="Fallback donor", group_name="Тест"),
+            legacy_id="stale-cached-url",
+            site_url="https://example.com/",
+        )
+        self.db.add(donor)
+        self.db.commit()
+        stale = "https://example.com/old-wm-100"
+        correct = "https://example.com/catalog/wm-100"
+
+        def fake_fetch(_donor, url, **kwargs):
+            if url == stale:
+                return "<h1>Страница не найдена</h1>", url
+            if url == correct:
+                return (
+                    "<h1>WM-100</h1><table><tr><th>Цвет</th><td>Белый</td></tr></table>",
+                    url,
+                )
+            raise RuntimeError(url)
+
+        with patch.object(
+            service,
+            "resolve_donor_url",
+            return_value=(stale, "Кэш ранее найденных товаров"),
+        ), patch.object(
+            service,
+            "_donor_url_candidates",
+            return_value=iter([
+                (stale, "Кэш ранее найденных товаров"),
+                (correct, "Найдена по модели при обходе каталога"),
+            ]),
+        ), patch.object(
+            service,
+            "fetch_donor_product_html",
+            side_effect=fake_fetch,
+        ) as fetch:
+            report = service.process_product_donors(
+                self.db,
+                batch.products[0],
+                [donor.id],
+            )
+
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(report["reports"][0]["status"], "parsed")
+        self.assertEqual(report["reports"][0]["url"], correct)
+        self.assertEqual(report["reports"][0]["resolved_by"], "Найдена по модели при обходе каталога")
 
     def test_list_donors_joins_through_the_owning_brand(self):
         donor = Donor(
@@ -990,6 +1111,40 @@ class AttributeAssistantTest(unittest.TestCase):
             )
 
         self.assertEqual(url, "https://example.com/catalog/fridges/bosch-kin86hdf0.html")
+        self.assertIn("обходе каталога", reason)
+
+    def test_catalog_crawl_prioritizes_relevant_start_url_without_site_rules(self):
+        target_category = "https://example.com/catalog/kholodilniki/vstraivaemye/"
+        expected = target_category + "kholodilnik-brand-ksi-17780-cvnf.html"
+        donor = Donor(
+            brand=Brand(name="Brand", group_name="Test"),
+            legacy_id="ranked-category-roots",
+            site_url="https://example.com/",
+            start_urls=[
+                *[f"https://example.com/catalog/unrelated-{index}/" for index in range(12)],
+                target_category,
+            ],
+        )
+
+        def fake_fetch(url, *args, **kwargs):
+            if url == target_category:
+                return (
+                    f'<a href="{expected}">Встраиваемый холодильник Brand KSI 17780 CVNF</a>',
+                    url,
+                )
+            raise RuntimeError("not found")
+
+        with patch.object(service, "_find_in_sitemaps", return_value=""), patch.object(
+            service, "fetch_public_html", side_effect=fake_fetch
+        ):
+            url, reason = service.resolve_donor_url(
+                donor,
+                "KSI 17780 CVNF",
+                product_name="Встраиваемый холодильник Brand KSI 17780 CVNF",
+                category="Встраиваемые холодильники",
+            )
+
+        self.assertEqual(url, expected)
         self.assertIn("обходе каталога", reason)
 
     def test_repeated_donor_processing_replaces_old_source_before_insert(self):
