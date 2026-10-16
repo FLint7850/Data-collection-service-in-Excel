@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AttributeValue } from "../app/types/attribute-assistant";
 import {
-  addableUnknownProposal, attributeValuesMatch, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
-  finalSelectOptions, selectedFinalParts, selectedFinalValue, sourceEvidenceCount, unknownSourceMatchesSelected, valueStatusColor, valueStatusLabel,
+  addableUnknownProposal, attributeValuesMatch, canAddUnknownFromNearest, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
+  finalSelectOptions, selectedFinalParts, selectedFinalValue, sourceEvidenceCount, unknownReviewValue, unknownSourceMatchesExactly, unknownSourceMatchesSelected, valueStatusColor, valueStatusLabel,
 } from "../app/utils/attribute-assistant";
 
 function value(overrides: Partial<AttributeValue> = {}): AttributeValue {
@@ -28,8 +28,46 @@ describe("attribute dictionary review", () => {
       } });
     expect(sourceEvidenceCount(row)).toBe(2);
     expect(unknownSourceMatchesSelected(row, row.source_details.unknown_values![0]!)).toBe(true);
+    expect(unknownSourceMatchesExactly(row, row.source_details.unknown_values![0]!)).toBe(false);
     row.source_details.unknown_values![0]!.suggestions = ["Галогенное"];
     expect(unknownSourceMatchesSelected(row, row.source_details.unknown_values![0]!)).toBe(false);
+  });
+
+  it("offers a new-value input only for a nearest match without an exact match", () => {
+    const nearest = {
+      ...unknown,
+      value: "630x440x870",
+      normalized_value: "87x63x44",
+      suggestions: ["87x63x64"],
+    };
+    const row = value({
+      current_value: "630x440x870",
+      final_value: "87x63x64",
+      source_details: { unknown_values: [nearest] },
+    });
+    expect(canAddUnknownFromNearest(row, nearest)).toBe(true);
+    expect(unknownReviewValue(nearest)).toBe("87x63x44");
+    expect(canAddUnknownFromNearest(row, { ...nearest, suggestions: [] })).toBe(false);
+    expect(canAddUnknownFromNearest(row, {
+      ...nearest,
+      suggestions: [nearest.normalized_value],
+    })).toBe(false);
+    expect(canAddUnknownFromNearest(row, {
+      ...nearest,
+      value: "A++",
+      normalized_value: undefined,
+      suggestions: ["a++"],
+    })).toBe(false);
+
+    row.source_details.candidates = [{
+      value: nearest.normalized_value, raw_value: nearest.value, source: "Donor", confidence: 100,
+      reason: "Точное совпадение", priority: 0, source_name: row.name,
+    }];
+    expect(canAddUnknownFromNearest(row, nearest)).toBe(false);
+
+    row.source_details.candidates = [];
+    row.allowed_values = [{ id: 10, value: nearest.normalized_value }];
+    expect(canAddUnknownFromNearest(row, nearest)).toBe(false);
   });
 
   it("shows a bad original as conflict and includes it only in the conflict filter", () => {

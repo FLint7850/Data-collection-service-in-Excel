@@ -148,9 +148,38 @@ export function unknownSourceMatchesSelected(
 ): boolean {
     const selected = value.final_value.trim() || value.current_value.trim();
     if (!selected) return false;
-    return attributeValuesMatch(unknown.value, selected)
+    return unknownSourceMatchesExactly(value, unknown)
         || Boolean(unknown.suggestions?.[0]
             && attributeValuesMatch(unknown.suggestions[0], selected));
+}
+
+export function unknownSourceMatchesExactly(
+    value: AttributeValue,
+    unknown: UnknownSourceValue,
+): boolean {
+    const selected = value.final_value.trim() || value.current_value.trim();
+    return Boolean(selected) && attributeValuesMatch(unknownReviewValue(unknown), selected);
+}
+
+export function unknownReviewValue(unknown: UnknownSourceValue): string {
+    return unknown.normalized_value?.trim() || unknown.value.trim();
+}
+
+export function canAddUnknownFromNearest(
+    value: AttributeValue,
+    unknown: UnknownSourceValue,
+): boolean {
+    const reviewValue = unknownReviewValue(unknown);
+    const hasNearest = (unknown.suggestions || []).some((item) => item.trim());
+    if (!reviewValue || !hasNearest || !value.field_id) return false;
+
+    const exactCandidate = (value.source_details.candidates || [])
+        .some((candidate) => attributeValuesMatch(candidate.value, reviewValue));
+    const exactAllowedValue = (value.allowed_values || [])
+        .some((allowed) => attributeValuesMatch(allowed.value, reviewValue));
+    const exactSuggestion = (unknown.suggestions || [])
+        .some((suggestion) => attributeValuesMatch(suggestion, reviewValue));
+    return !exactCandidate && !exactAllowedValue && !exactSuggestion;
 }
 
 export function hasPendingProposal(value: AttributeValue): boolean {

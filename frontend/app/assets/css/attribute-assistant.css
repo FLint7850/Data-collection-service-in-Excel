@@ -839,6 +839,13 @@ grid-column: 2 / 4;
   flex: 1 1 420px;
 }
 
+.aa-unknown-add {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  gap: 8px;
+  width: 100%;
+}
+
 
 @media (max-width: 1120px) {
   .aa-grid--templates > .aa-card--main {
@@ -1518,7 +1525,8 @@ grid-template-columns: 38px minmax(0, 1fr) auto;
 
 @media (max-width: 860px) {
   .aa-new-template-field,
-  .aa-unknown-map {
+  .aa-unknown-map,
+  .aa-unknown-add {
     grid-template-columns: 1fr;
   }
 

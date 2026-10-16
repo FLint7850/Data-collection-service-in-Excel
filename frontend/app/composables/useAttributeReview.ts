@@ -19,6 +19,7 @@ import {
     matchesAttributeStatus,
     matchesProductStatus,
     sourceKind,
+    unknownReviewValue,
     unknownSelectionKey,
 } from "~/utils/attribute-assistant";
 import { errorMessage } from "~/utils/format";
@@ -69,6 +70,7 @@ export function useAttributeReview(
     const loadingProductId = ref<number | null>(null);
     const selectedDonors = ref<number[]>([]);
     const unknownSelections = ref<Record<string, number>>({});
+    const unknownNewValues = ref<Record<string, string>>({});
     const donorRecommendations = ref<AttributeDonor[]>([]);
     const donorUrlOverrides = ref<Record<string, string>>({});
     const historyItems = ref<AttributeHistoryItem[]>([]);
@@ -632,6 +634,7 @@ export function useAttributeReview(
         }
 
         selectedProduct.value = product;
+        unknownNewValues.value = {};
         if (productPage.value) {
             productPage.value.items = productPage.value.items.map((item) => item.id === product.id
                 ? { id: product.id, model: product.model, name: product.name, brand: product.brand,
@@ -874,27 +877,35 @@ export function useAttributeReview(
     async function addUnknown(
         value: AttributeValue,
         unknown: NonNullable<AttributeValue["source_details"]["unknown_values"]>[number],
+        index: number,
     ) {
         if (!value.field_id) return;
+        const key = unknownSelectionKey(value, index);
+        const newValue = (unknownNewValues.value[key] ?? unknownReviewValue(unknown)).trim();
+        if (!newValue) {
+            error.value = "Введите новое значение справочника.";
+            return;
+        }
         const confirmed = await confirmAction({
-            title: `Добавить «${unknown.value}» в справочник?`,
+            title: `Добавить «${newValue}» в справочник?`,
             description: "Значение станет разрешённым для этого атрибута и будет применено к товару.",
             confirmLabel: "Добавить и применить",
         });
         if (!confirmed) return;
 
         const result = await run(`dictionary-${value.id}`, async () => {
-            await api.addAllowedValue(value.field_id!, unknown.value);
+            await api.addAllowedValue(value.field_id!, newValue);
             return api.updateValue(value.id, {
                 expected_version: selectedProduct.value!.version,
                 action: "accept",
-                value: unknown.value,
+                value: newValue,
             });
         });
 
         if (result && selectedProduct.value?.values) {
-            const index = selectedProduct.value.values.findIndex((item) => item.id === result.value.id);
-            if (index >= 0) selectedProduct.value.values[index] = result.value;
+            const valueIndex = selectedProduct.value.values.findIndex((item) => item.id === result.value.id);
+            if (valueIndex >= 0) selectedProduct.value.values[valueIndex] = result.value;
+            delete unknownNewValues.value[key];
             applyProductMutation(result);
             notify("Значение добавлено в справочник");
         }
@@ -997,6 +1008,7 @@ export function useAttributeReview(
         loadProducts,
         selectedDonors,
         unknownSelections,
+        unknownNewValues,
         donorRecommendations,
         donorUrlOverrides,
         historyItems,

@@ -88,6 +88,7 @@ export interface AttributeValue {
     }>;
     unknown_values?: Array<{
       value: string;
+      normalized_value?: string;
       donor_id?: number | null;
       source: string;
       source_name: string;

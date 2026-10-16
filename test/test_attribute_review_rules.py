@@ -451,11 +451,144 @@ class AttributeReviewRulesTest(unittest.TestCase):
 
         field = self.template("Высота, см без совпадения", ("85", "815")).fields[0]
         self.assertEqual(svc._allowed_match(field, "851", "Габариты (ШxГxВ)")[0], "")
-        self.assertEqual(svc._allowed_match(field, "850", "Габариты (ШxГxВ), см")[0], "")
+        explicit_wrong_unit = svc._allowed_match(field, "850", "Габариты (ШxГxВ), см")
+        self.assertEqual(explicit_wrong_unit[0], "85")
+        self.assertIn(svc.LINEAR_SCALE_INFERENCE_REASON_PREFIX, explicit_wrong_unit[2])
         self.assertEqual(svc._allowed_match(field, "85", "Габариты (ШxГxВ)")[0], "85")
 
         svc.add_allowed_value(self.db, field, "85000")
         self.assertEqual(svc._allowed_match(field, "850", "Габариты (ШxГxВ)")[0], "")
+
+    def test_dimensions_are_scaled_before_nearest_lookup_even_without_exact_value(self):
+        template = self.template(
+            "Габариты в упаковке, см (ВхШхГ)",
+            ("87x63x64", "87x63x48.5", "84.7x60x43"),
+        )
+        field = template.fields[0]
+        source_name = "Габариты в упаковке, см (ШхГхВ)"
+
+        canonical, confidence, reason, suggestions = svc._allowed_match(
+            field,
+            "630х440х870",
+            source_name,
+        )
+
+        self.assertEqual((canonical, confidence), ("", 0))
+        self.assertIn(svc.LINEAR_SCALE_INFERENCE_REASON_PREFIX, reason)
+        self.assertIn("87x63x44 см", reason)
+        self.assertEqual(suggestions[0], "87x63x48.5")
+
+        product = self.product(template, "630х440х870", source_name)
+        value = product.values[0]
+        self.assertEqual(value.final_value, "")
+        self.assertEqual(value.status, "conflict")
+        self.assertIn("87x63x44 см", value.reason)
+        self.assertIn("→ 87x63x44 см", value.source_details["current_value_hint"])
+        self.assertEqual(
+            value.source_details["unknown_values"][0]["suggestions"][0],
+            "87x63x48.5",
+        )
+        self.assertEqual(
+            value.source_details["unknown_values"][0]["normalized_value"],
+            "87x63x44",
+        )
+
+    def test_donor_dimension_order_is_preserved_and_reordered_before_matching(self):
+        template = self.template(
+            "Габариты в упаковке, см (ВхШхГ)",
+            ("87x63x64", "87x63x48.5", "84.7x60x43"),
+        )
+        field = template.fields[0]
+        product = self.product(template)
+        source_name = "Габариты в упаковке (ШхГхВ)"
+
+        with patch.object(
+            svc,
+            "map_attribute",
+            return_value=(field, 100, "Сопоставлено по названию", []),
+        ):
+            stats = svc.apply_parsed_attributes(
+                self.db,
+                product,
+                [{"name": source_name, "value": "630х440х870"}],
+                source="Donor",
+                priority=0,
+                donor_id=1,
+                source_url="https://donor.example/product",
+            )
+
+        self.assertEqual(stats["unknown"], 1)
+        unknown = product.values[0].source_details["unknown_values"][0]
+        self.assertEqual(unknown["source_name"], source_name)
+        self.assertEqual(unknown["normalized_value"], "87x63x44")
+        self.assertIn(
+            "Ширина × Глубина × Высота» приведён к «Высота × Ширина × Глубина",
+            unknown["reason"],
+        )
+        self.assertIn("87x63x44 см", unknown["reason"])
+        self.assertEqual(unknown["suggestions"][0], "87x63x48.5")
+
+    def test_single_dimensions_use_the_same_scale_check(self):
+        cases = [
+            ("Ширина, см", "Ширина, см", "596", ("59.5", "61.8", "65.7"), "59.6", "59.5"),
+            ("Глубина, см", "Глубина", "471", ("47", "40.1"), "47.1", "47"),
+            ("Высота, см", "Высота, см", "851", ("85", "81.5"), "85.1", "85"),
+        ]
+        for field_name, source_name, raw, allowed, converted, nearest in cases:
+            with self.subTest(field_name=field_name):
+                field = self.template(field_name, allowed).fields[0]
+                canonical, confidence, reason, suggestions = svc._allowed_match(
+                    field,
+                    raw,
+                    source_name,
+                )
+                self.assertEqual((canonical, confidence), ("", 0))
+                self.assertIn(f"{converted} см", reason)
+                self.assertEqual(suggestions[0], nearest)
+
+        field = self.template("Контрольная ширина, см", ("60", "65")).fields[0]
+        canonical, _, reason, suggestions = svc._allowed_match(
+            field,
+            "61",
+            "Контрольная ширина, см",
+        )
+        self.assertEqual(canonical, "")
+        self.assertIn("61 см", reason)
+        self.assertNotIn(svc.LINEAR_SCALE_INFERENCE_REASON_PREFIX, reason)
+        self.assertEqual(suggestions[0], "60")
+
+    def test_saved_dimension_unknown_is_rescaled_and_remains_addable(self):
+        template = self.template(
+            "Габариты в упаковке, см (ВхШхГ)",
+            ("87x63x64", "87x63x48.5", "84.7x60x43"),
+        )
+        product = self.product(template)
+        value = product.values[0]
+        value.current_value = "630х440х870"
+        value.status = "conflict"
+        value.reason = "Значения 870x630x440 см нет в справочнике"
+        value.source_details = {
+            "current_value_hint": (
+                "Габариты в упаковке, см (ШхГхВ): "
+                "630х440х870 → 870x630x440 см"
+            ),
+            "unknown_values": [{
+                "value": "630х440х870",
+                "source": "current_site",
+                "source_name": "Габариты в упаковке, см (ШхГхВ)",
+                "suggestions": ["87x63x64"],
+                "reason": "Значения 870x630x440 см нет в справочнике",
+            }],
+        }
+
+        self.assertTrue(svc._repair_confirming_evidence(value))
+        unknown = value.source_details["unknown_values"][0]
+        self.assertIn("87x63x44 см", unknown["reason"])
+        self.assertEqual(unknown["suggestions"][0], "87x63x48.5")
+        self.assertIn("→ 87x63x44 см", value.source_details["current_value_hint"])
+        self.assertEqual(unknown["normalized_value"], "87x63x44")
+        self.assertFalse(unknown.get("preserve_for_review", False))
+        self.assertFalse(svc._repair_confirming_evidence(value))
 
     def test_unitless_converted_candidate_keeps_raw_value_for_parser_and_chatgpt(self):
         template = self.template("Высота, см", ("85", "815"))
@@ -977,6 +1110,41 @@ class AttributeReviewRulesTest(unittest.TestCase):
                 self.assertEqual(ai._canonical_allowed(field, raw), "")
         self.assertEqual(svc._allowed_match(field, "60/65")[0], "60/65")
         self.assertEqual(svc._allowed_match(field, "60-65")[0], "60-65")
+
+    def test_standard_class_codes_convert_cyrillic_letters_to_latin(self):
+        for field_name in ("Класс энергопотребления", "Класс стирки", "Класс эффективности отжима"):
+            with self.subTest(field_name=field_name):
+                field = self.template(field_name, ("A", "A+", "A++", "B", "C", "E")).fields[0]
+                for raw, expected in (("А", "A"), ("а++", "A++"), ("В", "B"), ("С", "C"), ("Е", "E")):
+                    canonical, confidence, reason, suggestions = svc._allowed_match(field, raw, field_name)
+                    self.assertEqual((canonical, confidence, suggestions), (expected, 100, []))
+                    self.assertIn(svc.STANDARD_CLASS_CODE_REASON, reason)
+
+        generic = self.template("Класс", ("A", "A++")).fields[0]
+        self.assertEqual(svc._allowed_match(generic, "А++")[0], "")
+
+    def test_saved_cyrillic_class_conflict_is_repaired_to_latin_candidate(self):
+        template = self.template("Класс энергопотребления", ("A", "A++"))
+        product = self.product(template)
+        value = product.values[0]
+        value.current_value = "А++"
+        value.status = "conflict"
+        value.reason = "Значения нет в справочнике"
+        value.source_details = {"candidates": [], "unknown_values": [{
+            "value": "А++",
+            "source": "current_site",
+            "source_name": "Класс энергопотребления",
+            "url": product.source_url,
+            "role": "Исходная страница сайта",
+            "suggestions": ["A++"],
+            "reason": "Значения нет в справочнике",
+        }]}
+
+        self.assertTrue(svc._repair_confirming_evidence(value))
+        self.assertEqual(value.final_value, "A++")
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.source_details["unknown_values"], [])
+        self.assertEqual(value.source_details["candidates"][0]["value"], "A++")
 
     def test_case_is_ignored_in_value_hints_and_nearest_suggestions(self):
         field = self.template("Тип установки", ("Встраиваемый",)).fields[0]

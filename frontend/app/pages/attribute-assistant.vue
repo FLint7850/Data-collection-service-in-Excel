@@ -3,6 +3,7 @@ import {
   attributeReviewStatus,
   attributeValuesMatch,
   canConfirmConflictFinal,
+  canAddUnknownFromNearest,
   hasPendingProposal,
   displayedProposal,
   displayedProposalConfidence,
@@ -24,6 +25,8 @@ import {
   templateFieldTypeItems,
   templateUpdateModeItems,
   unknownAllowedMenuKey,
+  unknownReviewValue,
+  unknownSourceMatchesExactly,
   unknownSourceMatchesSelected,
   unknownSelectionKey,
   valueStatusColor,
@@ -172,6 +175,7 @@ const {
   changeProductPage,
   selectedDonors,
   unknownSelections,
+  unknownNewValues,
   donorUrlOverrides,
   historyItems,
   batchOperation,
@@ -1178,13 +1182,21 @@ onBeforeUnmount(() => {
                         <span v-if="unknown.suggestions?.length"><small>Ближайшее в справочнике</small><strong>{{ unknown.suggestions.join(", ") }}</strong></span>
                       </div>
                       <div class="aa-candidate-result">
-                        <UBadge v-if="unknownSourceMatchesSelected(value, unknown)" color="success" variant="subtle">Совпадает</UBadge>
+                        <UBadge v-if="unknownSourceMatchesExactly(value, unknown)" color="success" variant="subtle">Совпадает</UBadge>
+                        <UBadge v-else-if="unknownSourceMatchesSelected(value, unknown)" color="success" variant="subtle">Выбрано ближайшее</UBadge>
                         <UBadge v-else-if="value.final_value || value.current_value" color="error" variant="subtle">Расхождение</UBadge>
                         <UBadge v-else color="warning" variant="subtle">Нужно сопоставить</UBadge>
                       </div>
                       <small class="aa-candidate-reason">{{ unknown.reason }}</small>
-                      <div v-if="!value.current_value || isTechnicalDash(value.current_value)" class="aa-candidate-actions">
-                        <div v-if="unknown.donor_id && value.field_id" class="aa-unknown-map">
+                      <div
+                        v-if="((!value.current_value || isTechnicalDash(value.current_value)) && unknown.donor_id && value.field_id)
+                          || canAddUnknownFromNearest(value, unknown)"
+                        class="aa-candidate-actions"
+                      >
+                        <div
+                          v-if="(!value.current_value || isTechnicalDash(value.current_value)) && unknown.donor_id && value.field_id"
+                          class="aa-unknown-map"
+                        >
                           <USelectMenu
                             :ref="allowedSelectRef(unknownAllowedMenuKey(value, index))"
                             v-model="unknownSelections[unknownSelectionKey(value, index)]"
@@ -1210,7 +1222,26 @@ onBeforeUnmount(() => {
                             @click="rememberUnknownValue(value, unknown, index)"
                           >Применить и запомнить</UButton>
                         </div>
-                        <UButton color="warning" variant="soft" icon="i-lucide-book-plus" :loading="isBusy(`dictionary-${value.id}`)" @click="addUnknown(value, unknown)">Добавить как новое значение</UButton>
+                        <form
+                          v-if="canAddUnknownFromNearest(value, unknown)"
+                          class="aa-unknown-add"
+                          @submit.prevent="addUnknown(value, unknown, index)"
+                        >
+                          <UInput
+                            :model-value="unknownNewValues[unknownSelectionKey(value, index)] ?? unknownReviewValue(unknown)"
+                            aria-label="Новое значение справочника"
+                            placeholder="Введите новое значение"
+                            @update:model-value="unknownNewValues[unknownSelectionKey(value, index)] = String($event ?? '')"
+                          />
+                          <UButton
+                            type="submit"
+                            color="warning"
+                            variant="soft"
+                            icon="i-lucide-book-plus"
+                            :loading="isBusy(`dictionary-${value.id}`)"
+                            :disabled="!(unknownNewValues[unknownSelectionKey(value, index)] ?? unknownReviewValue(unknown)).trim()"
+                          >Добавить и применить</UButton>
+                        </form>
                       </div>
                     </div>
                 </SettingsCollapsible>

@@ -24,7 +24,7 @@ from services.attribute_files import delete_after_commit, stage_text
 from services.attribute_settings import StaleProductError
 from services.attribute_assistant import (
     BOOLEAN_FALSE_KEYS,
-    UNITLESS_LINEAR_INFERENCE_REASON_PREFIX,
+    _linear_scale_was_inferred,
     _is_presence_marker,
     _candidate_value_key,
     _has_confirmed_decision,
@@ -651,11 +651,11 @@ def validate_analysis(
                 "explanation": explanation,
                 "evidence": quote,
                 "preserve_raw_value": (
-                    UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in match_reason
+                    _linear_scale_was_inferred(match_reason)
                 ),
                 "raw_suggestions": (
                     alternatives
-                    if UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in match_reason
+                    if _linear_scale_was_inferred(match_reason)
                     else []
                 ),
             }

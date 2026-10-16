@@ -39,6 +39,7 @@ from config import (
     ATTRIBUTE_ASSISTANT_DIR,
     ATTRIBUTE_ASSISTANT_MAX_URLS,
     REQUEST_TIMEOUT,
+    VISUAL_MODEL_TRANSLATION,
 )
 from services.attribute_settings import (
     ALLOWED_VALUE_PAGE_SIZE,
@@ -194,6 +195,8 @@ LINEAR_UNIT_ALIASES = {
     **{unit: unit for unit in LINEAR_UNIT_FACTORS},
 }
 UNITLESS_LINEAR_INFERENCE_REASON_PREFIX = "Единица источника не указана;"
+LINEAR_SCALE_INFERENCE_REASON_PREFIX = "Масштаб линейного размера уточнён;"
+STANDARD_CLASS_CODE_REASON = "Кириллическое обозначение класса приведено к латинскому стандарту"
 MAX_PUBLIC_REDIRECTS = 8
 TEMPLATE_SNAPSHOT_SCHEMA = "attribute-template-snapshot"
 PRODUCT_SNAPSHOT_SCHEMA = "attribute-product-snapshot"
@@ -300,6 +303,27 @@ def _canonical_matching_value(allowed: Iterable[AttributeAllowedValue], value: A
         return exact
     key = value_match_key(value)
     return next((item.value for item in active if value_match_key(item.value) == key), "") if key else ""
+
+
+def _standard_class_code_key(field: AttributeTemplateField, value: Any) -> str:
+    """Normalize visually identical Cyrillic letters in standardized class codes."""
+
+    field_key = normalize_key(field.name)
+    if not (
+        ("класс" in field_key or "class" in field_key)
+        and re.search(
+            r"энерг|стир|отжим|суш|эффектив|energy|washing|wash|spin|dry|efficien",
+            field_key,
+            re.IGNORECASE,
+        )
+    ):
+        return ""
+    text = re.sub(r"\s+", "", exact_value_key(value))
+    code_pattern = r"[A-GАВСЕавсе](?:\+{0,3})?(?:/[A-GАВСЕавсе](?:\+{0,3})?)*"
+    if not re.fullmatch(code_pattern, text):
+        return ""
+    normalized = text.translate(VISUAL_MODEL_TRANSLATION).upper()
+    return normalized if re.fullmatch(r"[A-G](?:\+{0,3})?(?:/[A-G](?:\+{0,3})?)*", normalized) else ""
 
 
 def dictionary_value_key(value: Any, value_type: str = "select") -> str:
@@ -816,6 +840,11 @@ def _make_product_values(
                     match_cache[cache_key] = matched_value
             canonical, match_confidence, match_reason, suggestions = matched_value
             suggestions = list(suggestions)
+            normalized_source_value = _review_centimeter_value(
+                field,
+                current,
+                matched_source_name or field.name,
+            )
             if canonical:
                 final = canonical
                 confidence = match_confidence
@@ -838,11 +867,12 @@ def _make_product_values(
                         "reason": match_reason,
                     }]
                 }
+                if normalized_source_value is not None and normalized_source_value != current:
+                    source_details["unknown_values"][0]["normalized_value"] = normalized_source_value
             if matched_source_name and matched_source_name != field.name:
                 source_details["current_source_name"] = matched_source_name
-            centimeters = _centimeter_value(current, matched_source_name or field.name, field.name)
-            if centimeters is not None and centimeters != current:
-                source_details["current_value_hint"] = f"{matched_source_name or field.name}: {current} → {centimeters} см"
+            if normalized_source_value is not None and normalized_source_value != current:
+                source_details["current_value_hint"] = f"{matched_source_name or field.name}: {current} → {normalized_source_value} см"
         product.values.append(
             AttributeProductValue(
                 template_field=field,
@@ -3111,26 +3141,70 @@ def _centimeter_value(
     return "".join(result)
 
 
-def _unitless_linear_dictionary_match(
+def _linear_scale_was_inferred(reason: Any) -> bool:
+    text = clean_text(reason)
+    return (
+        UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in text
+        or LINEAR_SCALE_INFERENCE_REASON_PREFIX in text
+    )
+
+
+def _linear_measure_vector(value: Any) -> tuple[Decimal, ...] | None:
+    """Return one length or an ``x``-separated dimensions tuple as numbers."""
+
+    text = exact_value_key(value).replace("×", "x").replace("х", "x").replace("Х", "x")
+    parts = [clean_text(part) for part in re.split(r"[xX]", text)]
+    if not parts or any(not NUMBER_RE.fullmatch(part) for part in parts):
+        return None
+    return tuple(Decimal(part.replace(",", ".")) for part in parts)
+
+
+def _linear_dictionary_distance(
+    value: str,
+    field: AttributeTemplateField,
+    allowed: list[AttributeAllowedValue],
+) -> Decimal | None:
+    """Measure relative distance to compatible dictionary dimensions."""
+
+    source = _linear_measure_vector(value)
+    if source is None:
+        return None
+    distances: list[Decimal] = []
+    for item in allowed:
+        normalized = _centimeter_value(item.value, field.name, field.name)
+        target = _linear_measure_vector(normalized) if normalized is not None else None
+        if target is None or len(target) != len(source):
+            continue
+        component_distances = [
+            abs(left - right) / max(abs(left), abs(right), Decimal(1))
+            for left, right in zip(source, target)
+        ]
+        distances.append(sum(component_distances, Decimal(0)) / Decimal(len(source)))
+    return min(distances) if distances else None
+
+
+def _linear_scale_inference(
     field: AttributeTemplateField,
     raw_value: str,
     source_name: str,
     allowed: list[AttributeAllowedValue],
-) -> tuple[str, int, str] | None:
-    """Infer a missing length unit only when one dictionary value proves it.
+) -> tuple[str, str, int, str] | None:
+    """Infer a likely source scale without treating a nearest value as exact.
 
-    A bare ``850`` on a dimensions row may mean 850 mm, 850 cm or 850 m.
-    We must not pick one by magnitude alone. Trying the other supported length
-    units is safe only when exactly one interpretation lands on an existing
-    canonical dictionary value; the caller still keeps ``850`` for review.
+    Product feeds frequently omit a unit or label millimetres as centimetres.
+    An alternative scale is accepted when it produces one unambiguous exact
+    dictionary value. If no exact value exists, it may still be used solely
+    for nearest-value search when it is decisively closer to the dimensional
+    dictionary; the raw observation remains unknown and addable.
     """
 
     text = exact_value_key(raw_value)
+    source_unit = _linear_unit_from_name(source_name)
     if (
         not text
         or not allowed
         or _linear_unit_from_name(text)
-        or _linear_unit_from_name(source_name)
+        or source_unit not in {"", "см"}
         or _linear_unit_from_name(field.name) != "см"
         or not re.search(
             r"высот|ширин|глубин|длин|диаметр|габарит|размер|толщин|радиус|расстояни|"
@@ -3141,8 +3215,27 @@ def _unitless_linear_dictionary_match(
     ):
         return None
 
-    matches: list[tuple[str, str, str]] = []
-    for assumed_unit in ("мм", "м"):
+    direct = _centimeter_value(text, source_name, field.name)
+    if direct is None:
+        return None
+
+    # A declared/direct interpretation that exists in the dictionary always
+    # wins. The fallback below is only for values that otherwise stay unknown.
+    direct_variants = [
+        direct,
+        direct.replace(".", ","),
+        f"{direct} см",
+        f"{direct.replace('.', ',')} см",
+    ]
+    if any(_canonical_matching_value(allowed, variant) for variant in direct_variants):
+        return None
+
+    interpretations: list[tuple[str, str, str]] = []
+    # A centimetre label is occasionally attached to millimetre feed values.
+    # Do not also reinterpret it as metres: that would turn a legitimate
+    # 1.8 cm value into 180 cm merely because 180 exists in the dictionary.
+    assumed_units = ("мм",) if source_unit == "см" else ("мм", "м")
+    for assumed_unit in assumed_units:
         assumed_source_name = f"{source_name}, {assumed_unit}" if source_name else assumed_unit
         converted = _centimeter_value(text, assumed_source_name, field.name)
         formatted = _centimeter_value(
@@ -3169,19 +3262,85 @@ def _unitless_linear_dictionary_match(
             ),
             "",
         )
-        if canonical:
-            matches.append((canonical, assumed_unit, converted))
+        interpretations.append((canonical, assumed_unit, converted))
 
-    canonical_values = {value_match_key(item[0]) for item in matches}
-    if len(canonical_values) != 1:
+    exact_matches = [item for item in interpretations if item[0]]
+    canonical_values = {value_match_key(item[0]) for item in exact_matches}
+    if len(canonical_values) > 1:
         return None
-    canonical, assumed_unit, converted = matches[0]
-    return (
-        canonical,
-        92,
-        f"{UNITLESS_LINEAR_INFERENCE_REASON_PREFIX} {text} интерпретировано как "
-        f"{assumed_unit}, потому что {converted} см — точное значение справочника",
+    if len(canonical_values) == 1:
+        canonical, assumed_unit, converted = exact_matches[0]
+        prefix = (
+            UNITLESS_LINEAR_INFERENCE_REASON_PREFIX
+            if not source_unit
+            else LINEAR_SCALE_INFERENCE_REASON_PREFIX
+        )
+        source_note = (
+            f"подпись источника «{source_unit}» не согласуется со справочником; "
+            if source_unit else ""
+        )
+        return (
+            converted,
+            canonical,
+            92 if not source_unit else 90,
+            f"{prefix} {source_note}{text} интерпретировано как {assumed_unit}, "
+            f"потому что {converted} см — точное значение справочника",
+        )
+
+    direct_distance = _linear_dictionary_distance(direct, field, allowed)
+    ranked = sorted(
+        (
+            (_linear_dictionary_distance(converted, field, allowed), assumed_unit, converted)
+            for _canonical, assumed_unit, converted in interpretations
+        ),
+        key=lambda item: item[0] if item[0] is not None else Decimal("Infinity"),
     )
+    best_distance, assumed_unit, converted = ranked[0]
+    if best_distance is None:
+        return None
+
+    # Do not reinterpret a merely somewhat similar value. The alternative
+    # must be near the dimensional dictionary and at least four times closer
+    # than the direct centimetre reading. This also handles single
+    # width/depth/height fields, not only dimension tuples.
+    decisively_closer = (
+        best_distance <= Decimal("0.25")
+        and direct_distance is not None
+        and best_distance * Decimal(4) < direct_distance
+    )
+    if not decisively_closer:
+        return None
+
+    prefix = (
+        UNITLESS_LINEAR_INFERENCE_REASON_PREFIX
+        if not source_unit
+        else LINEAR_SCALE_INFERENCE_REASON_PREFIX
+    )
+    source_note = (
+        f"подпись источника «{source_unit}» не согласуется с масштабом справочника; "
+        if source_unit else ""
+    )
+    return (
+        converted,
+        "",
+        0,
+        f"{prefix} {source_note}{text} интерпретировано как {assumed_unit}; "
+        "ближайшие значения ищутся после конвертации в сантиметры",
+    )
+
+
+def _review_centimeter_value(
+    field: AttributeTemplateField,
+    raw_value: str,
+    source_name: str,
+) -> str | None:
+    ordered = _dimension_value_in_field_order(raw_value, source_name, field.name)
+    direct = _centimeter_value(ordered, source_name, field.name)
+    if direct is None:
+        return None
+    allowed = [item for item in field.allowed_values if item.is_active]
+    inferred = _linear_scale_inference(field, ordered, source_name, allowed)
+    return inferred[0] if inferred is not None else direct
 
 
 def _duration_unit(value: str) -> str:
@@ -3315,7 +3474,13 @@ def _allowed_match(
         return duration
     ordered_value = _dimension_value_in_field_order(raw_value, source_name, field.name)
     axes_reordered = exact_value_key(ordered_value) != exact_value_key(raw_value)
-    order_reason = "Порядок осей приведён к формату целевого поля; " if axes_reordered else ""
+    order_reason = ""
+    if axes_reordered:
+        source_axes, _ = _dimension_axis_order(source_name)
+        target_axes, _ = _dimension_axis_order(field.name)
+        source_order = " × ".join(DIMENSION_AXIS_LABELS[axis] for axis in source_axes)
+        target_order = " × ".join(DIMENSION_AXIS_LABELS[axis] for axis in target_axes)
+        order_reason = f"Порядок осей «{source_order}» приведён к «{target_order}»; "
     centimeters = _centimeter_value(ordered_value, source_name, field.name)
     if centimeters is not None:
         if not allowed and field.value_type in {"number", "dimensions"}:
@@ -3332,14 +3497,44 @@ def _allowed_match(
             if canonical:
                 return canonical, confidence, order_reason + "Конвертация единиц в сантиметры; " + reason, []
             nearest_values.extend(nearest)
-        inferred = _unitless_linear_dictionary_match(field, ordered_value, source_name, allowed)
+        inferred = _linear_scale_inference(field, ordered_value, source_name, allowed)
         if inferred:
-            canonical, confidence, reason = inferred
+            inferred_centimeters, canonical, confidence, reason = inferred
+            if canonical:
+                return (
+                    canonical,
+                    confidence,
+                    order_reason + reason,
+                    list(dict.fromkeys(nearest_values))[:3],
+                )
+            inferred_nearest: list[str] = []
+            inferred_variants = list(dict.fromkeys([
+                inferred_centimeters,
+                inferred_centimeters.replace(".", ","),
+                f"{inferred_centimeters} см",
+                f"{inferred_centimeters.replace('.', ',')} см",
+                f"{inferred_centimeters} cm",
+            ]))
+            for variant in inferred_variants:
+                matched, matched_confidence, matched_reason, nearest = _allowed_match_single(
+                    field,
+                    variant,
+                    allowed,
+                    source_name,
+                )
+                if matched:
+                    return (
+                        matched,
+                        matched_confidence,
+                        order_reason + reason + "; " + matched_reason,
+                        [],
+                    )
+                inferred_nearest.extend(nearest)
             return (
-                canonical,
-                confidence,
-                order_reason + reason,
-                list(dict.fromkeys(nearest_values))[:3],
+                "",
+                0,
+                order_reason + reason + f"; значения {inferred_centimeters} см нет в справочнике",
+                list(dict.fromkeys(inferred_nearest))[:3],
             )
         return "", 0, f"Значения {centimeters} см нет в справочнике", list(dict.fromkeys(nearest_values))[:3]
     if field.value_type not in {"number", "dimensions", "boolean"}:
@@ -3446,6 +3641,15 @@ def _allowed_match_single(
         for item in allowed:
             if any(comparison(synonym.synonym) == comparison(value) for synonym in item.synonyms):
                 return item.value, 98, "Синоним значения", []
+    class_code_key = _standard_class_code_key(field, value)
+    if class_code_key:
+        class_matches = [
+            item.value
+            for item in allowed
+            if _standard_class_code_key(field, item.value) == class_code_key
+        ]
+        if len(class_matches) == 1:
+            return class_matches[0], 100, STANDARD_CLASS_CODE_REASON, []
     if field.value_type in {"number", "dimensions"} and not allowed:
         return value, 96, "Формат проверен", []
     if field.value_type == "text" and not allowed:
@@ -3477,6 +3681,37 @@ def _allowed_match_single(
         nearby = [item for distance, _order, item in numeric_allowed
                   if distance <= max(abs(numeric_value), abs(Decimal(item.replace(",", ".")))) * Decimal("0.2")]
         return "", 0, "Точного числового значения нет в справочнике", nearby[:3]
+    dimension_value = _linear_measure_vector(value)
+    if dimension_value is not None and len(dimension_value) >= 2:
+        numeric_dimensions = []
+        for item in allowed:
+            item_value = _linear_measure_vector(item.value)
+            if item_value is None or len(item_value) != len(dimension_value):
+                continue
+            relative_distance = sum(
+                (
+                    abs(left - right) / max(abs(left), abs(right), Decimal(1))
+                    for left, right in zip(dimension_value, item_value)
+                ),
+                Decimal(0),
+            ) / Decimal(len(dimension_value))
+            absolute_distance = sum(
+                (abs(left - right) for left, right in zip(dimension_value, item_value)),
+                Decimal(0),
+            )
+            numeric_dimensions.append((relative_distance, absolute_distance, item.sort_order, item.value))
+        numeric_dimensions.sort()
+        nearby_dimensions = [
+            item
+            for distance, _absolute, _order, item in numeric_dimensions
+            if distance <= Decimal("0.25")
+        ]
+        return (
+            "",
+            0,
+            "Точного значения габаритов нет в справочнике; варианты подобраны по числовой близости",
+            nearby_dimensions[:3],
+        )
     ranked = sorted(
         ((SequenceMatcher(None, value_match_key(value), value_match_key(item.value)).ratio(), item.value) for item in allowed),
         reverse=True,
@@ -3653,8 +3888,34 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
     if area_field and "current_value_hint" in details:
         # Remove hints persisted by the old bug (for example, 23 -> 2300 cm).
         details.pop("current_value_hint", None)
-        target.source_details = details
+    elif exact_value_key(target.current_value):
+        current_observation = next(
+            (
+                item
+                for item in details.get("unknown_values", [])
+                if isinstance(item, dict)
+                and item.get("source") in {"current_site", "current_csv"}
+                and exact_value_key(item.get("value")) == exact_value_key(target.current_value)
+            ),
+            None,
+        )
+        current_source_name = clean_text(
+            (current_observation or {}).get("source_name")
+            or details.get("current_source_name")
+            or field.name
+        )
+        centimeters = _review_centimeter_value(
+            field,
+            exact_value_key(target.current_value),
+            current_source_name,
+        )
+        if centimeters is not None and centimeters != exact_value_key(target.current_value):
+            details["current_value_hint"] = (
+                f"{current_source_name}: {target.current_value} → {centimeters} см"
+            )
     details_changed = details != before[-1]
+    if details_changed:
+        target.source_details = details
     resolved_unknown = _clear_resolved_unknown_values(target)
     unknown = [dict(item) for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown:
@@ -3680,8 +3941,20 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
         for item in facts:
             raw = exact_value_key(item.get("value"))
             name = clean_text(item.get("source_name"))
+            normalized = _review_centimeter_value(field, raw, name)
+            if (
+                normalized is not None
+                and normalized != raw
+                and item.get("normalized_value") != normalized
+            ):
+                item["normalized_value"] = normalized
+                suggestions_changed = True
             canonical, confidence, reason, suggestions = _allowed_match(field, raw, name)
-            if canonical and UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in reason:
+            if canonical and STANDARD_CLASS_CODE_REASON in reason:
+                replacements.append((item, name, canonical, confidence, raw, reason))
+                consumed.add(id(item))
+                continue
+            if canonical and _linear_scale_was_inferred(reason):
                 if (
                     item.get("suggestions") != suggestions
                     or item.get("reason") != reason
@@ -3702,6 +3975,11 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
                 )
                 if not already_resolved:
                     replacements.append((item, name, canonical, confidence, raw, reason))
+                continue
+            if not canonical and _linear_scale_was_inferred(reason):
+                if item.get("suggestions") != suggestions or item.get("reason") != reason:
+                    item.update(suggestions=suggestions, reason=reason)
+                    suggestions_changed = True
                 continue
             if area_field or _is_area_measurement(name):
                 canonical, confidence, reason, _ = _allowed_match(field, raw, name)
@@ -3773,6 +4051,11 @@ def record_unknown_value(
         "url": source_url, "donor_id": donor_id, "role": role,
         "suggestions": list(dict.fromkeys(suggestions)), "reason": reason,
     }
+    field = target.template_field
+    if field is not None:
+        normalized = _review_centimeter_value(field, raw_value, source_name)
+        if normalized is not None and normalized != exact_value_key(raw_value):
+            unknown_item["normalized_value"] = normalized
     if preserve_for_review:
         unknown_item["preserve_for_review"] = True
     details["unknown_values"] = [item for item in details.get("unknown_values", []) if not same_source(item)] + [unknown_item]
@@ -4125,10 +4408,10 @@ def apply_parsed_attributes(
                 canonical, value_confidence, value_reason, suggestions = _allowed_match(
                     field, raw_value, source_name
                 )
-            preserve_unitless_original = bool(
+            preserve_inferred_original = bool(
                 not saved_value
                 and canonical
-                and UNITLESS_LINEAR_INFERENCE_REASON_PREFIX in value_reason
+                and _linear_scale_was_inferred(value_reason)
             )
             if not canonical:
                 stats["unknown"] += 1
@@ -4156,7 +4439,7 @@ def apply_parsed_attributes(
             if details["unknown_values"] != previous_unknown:
                 target.source_details = details
             source_role = "Основной донор" if priority == 0 else "Дополнительный донор"
-            if preserve_unitless_original:
+            if preserve_inferred_original:
                 stats["unknown"] += 1
                 record_unknown_value(
                     product,
