@@ -1035,6 +1035,24 @@ class AttributeAssistantTest(unittest.TestCase):
             {"name": "Цвет", "value": "Белый", "group": ""}
         ])
 
+    def test_product_description_is_extracted_from_structured_and_visible_content(self):
+        html = """
+        <script type="application/ld+json">
+          {"@type":"Product","name":"WM-100","description":"Корпус выполнен в белом цвете."}
+        </script>
+        <h1>WM-100</h1>
+        <h2>Описание товара</h2>
+        <p>Инверторный двигатель работает тихо.</p>
+        <h2>Характеристики</h2>
+        <p>Этот служебный текст уже не относится к описанию.</p>
+        """
+
+        parsed = service.parse_product_html(html, "https://example.com/product")
+
+        self.assertIn("Корпус выполнен в белом цвете.", parsed["description"])
+        self.assertIn("Инверторный двигатель работает тихо.", parsed["description"])
+        self.assertNotIn("служебный текст", parsed["description"])
+
     def test_hidden_tooltip_templates_are_excluded_without_site_classes(self):
         from services import attribute_ai as ai
 
@@ -1934,7 +1952,11 @@ class AttributeAssistantTest(unittest.TestCase):
         self.db.add(donor)
         self.db.flush()
         raw_path = Path(self.temp.name) / "saved-page.html"
-        raw_path.write_text("<div>Цвет: Белый</div>", encoding="utf-8")
+        raw_path.write_text(
+            "<div>Цвет: Белый</div><h2>Описание товара</h2>"
+            "<p>Корпус выполнен в цвете Белый.</p>",
+            encoding="utf-8",
+        )
         product = batch.products[0]
         product.sources.append(
             AttributeProductSource(
@@ -1956,6 +1978,8 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(source_url, "https://official.example.com/wm-100")
         self.assertIn("Цвет: Белый", html)
         self.assertEqual(parsed["attributes"], [{"name": "Цвет", "value": "Белый"}])
+        self.assertEqual(parsed["description"], "Корпус выполнен в цвете Белый.")
+        self.assertEqual(product.sources[0].parsed_data["description"], parsed["description"])
     def test_chatgpt_source_resolution_persists_exact_product_url(self):
         from services import attribute_ai
 
@@ -2335,6 +2359,47 @@ class AttributeAssistantTest(unittest.TestCase):
         detail = next(item for item in data['template_fields'] if item['id'] == field.id)
         self.assertNotIn('Новая технология', detail['program_components'])
         self.assertNotIn('новый режим', detail.get('program_synonyms', {}))
+
+    def test_chatgpt_prompt_keeps_description_as_validated_evidence_without_html(self):
+        from services import attribute_ai as ai
+
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db, template, '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode('cp1251'), filename='products.csv',
+        )
+        description = 'Корпус стиральной машины выполнен в цвете Белый.'
+        prompt, evidence = ai.build_product_prompt(
+            batch.products[0],
+            source_url='https://example.com/product',
+            parsed={"description": description, "attributes": []},
+        )
+        data = json.loads(prompt.split('КОНТЕКСТ ДЛЯ АНАЛИЗА:\n', 1)[1])
+
+        self.assertEqual(data['product_description'], description)
+        self.assertEqual(data['page_evidence'], '')
+        self.assertIn(description, evidence)
+        self.assertTrue(ai._evidence_present(description, evidence, exact=True), repr(evidence))
+        self.assertTrue(ai._evidence_present('Белый', description, exact=True), repr(description))
+        self.assertTrue(ai._evidence_present('10.5', 'Глубина 10.5.', exact=True))
+        self.assertFalse(ai._evidence_present('10', 'Глубина 10.5.', exact=True))
+
+        color = template.fields[0]
+        analysis = ai.validate_analysis(
+            batch.products[0],
+            {"attributes": [{
+                "name": "Цвет",
+                "value": "Белый",
+                "evidence": description,
+                "field_id": color.id,
+                "confidence": 82,
+            }]},
+            page_evidence=evidence,
+        )
+        self.assertEqual(
+            [item['proposed_value'] for item in analysis['suggestions']],
+            ['Белый'],
+            analysis,
+        )
 
     def test_chatgpt_evidence_deduplicates_paragraphs_without_losing_dimensions(self):
         from services import attribute_ai as ai

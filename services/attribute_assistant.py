@@ -1638,9 +1638,90 @@ def _infer_product_model(name: str, url: str = "", brand: str = "") -> str:
     return ""
 
 
+PARSED_PRODUCT_DESCRIPTION_MAX_CHARS = 30_000
+
+
+def _extract_product_description(
+    soup: BeautifulSoup,
+    structured_descriptions: list[str] | None = None,
+) -> str:
+    """Extract product-specific prose using semantic markup, not site names/classes."""
+
+    candidates: list[str] = []
+
+    def append(value: object) -> None:
+        text = clean_text(value)
+        if not text:
+            return
+        key = normalize_key(text)
+        if any(key == normalize_key(item) or key in normalize_key(item) for item in candidates):
+            return
+        candidates.append(text)
+
+    for value in structured_descriptions or []:
+        append(value)
+
+    # Schema.org and explicit data attributes are stable cross-site signals.
+    for node in soup.select(
+        '[itemprop="description"], [data-product-description], [data-description]'
+    ):
+        append(
+            node.get("content")
+            or node.get("data-product-description")
+            or node.get("data-description")
+            or _text_without_ui_noise(node)
+        )
+
+    # Description/feature sections often have no semantic attribute at all.
+    # Read their adjacent content, stopping at the next section heading.
+    description_heading = re.compile(
+        r"^(?:полное\s+)?описание(?:\s+товара)?$|^о\s+товаре$|"
+        r"^ключевые\s+особенности(?:\s+товара)?$|^особенности(?:\s+товара)?$|"
+        r"^преимущества(?:\s+товара)?$|^product\s+description$|^description$|"
+        r"^features$|^highlights$",
+        re.IGNORECASE,
+    )
+    for heading in soup.find_all(re.compile(r"^h[1-6]$", re.IGNORECASE)):
+        if not description_heading.match(clean_text(heading.get_text(" "))):
+            continue
+        parts: list[str] = []
+        for sibling in heading.find_next_siblings():
+            if getattr(sibling, "name", "") and re.match(
+                r"^h[1-6]$", str(sibling.name), re.IGNORECASE
+            ):
+                break
+            text = _text_without_ui_noise(sibling)
+            if text:
+                parts.append(text)
+            if len(" ".join(parts)) >= PARSED_PRODUCT_DESCRIPTION_MAX_CHARS:
+                break
+        append(" ".join(parts))
+
+    # Metadata is a useful fallback for JS-rendered cards, but is deliberately
+    # considered after product-specific visible/structured content.
+    for selector in (
+        'meta[property="og:description"]',
+        'meta[name="description"]',
+    ):
+        node = soup.select_one(selector)
+        if node:
+            append(node.get("content"))
+
+    return "\n".join(candidates)[:PARSED_PRODUCT_DESCRIPTION_MAX_CHARS]
+
+
 def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
-    result: dict[str, Any] = {"url": url, "name": "", "model": "", "brand": "", "category": "", "attributes": []}
+    result: dict[str, Any] = {
+        "url": url,
+        "name": "",
+        "model": "",
+        "brand": "",
+        "category": "",
+        "description": "",
+        "attributes": [],
+    }
+    structured_descriptions: list[str] = []
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.string or script.get_text() or "{}")
@@ -1656,6 +1737,9 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
             brand = item.get("brand")
             result["brand"] = clean_text(brand.get("name") if isinstance(brand, dict) else brand) or result["brand"]
             result["category"] = clean_text(item.get("category")) or result["category"]
+            description = clean_text(item.get("description"))
+            if description:
+                structured_descriptions.append(description)
             for prop in item.get("additionalProperty") or []:
                 if isinstance(prop, dict) and prop.get("name"):
                     result["attributes"].append({
@@ -1666,6 +1750,7 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
     # Read JSON-LD first, then exclude help panels from row discovery as well as cell text.
     # A tooltip's title/body pair otherwise looks like a two-column specification.
     _remove_ui_noise(soup)
+    result["description"] = _extract_product_description(soup, structured_descriptions)
     selectors = ("table tr", ".characteristics tr", ".specifications tr", ".properties tr")
     seen = {(normalize_key(item["name"]), exact_value_key(item["value"])) for item in result["attributes"]}
     for row in soup.select(",".join(selectors)):

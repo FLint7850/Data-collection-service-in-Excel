@@ -60,7 +60,7 @@ from services.attribute_assistant import (
 )
 
 
-ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v17-compact-dynamic-template"
+ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v18-product-description"
 ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD = 30
 ATTRIBUTE_AI_MAX_PAGE_CHARS = 60_000
 ATTRIBUTE_AI_MAX_RESPONSE_CHARS = 2_000_000
@@ -110,11 +110,13 @@ def _page_evidence(visible_text: str, parsed: dict[str, Any]) -> str:
         clean_text(parsed.get("brand")),
         clean_text(parsed.get("category")),
     ]
+    description = clean_text(parsed.get("description"))
     return "\n".join(
         [
             "ДАННЫЕ, НАЙДЕННЫЕ ПАРСЕРОМ:",
             *[item for item in identity if item],
             *attributes,
+            *(["", "ОПИСАНИЕ ТОВАРА:", description] if description else []),
             "",
             "ВИДИМЫЙ ТЕКСТ СТРАНИЦЫ:",
             visible_text,
@@ -310,7 +312,12 @@ def build_product_prompt(
     visible = _compact_visible_text(html)
     truncated = len(visible) > ATTRIBUTE_AI_MAX_PAGE_CHARS
     visible = visible[:ATTRIBUTE_AI_MAX_PAGE_CHARS]
-    evidence = _page_evidence(visible, parsed) if html or parsed.get("attributes") else ""
+    description = clean_text(parsed.get("description"))
+    evidence = (
+        _page_evidence(visible, parsed)
+        if html or parsed.get("attributes") or description
+        else ""
+    )
     template = product_template(product)
     context = {
         # The shared template prefix precedes per-product facts; no mutable
@@ -325,6 +332,7 @@ def build_product_prompt(
         "official_product_url": source_url,
         "parser_attributes": parsed_attribute_facts(parsed),
         "template_fields": _template_context(product, parsed, evidence),
+        **({"product_description": description} if description else {}),
         "page_evidence": visible,
         **({"page_evidence_truncated": True} if truncated else {}),
     }
@@ -371,9 +379,32 @@ def _parse_json_response(value: object) -> dict[str, Any]:
 def _evidence_present(quote: str, evidence: str, *, exact: bool = False) -> bool:
     if exact:
         key = exact_value_key(quote)
-        return bool(key) and re.search(
-            r"(?<![\w+./%−-])" + re.escape(key) + r"(?![\w+./%−-])", exact_value_key(evidence),
-        ) is not None
+        haystack = exact_value_key(evidence)
+        if not key:
+            return False
+        # A full stop is ordinary sentence punctuation in descriptions, but it
+        # may also be a decimal separator. Check matches explicitly so
+        # ``Белый.`` confirms ``Белый`` while ``10.5`` does not confirm ``10``.
+        token_punctuation = "+/%−-"
+        for match in re.finditer(re.escape(key), haystack):
+            left_index = match.start() - 1
+            right_index = match.end()
+            left = haystack[left_index] if left_index >= 0 else ""
+            right = haystack[right_index] if right_index < len(haystack) else ""
+            if (left and (left.isalnum() or left == "_" or left in token_punctuation)) or (
+                right and (right.isalnum() or right == "_" or right in token_punctuation)
+            ):
+                continue
+            if key[0].isdigit() and left in ".,":
+                before_left = haystack[left_index - 1] if left_index > 0 else ""
+                if before_left.isdigit():
+                    continue
+            if key[-1].isdigit() and right in ".,":
+                after_right = haystack[right_index + 1] if right_index + 1 < len(haystack) else ""
+                if after_right.isdigit():
+                    continue
+            return True
+        return False
     return bool(normalize_key(quote)) and normalize_key(quote) in normalize_key(evidence)
 
 
@@ -1042,9 +1073,30 @@ def prepare_product_source(
         except OSError:
             stored_html = ""
 
-    # A regular parser run is the canonical page snapshot. Reuse its exact result
-    # instead of downloading and parsing the page a second time for ChatGPT.
-    if stored_parsed.get("attributes"):
+    # A regular parser run is the canonical page snapshot. Re-run the current
+    # parser over its saved HTML so newer generic extraction rules (including
+    # product descriptions) also work for products parsed before an update.
+    if stored_parsed.get("attributes") and stored_html:
+        refreshed = (
+            parse_product_html_for_donor(stored_html, source_url, donor)
+            if donor
+            else parse_product_html(stored_html, source_url)
+        )
+        old_attributes = stored_parsed.get("attributes") or []
+        new_attributes = refreshed.get("attributes") or []
+        if len(new_attributes) >= len(old_attributes):
+            stored_parsed["attributes"] = new_attributes
+        for key in ("name", "model", "brand", "category", "description"):
+            if clean_text(refreshed.get(key)):
+                stored_parsed[key] = refreshed[key]
+        if persist and existing is not None:
+            existing.parsed_data = stored_parsed
+            db.flush()
+        return source_url, stored_html, stored_parsed, resolved_by
+
+    # Old snapshots without raw HTML and without a stored description are
+    # downloaded once more; otherwise ChatGPT could never inspect their prose.
+    if stored_parsed.get("attributes") and clean_text(stored_parsed.get("description")):
         return source_url, stored_html, stored_parsed, resolved_by
 
     html = stored_html
