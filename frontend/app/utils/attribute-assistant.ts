@@ -192,9 +192,31 @@ export function selectedFinalParts(value: AttributeValue) {
 }
 
 export function selectedFinalValue(value: AttributeValue) {
-    if (value.final_value && value.final_value !== "-") return value.final_value;
+    if (value.final_value) return value.final_value;
     if (value.status === "rejected") return "";
     return hasPendingProposal(value) ? displayedProposal(value) : "";
+}
+
+type FinalSelectOption = {
+    id: number;
+    value: string;
+    disabled?: boolean;
+};
+
+export function finalSelectOptions(
+    value: AttributeValue,
+    options: Array<{ id: number; value: string }>,
+): FinalSelectOption[] {
+    if (!isTechnicalDash(value.final_value)) return options;
+
+    const dash = value.final_value.trim();
+    const result: FinalSelectOption[] = options.map((option) => (
+        isTechnicalDash(option.value) ? { ...option, disabled: true } : option
+    ));
+    if (!result.some((option) => option.value === dash)) {
+        result.unshift({ id: Number.MIN_SAFE_INTEGER + value.id, value: dash, disabled: true });
+    }
+    return result;
 }
 
 export function sourceStatusText(

@@ -7,6 +7,7 @@ import {
   displayedProposal,
   displayedProposalConfidence,
   displayedProposalSource,
+  finalSelectOptions,
   finalAllowedMenuKey,
   formatHistoryDate,
   inputModeItems,
@@ -1032,7 +1033,7 @@ onBeforeUnmount(() => {
                       :ref="allowedSelectRef(finalAllowedMenuKey(value))"
                       class="aa-final-select aa-final-select--multiple"
                       :model-value="[...selectedFinalParts(value)]"
-                      :items="optionsFor(value).filter((item) => !item.value.includes('/'))"
+                      :items="finalSelectOptions(value, optionsFor(value)).filter((item) => !item.value.includes('/'))"
                       value-key="value"
                       label-key="value"
                       :search-input="{ placeholder: 'Найти значение…' }"
@@ -1051,7 +1052,7 @@ onBeforeUnmount(() => {
                       :ref="allowedSelectRef(finalAllowedMenuKey(value))"
                       class="aa-final-select"
                       :model-value="selectedFinalValue(value)"
-                      :items="optionsFor(value)"
+                      :items="finalSelectOptions(value, optionsFor(value))"
                       value-key="value"
                       label-key="value"
                       placeholder="Выберите итоговое значение"

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AttributeValue } from "../app/types/attribute-assistant";
 import {
   addableUnknownProposal, attributeValuesMatch, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
-  sourceEvidenceCount, unknownSourceMatchesSelected, valueStatusColor, valueStatusLabel,
+  finalSelectOptions, selectedFinalParts, selectedFinalValue, sourceEvidenceCount, unknownSourceMatchesSelected, valueStatusColor, valueStatusLabel,
 } from "../app/utils/attribute-assistant";
 
 function value(overrides: Partial<AttributeValue> = {}): AttributeValue {
@@ -197,6 +197,17 @@ describe("attribute value letter case", () => {
 });
 
 describe("filled and unfilled attribute filters", () => {
+  it.each(["-", "—"])('shows the technical dash %j in the final selector but keeps it unfilled', (dash) => {
+    const row = value({ status: "dash", current_value: "", final_value: dash });
+    const options = finalSelectOptions(row, [{ id: 10, value: "A++" }]);
+
+    expect(selectedFinalValue(row)).toBe(dash);
+    expect([...selectedFinalParts(row)]).toEqual([dash]);
+    expect(options[0]).toMatchObject({ value: dash, disabled: true });
+    expect(matchesAttributeStatus(row, "unfilled")).toBe(true);
+    expect(matchesAttributeStatus(row, "from_source")).toBe(false);
+  });
+
   it.each([
     { status: "kept", current_value: "85", final_value: "85", source: "current_csv" },
     { status: "kept", current_value: "Нет", final_value: "Нет", source: "current_site" },
