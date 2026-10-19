@@ -160,6 +160,12 @@ NUMBER_WITH_UNIT_RE = re.compile(
     r"(месяц(?:а|ев)?|мес\.?|год(?:а|ов)?|лет|квт(?:/ч)?|вт(?:/ч)?|см|мм|м|кг|мг|г|мл|л|дб|гц|ч)?\s*$",
     re.IGNORECASE,
 )
+NUMERIC_SCALAR_WITH_UNIT_RE = re.compile(
+    r"^\s*([+-]?\d+(?:[.,]\d+)?)\s*"
+    r"([A-Za-zА-Яа-яЁёµμ°%‰²³/·*^._()\[\]\-]+"
+    r"(?:\s+[A-Za-zА-Яа-яЁёµμ°%‰²³/·*^._()\[\]\-]+)*)\s*$",
+    re.IGNORECASE,
+)
 DURATION_UNIT_PATTERN = (
     r"(?:месяц(?:а|ев|ы|ах|ами|е)?|мес\.?|months?|mos?|"
     r"год(?:а|ов|ы|ах|ами)?|лет|years?|yrs?)"
@@ -278,6 +284,18 @@ def normalize_number(value: Any) -> str:
     return number
 
 
+def _numeric_scalar_without_unit(value: Any) -> str:
+    """Return a bare scalar while keeping the source unit as audit-only context."""
+
+    match = NUMERIC_SCALAR_WITH_UNIT_RE.fullmatch(exact_value_key(value))
+    if not match:
+        return ""
+    try:
+        return normalize_number(match.group(1))
+    except ValueError:
+        return ""
+
+
 def normalize_dimensions(value: Any) -> str:
     text = clean_text(value)
     if not DIMENSION_RE.fullmatch(text):
@@ -295,6 +313,15 @@ def value_match_key(value: Any) -> str:
     return exact_value_key(value).lower()
 
 
+def _boolean_equivalence_key(value: Any) -> str:
+    key = value_match_key(value)
+    if key in BOOLEAN_TRUE_KEYS:
+        return "boolean:true"
+    if key in BOOLEAN_FALSE_KEYS:
+        return "boolean:false"
+    return ""
+
+
 def _canonical_matching_value(allowed: Iterable[AttributeAllowedValue], value: Any) -> str:
     active = [item for item in allowed if item.is_active]
     exact_key = exact_value_key(value)
@@ -302,7 +329,23 @@ def _canonical_matching_value(allowed: Iterable[AttributeAllowedValue], value: A
     if exact:
         return exact
     key = value_match_key(value)
-    return next((item.value for item in active if value_match_key(item.value) == key), "") if key else ""
+    case_insensitive = next(
+        (item.value for item in active if value_match_key(item.value) == key),
+        "",
+    ) if key else ""
+    if case_insensitive:
+        return case_insensitive
+    boolean_key = _boolean_equivalence_key(value)
+    if not boolean_key:
+        return ""
+    return next(
+        (
+            item.value
+            for item in sorted(active, key=lambda item: (item.sort_order, item.id or 0))
+            if _boolean_equivalence_key(item.value) == boolean_key
+        ),
+        "",
+    )
 
 
 def _standard_class_code_key(field: AttributeTemplateField, value: Any) -> str:
@@ -3649,6 +3692,14 @@ def _converted_value_candidates(
 ) -> list[str]:
     text_value = exact_value_key(raw_value)
     candidates = [text_value]
+    numeric_dictionary = any(
+        item.is_active and NUMBER_RE.fullmatch(exact_value_key(item.value))
+        for item in field.allowed_values
+    )
+    bare_number = _numeric_scalar_without_unit(text_value)
+    if bare_number and (field.value_type == "number" or numeric_dictionary):
+        # Units help interpret the observation, but dictionary numbers stay bare.
+        candidates.insert(0, bare_number)
     for rule in list(field.conversion_rules or []):
         if not isinstance(rule, dict):
             continue
@@ -3708,6 +3759,16 @@ def _allowed_match(
     if is_program_list(field):
         return match_programs(field, raw_value)
     allowed = [item for item in field.allowed_values if item.is_active]
+    boolean_key = _boolean_equivalence_key(raw_value)
+    boolean_canonical = _canonical_matching_value(allowed, raw_value) if boolean_key else ""
+    if boolean_canonical and not _is_presence_marker(field, raw_value, source_name):
+        exact_boolean = value_match_key(boolean_canonical) == value_match_key(raw_value)
+        return (
+            boolean_canonical,
+            100,
+            "Точное значение справочника" if exact_boolean else "Логический эквивалент значения справочника",
+            [],
+        )
     duration = _duration_match(field, raw_value, source_name)
     if duration is not None:
         return duration
@@ -3889,6 +3950,35 @@ def _allowed_match_single(
         ]
         if len(class_matches) == 1:
             return class_matches[0], 100, STANDARD_CLASS_CODE_REASON, []
+    raw_phrase = clean_text(value).lower().replace("ё", "е")
+    raw_phrase = re.sub(r"\([^)]*[a-z][^)]*\)", " ", raw_phrase, flags=re.IGNORECASE)
+    context_tokens = _name_tokens(field.name) | _name_tokens(source_name)
+    contextual_matches = []
+    for item in allowed:
+        canonical_phrase = clean_text(item.value).lower().replace("ё", "е")
+        if not canonical_phrase or NUMBER_RE.fullmatch(canonical_phrase):
+            continue
+        match = re.search(
+            rf"(?<![a-zа-яе0-9]){re.escape(canonical_phrase)}(?![a-zа-яе0-9])",
+            raw_phrase,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        remainder = clean_text(raw_phrase[:match.start()] + " " + raw_phrase[match.end():])
+        if not remainder or re.search(r"[^a-zа-яе0-9\s,;:()\-–—]", remainder, re.IGNORECASE):
+            continue
+        remainder_tokens = _name_tokens(remainder)
+        if remainder_tokens and remainder_tokens <= context_tokens:
+            contextual_matches.append(item.value)
+    contextual_matches = list(dict.fromkeys(contextual_matches))
+    if len(contextual_matches) == 1:
+        return (
+            contextual_matches[0],
+            96,
+            "Каноническое значение выделено из поясняющей фразы",
+            [],
+        )
     if field.value_type in {"number", "dimensions"} and not allowed:
         return value, 96, "Формат проверен", []
     if field.value_type == "text" and not allowed:
@@ -3965,6 +4055,9 @@ def _target_value(product: AttributeProduct, field_id: int) -> AttributeProductV
 def _candidate_value_key(target: AttributeProductValue, value: Any) -> str:
     field = target.template_field
     if field:
+        boolean_key = _boolean_equivalence_key(value)
+        if boolean_key and _canonical_matching_value(field.allowed_values, value):
+            return boolean_key
         if is_program_list(field):
             canonical, _, _, _ = match_programs(field, value)
             if canonical:
@@ -4023,6 +4116,27 @@ def _clear_unchanged_proposal(target: AttributeProductValue) -> bool:
 def _repair_existing_value_status(target: AttributeProductValue) -> bool:
     if _clear_unchanged_proposal(target):
         return True
+    has_original = bool(exact_value_key(target.current_value)) and not is_technical_dash(target.current_value)
+    if (
+        not has_original
+        and not exact_value_key(target.final_value)
+        and target.status in {"conflict", "unknown"}
+    ):
+        details = target.source_details or {}
+        has_source_proposal = any(
+            isinstance(item, dict) and exact_value_key(item.get("value"))
+            for item in details.get("candidates", [])
+        ) or any(
+            isinstance(item, dict) and (
+                exact_value_key(item.get("value"))
+                or any(exact_value_key(value) for value in item.get("suggestions", []))
+            )
+            for item in details.get("unknown_values", [])
+        )
+        if has_source_proposal:
+            before = (target.status, target.proposed_value, target.final_value, target.reason)
+            _recalculate_candidate_state(target.product, target)
+            return before != (target.status, target.proposed_value, target.final_value, target.reason)
     if (exact_value_key(target.current_value) and not is_technical_dash(target.current_value)
             and target.status in {"suggested", "unknown"}):
         target.status = "conflict"
@@ -4220,6 +4334,13 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
                     item.update(suggestions=suggestions, reason=reason)
                     suggestions_changed = True
                 continue
+            if canonical:
+                # Any exact canonicalization resolves the old unknown fact.
+                # Keep the raw text in candidate.raw_value for audit, but it
+                # must no longer create a conflict or a new-value proposal.
+                replacements.append((item, name, canonical, confidence, raw, reason))
+                consumed.add(id(item))
+                continue
             if area_field or _is_area_measurement(name):
                 canonical, confidence, reason, _ = _allowed_match(field, raw, name)
                 if canonical:
@@ -4322,6 +4443,37 @@ def _unknown_value_confirms_reference(
     )
 
 
+def _exact_current_dictionary_value(target: AttributeProductValue) -> str:
+    """Return the canonical current value only when its dictionary match is exact."""
+
+    field = target.template_field
+    current = exact_value_key(target.current_value)
+    if not field or not current or is_technical_dash(current):
+        return ""
+    details = target.source_details or {}
+    current_observation = next(
+        (
+            item
+            for item in details.get("unknown_values", [])
+            if isinstance(item, dict)
+            and clean_text(item.get("source")) in {"current_site", "current_csv"}
+            and exact_value_key(item.get("value")) == current
+        ),
+        None,
+    )
+    source_name = clean_text(
+        (current_observation or {}).get("source_name")
+        or details.get("current_source_name")
+        or field.name
+    )
+    canonical, confidence, _reason, _suggestions = _allowed_match(
+        field,
+        current,
+        source_name,
+    )
+    return canonical if canonical and confidence == EXACT_VALUE_CONFIDENCE else ""
+
+
 def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dict]) -> bool:
     unknown = [item for item in (target.source_details or {}).get("unknown_values", []) if isinstance(item, dict)]
     if not unknown or _has_confirmed_decision(target):
@@ -4332,13 +4484,31 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
     valid_original = bool(
         has_current and target.final_value and not is_technical_dash(target.final_value) and not current_unknown
     )
+    exact_original = _exact_current_dictionary_value(target)
     distinct = list({value_match_key(item["value"]): item["value"] for item in reversed(candidates)}.values())
     # Disagreement between known dictionary values remains a source conflict.
-    if len(distinct) > 1 or (valid_original and any(
-        _candidate_value_key(target, value) != _candidate_value_key(target, target.final_value)
+    reference = exact_original or target.final_value
+    if len(distinct) > 1 or (reference and any(
+        _candidate_value_key(target, value) != _candidate_value_key(target, reference)
         for value in distinct
     )):
         return False
+    conflicting_unknown_proposal = bool(exact_original and any(
+        item.get("suggestions")
+        and _candidate_value_key(target, item["suggestions"][0])
+        != _candidate_value_key(target, exact_original)
+        for item in unknown
+    ))
+    if exact_original and not conflicting_unknown_proposal:
+        target.final_value = exact_original
+        target.proposed_value = ""
+        target.status = "kept"
+        target.confidence = EXACT_VALUE_CONFIDENCE
+        target.reason = (
+            "Исходное значение точно совпадает со справочником; "
+            "несопоставленные наблюдения других источников не создают конфликт"
+        )
+        return True
     if valid_original and all(
         _unknown_value_confirms_reference(target, item, target.final_value)
         for item in unknown
@@ -4362,7 +4532,7 @@ def _apply_dictionary_review(target: AttributeProductValue, candidates: list[dic
     target.proposed_value = proposals[0] if proposals else ""
     if not valid_original:
         target.final_value = ""
-    target.status = "conflict" if has_current else ("suggested" if proposals else "conflict")
+    target.status = "conflict" if has_current else "suggested"
     if target.status != "dash":
         target.dash_reason = ""
     target.confidence = int(candidates[0].get("confidence", 0)) if candidates else 0
@@ -4453,7 +4623,26 @@ def _recalculate_candidate_state(
     candidates = _program_candidate_groups(target, candidates)
     if _apply_dictionary_review(target, candidates):
         return
-    if target.current_value:
+    manual_final = (
+        exact_value_key(target.final_value)
+        if clean_text(target.source).casefold() == "manual"
+        and not (target.source_details or {}).get("auto_accepted")
+        else ""
+    )
+    if manual_final:
+        conflicts = [
+            item for item in candidates
+            if _candidate_value_key(target, item["value"])
+            != _candidate_value_key(target, manual_final)
+        ]
+        target.proposed_value = ""
+        target.status = "conflict" if conflicts else "approved"
+        target.reason = (
+            "Источник предлагает значение, отличающееся от выбранного пользователем"
+            if conflicts else "Источники подтверждают выбранное пользователем значение"
+        )
+        return
+    if exact_value_key(target.current_value) and not is_technical_dash(target.current_value):
         current_key = _candidate_value_key(target, _current_reference_value(target))
         conflicts = [
             item for item in candidates
@@ -4480,11 +4669,17 @@ def _recalculate_candidate_state(
         return
     distinct = {_candidate_value_key(target, item["value"]) for item in candidates}
     if len(distinct) > 1:
-        target.status = "conflict"
-        target.reason = "Источники предлагают разные значения"
-        target.proposed_value = ""
+        best = sorted(
+            candidates,
+            key=lambda item: (int(item.get("priority") or 0), -int(item.get("confidence") or 0)),
+        )[0]
+        target.status = "suggested"
+        target.reason = "Источники предлагают разные значения; выбрано приоритетное предложение для ручной проверки"
+        target.proposed_value = exact_value_key(best.get("value"))
         target.final_value = ""
-        target.confidence = max(int(item.get("confidence") or 0) for item in candidates)
+        target.source = clean_text(best.get("source"))
+        target.confidence = int(best.get("confidence") or 0)
+        target.source_details = {**(target.source_details or {}), "auto_accepted": False}
         return
     best = sorted(
         candidates,
@@ -5192,6 +5387,7 @@ def serialize_value(
     include_allowed_values: bool = True,
     allowed_values_count: int | None = None,
 ) -> dict[str, Any]:
+    _repair_confirming_evidence(value) or _repair_existing_value_status(value)
     field = value.template_field
     active_allowed = None
     if field and (include_allowed_values or allowed_values_count is None):

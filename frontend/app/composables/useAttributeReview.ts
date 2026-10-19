@@ -864,7 +864,15 @@ export function useAttributeReview(
 
     async function selectFinalValue(value: AttributeValue, selection: unknown) {
         const parts = (Array.isArray(selection) ? selection : [selection])
-            .filter((item): item is string => typeof item === "string" && Boolean(item));
+            .map((item) => {
+                if (typeof item === "string") return item;
+                if (item && typeof item === "object" && "value" in item) {
+                    const selectedValue = (item as { value?: unknown }).value;
+                    return typeof selectedValue === "string" ? selectedValue : "";
+                }
+                return "";
+            })
+            .filter(Boolean);
         const selected = value.is_composite
             ? parts.sort((left, right) => left.localeCompare(right, "ru")).join("/")
             : parts[0] || "";

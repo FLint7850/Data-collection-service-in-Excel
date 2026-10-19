@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computed, nextTick, ref, watch } from "vue";
 import { useAttributeReview } from "../app/composables/useAttributeReview";
+import { useAttributeAllowedValues } from "../app/composables/useAttributeAllowedValues";
 import type { AttributeAssistantContext } from "../app/composables/useAttributeAssistant";
 import type { AttributeAllowedValuesContext } from "../app/composables/useAttributeAllowedValues";
 import type { AttributeValue } from "../app/types/attribute-assistant";
@@ -62,6 +63,7 @@ describe("large attribute batches", () => {
     vi.stubGlobal("ref", ref);
     vi.stubGlobal("computed", computed);
     vi.stubGlobal("watch", watch);
+    vi.stubGlobal("onBeforeUnmount", vi.fn());
     vi.stubGlobal("useToast", () => ({ add: vi.fn() }));
     api.batch.mockImplementation(async (id) => batch(id));
     api.products.mockImplementation(async (_id, _query, _status, offset = 0) => page(offset));
@@ -226,6 +228,43 @@ describe("large attribute batches", () => {
     expect(api.batch).toHaveBeenCalledTimes(calls.batches);
     expect(api.products).toHaveBeenCalledTimes(calls.products);
     expect(api.productHistory).toHaveBeenCalledTimes(calls.history);
+  });
+
+  it("accepts an object emitted by the final-value selector", async () => {
+    const original = attribute(11, { allowed_values_count: 2 });
+    api.product.mockResolvedValueOnce({ ...summary(4), batch_id: 1, values: [original], sources: [] });
+    await review.openBatch(1, 4);
+    api.updateValue.mockResolvedValueOnce({
+      value: { ...original, final_value: "Есть", status: "approved" },
+      product: { ...summary(4), batch_id: 1, status: "ready" },
+      batch: batch(1),
+      history: [],
+    });
+
+    await review.selectFinalValue(original, { id: 10, value: "Есть" });
+
+    expect(api.updateValue).toHaveBeenCalledWith(11, expect.objectContaining({
+      action: "accept",
+      value: "Есть",
+    }));
+  });
+
+  it("does not inject a raw unknown into the allowed-value selector", () => {
+    const allowed = useAttributeAllowedValues();
+    const row = attribute(12, {
+      status: "suggested",
+      proposed_value: "",
+      allowed_values_count: 2,
+      allowed_values: [{ id: 1, value: "Есть" }, { id: 2, value: "Нет" }],
+      source_details: {
+        unknown_values: [{
+          value: "да", source: "Donor", source_name: "Режим Отпуск",
+          suggestions: [], reason: "Значения нет в справочнике",
+        }],
+      },
+    });
+
+    expect(allowed.optionsFor(row).map((item) => item.value)).toEqual(["Есть", "Нет"]);
   });
 
   it("cancels pending searches when switching batches and clears product-specific donors", async () => {

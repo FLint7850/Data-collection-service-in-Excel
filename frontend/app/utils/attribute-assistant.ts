@@ -132,7 +132,13 @@ export function originalValueHints(value: AttributeValue): string[] {
 }
 
 export function attributeValuesMatch(left: string, right: string): boolean {
-    return left.trim().toLowerCase() === right.trim().toLowerCase();
+    const leftKey = left.trim().toLowerCase();
+    const rightKey = right.trim().toLowerCase();
+    if (leftKey === rightKey) return true;
+    const trueValues = new Set(["да", "есть", "yes", "true", "1", "имеется", "присутствует"]);
+    const falseValues = new Set(["нет", "no", "false", "0", "отсутствует"]);
+    return (trueValues.has(leftKey) && trueValues.has(rightKey))
+        || (falseValues.has(leftKey) && falseValues.has(rightKey));
 }
 
 type UnknownSourceValue = NonNullable<AttributeValue["source_details"]["unknown_values"]>[number];

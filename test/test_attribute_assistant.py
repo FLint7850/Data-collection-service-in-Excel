@@ -2565,7 +2565,7 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(text.count(description.strip()), 1)
         self.assertIn('Высота\n65\nШирина\n65', text)
 
-    def test_conflicting_sources_require_review(self):
+    def test_different_sources_are_suggestions_when_original_is_empty(self):
         template = self.make_template()
         source = '_MODEL_;_ATTRIBUTES_\r\nWM-100;""\r\n'.encode("cp1251")
         batch = service.create_batch_from_csv(self.db, template, source, filename="products.csv")
@@ -2577,7 +2577,8 @@ class AttributeAssistantTest(unittest.TestCase):
         service.apply_candidate(
             product, target, value="Чёрный", confidence=95, source="B", reason="", priority=1, source_name="Цвет"
         )
-        self.assertEqual(target.status, "conflict")
+        self.assertEqual(target.status, "suggested")
+        self.assertEqual(target.proposed_value, "Белый")
         self.assertEqual(target.final_value, "")
 
 

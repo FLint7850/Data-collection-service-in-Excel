@@ -134,7 +134,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
         self.assertEqual(value.dash_reason, "")
         self.assertEqual(product.batch.summary["suggestions"], 1)
 
-    def test_different_new_values_from_sources_remain_a_conflict(self):
+    def test_different_new_values_are_suggestions_when_original_is_empty(self):
         template = self.template("Тип установки", ("Подвесной", "Островной"))
         product = self.product(template)
         for source, raw in (("Donor A", "Встраиваемая"), ("Donor B", "Настольная")):
@@ -146,7 +146,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
                 priority=0,
             )
         value = product.values[0]
-        self.assertEqual(value.status, "conflict")
+        self.assertEqual(value.status, "suggested")
         self.assertEqual(value.proposed_value, "")
         self.assertEqual(value.final_value, "")
 
@@ -163,8 +163,11 @@ class AttributeReviewRulesTest(unittest.TestCase):
             priority=0,
             source_url=source_url,
         )
-        self.assertEqual(stats["unknown"], 1)
-        self.assertEqual(product.values[0].status, "conflict")
+        self.assertEqual(stats["mapped"], 1)
+        self.assertEqual(stats["unknown"], 0)
+        self.assertEqual(product.values[0].status, "kept")
+        self.assertEqual(product.values[0].final_value, "Есть")
+        self.assertEqual(product.values[0].proposed_value, "")
 
         analysis = self.analyze(product, "Таймер", "Да", allowed="Есть")
         ai.apply_analysis(self.db, product, analysis, source_url=source_url)
@@ -173,8 +176,47 @@ class AttributeReviewRulesTest(unittest.TestCase):
         self.assertEqual(value.status, "kept")
         self.assertEqual(value.final_value, "Есть")
         self.assertEqual(value.proposed_value, "")
-        self.assertEqual(value.source_details["unknown_values"], [])
+        self.assertEqual(value.source_details.get("unknown_values", []), [])
         self.assertEqual(value.source_details["candidates"][0]["raw_value"], "Да")
+
+    def test_yes_and_exists_are_global_symmetric_dictionary_equivalents(self):
+        for value_type in ("select", "text"):
+            with self.subTest(value_type=value_type, direction="yes-to-exists"):
+                field = self.template(
+                    f"Режим Отпуск {value_type}",
+                    ("Есть", "Нет"),
+                    value_type,
+                ).fields[0]
+                self.assertEqual(svc._allowed_match(field, "Да", field.name)[:2], ("Есть", 100))
+                self.assertEqual(svc._allowed_match(field, "да", field.name)[:2], ("Есть", 100))
+            with self.subTest(value_type=value_type, direction="exists-to-yes"):
+                field = self.template(
+                    f"Режим Отпуск reverse {value_type}",
+                    ("Да", "Нет"),
+                    value_type,
+                ).fields[0]
+                self.assertEqual(svc._allowed_match(field, "Есть", field.name)[:2], ("Да", 100))
+    def test_saved_unknown_yes_is_repaired_to_exists_on_read(self):
+        template = self.template("Режим «Отпуск»", ("Есть", "Нет"))
+        product = self.product(template)
+        value = product.values[0]
+        value.status = "suggested"
+        value.proposed_value = "да"
+        value.source_details = {"candidates": [], "unknown_values": [{
+            "value": "да",
+            "source": "Donor",
+            "source_name": "Режим «Отпуск»",
+            "url": "https://example.com/product",
+            "suggestions": [],
+            "reason": "Значения нет в справочнике",
+        }]}
+
+        serialized = svc.serialize_product(product, detailed=True)["values"][0]
+
+        self.assertEqual(serialized["status"], "suggested")
+        self.assertEqual(serialized["proposed_value"], "Есть")
+        self.assertEqual(serialized["source_details"]["unknown_values"], [])
+        self.assertEqual(serialized["source_details"]["candidates"][0]["raw_value"], "да")
 
     def test_saved_duplicate_raw_observation_is_repaired(self):
         template = self.template("Таймер", ("Есть", "Нет", "До 15 минут"))
@@ -984,19 +1026,138 @@ class AttributeReviewRulesTest(unittest.TestCase):
         field = self.template("Ширина, см", ("60,0",)).fields[0]
         self.assertEqual(svc._allowed_match(field, "60,0", "Ширина, см")[0], "60,0")
 
-    def test_invalid_donor_value_is_visible_even_with_valid_original(self):
+    def test_only_a_different_dictionary_proposal_conflicts_with_exact_original(self):
         template = self.template()
-        for raw, status in [("совершенно другое", "conflict"), ("A+++", "kept")]:
+        for current, raw, expected_status, expected_proposal in (
+            ("A++", "совершенно другое", "kept", ""),
+            ("A++", "A+++", "kept", ""),
+            ("A", "A+++", "conflict", "A++"),
+        ):
             for method in ["parser", "gpt"]:
-                with self.subTest(raw=raw, method=method):
-                    product = self.product(template, "A++", mode="auto_all")
+                with self.subTest(current=current, raw=raw, method=method):
+                    product = self.product(template, current, mode="auto_all")
                     if method == "parser":
                         svc.apply_parsed_attributes(self.db, product, [{"name": "Класс", "value": raw}], source="Donor", priority=0)
                     else:
                         ai.apply_analysis(self.db, product, self.analyze(product, "Класс", raw), source_url=product.source_url)
-                    self.assertEqual(product.values[0].status, status)
-                    self.assertEqual(product.values[0].final_value, "A++")
+                    self.assertEqual(product.values[0].status, expected_status)
+                    self.assertEqual(product.values[0].final_value, current)
+                    self.assertEqual(product.values[0].proposed_value, expected_proposal)
                     self.assertEqual(product.values[0].source_details["unknown_values"][0]["value"], raw)
+
+    def test_exact_original_rule_is_generic_for_text_and_numeric_attributes(self):
+        cases = (
+            (
+                "Размораживание морозильной камеры",
+                ("No Frost", "Ручное"),
+                "select",
+                "No Frost",
+                (
+                    ("Система без инея (no frost)", "в морозильном отделении", ["No Frost"]),
+                    ("Система размораживания м.к.", "автоматическая", []),
+                ),
+            ),
+            (
+                "Уровень шума, дБ",
+                ("41", "42"),
+                "number",
+                "41",
+                (("Уровень шума", "неопределенное пояснение", []),),
+            ),
+        )
+        for name, allowed, value_type, current, unknown in cases:
+            with self.subTest(name=name):
+                template = self.template(name, allowed, value_type)
+                product = self.product(template, current)
+                value = product.values[0]
+                svc.apply_parsed_attributes(
+                    self.db,
+                    product,
+                    [{"name": name, "value": current}],
+                    source="Exact donor",
+                    priority=0,
+                )
+                for source_name, raw, suggestions in unknown:
+                    svc.record_unknown_value(
+                        product,
+                        value,
+                        raw_value=raw,
+                        source="ChatGPT",
+                        source_name=source_name,
+                        suggestions=suggestions,
+                        reason="Значения нет в справочнике",
+                    )
+                self.assertEqual(value.status, "kept")
+                self.assertEqual(value.final_value, current)
+                self.assertEqual(value.proposed_value, "")
+                self.assertEqual(len(value.source_details["unknown_values"]), len(unknown))
+
+    def test_empty_original_with_different_source_values_is_always_a_suggestion(self):
+        for value_type in ("select", "number"):
+            for current in ("", "-"):
+                with self.subTest(value_type=value_type, current=current):
+                    template = self.template(
+                        f"Количество полок {value_type} {current or 'empty'}",
+                        ("1", "4"),
+                        value_type,
+                    )
+                    product = self.product(template, current, mode="auto_all")
+                    value = product.values[0]
+                    svc.apply_candidate(
+                        product,
+                        value,
+                        value="1",
+                        confidence=76,
+                        source="Donor A",
+                        reason="Точное значение справочника",
+                        priority=0,
+                        source_name=template.fields[0].name,
+                    )
+                    svc.apply_candidate(
+                        product,
+                        value,
+                        value="4",
+                        confidence=85,
+                        source="ChatGPT",
+                        reason="Точное значение справочника",
+                        priority=90,
+                        source_name=template.fields[0].name,
+                    )
+
+                    self.assertEqual(value.status, "suggested")
+                    self.assertEqual(value.proposed_value, "1")
+                    self.assertEqual(value.final_value, "")
+                    svc.refresh_batch_summary(product.batch)
+                    self.assertEqual(product.batch.summary["suggestions"], 1)
+                    self.assertEqual(product.batch.summary["conflicts"], 0)
+
+    def test_saved_empty_conflict_with_source_proposals_is_repaired_on_read(self):
+        template = self.template("Количество полок", ("1", "4"), "number")
+        product = self.product(template)
+        value = product.values[0]
+        for proposed, confidence, priority, source in (
+            ("1", 76, 0, "Donor"),
+            ("4", 85, 90, "ChatGPT"),
+        ):
+            svc.apply_candidate(
+                product,
+                value,
+                value=proposed,
+                confidence=confidence,
+                source=source,
+                reason="Точное значение справочника",
+                priority=priority,
+                source_name="Количество полок",
+            )
+        value.status = "conflict"
+        value.proposed_value = ""
+        value.reason = "Источники предлагают разные значения"
+
+        serialized = svc.serialize_product(product, detailed=True)["values"][0]
+
+        self.assertEqual(serialized["status"], "suggested")
+        self.assertEqual(serialized["proposed_value"], "1")
+        self.assertEqual(serialized["final_value"], "")
 
     def test_confirmed_original_clears_stale_alternative_after_reanalysis(self):
         template = self.template()
@@ -1155,6 +1316,124 @@ class AttributeReviewRulesTest(unittest.TestCase):
         self.assertEqual(lower, upper)
         self.assertEqual(lower[0], "")
         self.assertIn("Встраиваемый", lower[3])
+
+    def test_numeric_units_are_used_for_matching_but_not_saved_in_values(self):
+        cases = (
+            ("Уровень шума, дБ", "41 дБ", "Уровень шума", "41"),
+            (
+                "Годовое энергопотребление, кВт",
+                "287 кВт·ч/год",
+                "Энергопотребление (кВт/год)",
+                "287",
+            ),
+        )
+        for field_name, raw, source_name, expected in cases:
+            field = self.template(
+                field_name,
+                (expected, "999"),
+                value_type="number",
+            ).fields[0]
+            for value_type in ("number", "select"):
+                with self.subTest(value_type=value_type, raw=raw):
+                    field.value_type = value_type
+                    canonical, confidence, _reason, suggestions = svc._allowed_match(
+                        field,
+                        raw,
+                        source_name,
+                    )
+                    self.assertEqual(canonical, expected)
+                    self.assertEqual(confidence, 100)
+                    self.assertEqual(suggestions, [])
+                    self.assertNotIn("дБ", canonical)
+                    self.assertNotIn("кВт", canonical)
+            field.value_type = "select"
+            product = self.product(
+                field.template,
+                current=raw,
+                source_name=source_name,
+            )
+            stored = product.values[0]
+            self.assertEqual(stored.current_value, raw)
+            self.assertEqual(stored.final_value, expected)
+            self.assertEqual(stored.status, "kept")
+            self.assertFalse(stored.source_details.get("unknown_values"))
+
+    def test_attribute_words_and_explanations_do_not_become_new_values(self):
+        field = self.template(
+            "Тип крепления фасадов",
+            ("Жесткое", "Скользящее"),
+        ).fields[0]
+        for raw, source_name in (
+            ("жесткое крепление", "Крепление фасада"),
+            ("жесткое крепление (система door on door)", "Монтаж двери"),
+        ):
+            with self.subTest(raw=raw):
+                canonical, confidence, reason, suggestions = svc._allowed_match(
+                    field,
+                    raw,
+                    source_name,
+                )
+                self.assertEqual(canonical, "Жесткое")
+                self.assertEqual(confidence, 96)
+                self.assertIn("поясняющей фразы", reason)
+                self.assertEqual(suggestions, [])
+
+        self.assertEqual(
+            svc._allowed_match(field, "гибкое крепление", "Крепление фасада")[0],
+            "",
+        )
+
+        product = self.product(field.template, current="Жесткое")
+        analysis = self.analyze(
+            product,
+            "Монтаж двери",
+            "жесткое крепление (система door on door)",
+        )
+        self.assertEqual(analysis["suggestions"][0]["proposed_value"], "Жесткое")
+        ai.apply_analysis(self.db, product, analysis, source_url=product.source_url)
+        stored = product.values[0]
+        self.assertEqual(stored.status, "kept")
+        self.assertEqual(stored.final_value, "Жесткое")
+        self.assertFalse(stored.source_details.get("unknown_values"))
+
+    def test_saved_unit_conflict_is_repaired_to_bare_dictionary_number(self):
+        template = self.template(
+            "Годовое энергопотребление, кВт",
+            ("287", "300"),
+            value_type="select",
+        )
+        product = self.product(template)
+        value = product.values[0]
+        value.current_value = "287 кВт/ч"
+        value.status = "conflict"
+        value.reason = "Значения нет в справочнике"
+        value.source_details = {
+            "candidates": [{
+                "value": "287",
+                "raw_value": "287",
+                "confidence": 100,
+                "source": "Korting",
+                "source_name": "Энергопотребление (кВт/год)",
+                "url": "https://donor.example/product",
+                "priority": 1,
+                "reason": "Точное значение справочника",
+            }],
+            "unknown_values": [{
+                "value": "287 кВт/ч",
+                "source": "current_site",
+                "source_name": "Годовое энергопотребление, кВт",
+                "url": product.source_url,
+                "reason": "Значения нет в справочнике",
+                "suggestions": [],
+            }],
+        }
+
+        self.assertTrue(svc._repair_confirming_evidence(value))
+        self.assertEqual(value.final_value, "287")
+        self.assertEqual(value.status, "kept")
+        self.assertEqual(value.proposed_value, "")
+        self.assertEqual(value.source_details.get("unknown_values"), [])
+        self.assertTrue(all(item["value"] == "287" for item in value.source_details["candidates"]))
 
     def test_synonyms_and_saved_rules_ignore_case_but_keep_signs(self):
         from models import Brand, Donor

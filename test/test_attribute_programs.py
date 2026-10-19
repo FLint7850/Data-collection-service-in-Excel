@@ -266,15 +266,15 @@ class ProgramAndProposalIntegrationTest(unittest.TestCase):
         self.assertEqual(target.source_details["candidates"][0]["value"], "Очистка барабана")
         self.assertEqual(target.status, "conflict")
 
-    def test_unmatched_source_with_same_nearest_alternative_requires_review_without_a_proposal(self):
+    def test_unmatched_source_with_same_nearest_alternative_confirms_original(self):
         product = self.product(["Отдельностоящий", "Встраиваемый"], name="Тип установки", current="Отдельностоящий")
         target = product.values[0]
         svc.record_unknown_value(product, target, raw_value="Отдельностоящая техника", source="ChatGPT",
                                  source_name="Тип", suggestions=["Отдельностоящий"], reason="Нет в справочнике")
-        self.assertEqual(target.status, "conflict")
+        self.assertEqual(target.status, "kept")
         self.assertEqual(target.proposed_value, "")
         self.assertEqual(svc.refresh_batch_summary(product.batch)["suggestions"], 0)
-        self.assertEqual(svc.refresh_product_status(product), "needs_review")
+        self.assertEqual(svc.refresh_product_status(product), "ready")
 
     def test_historical_same_suggestion_is_removed_but_real_changes_remain(self):
         product = self.product(["Отдельностоящий", "Встраиваемый"], name="Тип установки", current="Отдельностоящий")

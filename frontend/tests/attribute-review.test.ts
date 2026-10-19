@@ -224,6 +224,12 @@ describe("attribute value letter case", () => {
     expect(valueStatusColor(row)).toBe("success");
   });
 
+  it("treats Да and Есть as the same value in both directions", () => {
+    expect(attributeValuesMatch("Да", "Есть")).toBe(true);
+    expect(attributeValuesMatch("есть", "ДА")).toBe(true);
+    expect(attributeValuesMatch("Нет", "Есть")).toBe(false);
+  });
+
   it("preserves all differences other than letter case", () => {
     expect(attributeValuesMatch("a++", "A++")).toBe(true);
     expect(attributeValuesMatch("ё", "Ё")).toBe(true);

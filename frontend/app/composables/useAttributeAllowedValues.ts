@@ -1,6 +1,5 @@
 import { attributeAssistantService as api } from "~/services/attribute-assistant.service";
 import type { AttributeValue } from "~/types/attribute-assistant";
-import { displayedProposal } from "~/utils/attribute-assistant";
 import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
 import { createLatestRequestCoordinator, isAbortError } from "~/utils/latest-request";
 
@@ -36,7 +35,14 @@ export function useAttributeAllowedValues(
     function optionsFor(value: AttributeValue) {
         const loaded = allowedOptionCache.value[value.id] || value.allowed_values;
         const result = [...loaded];
-        const pinned = [value.final_value, displayedProposal(value)]
+        // Only canonical dictionary-backed values may be selectable here.
+        // A raw unknown is shown in source evidence and must not masquerade as
+        // an allowed option merely because it is the current proposal text.
+        const pinned = [
+            value.final_value,
+            value.proposed_value,
+            ...(value.source_details.candidates || []).map((item) => item.value),
+        ]
             .flatMap((item) => value.is_composite ? item.split("/") : [item])
             .map((item) => item.trim())
             .filter((item) => item && item !== "-");
