@@ -1,3 +1,4 @@
+import gzip
 import json
 import tempfile
 import threading
@@ -943,6 +944,109 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(url, expected)
         self.assertIn("карте сайта", reason)
         crawl.assert_not_called()
+
+    def test_large_sitemap_is_parsed_incrementally_past_html_page_limit(self):
+        target = "https://example.com/catalog/mdre371fge01m/"
+        xml = (
+            b'<?xml version="1.0" encoding="UTF-8"?><urlset>'
+            + b"<!--"
+            + (b"x" * (6 * 1024 * 1024))
+            + b"-->"
+            + f"<url><loc>{target}</loc></url></urlset>".encode()
+        )
+
+        locations, root_kind = service._parse_sitemap_chunks(
+            (xml[index:index + 65536] for index in range(0, len(xml), 65536))
+        )
+        compressed_locations, compressed_root = service._parse_sitemap_chunks([
+            gzip.compress(f"<urlset><url><loc>{target}</loc></url></urlset>".encode())
+        ])
+
+        self.assertEqual(root_kind, "urlset")
+        self.assertEqual(locations, [target])
+        self.assertEqual(compressed_root, "urlset")
+        self.assertEqual(compressed_locations, [target])
+
+    def test_sitemap_index_accepts_extensionless_query_children(self):
+        index_url = "https://example.com/sitemap.php"
+        child_url = "https://example.com/sitemap.php?region=msk"
+        target = "https://example.com/catalog/mdre371fge01m/"
+
+        def fake_read(url):
+            if url == index_url:
+                return [child_url], "sitemapindex", index_url
+            if url == child_url:
+                return [target], "urlset", child_url
+            raise RuntimeError(url)
+
+        with patch.object(service, "_site_sitemap_urls", return_value=[index_url]), patch.object(
+            service, "_read_public_sitemap", side_effect=fake_read
+        ):
+            result = service._find_in_sitemaps(
+                "https://example.com/",
+                service.normalize_model("MDRE371FGE01M"),
+            )
+
+        self.assertEqual(result, target)
+
+    def test_internal_search_form_finds_exact_model_link(self):
+        home = """
+            <form action="/search/" method="get" role="search">
+                <input type="hidden" name="section" value="catalog">
+                <input type="search" name="q" placeholder="Поиск">
+            </form>
+        """
+        expected = "https://example.com/catalog/midea/mdre371fge01m/"
+
+        def fake_fetch(url, *args, **kwargs):
+            if url == "https://example.com/":
+                return home, url
+            if url.startswith("https://example.com/search/"):
+                return f'<a href="{expected}">Midea MDRE371FGE01M</a>', url
+            raise RuntimeError(url)
+
+        with patch.object(service, "fetch_public_html", side_effect=fake_fetch):
+            result = service._find_by_internal_search(
+                ["https://example.com/catalog/fridges/"],
+                service.normalize_model("MDRE371FGE01M"),
+                "MDRE371FGE01M",
+            )
+
+        self.assertEqual(result, expected)
+
+    def test_catalog_crawl_does_not_let_product_cards_starve_category_navigation(self):
+        root = "https://example.com/"
+        map_url = "https://example.com/map/"
+        category = "https://example.com/catalog/midea/"
+        expected = category + "mdre371fge01m.html"
+        product_cards = "".join(
+            f'<a href="/catalog/midea/unrelated-{index}.html">'
+            f'Встраиваемый холодильник Midea {index}</a>'
+            for index in range(30)
+        )
+        fetched: list[str] = []
+
+        def fake_fetch(url, *args, **kwargs):
+            fetched.append(url)
+            if url == root:
+                return product_cards + f'<a href="{category}">Холодильники Midea</a>', url
+            if url == map_url:
+                return "<a href='/delivery/'>Доставка</a>", url
+            if url == category:
+                return f'<a href="{expected}">Midea MDRE371FGE01M</a>', url
+            return "", url
+
+        with patch.object(service, "fetch_public_html", side_effect=fake_fetch):
+            result = service._find_by_catalog_crawl(
+                [root, map_url],
+                service.normalize_model("MDRE371FGE01M"),
+                product_name="Холодильник встраиваемый Midea MDRE371FGE01M",
+                category="Встраиваемые холодильники",
+                max_pages=4,
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(fetched[:3], [root, map_url, category])
 
     def test_related_model_validation_rejects_non_product_page(self):
         donor = Donor(

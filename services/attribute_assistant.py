@@ -16,6 +16,8 @@ import re
 import socket
 import threading
 import uuid
+import xml.etree.ElementTree as ET
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
@@ -25,7 +27,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import chardet
 import requests
@@ -172,11 +174,24 @@ SPECIFICATION_IGNORED_NAMES = {
     "показать все характеристики",
     "показать все",
     "показать всё",
+    "открыть все характеристики",
+    "открыть все параметры",
+    "развернуть характеристики",
     "скрыть характеристики",
+    "свернуть характеристики",
     "скрыть",
     "смотреть все",
     "смотреть всё",
 }
+
+# Last-resort structural discovery for stores that render many specification
+# rows but give their enclosing block no useful semantic id/class or tab target.
+# The thresholds are intentionally conservative to avoid treating delivery,
+# payment, FAQ or product-card grids as characteristics.
+MIN_STRUCTURAL_SPECIFICATION_ROWS = 6
+MIN_UNLABELED_STRUCTURAL_SPECIFICATION_ROWS = 10
+MAX_STRUCTURAL_ANCESTOR_DEPTH = 8
+MAX_DENSITY_SPECIFICATION_ROOTS = 4
 
 UI_NOISE_SELECTOR = (
     "script,style,svg,canvas,noscript,template,.glossary-tooltip,.tooltip,.popover,"
@@ -1862,6 +1877,203 @@ def _structural_group_name(row: Any, root: Any) -> str:
     return ""
 
 
+def _density_candidate_rows(soup: BeautifulSoup) -> list[tuple[Any, str, str]]:
+    """Detect plausible label/value rows once for the density fallback."""
+
+    rows: list[tuple[Any, str, str]] = []
+    seen: set[int] = set()
+
+    for row in soup.find_all(["div", "li", "section", "article"], recursive=True):
+        row_key = id(row)
+        if row_key in seen:
+            continue
+
+        # Cheap pre-filter before the more expensive structural analysis. Real
+        # specification rows normally contain only a few direct elements; the
+        # helper may still discard visual dot/separator elements afterwards.
+        direct_tags = [
+            child
+            for child in row.find_all(recursive=False)
+            if getattr(child, "name", None)
+            and child.name not in {"script", "style", "svg", "canvas", "noscript", "template"}
+        ]
+        if len(direct_tags) < 2 or len(direct_tags) > 5:
+            continue
+
+        parts = _structural_row_parts(row)
+        if parts is None:
+            continue
+
+        name, value = parts
+        rows.append((row, name, value))
+        seen.add(row_key)
+
+    return rows
+
+
+def _nearby_specification_heading(node: Any) -> bool:
+    """Return whether a nearby short heading describes a specification block."""
+
+    # Standard heading immediately above/around the candidate.
+    heading = node.find_previous(re.compile(r"^h[1-6]$", re.IGNORECASE))
+    if heading is not None:
+        text = _text_without_ui_noise(heading)
+        if len(text) <= 160 and SPECIFICATION_HEADING_RE.search(text):
+            return True
+
+    # Many storefront constructors use a plain div/span instead of h2/h3.
+    # Only inspect a few nearby siblings; never scan arbitrary page text.
+    branch = node
+    for _depth in range(3):
+        if branch is None or not getattr(branch, "name", None):
+            break
+        sibling = branch.find_previous_sibling()
+        checked = 0
+        while sibling is not None and checked < 4:
+            checked += 1
+            if not getattr(sibling, "name", None):
+                sibling = sibling.previous_sibling
+                continue
+            text = _text_without_ui_noise(sibling)
+            if not text:
+                sibling = sibling.find_previous_sibling()
+                continue
+            if len(text) <= 120 and SPECIFICATION_HEADING_RE.search(text):
+                return True
+            # A large content block means the nearby-heading window ended.
+            if len(text) > 240:
+                break
+            sibling = sibling.find_previous_sibling()
+        branch = getattr(branch, "parent", None)
+
+    return False
+
+
+def _density_specification_roots(soup: BeautifulSoup) -> list[Any]:
+    """Find unnamed specification sections by repeated label/value structure.
+
+    Rows are detected once and attributed to a bounded ancestor chain. This
+    avoids rescanning every possible container recursively and keeps the
+    fallback practical on large product pages.
+    """
+
+    candidate_rows = _density_candidate_rows(soup)
+    if len(candidate_rows) < MIN_STRUCTURAL_SPECIFICATION_ROWS:
+        return []
+
+    # BeautifulSoup tags compare structurally, so object ids are used as the
+    # in-memory identity for aggregation.
+    aggregates: dict[int, dict[str, Any]] = {}
+
+    for row, name, _value in candidate_rows:
+        ancestor = getattr(row, "parent", None)
+        depth = 0
+
+        while ancestor is not None and depth < MAX_STRUCTURAL_ANCESTOR_DEPTH:
+            tag_name = str(getattr(ancestor, "name", "") or "").lower()
+
+            if tag_name in {"div", "section", "article", "main", "ul", "ol"}:
+                bucket = aggregates.setdefault(
+                    id(ancestor),
+                    {
+                        "node": ancestor,
+                        "rows": set(),
+                        "names": set(),
+                    },
+                )
+                bucket["rows"].add(id(row))
+                name_key = normalize_key(name)
+                if name_key:
+                    bucket["names"].add(name_key)
+
+            if tag_name in {"body", "html"}:
+                break
+
+            ancestor = getattr(ancestor, "parent", None)
+            depth += 1
+
+    ranked: list[tuple[float, int, int, Any]] = []
+
+    for bucket in aggregates.values():
+        node = bucket["node"]
+        row_count = len(bucket["rows"])
+        unique_names = len(bucket["names"])
+
+        if row_count < MIN_STRUCTURAL_SPECIFICATION_ROWS:
+            continue
+        if unique_names < MIN_STRUCTURAL_SPECIFICATION_ROWS:
+            continue
+
+        descendant_count = sum(1 for _ in node.find_all(True))
+        if descendant_count <= 0:
+            continue
+
+        density = row_count / descendant_count
+
+        # Very diffuse containers are usually wrappers for the whole product
+        # page rather than the characteristics section itself.
+        if density < 0.035 and descendant_count > row_count * 24:
+            continue
+
+        marker = _node_marker(node)
+        semantic_marker = bool(
+            marker and SPECIFICATION_CONTAINER_RE.search(marker)
+        )
+        nearby_heading = _nearby_specification_heading(node)
+
+        # Six rows are enough when the DOM itself says that this is a
+        # specification section. With no semantic/heading evidence, require a
+        # larger repeated block to keep ordinary delivery/payment lists out.
+        if (
+            not semantic_marker
+            and not nearby_heading
+            and row_count < MIN_UNLABELED_STRUCTURAL_SPECIFICATION_ROWS
+        ):
+            continue
+
+        if unique_names / row_count < 0.65:
+            continue
+
+        score = float(row_count * 20 + unique_names * 5)
+
+        if semantic_marker:
+            score += 40
+        if nearby_heading:
+            score += 30
+
+        # Prefer the most local/high-density container when the same rows are
+        # visible through several nested ancestors.
+        score += min(density, 1.0) * 100
+        ranked.append((score, row_count, -descendant_count, node))
+
+    ranked.sort(
+        key=lambda item: (item[0], item[1], item[2]),
+        reverse=True,
+    )
+
+    selected: list[Any] = []
+
+    for _score, _row_count, _size, node in ranked:
+        # If a more precise selected child is already inside this candidate,
+        # the broad ancestor adds nothing and may pull unrelated page content.
+        if any(node in getattr(existing, "parents", []) for existing in selected):
+            continue
+
+        # If this candidate is a more precise child of an already selected
+        # ancestor, replace the broad ancestor.
+        selected = [
+            existing
+            for existing in selected
+            if existing not in getattr(node, "parents", [])
+        ]
+
+        selected.append(node)
+        if len(selected) >= MAX_DENSITY_SPECIFICATION_ROOTS:
+            break
+
+    return selected
+
+
 def _structural_specification_roots(soup: BeautifulSoup) -> list[Any]:
     """Find specification sections without depending on site-specific CSS."""
 
@@ -1936,14 +2148,28 @@ def _structural_specification_roots(soup: BeautifulSoup) -> list[Any]:
                 add(sibling, 90)
             sibling = sibling.find_next_sibling()
 
-    # 3. Fallback: semantic id/class names.  Unlike the first two branches this
+    # 3. Fallback: semantic id/class names. Unlike the first two branches this
     # one must also prove that the candidate actually contains a spec-like row.
     for node in soup.find_all(["div", "section", "article", "main", "table", "dl"]):
         marker = _node_marker(node)
         if marker and SPECIFICATION_CONTAINER_RE.search(marker):
             add(node, 60, require_shape=True)
 
-    return [node for _priority, node in sorted(roots, key=lambda item: item[0], reverse=True)]
+    # 4. Last generic fallback: some stores expose a large repeated list of
+    # label/value rows but give the wrapper no meaningful id/class and do not
+    # connect a "Параметры" tab to it semantically. Detect those blocks by
+    # structural density rather than adding donor-specific selectors.
+    for node in _density_specification_roots(soup):
+        add(node, 40, require_shape=True)
+
+    return [
+        node
+        for _priority, node in sorted(
+            roots,
+            key=lambda item: item[0],
+            reverse=True,
+        )
+    ]
 
 
 def _append_structural_specification_attributes(
@@ -3044,6 +3270,84 @@ def _sitemap_locations(xml: str) -> list[str]:
     return [clean_text(item) for item in re.findall(r"<loc\b[^>]*>(.*?)</loc>", xml, re.I | re.S) if clean_text(item)]
 
 
+SITEMAP_MAX_BYTES = 128 * 1024 * 1024
+SITEMAP_MAX_LOCATIONS = 500_000
+SITEMAP_MAX_FILES = 64
+
+
+def _parse_sitemap_chunks(
+    chunks: Iterable[bytes],
+    *,
+    max_bytes: int = SITEMAP_MAX_BYTES,
+    max_locations: int = SITEMAP_MAX_LOCATIONS,
+) -> tuple[list[str], str]:
+    """Parse a sitemap incrementally, including raw ``.xml.gz`` payloads."""
+
+    parser = ET.XMLPullParser(events=("start", "end"))
+    locations: list[str] = []
+    root_kind = ""
+    decoded_size = 0
+    decompressor: zlib.decompressobj | None = None
+    first_chunk = True
+
+    def drain_events() -> None:
+        nonlocal root_kind
+        for event, element in parser.read_events():
+            tag = str(element.tag).rsplit("}", 1)[-1].casefold()
+            if event == "start" and not root_kind:
+                root_kind = tag
+            if event == "end" and tag == "loc":
+                location = clean_text(element.text)
+                if location:
+                    locations.append(location)
+                    if len(locations) > max_locations:
+                        raise ValueError("В карте сайта слишком много URL")
+            if event == "end":
+                element.clear()
+
+    def consume(payload: bytes) -> None:
+        nonlocal decoded_size
+        if not payload:
+            return
+        decoded_size += len(payload)
+        if decoded_size > max_bytes:
+            raise ValueError("Карта сайта превышает допустимый размер")
+        parser.feed(payload)
+        drain_events()
+
+    for raw_chunk in chunks:
+        if not raw_chunk:
+            continue
+        if first_chunk:
+            first_chunk = False
+            if raw_chunk.startswith(b"\x1f\x8b"):
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        consume(decompressor.decompress(raw_chunk) if decompressor else raw_chunk)
+    if decompressor:
+        consume(decompressor.flush())
+    parser.close()
+    drain_events()
+    return locations, root_kind
+
+
+def _read_public_sitemap(url: str) -> tuple[list[str], str, str]:
+    """Fetch a sitemap without applying the much smaller ordinary-page limit."""
+
+    with requests.Session() as session:
+        session.trust_env = False
+        response, final_url = _open_public_response(
+            session,
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AttributeAssistant/1.0)"},
+        )
+        try:
+            response.raise_for_status()
+            locations, root_kind = _parse_sitemap_chunks(response.iter_content(65536))
+            return locations, root_kind, final_url
+        finally:
+            response.close()
+
+
 def _site_sitemap_urls(site_url: str) -> list[str]:
     parsed = urlparse(clean_text(site_url))
     if not parsed.scheme or not parsed.netloc:
@@ -3062,7 +3366,11 @@ def _site_sitemap_urls(site_url: str) -> list[str]:
     return list(dict.fromkeys(result))
 
 
-def _find_in_sitemaps(site_url: str, wanted: str, max_sitemaps: int = 12) -> str:
+def _find_in_sitemaps(
+    site_url: str,
+    wanted: str,
+    max_sitemaps: int = SITEMAP_MAX_FILES,
+) -> str:
     queue = _site_sitemap_urls(site_url)
     visited: set[str] = set()
     while queue and len(visited) < max_sitemaps:
@@ -3071,20 +3379,157 @@ def _find_in_sitemaps(site_url: str, wanted: str, max_sitemaps: int = 12) -> str
             continue
         visited.add(sitemap_url)
         try:
-            xml, final_url = fetch_public_html(sitemap_url)
+            locations, root_kind, final_url = _read_public_sitemap(sitemap_url)
         except Exception:
             continue
-        locations = _sitemap_locations(xml)
         for location in locations:
             absolute = urljoin(final_url, location)
             if _same_site(site_url, absolute) and wanted and wanted in normalize_model(absolute):
                 return absolute
-        for location in locations:
+        # A sitemap index may point to extensionless or query-string endpoints,
+        # so its XML root is authoritative. Path heuristics are only a fallback
+        # for imperfect sitemap documents.
+        if root_kind == "sitemapindex":
+            nested = locations
+        elif root_kind == "urlset":
+            nested = []
+        else:
+            nested = [
+                location
+                for location in locations
+                if urlparse(location).path.casefold().endswith((".xml", ".xml.gz"))
+                or "sitemap" in urlparse(location).path.casefold()
+            ]
+        for location in nested:
             absolute = urljoin(final_url, location)
-            path = urlparse(absolute).path.casefold()
-            if _same_site(site_url, absolute) and (path.endswith(".xml") or "sitemap" in path):
-                if absolute not in visited and absolute not in queue:
-                    queue.append(absolute)
+            if _same_site(site_url, absolute) and absolute not in visited and absolute not in queue:
+                queue.append(absolute)
+    return ""
+
+
+_SEARCH_INPUT_NAMES = {
+    "q", "query", "s", "search", "searchtext", "search_text", "text", "term", "keyword",
+}
+_SEARCH_MARKERS = ("search", "find", "poisk", "поиск")
+
+
+def _internal_search_urls(html: str, page_url: str, model: str) -> list[str]:
+    """Build same-site GET requests from genuine search forms on a page."""
+
+    soup = BeautifulSoup(html, "html.parser")
+    result: list[str] = []
+    for form in soup.select("form"):
+        if clean_text(form.get("method") or "get").casefold() != "get":
+            continue
+        action = urljoin(page_url, clean_text(form.get("action")) or page_url)
+        if not _same_site(page_url, action):
+            continue
+        inputs = list(form.select("input[name]"))
+        ranked: list[tuple[int, Any]] = []
+        form_evidence = normalize_key(" ".join([
+            clean_text(form.get("role")),
+            clean_text(form.get("class")),
+            clean_text(form.get("id")),
+            clean_text(form.get("action")),
+        ]))
+        for field in inputs:
+            name = clean_text(field.get("name"))
+            field_type = clean_text(field.get("type") or "text").casefold()
+            evidence = normalize_key(" ".join([
+                name,
+                clean_text(field.get("placeholder")),
+                clean_text(field.get("aria-label")),
+            ]))
+            score = 0
+            if field_type == "search":
+                score += 100
+            if name.casefold() in _SEARCH_INPUT_NAMES:
+                score += 80
+            if any(marker in evidence for marker in _SEARCH_MARKERS):
+                score += 40
+            if any(marker in form_evidence for marker in _SEARCH_MARKERS):
+                score += 20
+            if field_type in {"text", "search"} and score:
+                ranked.append((score, field))
+        if not ranked:
+            continue
+        query_field = max(ranked, key=lambda item: item[0])[1]
+        params = parse_qsl(urlparse(action).query, keep_blank_values=True)
+        for field in inputs:
+            if field is query_field or clean_text(field.get("type")).casefold() != "hidden":
+                continue
+            name = clean_text(field.get("name"))
+            if name:
+                params.append((name, clean_text(field.get("value"))))
+        params.append((clean_text(query_field.get("name")), clean_text(model)))
+        parsed = urlparse(action)
+        search_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True), fragment=""))
+        if search_url not in result:
+            result.append(search_url)
+    return result
+
+
+def _exact_model_link(html: str, page_url: str, site_url: str, wanted: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = [
+        (node.get("href"), clean_text(node.get_text(" ")), clean_text(node.get("title")))
+        for node in soup.select("a[href]")
+    ]
+    candidates.extend(
+        (node.get("href"), "", "")
+        for node in soup.select('link[rel="canonical"][href]')
+    )
+    for href, text, title in candidates:
+        absolute = urljoin(page_url, clean_text(href)).split("#", 1)[0]
+        if not _same_site(site_url, absolute):
+            continue
+        # Ignore the search query itself (usually ?q=MODEL). Evidence must be
+        # present in the linked path or in the visible result label.
+        path = unquote(urlparse(absolute).path)
+        if wanted and wanted in normalize_model(f"{path} {text} {title}"):
+            return absolute
+    return ""
+
+
+def _find_by_internal_search(
+    start_urls: list[str],
+    wanted: str,
+    model: str,
+    *,
+    max_forms: int = 4,
+) -> str:
+    """Use search forms exposed by the site, without domain-specific rules."""
+
+    roots: list[str] = []
+    seen_hosts: set[str] = set()
+    for item in start_urls:
+        parsed = urlparse(clean_text(item))
+        host = _host_key(item)
+        if not parsed.scheme or not parsed.netloc or not host or host in seen_hosts:
+            continue
+        seen_hosts.add(host)
+        roots.append(f"{parsed.scheme}://{parsed.netloc}/")
+
+    attempted = 0
+    for root in roots:
+        try:
+            home_html, home_url = fetch_public_html(root)
+        except Exception:
+            continue
+        for search_url in _internal_search_urls(home_html, home_url, model):
+            if attempted >= max_forms:
+                return ""
+            attempted += 1
+            try:
+                result_html, result_url = fetch_public_html(search_url)
+            except Exception:
+                continue
+            # Some searches redirect an exact hit straight to the product.
+            if wanted in normalize_model(unquote(urlparse(result_url).path)):
+                return result_url
+            found = _exact_model_link(result_html, result_url, root, wanted)
+            if found:
+                return found
     return ""
 
 
@@ -3122,9 +3567,42 @@ def _catalog_link_score(anchor_text: str, href: str, tokens: set[str]) -> int:
     path = urlparse(href).path.casefold()
     if any(part in path for part in ("catalog", "product", "tovar", "item", "goods", "shop")):
         score += 2
+    parsed = urlparse(href)
+    last_segment = unquote(parsed.path.rstrip("/").rsplit("/", 1)[-1])
+    product_like = (
+        parsed.path.casefold().endswith((".html", ".htm"))
+        or any(part in parsed.path.casefold() for part in ("/product/", "/tovar/", "/item/", "/goods/"))
+        or bool(re.search(r"[a-zа-я]\D*\d|\d\D*[a-zа-я]", last_segment, re.I))
+    )
+    if parsed.path.endswith("/") and not parsed.query:
+        score += 12
+    if product_like:
+        # Exact-model product links are returned before scoring. This penalty
+        # prevents unrelated cards from consuming the crawl budget ahead of
+        # brand/category navigation.
+        score -= 28
+    query_keys = {key.casefold() for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}
+    if query_keys & {"sort", "order", "view", "limit", "filter", "price", "brand", "page_size"}:
+        score -= 50
     if any(part in path for part in ("login", "account", "cart", "compare", "favorite", "delivery", "contact", "blog", "news")):
         score -= 20
     return score
+
+
+def _canonical_crawl_url(url: str) -> str:
+    parsed = urlparse(clean_text(url))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    ignored = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "yclid", "gclid", "fbclid", "from", "ref", "referrer", "session", "sid",
+    }
+    params = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.casefold() not in ignored
+    ]
+    return urlunparse(parsed._replace(query=urlencode(params, doseq=True), fragment=""))
 
 
 def _find_by_catalog_crawl(
@@ -3133,17 +3611,24 @@ def _find_by_catalog_crawl(
     *,
     product_name: str = "",
     category: str = "",
-    max_pages: int = 24,
-    max_depth: int = 2,
+    max_pages: int = 48,
+    max_depth: int = 3,
 ) -> str:
-    roots = [clean_text(item) for item in start_urls if clean_text(item)]
+    roots = list(dict.fromkeys(
+        canonical
+        for item in start_urls
+        if (canonical := _canonical_crawl_url(item))
+    ))
     if not roots:
         return ""
     canonical_root = roots[0]
     tokens = _search_tokens(product_name, category)
+    # Every explicitly configured root gets one fair chance before discovered
+    # descendants. A high-scoring product grid can no longer starve the site
+    # root, map or the relevant category root.
     queue: list[tuple[str, int, int]] = [
-        (item, 0, _catalog_link_score("", item, tokens))
-        for item in roots
+        (item, 0, 1_000_000 + _catalog_link_score("", item, tokens) - index)
+        for index, item in enumerate(roots)
     ]
     queued = {item for item in roots}
     visited: set[str] = set()
@@ -3164,7 +3649,9 @@ def _find_by_catalog_crawl(
             href = clean_text(anchor.get("href"))
             if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
                 continue
-            absolute = urljoin(final_url, href).split("#", 1)[0]
+            absolute = _canonical_crawl_url(urljoin(final_url, href))
+            if not absolute:
+                continue
             if not _same_site(canonical_root, absolute):
                 continue
             text = clean_text(anchor.get_text(" "))
@@ -3181,7 +3668,7 @@ def _find_by_catalog_crawl(
                 continue
             candidates.append((_catalog_link_score(f"{text} {title}", absolute, tokens), absolute))
         # Keep navigation bounded, but prefer links semantically related to the current product/category.
-        for score, absolute in sorted(candidates, key=lambda pair: pair[0], reverse=True)[:48]:
+        for score, absolute in sorted(candidates, key=lambda pair: pair[0], reverse=True)[:64]:
             queue.append((absolute, depth + 1, score))
             queued.add(absolute)
     return ""
@@ -3225,6 +3712,11 @@ def _donor_url_candidates(
         if found and found not in yielded:
             yielded.add(found)
             yield found, "Найдена по модели в карте сайта"
+
+    found = _find_by_internal_search(roots, wanted, model)
+    if found and found not in yielded:
+        yielded.add(found)
+        yield found, "Найдена по модели через поиск сайта"
 
     found = _find_by_catalog_crawl(
         roots,
