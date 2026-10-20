@@ -190,12 +190,34 @@ def _program_registry(field: Any):
     # rename, deactivation or synonym edit needs no code change or cache reset.
     for item in active:
         parts = _registry_parts(field, item)
-        canonical = "/".join(sorted({aliases[program_value_key(part)] for part in parts}, key=program_value_key))
+
+        canonical = "/".join(
+            sorted(
+                {
+                    aliases[program_value_key(part)]
+                    for part in parts
+                },
+                key=program_value_key,
+            )
+        )
+
         for synonym in item.synonyms:
             key = program_value_key(synonym.synonym)
-            if key:
-                (explicit if len(parts) == 1 else whole).setdefault(key, set()).add(canonical)
+
+            if not key:
+                continue
+
+            # Настоящее значение справочника всегда важнее синонима.
+            if key in components:
+                continue
+
+            (
+                explicit if len(parts) == 1 else whole
+            ).setdefault(key, set()).add(canonical)
     for key, targets in explicit.items():
+        if key in components:
+            continue
+
         if len(targets) == 1:
             aliases[key] = next(iter(targets))
         else:
