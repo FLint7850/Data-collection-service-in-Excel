@@ -119,9 +119,65 @@ DIMENSION_AXIS_LABELS = {
 HEADER_GROUP_RE = re.compile(r"^(.*?)\s*\(([^()]*)\)\s*$")
 WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
 SPECIFICATION_HEADING_RE = re.compile(
-    r"(?:характеристик|параметр|спецификац|specification|properties)",
+    r"(?:"
+    r"характеристик|"
+    r"параметр|"
+    r"техническ(?:ие|ая|их)?\s+(?:данн|характеристик)|"
+    r"спецификац|"
+    r"specifications?|"
+    r"\bspecs?\b|"
+    r"properties|"
+    r"attributes?|"
+    r"technical\s+(?:data|specifications?|specs?)"
+    r")",
     re.IGNORECASE,
 )
+
+# Class/id marker of a characteristics container. Boundaries are deliberate:
+# "attribute" should match "product-attributes" but not an unrelated word
+# such as "attribution".
+SPECIFICATION_CONTAINER_RE = re.compile(
+    r"(?:^|[-_\s])(?:"
+    r"spec(?:ification)?s?|"
+    r"characteristics?|"
+    r"propert(?:y|ies)|"
+    r"parameters?|"
+    r"attributes?|"
+    r"technical[-_\s]?(?:data|specs?|specifications?)"
+    r")(?:$|[-_\s])",
+    re.IGNORECASE,
+)
+
+STRUCTURAL_GROUP_RE = re.compile(
+    r"(?:^|[-_\s])(?:"
+    r"header|heading|title|caption|group(?:[-_\s]?(?:name|title))?|"
+    r"section(?:[-_\s]?(?:name|title))?"
+    r")(?:$|[-_\s])",
+    re.IGNORECASE,
+)
+
+STRUCTURAL_SEPARATOR_RE = re.compile(
+    r"(?:^|[-_\s])(?:line|separator|delimiter|dots?|leader)(?:$|[-_\s])",
+    re.IGNORECASE,
+)
+
+SPECIFICATION_IGNORED_NAMES = {
+    "характеристики",
+    "характеристики товара",
+    "технические характеристики",
+    "параметры",
+    "параметры товара",
+    "спецификация",
+    "описание",
+    "показать все характеристики",
+    "показать все",
+    "показать всё",
+    "скрыть характеристики",
+    "скрыть",
+    "смотреть все",
+    "смотреть всё",
+}
+
 UI_NOISE_SELECTOR = (
     "script,style,svg,canvas,noscript,template,.glossary-tooltip,.tooltip,.popover,"
     ".tooltip-popper,[data-tooltip-content],[role='tooltip'],dialog,[role='dialog'],"
@@ -1558,20 +1614,315 @@ def _append_parsed_attribute(
 ) -> None:
     clean_name = clean_text(name).rstrip(":").strip()
     clean_value = exact_value_key(value)
+    clean_group = clean_text(group)
     key = (normalize_key(clean_name), exact_value_key(clean_value))
-    if not clean_name or not clean_value or clean_name == clean_value or key in seen:
+    if not clean_name or not clean_value or clean_name == clean_value:
+        return
+    if key in seen:
+        # A fast parser may have found the pair before the structural parser.
+        # Keep one row, but let the later, more contextual pass fill its group.
+        if clean_group:
+            for item in reversed(result["attributes"]):
+                if (
+                    normalize_key(item.get("name")) == key[0]
+                    and exact_value_key(item.get("value")) == key[1]
+                    and not clean_text(item.get("group"))
+                ):
+                    item["group"] = clean_group
+                    break
         return
     result["attributes"].append({
         "name": clean_name,
         "value": clean_value,
-        "group": clean_text(group),
+        "group": clean_group,
     })
     seen.add(key)
 
 
+def _semantic_node_text(node: Any) -> str:
+    """Read visible text or a semantic value stored in an element attribute."""
+
+    if node is None:
+        return ""
+    for attribute in ("content", "value", "data-value"):
+        value = clean_text(node.get(attribute))
+        if value:
+            return value
+    return _text_without_ui_noise(node)
+
+
+def _node_marker(node: Any) -> str:
+    """Return normalized id/class metadata used only as a semantic hint."""
+
+    if node is None or not getattr(node, "name", None):
+        return ""
+    classes = node.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return clean_text(" ".join([
+        clean_text(node.get("id")),
+        *(clean_text(item) for item in classes),
+    ]))
+
+
+def _structural_direct_children(node: Any) -> list[Any]:
+    """Return meaningful direct children, ignoring visual separators."""
+
+    children: list[Any] = []
+    for child in node.find_all(recursive=False):
+        if not getattr(child, "name", None):
+            continue
+        if child.name in {"script", "style", "svg", "canvas", "noscript", "template"}:
+            continue
+        text = _text_without_ui_noise(child)
+        if not text:
+            continue
+        marker = _node_marker(child)
+        if (
+            STRUCTURAL_SEPARATOR_RE.search(marker)
+            and len(text) <= 16
+            and not any(char.isalnum() for char in text)
+        ):
+            continue
+        if len(text) <= 16 and re.fullmatch(r"[\s.:·•…_\-–—]+", text):
+            continue
+        children.append(child)
+    return children
+
+
+def _has_nested_structural_row(node: Any) -> bool:
+    """Reject wrappers whose child/descendant already is a label/value row."""
+
+    if node.find(["table", "dl", "ul", "ol"], recursive=True):
+        return True
+
+    candidates = [node]
+    candidates.extend(
+        node.find_all(["div", "li", "section", "article"], recursive=True)
+    )
+    for checked, nested in enumerate(candidates, start=1):
+        if checked > 40:
+            break
+        if nested.find(["button", "input", "select", "textarea", "form"]):
+            continue
+        children = _structural_direct_children(nested)
+        if len(children) != 2:
+            continue
+        name = _text_without_ui_noise(children[0]).rstrip(":").strip()
+        value = _text_without_ui_noise(children[1])
+        if (
+            name
+            and value
+            and name != value
+            and len(name) <= 240
+            and len(value) <= 2000
+        ):
+            return True
+    return False
+
+
+def _structural_row_parts(row: Any) -> tuple[str, str] | None:
+    """Recognize one generic specification row as a label/value pair."""
+
+    if row is None or not getattr(row, "name", None):
+        return None
+    if row.find(["button", "input", "select", "textarea", "form"]):
+        return None
+
+    children = _structural_direct_children(row)
+    if len(children) != 2:
+        return None
+
+    # A section wrapper can itself have two children: a heading and a container
+    # with the real rows. Never flatten such a wrapper into one false attribute.
+    if any(_has_nested_structural_row(child) for child in children):
+        return None
+
+    name = _text_without_ui_noise(children[0]).rstrip(":").strip()
+    value = _text_without_ui_noise(children[1])
+    name_key = normalize_key(name)
+
+    if not name or not value or name == value:
+        return None
+    if len(name) > 240 or len(value) > 2000:
+        return None
+    if name_key in SPECIFICATION_IGNORED_NAMES:
+        return None
+    if not any(char.isalnum() for char in name):
+        return None
+
+    return name, value
+
+
+def _specification_shape_score(root: Any, limit: int = 3) -> int:
+    """Return a small confidence score that a node actually contains specs."""
+
+    if root is None or not getattr(root, "name", None):
+        return 0
+
+    score = 0
+
+    for row in root.select("table tr"):
+        cells = row.find_all(["th", "td"], recursive=False) or row.find_all(["th", "td"])
+        if len(cells) >= 2 and _text_without_ui_noise(cells[0]) and _text_without_ui_noise(cells[-1]):
+            score += 1
+            if score >= limit:
+                return score
+
+    for term in root.select("dl dt"):
+        definition = term.find_next_sibling("dd")
+        if definition and _text_without_ui_noise(term) and _text_without_ui_noise(definition):
+            score += 1
+            if score >= limit:
+                return score
+
+    semantic_rows = root.select(
+        '[itemprop="additionalProperty"], [data-characteristic], [data-property], [data-attribute]'
+    )
+    if semantic_rows:
+        score += 1
+        if score >= limit:
+            return score
+
+    candidates = [root] if str(root.name).lower() in {"div", "li", "section", "article"} else []
+    candidates.extend(root.find_all(["div", "li", "section", "article"], recursive=True))
+    for row in candidates:
+        if _structural_row_parts(row) is None:
+            continue
+        score += 1
+        if score >= limit:
+            return score
+
+    return score
+
+
+def _looks_like_structural_group(node: Any) -> bool:
+    """Recognize a short heading that names a specification subgroup."""
+
+    if node is None or not getattr(node, "name", None):
+        return False
+    text = _text_without_ui_noise(node)
+    if not text or len(text) > 160 or len(text.split()) > 16:
+        return False
+    if _structural_row_parts(node) is not None:
+        return False
+
+    name = str(node.name).lower()
+    if re.fullmatch(r"h[1-6]", name):
+        return True
+    if clean_text(node.get("role")).casefold() == "heading":
+        return True
+    if STRUCTURAL_GROUP_RE.search(_node_marker(node)):
+        return True
+
+    # Some shops use a plain div/strong with an uppercase group title and no
+    # semantic class. Keep this conservative so values such as "NO FROST" do
+    # not become headings merely because they are uppercase.
+    letters = [char for char in text if char.isalpha()]
+    return bool(
+        letters
+        and len(letters) >= 6
+        and len(text) <= 80
+        and len(text.split()) >= 2
+        and not any(char.isdigit() for char in text)
+        and text.upper() == text
+    )
+
+
+def _structural_group_name(row: Any, root: Any) -> str:
+    """Find the nearest subgroup heading without leaving the specification root."""
+
+    branch = row
+    while branch is not None and branch is not root:
+        sibling = branch.find_previous_sibling()
+        checked = 0
+        while sibling is not None and checked < 6:
+            checked += 1
+            if not getattr(sibling, "name", None):
+                sibling = sibling.previous_sibling
+                continue
+            text = _text_without_ui_noise(sibling)
+            if not text:
+                sibling = sibling.find_previous_sibling()
+                continue
+            if _looks_like_structural_group(sibling):
+                return text
+            # Once another real row is reached, this level has no heading
+            # between the previous row and the current one.
+            if _structural_row_parts(sibling) is not None:
+                break
+            sibling = sibling.find_previous_sibling()
+        branch = getattr(branch, "parent", None)
+
+    for heading in row.find_all_previous(re.compile(r"^h[1-6]$", re.IGNORECASE)):
+        if heading is root or root in getattr(heading, "parents", []):
+            return _text_without_ui_noise(heading)
+        if root not in getattr(row, "parents", []):
+            break
+    return ""
+
+
 def _structural_specification_roots(soup: BeautifulSoup) -> list[Any]:
-    roots: list[Any] = []
+    """Find specification sections without depending on site-specific CSS."""
+
+    roots: list[tuple[int, Any]] = []
     seen: set[int] = set()
+
+    def add(node: Any, priority: int, *, require_shape: bool = False) -> None:
+        if node is None or not getattr(node, "name", None):
+            return
+        if require_shape and _specification_shape_score(node, limit=1) < 1:
+            return
+
+        key = id(node)
+        if key in seen:
+            return
+
+        # Prefer a higher-confidence ancestor (for example a tab target named
+        # "Характеристики") over nested class-based candidates. Conversely, a
+        # high-confidence child must not be discarded because of a vague parent.
+        for existing_priority, existing in roots:
+            if existing is node:
+                return
+            if existing in getattr(node, "parents", []) and existing_priority >= priority:
+                return
+
+        kept: list[tuple[int, Any]] = []
+        for existing_priority, existing in roots:
+            if node in getattr(existing, "parents", []) and priority >= existing_priority:
+                seen.discard(id(existing))
+                continue
+            kept.append((existing_priority, existing))
+        roots[:] = kept
+        roots.append((priority, node))
+        seen.add(key)
+
+    # 1. Strongest signal: a tab/collapse control explicitly called
+    # "Характеристики"/"Specifications" and pointing at a local container.
+    for control in soup.find_all(["a", "button"]):
+        title = _text_without_ui_noise(control)
+        if not title or not SPECIFICATION_HEADING_RE.search(title):
+            continue
+
+        targets: list[str] = []
+        for attribute in ("href", "data-target", "data-bs-target", "aria-controls"):
+            raw_target = clean_text(control.get(attribute))
+            if not raw_target:
+                continue
+            if raw_target.startswith("#"):
+                raw_target = raw_target[1:]
+            elif attribute == "aria-controls":
+                raw_target = raw_target.lstrip("#")
+            else:
+                continue
+            if raw_target:
+                targets.append(raw_target)
+
+        for target_id in dict.fromkeys(targets):
+            add(soup.find(id=target_id), 100)
+
+    # 2. Standard HTML headings followed by the section body.  We intentionally
+    # stop at the next heading of the same/higher level.
     for heading in soup.find_all(re.compile(r"^h[1-6]$", re.IGNORECASE)):
         if not SPECIFICATION_HEADING_RE.search(_text_without_ui_noise(heading)):
             continue
@@ -1581,65 +1932,51 @@ def _structural_specification_roots(soup: BeautifulSoup) -> list[Any]:
             sibling_name = str(getattr(sibling, "name", "") or "").lower()
             if re.fullmatch(r"h[1-6]", sibling_name) and int(sibling_name[1]) <= level:
                 break
-            if sibling_name and id(sibling) not in seen:
-                seen.add(id(sibling))
-                roots.append(sibling)
+            if sibling_name:
+                add(sibling, 90)
             sibling = sibling.find_next_sibling()
-    return roots
+
+    # 3. Fallback: semantic id/class names.  Unlike the first two branches this
+    # one must also prove that the candidate actually contains a spec-like row.
+    for node in soup.find_all(["div", "section", "article", "main", "table", "dl"]):
+        marker = _node_marker(node)
+        if marker and SPECIFICATION_CONTAINER_RE.search(marker):
+            add(node, 60, require_shape=True)
+
+    return [node for _priority, node in sorted(roots, key=lambda item: item[0], reverse=True)]
 
 
 def _append_structural_specification_attributes(
     result: dict[str, Any],
     seen: set[tuple[str, str]],
     soup: BeautifulSoup,
+    roots: list[Any] | None = None,
 ) -> None:
-    """Read repeated two-column rows inside a characteristics section without site CSS."""
+    """Extract generic label/value rows only inside detected specification sections."""
 
-    ignored_names = {
-        "характеристики", "характеристики товара", "параметры", "описание",
-        "показать все характеристики", "скрыть характеристики",
-    }
-    for root in _structural_specification_roots(soup):
-        for row in root.find_all(["div", "li", "section"], recursive=True):
-            if row.find(["button", "input", "select", "textarea", "form"]):
+    processed_rows: set[int] = set()
+    for root in roots if roots is not None else _structural_specification_roots(soup):
+        candidates = [root] if str(getattr(root, "name", "")).lower() in {
+            "div", "li", "section", "article",
+        } else []
+        candidates.extend(root.find_all(["div", "li", "section", "article"], recursive=True))
+
+        for row in candidates:
+            row_key = id(row)
+            if row_key in processed_rows:
                 continue
-            children = [
-                child for child in row.find_all(recursive=False)
-                if getattr(child, "name", None)
-                and child.name not in {"script", "style", "svg", "noscript"}
-                and _text_without_ui_noise(child)
-            ]
-            if len(children) != 2:
+            parts = _structural_row_parts(row)
+            if parts is None:
                 continue
-            # Inline fragments commonly split a label into its title and axis order
-            # (for example, "Габаритные размеры" + "(ШxВxГ)"). Only nested
-            # block collections indicate that this is a wrapper around more rows.
-            if any(
-                len([
-                    nested for nested in child.find_all(recursive=False)
-                    if getattr(nested, "name", None) in {
-                        "div", "li", "section", "table", "dl", "ul", "ol",
-                    }
-                    and _text_without_ui_noise(nested)
-                ]) >= 2
-                for child in children
-            ):
-                continue
-            name = _text_without_ui_noise(children[0]).rstrip(":").strip()
-            value = _text_without_ui_noise(children[1])
-            if (
-                not name
-                or not value
-                or len(name) > 240
-                or len(value) > 2000
-                or normalize_key(name) in ignored_names
-            ):
-                continue
-            group = ""
-            heading = row.find_previous(re.compile(r"^h[3-6]$", re.IGNORECASE))
-            if heading is not None and root in heading.parents:
-                group = _text_without_ui_noise(heading)
-            _append_parsed_attribute(result, seen, name, value, group)
+            name, value = parts
+            _append_parsed_attribute(
+                result,
+                seen,
+                name,
+                value,
+                _structural_group_name(row, root),
+            )
+            processed_rows.add(row_key)
 
 
 def _infer_product_model(name: str, url: str = "", brand: str = "") -> str:
@@ -1818,7 +2155,8 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
         )
 
     # Product sites often render specifications as semantic div/span pairs rather than tables.
-    # Keep the selectors structural so this works across categories without domain-specific code.
+    # These selectors describe common semantic shapes, not individual donor sites.
+    specification_roots = _structural_specification_roots(soup)
     semantic_rows = (
         (".detail-properties__field", ".detail-properties__name", ".detail-properties__value"),
         (".characteristic-list__item", ".characteristic-list__key", ".characteristic-list__val"),
@@ -1830,7 +2168,10 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
         (".property__row", ".property__name", ".property__value"),
         (".parameters__row", ".parameters__name", ".parameters__value"),
         (".parameter__row", ".parameter__name", ".parameter__value"),
+        ('[itemprop="additionalProperty"]', '[itemprop="name"]', '[itemprop="value"]'),
         ("[data-characteristic]", "[data-characteristic-name]", "[data-characteristic-value]"),
+        ("[data-property]", "[data-property-name]", "[data-property-value]"),
+        ("[data-attribute]", "[data-attribute-name]", "[data-attribute-value]"),
     )
     for row_selector, name_selector, value_selector in semantic_rows:
         for row in soup.select(row_selector):
@@ -1838,24 +2179,50 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
             value_node = row.select_one(value_selector)
             if not name_node or not value_node:
                 continue
-            group = ""
-            block = row.find_parent(
-                class_=re.compile(r"(?:characteristic|specification|propert|parameter).*(?:block|group)", re.I)
+
+            containing_root = next(
+                (
+                    root
+                    for root in specification_roots
+                    if root is row or root in getattr(row, "parents", [])
+                ),
+                None,
             )
-            if block:
-                heading = block.select_one(
-                    ".characteristic-list__caption,.characteristics__title,.characteristic__title,.specifications__title,"
-                    ".specification__title,.properties__title,.parameters__title,h2,h3,h4"
+            group = (
+                _structural_group_name(row, containing_root)
+                if containing_root is not None
+                else ""
+            )
+            if not group:
+                block = row.find_parent(
+                    class_=re.compile(
+                        r"(?:characteristic|specification|propert|parameter|attribute)"
+                        r".*(?:block|box|group|section)",
+                        re.I,
+                    )
                 )
-                group = _text_without_ui_noise(heading) if heading else ""
+                if block:
+                    heading = block.select_one(
+                        ".characteristic-list__caption,.characteristics__title,.characteristic__title,"
+                        ".specifications__title,.specification__title,.properties__title,.parameters__title,"
+                        "[role='heading'],h2,h3,h4,h5,h6"
+                    )
+                    group = _text_without_ui_noise(heading) if heading else ""
+
             _append_parsed_attribute(
                 result,
                 seen,
-                _text_without_ui_noise(name_node),
-                _text_without_ui_noise(value_node),
+                _semantic_node_text(name_node),
+                _semantic_node_text(value_node),
                 group,
             )
-    _append_structural_specification_attributes(result, seen, soup)
+
+    _append_structural_specification_attributes(
+        result,
+        seen,
+        soup,
+        roots=specification_roots,
+    )
     if not result["name"]:
         heading = soup.select_one("h1")
         result["name"] = clean_text(heading.get_text(" ")) if heading else ""
