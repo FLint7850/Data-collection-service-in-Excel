@@ -40,31 +40,72 @@ def is_program_list(field: Any) -> bool:
     return True
 
 
+def _program_delimiters(field: Any) -> tuple[str, ...]:
+    """Return all accepted separators for a program list."""
+
+    field_separator = str(getattr(field, "separator", "/") or "/").strip()
+
+    separators = {
+        "/",
+        ";",
+    }
+
+    if field_separator:
+        separators.add(field_separator)
+
+    # Сначала длинные разделители, чтобы, например, " / " не был
+    # перехвачен более коротким "/".
+    return tuple(sorted(separators, key=len, reverse=True))
+
+
 def _parts(field: Any, value: str) -> list[str]:
-    separator = getattr(field, "separator", "/") or "/"
-    # Remote dictionaries traditionally use '/', including when the local
-    # field has a custom separator. Parentheses can contain literal slashes.
-    result, buffer, depth = [], [], 0
+    """Split a program list by all supported separators.
+
+    Separators inside parentheses are preserved as literal text.
+    """
+
+    delimiters = _program_delimiters(field)
+
+    result: list[str] = []
+    buffer: list[str] = []
+    depth = 0
     index = 0
+
     while index < len(value):
         char = value[index]
+
         if char == "(":
             depth += 1
         elif char == ")":
             depth = max(0, depth - 1)
-        delimiter = next((item for item in {separator, "/"} if not depth and value.startswith(item, index)), "")
+
+        delimiter = next(
+            (
+                item
+                for item in delimiters
+                if not depth and value.startswith(item, index)
+            ),
+            "",
+        )
+
         if delimiter:
             part = " ".join("".join(buffer).split()).strip()
+
             if part and part not in {"-", "–", "—"}:
                 result.append(part)
+
             buffer = []
             index += len(delimiter)
-        else:
-            buffer.append(char)
-            index += 1
+            continue
+
+        buffer.append(char)
+        index += 1
+
     part = " ".join("".join(buffer).split()).strip()
+
     if part and part not in {"-", "–", "—"}:
         result.append(part)
+
     return result
 
 
@@ -96,26 +137,39 @@ def _protected_parts(
     aliases: dict[str, str],
     whole: dict[str, set[str]],
 ) -> list[str]:
-    """Split a source list while preserving saved aliases containing '/'."""
+    """Split a source list while preserving saved aliases containing delimiters."""
 
-    separator = getattr(field, "separator", "/") or "/"
+    delimiters = _program_delimiters(field)
     protected = raw
     replacements: dict[str, str] = {}
+
     literal_keys = [
-        key for key in {*aliases, *whole}
-        if "/" in key or (separator != "/" and separator in key)
+        key
+        for key in {*aliases, *whole}
+        if any(delimiter in key for delimiter in delimiters)
     ]
-    for index, key in enumerate(sorted(literal_keys, key=lambda value: (-len(value), value))):
+
+    for index, key in enumerate(
+        sorted(literal_keys, key=lambda value: (-len(value), value))
+    ):
         token = f"§program{index}§"
-        pattern = re.compile(r"(?<![\w+-])" + re.escape(key) + r"(?![\w+-])")
+        pattern = re.compile(
+            r"(?<![\w+-])" + re.escape(key) + r"(?![\w+-])"
+        )
+
         protected, count = pattern.subn(token, protected)
+
         if count:
             replacements[token] = key
+
     result: list[str] = []
+
     for part in _parts(field, protected):
         for token, key in replacements.items():
             part = part.replace(token, key)
+
         result.append(part)
+
     return result
 
 
