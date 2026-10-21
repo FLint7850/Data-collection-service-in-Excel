@@ -253,10 +253,15 @@ describe("large attribute batches", () => {
     const allowed = useAttributeAllowedValues();
     const row = attribute(12, {
       status: "suggested",
-      proposed_value: "",
+      proposed_value: "Да",
+      final_value: "Да",
       allowed_values_count: 2,
       allowed_values: [{ id: 1, value: "Есть" }, { id: 2, value: "Нет" }],
       source_details: {
+        candidates: [{
+          value: "Неизвестно", raw_value: "Неизвестно", source: "AI",
+          source_name: "Режим", confidence: 80, reason: "Предложение", priority: 0,
+        }],
         unknown_values: [{
           value: "да", source: "Donor", source_name: "Режим Отпуск",
           suggestions: [], reason: "Значения нет в справочнике",

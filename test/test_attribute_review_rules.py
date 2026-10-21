@@ -1317,6 +1317,56 @@ class AttributeReviewRulesTest(unittest.TestCase):
         self.assertEqual(lower[0], "")
         self.assertIn("Встраиваемый", lower[3])
 
+    def test_long_phrase_offers_real_dictionary_values_by_word_forms(self):
+        template = self.template(
+            "Тип управления",
+            ("Кнопочный", "Сенсорное", "Сенсорный", "Электронное"),
+        )
+        field = template.fields[0]
+        field.is_composite = True
+        raw = "Электронная система управления с сенсорными кнопками"
+
+        canonical, confidence, reason, suggestions = svc._allowed_match(
+            field,
+            raw,
+            "Управление",
+        )
+
+        self.assertEqual((canonical, confidence), ("", 0))
+        self.assertEqual(suggestions, ["Электронное", "Сенсорное", "Сенсорный"])
+
+        product = self.product(template)
+        svc.apply_parsed_attributes(
+            self.db,
+            product,
+            [{"name": "Управление", "value": raw}],
+            source="Donor",
+            priority=0,
+        )
+        stored = product.values[0]
+        self.assertEqual(stored.proposed_value, "Электронное")
+        self.assertEqual(stored.final_value, "")
+        self.assertEqual(
+            stored.source_details["unknown_values"][0]["suggestions"],
+            suggestions,
+        )
+        stored.source_details["unknown_values"][0]["suggestions"] = []
+        stored.proposed_value = raw
+        serialized = svc.serialize_product(product, detailed=True)
+        serialized_value = next(
+            item for item in serialized["values"]
+            if item["name"] == "Тип управления"
+        )
+        self.assertCountEqual(
+            [item["value"] for item in serialized_value["allowed_values"]],
+            suggestions,
+        )
+        self.assertEqual(serialized_value["proposed_value"], "Электронное")
+        self.assertEqual(
+            serialized_value["source_details"]["unknown_values"][0]["suggestions"],
+            suggestions,
+        )
+
     def test_numeric_units_are_used_for_matching_but_not_saved_in_values(self):
         cases = (
             ("Уровень шума, дБ", "41 дБ", "Уровень шума", "41"),

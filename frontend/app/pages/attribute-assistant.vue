@@ -3,7 +3,7 @@ import {
   attributeReviewStatus,
   attributeValuesMatch,
   canConfirmConflictFinal,
-  canAddUnknownFromNearest,
+  needsUnknownValueResolution,
   hasPendingProposal,
   displayedProposal,
   displayedProposalConfidence,
@@ -1036,10 +1036,11 @@ onBeforeUnmount(() => {
                       v-if="value.is_composite && value.allowed_values_count"
                       :ref="allowedSelectRef(finalAllowedMenuKey(value))"
                       class="aa-final-select aa-final-select--multiple"
-                      :model-value="[...selectedFinalParts(value)]"
+                      :model-value="[...selectedFinalParts(value, optionsFor(value))]"
                       :items="finalSelectOptions(value, optionsFor(value)).filter((item) => !item.value.includes('/'))"
                       value-key="value"
                       label-key="value"
+                      :placeholder="isTechnicalDash(value.final_value) ? value.final_value.trim() : 'Выберите итоговые значения'"
                       :search-input="{ placeholder: 'Найти значение…' }"
                       :loading="searchingAllowedValueIds.has(value.id)"
                       :reset-search-term-on-blur="true"
@@ -1055,11 +1056,11 @@ onBeforeUnmount(() => {
                       v-else-if="value.allowed_values_count"
                       :ref="allowedSelectRef(finalAllowedMenuKey(value))"
                       class="aa-final-select"
-                      :model-value="selectedFinalValue(value)"
+                      :model-value="selectedFinalValue(value, optionsFor(value))"
                       :items="finalSelectOptions(value, optionsFor(value))"
                       value-key="value"
                       label-key="value"
-                      placeholder="Выберите итоговое значение"
+                      :placeholder="isTechnicalDash(value.final_value) ? value.final_value.trim() : 'Выберите итоговое значение'"
                       :search-input="{ placeholder: 'Найти значение…' }"
                       :loading="searchingAllowedValueIds.has(value.id)"
                       :reset-search-term-on-blur="true"
@@ -1189,58 +1190,69 @@ onBeforeUnmount(() => {
                       </div>
                       <small class="aa-candidate-reason">{{ unknown.reason }}</small>
                       <div
-                        v-if="((!value.current_value || isTechnicalDash(value.current_value)) && unknown.donor_id && value.field_id)
-                          || canAddUnknownFromNearest(value, unknown)"
+                        v-if="needsUnknownValueResolution(value, unknown)"
                         class="aa-candidate-actions"
                       >
-                        <div
-                          v-if="(!value.current_value || isTechnicalDash(value.current_value)) && unknown.donor_id && value.field_id"
-                          class="aa-unknown-map"
+                        <section
+                          v-if="unknown.donor_id"
+                          class="aa-unknown-resolution aa-unknown-resolution--map"
                         >
-                          <USelectMenu
-                            :ref="allowedSelectRef(unknownAllowedMenuKey(value, index))"
-                            v-model="unknownSelections[unknownSelectionKey(value, index)]"
-                            class="aa-unknown-select"
-                            :items="optionsFor(value)"
-                            value-key="id"
-                            label-key="value"
-                            placeholder="Выберите значение шаблона"
-                            :search-input="{ placeholder: 'Найти значение…' }"
-                            :loading="searchingAllowedValueIds.has(value.id)"
-                            :reset-search-term-on-blur="true"
-                            :ignore-filter="true"
-                            :virtualize="true"
-                            @update:search-term="queueAllowedSearch(value, $event)"
-                            @update:open="handleAllowedMenuOpen(value, unknownAllowedMenuKey(value, index), $event)"
-                          />
-                          <UButton
-                            color="primary"
-                            variant="soft"
-                            icon="i-lucide-bookmark-check"
-                            :loading="isBusy(`value-mapping-${value.id}-${index}`)"
-                            :disabled="!unknownSelections[unknownSelectionKey(value, index)]"
-                            @click="rememberUnknownValue(value, unknown, index)"
-                          >Применить и запомнить</UButton>
-                        </div>
+                          <header class="aa-unknown-resolution-head">
+                            <strong>Сопоставить со справочником</strong>
+                            <small>Выберите существующее значение. Соответствие сохранится для этого донора.</small>
+                          </header>
+                          <div class="aa-unknown-map">
+                            <USelectMenu
+                              :ref="allowedSelectRef(unknownAllowedMenuKey(value, index))"
+                              v-model="unknownSelections[unknownSelectionKey(value, index)]"
+                              class="aa-unknown-select"
+                              :items="optionsFor(value)"
+                              value-key="id"
+                              label-key="value"
+                              placeholder="Выберите значение"
+                              :search-input="{ placeholder: 'Найти в справочнике…' }"
+                              :loading="searchingAllowedValueIds.has(value.id)"
+                              :reset-search-term-on-blur="true"
+                              :ignore-filter="true"
+                              :virtualize="true"
+                              @update:search-term="queueAllowedSearch(value, $event)"
+                              @update:open="handleAllowedMenuOpen(value, unknownAllowedMenuKey(value, index), $event)"
+                            />
+                            <UButton
+                              color="primary"
+                              variant="soft"
+                              icon="i-lucide-bookmark-check"
+                              :loading="isBusy(`value-mapping-${value.id}-${index}`)"
+                              :disabled="!unknownSelections[unknownSelectionKey(value, index)]"
+                              @click="rememberUnknownValue(value, unknown, index)"
+                            >Сопоставить</UButton>
+                          </div>
+                        </section>
                         <form
-                          v-if="canAddUnknownFromNearest(value, unknown)"
-                          class="aa-unknown-add"
+                          v-if="needsUnknownValueResolution(value, unknown)"
+                          class="aa-unknown-resolution aa-unknown-resolution--add"
                           @submit.prevent="addUnknown(value, unknown, index)"
                         >
-                          <UInput
-                            :model-value="unknownNewValues[unknownSelectionKey(value, index)] ?? unknownReviewValue(unknown)"
-                            aria-label="Новое значение справочника"
-                            placeholder="Введите новое значение"
-                            @update:model-value="unknownNewValues[unknownSelectionKey(value, index)] = String($event ?? '')"
-                          />
-                          <UButton
-                            type="submit"
-                            color="warning"
-                            variant="soft"
-                            icon="i-lucide-book-plus"
-                            :loading="isBusy(`dictionary-${value.id}`)"
-                            :disabled="!(unknownNewValues[unknownSelectionKey(value, index)] ?? unknownReviewValue(unknown)).trim()"
-                          >Добавить и применить</UButton>
+                          <header class="aa-unknown-resolution-head">
+                            <strong>Добавить новое значение</strong>
+                            <small>Проверьте написание. Значение попадёт в справочник и применится к товару.</small>
+                          </header>
+                          <div class="aa-unknown-add-controls">
+                            <UInput
+                              :model-value="unknownNewValues[unknownSelectionKey(value, index)] ?? unknownReviewValue(unknown)"
+                              aria-label="Новое значение справочника"
+                              placeholder="Введите новое значение"
+                              @update:model-value="unknownNewValues[unknownSelectionKey(value, index)] = String($event ?? '')"
+                            />
+                            <UButton
+                              type="submit"
+                              color="warning"
+                              variant="soft"
+                              icon="i-lucide-book-plus"
+                              :loading="isBusy(`dictionary-${value.id}`)"
+                              :disabled="!(unknownNewValues[unknownSelectionKey(value, index)] ?? unknownReviewValue(unknown)).trim()"
+                            >Добавить и применить</UButton>
+                          </div>
                         </form>
                       </div>
                     </div>

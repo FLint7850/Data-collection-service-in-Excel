@@ -171,13 +171,12 @@ export function unknownReviewValue(unknown: UnknownSourceValue): string {
     return unknown.normalized_value?.trim() || unknown.value.trim();
 }
 
-export function canAddUnknownFromNearest(
+export function needsUnknownValueResolution(
     value: AttributeValue,
     unknown: UnknownSourceValue,
 ): boolean {
     const reviewValue = unknownReviewValue(unknown);
-    const hasNearest = (unknown.suggestions || []).some((item) => item.trim());
-    if (!reviewValue || !hasNearest || !value.field_id) return false;
+    if (!reviewValue || !value.field_id) return false;
 
     const exactCandidate = (value.source_details.candidates || [])
         .some((candidate) => attributeValuesMatch(candidate.value, reviewValue));
@@ -219,17 +218,61 @@ export function matchesAttributeStatus(value: AttributeValue, status: string): b
     return true;
 }
 
-export function selectedFinalParts(value: AttributeValue) {
-    const selected = value.status === "rejected"
-        ? value.final_value
-        : value.final_value || displayedProposal(value);
-    return new Set(selected.split("/").map((item) => item.trim()).filter(Boolean));
+function selectedDictionaryValue(
+    selected: string,
+    options: Array<{ value: string }>,
+): string {
+    return options.find((option) => attributeValuesMatch(option.value, selected))?.value || "";
 }
 
-export function selectedFinalValue(value: AttributeValue) {
-    if (value.final_value) return value.final_value;
+function selectedDictionaryParts(
+    selected: string,
+    options: Array<{ value: string }>,
+    composite: boolean,
+): string[] {
+    return (composite ? selected.split("/") : [selected])
+        .map((item) => selectedDictionaryValue(item.trim(), options))
+        .filter(Boolean);
+}
+
+function proposedDictionaryParts(
+    value: AttributeValue,
+    options: Array<{ value: string }>,
+): string[] {
+    const proposals = [
+        displayedProposal(value),
+        ...(value.source_details.unknown_values || [])
+            .flatMap((unknown) => unknown.suggestions || []),
+    ];
+    for (const proposal of proposals) {
+        const selected = selectedDictionaryParts(proposal, options, value.is_composite);
+        if (selected.length) return selected;
+    }
+    return [];
+}
+
+export function selectedFinalParts(
+    value: AttributeValue,
+    options: Array<{ value: string }> = value.allowed_values || [],
+) {
+    if (value.final_value) {
+        const selected = selectedDictionaryParts(value.final_value, options, true);
+        if (selected.length) return new Set(selected);
+    }
+    if (value.status === "rejected") return new Set<string>();
+    return new Set(proposedDictionaryParts(value, options));
+}
+
+export function selectedFinalValue(
+    value: AttributeValue,
+    options: Array<{ value: string }> = value.allowed_values || [],
+) {
+    if (value.final_value) {
+        const selected = selectedDictionaryValue(value.final_value, options);
+        if (selected) return selected;
+    }
     if (value.status === "rejected") return "";
-    return hasPendingProposal(value) ? displayedProposal(value) : "";
+    return proposedDictionaryParts(value, options)[0] || "";
 }
 
 type FinalSelectOption = {
@@ -239,19 +282,10 @@ type FinalSelectOption = {
 };
 
 export function finalSelectOptions(
-    value: AttributeValue,
+    _value: AttributeValue,
     options: Array<{ id: number; value: string }>,
 ): FinalSelectOption[] {
-    if (!isTechnicalDash(value.final_value)) return options;
-
-    const dash = value.final_value.trim();
-    const result: FinalSelectOption[] = options.map((option) => (
-        isTechnicalDash(option.value) ? { ...option, disabled: true } : option
-    ));
-    if (!result.some((option) => option.value === dash)) {
-        result.unshift({ id: Number.MIN_SAFE_INTEGER + value.id, value: dash, disabled: true });
-    }
-    return result;
+    return options;
 }
 
 export function sourceStatusText(

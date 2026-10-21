@@ -33,24 +33,14 @@ export function useAttributeAllowedValues(
     const requests = createLatestRequestCoordinator();
 
     function optionsFor(value: AttributeValue) {
-        const loaded = allowedOptionCache.value[value.id] || value.allowed_values;
-        const result = [...loaded];
-        // Only canonical dictionary-backed values may be selectable here.
-        // A raw unknown is shown in source evidence and must not masquerade as
-        // an allowed option merely because it is the current proposal text.
-        const pinned = [
-            value.final_value,
-            value.proposed_value,
-            ...(value.source_details.candidates || []).map((item) => item.value),
-        ]
-            .flatMap((item) => value.is_composite ? item.split("/") : [item])
-            .map((item) => item.trim())
-            .filter((item) => item && item !== "-");
-
-        for (const item of [...new Set(pinned)].reverse()) {
-            if (!result.some((option) => option.value === item)) {
-                result.unshift({ id: -result.length - 1, value: item });
-            }
+        const loaded = allowedOptionCache.value[value.id] || [];
+        // The selector is a view of the persisted dictionary, never a place
+        // for raw proposals. Unknown values are resolved by the dedicated
+        // mapping/add-new controls below the source evidence.
+        const result = [...value.allowed_values];
+        const knownIds = new Set(result.map((item) => item.id));
+        for (const item of loaded) {
+            if (!knownIds.has(item.id)) result.push(item);
         }
         return result;
     }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AttributeValue } from "../app/types/attribute-assistant";
 import {
-  addableUnknownProposal, attributeValuesMatch, canAddUnknownFromNearest, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
+  addableUnknownProposal, attributeValuesMatch, needsUnknownValueResolution, canConfirmConflictFinal, displayedProposal, hasPendingProposal, matchesAttributeStatus, originalValueHints,
   finalSelectOptions, selectedFinalParts, selectedFinalValue, sourceEvidenceCount, unknownReviewValue, unknownSourceMatchesExactly, unknownSourceMatchesSelected, valueStatusColor, valueStatusLabel,
 } from "../app/utils/attribute-assistant";
 
@@ -33,7 +33,7 @@ describe("attribute dictionary review", () => {
     expect(unknownSourceMatchesSelected(row, row.source_details.unknown_values![0]!)).toBe(false);
   });
 
-  it("offers a new-value input only for a nearest match without an exact match", () => {
+  it("offers resolution actions for every unknown value without an exact match", () => {
     const nearest = {
       ...unknown,
       value: "630x440x870",
@@ -45,14 +45,14 @@ describe("attribute dictionary review", () => {
       final_value: "87x63x64",
       source_details: { unknown_values: [nearest] },
     });
-    expect(canAddUnknownFromNearest(row, nearest)).toBe(true);
+    expect(needsUnknownValueResolution(row, nearest)).toBe(true);
     expect(unknownReviewValue(nearest)).toBe("87x63x44");
-    expect(canAddUnknownFromNearest(row, { ...nearest, suggestions: [] })).toBe(false);
-    expect(canAddUnknownFromNearest(row, {
+    expect(needsUnknownValueResolution(row, { ...nearest, suggestions: [] })).toBe(true);
+    expect(needsUnknownValueResolution(row, {
       ...nearest,
       suggestions: [nearest.normalized_value],
     })).toBe(false);
-    expect(canAddUnknownFromNearest(row, {
+    expect(needsUnknownValueResolution(row, {
       ...nearest,
       value: "A++",
       normalized_value: undefined,
@@ -63,11 +63,11 @@ describe("attribute dictionary review", () => {
       value: nearest.normalized_value, raw_value: nearest.value, source: "Donor", confidence: 100,
       reason: "Точное совпадение", priority: 0, source_name: row.name,
     }];
-    expect(canAddUnknownFromNearest(row, nearest)).toBe(false);
+    expect(needsUnknownValueResolution(row, nearest)).toBe(false);
 
     row.source_details.candidates = [];
     row.allowed_values = [{ id: 10, value: nearest.normalized_value }];
-    expect(canAddUnknownFromNearest(row, nearest)).toBe(false);
+    expect(needsUnknownValueResolution(row, nearest)).toBe(false);
   });
 
   it("shows a bad original as conflict and includes it only in the conflict filter", () => {
@@ -241,15 +241,70 @@ describe("attribute value letter case", () => {
 });
 
 describe("filled and unfilled attribute filters", () => {
-  it.each(["-", "—"])('shows the technical dash %j in the final selector but keeps it unfilled', (dash) => {
+  it.each(["-", "—"])('keeps the technical dash %j out of selector options and treats it as unfilled', (dash) => {
     const row = value({ status: "dash", current_value: "", final_value: dash });
     const options = finalSelectOptions(row, [{ id: 10, value: "A++" }]);
 
-    expect(selectedFinalValue(row)).toBe(dash);
-    expect([...selectedFinalParts(row)]).toEqual([dash]);
-    expect(options[0]).toMatchObject({ value: dash, disabled: true });
+    expect(selectedFinalValue(row)).toBe("");
+    expect([...selectedFinalParts(row)]).toEqual([]);
+    expect(options).toEqual([{ id: 10, value: "A++" }]);
     expect(matchesAttributeStatus(row, "unfilled")).toBe(true);
     expect(matchesAttributeStatus(row, "from_source")).toBe(false);
+  });
+
+  it("never presents an unknown proposal as the selected dictionary value", () => {
+    const row = value({
+      status: "suggested",
+      proposed_value: "Электронная система управления с сенсорными кнопками",
+      final_value: "",
+      allowed_values: [{ id: 1, value: "Кнопочный" }],
+    });
+
+    expect(selectedFinalValue(row)).toBe("");
+    expect([...selectedFinalParts(row)]).toEqual([]);
+
+    row.final_value = row.proposed_value;
+    expect(selectedFinalValue(row)).toBe("");
+  });
+
+  it("may preselect a proposal only when it is backed by the dictionary", () => {
+    const row = value({
+      status: "suggested",
+      proposed_value: "Кнопочный",
+      allowed_values: [{ id: 1, value: "Кнопочный" }],
+    });
+
+    expect(selectedFinalValue(row)).toBe("Кнопочный");
+  });
+
+  it("preselects the first real nearest value instead of a raw unknown", () => {
+    const nearest = {
+      value: "920х600х610", normalized_value: "92x60x61", source: "Donor",
+      source_name: "Габариты, мм", suggestions: ["90x60x60", "95x60x60"],
+      reason: "Точного значения нет",
+    };
+    const row = value({
+      status: "suggested",
+      current_value: "",
+      proposed_value: "92x60x61",
+      allowed_values: [{ id: 1, value: "90x60x60" }, { id: 2, value: "95x60x60" }],
+      source_details: { unknown_values: [nearest] },
+    });
+
+    expect(selectedFinalValue(row)).toBe("90x60x60");
+
+    row.final_value = row.proposed_value;
+    expect(selectedFinalValue(row)).toBe("90x60x60");
+
+    row.is_composite = true;
+    row.proposed_value = "Электронная система управления";
+    row.allowed_values = [{ id: 3, value: "Электронное" }];
+    row.source_details.unknown_values = [{
+      ...nearest,
+      value: row.proposed_value,
+      suggestions: ["Электронное"],
+    }];
+    expect([...selectedFinalParts(row)]).toEqual(["Электронное"]);
   });
 
   it.each([

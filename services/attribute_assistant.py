@@ -328,7 +328,7 @@ def _canonical_name_token(token: str) -> str:
     return token
 
 
-def _name_tokens(value: Any) -> set[str]:
+def _name_token_sequence(value: Any) -> list[str]:
     text = clean_text(value).casefold().replace("ё", "е")
     # Axis order describes the tuple layout, not the attribute's semantic identity.
     # Treating ШxВxГ and ВxШxГ as words prevents otherwise identical fields from mapping.
@@ -342,7 +342,11 @@ def _name_tokens(value: Any) -> set[str]:
         canonical = _canonical_name_token(token)
         if canonical and canonical not in IGNORED_NAME_TOKENS:
             tokens.append(canonical)
-    return set(tokens)
+    return tokens
+
+
+def _name_tokens(value: Any) -> set[str]:
+    return set(_name_token_sequence(value))
 
 
 def normalize_number(value: Any) -> str:
@@ -4783,6 +4787,49 @@ def _numeric_range_bounds(
     return min(left, right), max(left, right)
 
 
+def _phrase_dictionary_suggestions(
+    value: str,
+    allowed: list[AttributeAllowedValue],
+) -> list[str]:
+    """Find canonical values mentioned inside a longer explanatory phrase.
+
+    This is deliberately a nearest-value lookup, not an exact match.  Word-form
+    normalization can connect ``электронная`` to ``Электронное``, but the
+    remaining phrase may still carry meaning that requires manual review.
+    """
+
+    text = clean_text(value)
+    source_tokens = _name_token_sequence(text)
+    if not re.search(r"\s", text) or len(source_tokens) < 2:
+        return []
+    source_set = set(source_tokens)
+    ranked: dict[str, tuple[int, int, int, int, str]] = {}
+    for item in allowed:
+        if _boolean_equivalence_key(item.value):
+            continue
+        best_rank: tuple[int, int, int, int, str] | None = None
+        for phrase in [item.value, *(synonym.synonym for synonym in item.synonyms)]:
+            candidate_tokens = _name_token_sequence(phrase)
+            candidate_set = set(candidate_tokens)
+            if not candidate_set or not candidate_set <= source_set:
+                continue
+            positions = [source_tokens.index(token) for token in candidate_set]
+            rank = (
+                -len(candidate_set),
+                max(positions) - min(positions),
+                min(positions),
+                item.sort_order,
+                item.value.casefold(),
+            )
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+        if best_rank is not None:
+            current = ranked.get(item.value)
+            if current is None or best_rank < current:
+                ranked[item.value] = best_rank
+    return [value for value, _rank in sorted(ranked.items(), key=lambda pair: pair[1])[:3]]
+
+
 def _allowed_match_single(
     field: AttributeTemplateField,
     value: str,
@@ -4899,6 +4946,14 @@ def _allowed_match_single(
             0,
             "Точного значения габаритов нет в справочнике; варианты подобраны по числовой близости",
             nearby_dimensions[:3],
+        )
+    phrase_suggestions = _phrase_dictionary_suggestions(value, allowed)
+    if phrase_suggestions:
+        return (
+            "",
+            0,
+            "Точного значения нет в справочнике; ближайшие варианты найдены по словам и словоформам",
+            phrase_suggestions,
         )
     ranked = sorted(
         ((SequenceMatcher(None, value_match_key(value), value_match_key(item.value)).ratio(), item.value) for item in allowed),
@@ -5217,6 +5272,13 @@ def _repair_confirming_evidence(target: AttributeProductValue) -> bool:
                 if canonical:
                     replacements.append((item, name, canonical, confidence, raw, reason))
                     consumed.add(id(item))
+            if (
+                not canonical
+                and not any(exact_value_key(value) for value in item.get("suggestions", []))
+                and suggestions
+            ):
+                item.update(suggestions=suggestions, reason=reason)
+                suggestions_changed = True
     if replacements or suggestions_changed:
         target.source_details = {**(target.source_details or {}),
                                  "unknown_values": [item for item in unknown if id(item) not in consumed]}
@@ -6245,12 +6307,42 @@ def serialize_value(
     *,
     include_allowed_values: bool = True,
     allowed_values_count: int | None = None,
+    selected_allowed_values: Iterable[AttributeAllowedValue] = (),
 ) -> dict[str, Any]:
     _repair_confirming_evidence(value) or _repair_existing_value_status(value)
     field = value.template_field
     active_allowed = None
     if field and (include_allowed_values or allowed_values_count is None):
         active_allowed = [item for item in field.allowed_values if item.is_active]
+    ordered_allowed = sorted(
+        active_allowed if active_allowed is not None else selected_allowed_values,
+        key=lambda item: (item.sort_order, item.value.casefold()),
+    )
+    allowed_page = ordered_allowed[:200] if include_allowed_values else ordered_allowed
+    if field and include_allowed_values and ordered_allowed:
+        # Keep an already selected canonical value available even when it lies
+        # beyond the first page of a large dictionary. Raw proposals are never
+        # added: every appended row is an actual active dictionary entity.
+        selected_parts = [
+            part.strip()
+            for raw in (value.final_value, value.proposed_value)
+            for part in (
+                exact_value_key(raw).split("/")
+                if field.is_composite
+                else [exact_value_key(raw)]
+            )
+            if part.strip() and not is_technical_dash(part)
+        ]
+        known_ids = {item.id for item in allowed_page}
+        for part in selected_parts:
+            canonical = _canonical_matching_value(ordered_allowed, part)
+            selected_allowed = next(
+                (item for item in ordered_allowed if item.value == canonical),
+                None,
+            )
+            if selected_allowed is not None and selected_allowed.id not in known_ids:
+                allowed_page.append(selected_allowed)
+                known_ids.add(selected_allowed.id)
     return {
         "id": value.id,
         "field_id": value.template_field_id,
@@ -6275,14 +6367,79 @@ def serialize_value(
         ),
         "allowed_values": [
             {"id": item.id, "value": item.value, "is_combination": item.is_combination}
-            for item in sorted(
-                active_allowed or [],
-                key=lambda item: (item.sort_order, item.value.casefold()),
-            )[:200]
-        ] if field and include_allowed_values else [],
+            for item in allowed_page
+        ] if field else [],
         "source_details": value.source_details or {},
         "sort_order": value.sort_order,
     }
+
+
+def _selected_product_allowed_values(
+    session: Session | None,
+    values: Iterable[AttributeProductValue],
+) -> dict[int, list[AttributeAllowedValue]]:
+    """Load only real dictionary rows needed to render current suggestions.
+
+    Product details intentionally do not include whole dictionaries.  Without
+    this small canonical subset, a valid proposal cannot be displayed until
+    the user opens the lazy-loaded selector.
+    """
+
+    if session is None:
+        return {}
+    keys_by_field: dict[int, set[str]] = {}
+    for value in values:
+        field = value.template_field
+        if field is None or field.id is None:
+            continue
+        raw_values = [value.final_value, value.proposed_value]
+        details = value.source_details or {}
+        raw_values.extend(
+            exact_value_key(item.get("value"))
+            for item in details.get("candidates", [])
+            if isinstance(item, dict)
+        )
+        raw_values.extend(
+            exact_value_key(suggestion)
+            for item in details.get("unknown_values", [])
+            if isinstance(item, dict)
+            for suggestion in item.get("suggestions", [])
+        )
+        for raw in raw_values:
+            text = exact_value_key(raw)
+            if not text or is_technical_dash(text):
+                continue
+            candidates = [text]
+            if field.is_composite:
+                candidates.extend(part.strip() for part in text.split("/") if part.strip())
+            for candidate in candidates:
+                try:
+                    key = dictionary_value_key(candidate, field.value_type)
+                except ValueError:
+                    continue
+                if key:
+                    keys_by_field.setdefault(int(field.id), set()).add(key)
+    if not keys_by_field:
+        return {}
+
+    clauses = [
+        and_(
+            AttributeAllowedValue.field_id == field_id,
+            AttributeAllowedValue.normalized_value.in_(sorted(keys)),
+        )
+        for field_id, keys in keys_by_field.items()
+    ]
+    selected = list(session.scalars(
+        select(AttributeAllowedValue).where(
+            AttributeAllowedValue.is_active.is_(True),
+            or_(*clauses),
+        )
+    ))
+    result: dict[int, list[AttributeAllowedValue]] = {}
+    for item in sorted(selected, key=lambda row: (row.sort_order, row.value.casefold())):
+        result.setdefault(item.field_id, []).append(item)
+    return result
+
 
 def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict[str, Any]:
     repaired = [
@@ -6334,6 +6491,7 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
             if value.template_field_id is not None
         }
         allowed_counts: dict[int, int] = {}
+        selected_allowed: dict[int, list[AttributeAllowedValue]] = {}
         session = object_session(product)
         if session is not None and field_ids:
             allowed_counts = dict(session.execute(
@@ -6344,11 +6502,13 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
                 )
                 .group_by(AttributeAllowedValue.field_id)
             ).all())
+            selected_allowed = _selected_product_allowed_values(session, product.values)
         result["values"] = [
             serialize_value(
                 value,
                 include_allowed_values=False,
                 allowed_values_count=allowed_counts.get(value.template_field_id, 0),
+                selected_allowed_values=selected_allowed.get(value.template_field_id or 0, []),
             )
             for value in product.values
         ]
