@@ -291,6 +291,37 @@ def product_template(product: AttributeProduct) -> AttributeTemplate | None:
     return None
 
 
+def load_product_detail(db: Session, product_id: int) -> AttributeProduct | None:
+    """Load only the bounded ORM graph required by product API responses.
+
+    Large allowed-value dictionaries are deliberately excluded. Product
+    serialization fetches their counts and selected canonical rows with
+    dedicated aggregate queries instead of materializing every synonym.
+    """
+
+    return db.scalar(
+        select(AttributeProduct)
+        .where(AttributeProduct.id == product_id)
+        .options(
+            selectinload(AttributeProduct.batch)
+            .selectinload(AttributeBatch.template)
+            .selectinload(AttributeTemplate.category),
+            selectinload(AttributeProduct.batch)
+            .selectinload(AttributeBatch.template)
+            .selectinload(AttributeTemplate.fields),
+            selectinload(AttributeProduct.template)
+            .selectinload(AttributeTemplate.category),
+            selectinload(AttributeProduct.template)
+            .selectinload(AttributeTemplate.fields),
+            selectinload(AttributeProduct.values)
+            .selectinload(AttributeProductValue.template_field),
+            selectinload(AttributeProduct.sources)
+            .selectinload(AttributeProductSource.donor)
+            .selectinload(Donor.brand),
+        )
+    )
+
+
 def clean_text(value: Any) -> str:
     return SPACE_RE.sub(" ", str(value or "").replace("\xa0", " ")).strip()
 
@@ -4864,14 +4895,11 @@ def _allowed_match_single(
         canonical_phrase = clean_text(item.value).lower().replace("ё", "е")
         if not canonical_phrase or NUMBER_RE.fullmatch(canonical_phrase):
             continue
-        match = re.search(
-            rf"(?<![a-zа-яе0-9]){re.escape(canonical_phrase)}(?![a-zа-яе0-9])",
-            raw_phrase,
-            re.IGNORECASE,
-        )
-        if not match:
+        match_span = _bounded_phrase_span(raw_phrase, canonical_phrase)
+        if match_span is None:
             continue
-        remainder = clean_text(raw_phrase[:match.start()] + " " + raw_phrase[match.end():])
+        start, end = match_span
+        remainder = clean_text(raw_phrase[:start] + " " + raw_phrase[end:])
         if not remainder or re.search(r"[^a-zа-яе0-9\s,;:()\-–—]", remainder, re.IGNORECASE):
             continue
         remainder_tokens = _name_tokens(remainder)
@@ -4960,6 +4988,24 @@ def _allowed_match_single(
         reverse=True,
     )
     return "", 0, "Значения нет в справочнике", [item for score, item in ranked if score >= 0.6][:3]
+
+
+def _bounded_phrase_span(text: str, phrase: str) -> tuple[int, int] | None:
+    """Find a phrase using the same boundaries as the former dynamic regex."""
+
+    start = text.find(phrase)
+    while start >= 0:
+        end = start + len(phrase)
+        before_is_word = start > 0 and _matching_word_character(text[start - 1])
+        after_is_word = end < len(text) and _matching_word_character(text[end])
+        if not before_is_word and not after_is_word:
+            return start, end
+        start = text.find(phrase, start + 1)
+    return None
+
+
+def _matching_word_character(character: str) -> bool:
+    return character.isdigit() or "a" <= character <= "z" or "а" <= character <= "я"
 
 
 def _target_value(product: AttributeProduct, field_id: int) -> AttributeProductValue | None:
@@ -5097,18 +5143,28 @@ def _clear_resolved_unknown_values(target: AttributeProductValue) -> bool:
 
 
 def migrate_existing_attribute_suggestions(db: Session) -> int:
-    """Repair saved review statuses in bounded rows without opening batch.products."""
+    """Repair saved review statuses once without opening batch.products."""
     value, product = AttributeProductValue, AttributeProduct
-    statement = select(value, product.batch_id).join(product, product.id == value.product_id).where(
-        or_(
-            and_(value.status.in_(["suggested", "unknown"]), func.trim(value.current_value) != ""),
-            value.status == "conflict",
-            and_(
-                value.status.in_(["dash", "missing"]),
-                func.json_array_length(value.source_details, "$.unknown_values") > 0,
+    statement = (
+        select(value, product.batch_id)
+        .join(product, product.id == value.product_id)
+        .where(
+            or_(
+                value.status.in_(["suggested", "unknown", "conflict"]),
+                and_(
+                    value.status.in_(["dash", "missing"]),
+                    func.json_array_length(value.source_details, "$.unknown_values") > 0,
+                ),
             ),
-        ),
-    ).execution_options(yield_per=100)
+        )
+        .options(
+            selectinload(value.product),
+            selectinload(value.template_field)
+            .selectinload(AttributeTemplateField.allowed_values)
+            .selectinload(AttributeAllowedValue.synonyms),
+        )
+        .execution_options(yield_per=100)
+    )
     products, batches, changed = set(), set(), 0
     for target, batch_id in db.execute(statement):
         if _repair_confirming_evidence(target) or _repair_existing_value_status(target):
@@ -6309,7 +6365,6 @@ def serialize_value(
     allowed_values_count: int | None = None,
     selected_allowed_values: Iterable[AttributeAllowedValue] = (),
 ) -> dict[str, Any]:
-    _repair_confirming_evidence(value) or _repair_existing_value_status(value)
     field = value.template_field
     active_allowed = None
     if field and (include_allowed_values or allowed_values_count is None):
@@ -6441,13 +6496,29 @@ def _selected_product_allowed_values(
     return result
 
 
+def serialize_product_value(value: AttributeProductValue) -> dict[str, Any]:
+    """Serialize one edited value without opening its whole dictionary."""
+
+    session = object_session(value)
+    field_id = value.template_field_id
+    if session is None or field_id is None:
+        return serialize_value(value)
+    allowed_count = int(session.scalar(
+        select(func.count(AttributeAllowedValue.id)).where(
+            AttributeAllowedValue.field_id == field_id,
+            AttributeAllowedValue.is_active.is_(True),
+        )
+    ) or 0)
+    selected = _selected_product_allowed_values(session, [value]).get(field_id, [])
+    return serialize_value(
+        value,
+        include_allowed_values=False,
+        allowed_values_count=allowed_count,
+        selected_allowed_values=selected,
+    )
+
+
 def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict[str, Any]:
-    repaired = [
-        _repair_confirming_evidence(value) or _repair_existing_value_status(value)
-        for value in product.values
-    ]
-    if any(repaired):
-        refresh_product_status(product)
     result = {
         "id": product.id,
         "batch_id": product.batch_id,

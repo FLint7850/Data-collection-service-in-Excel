@@ -196,7 +196,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
                     value_type,
                 ).fields[0]
                 self.assertEqual(svc._allowed_match(field, "Есть", field.name)[:2], ("Да", 100))
-    def test_saved_unknown_yes_is_repaired_to_exists_on_read(self):
+    def test_saved_unknown_yes_is_repaired_to_exists_by_migration(self):
         template = self.template("Режим «Отпуск»", ("Есть", "Нет"))
         product = self.product(template)
         value = product.values[0]
@@ -211,12 +211,36 @@ class AttributeReviewRulesTest(unittest.TestCase):
             "reason": "Значения нет в справочнике",
         }]}
 
+        svc.migrate_existing_attribute_suggestions(self.db)
         serialized = svc.serialize_product(product, detailed=True)["values"][0]
 
         self.assertEqual(serialized["status"], "suggested")
         self.assertEqual(serialized["proposed_value"], "Есть")
         self.assertEqual(serialized["source_details"]["unknown_values"], [])
         self.assertEqual(serialized["source_details"]["candidates"][0]["raw_value"], "да")
+
+    def test_product_serialization_does_not_repair_or_dirty_saved_state(self):
+        template = self.template("Режим «Отпуск»", ("Есть", "Нет"))
+        product = self.product(template)
+        value = product.values[0]
+        value.status = "suggested"
+        value.proposed_value = "да"
+        value.source_details = {"candidates": [], "unknown_values": [{
+            "value": "да",
+            "source": "Donor",
+            "source_name": "Режим «Отпуск»",
+            "suggestions": [],
+            "reason": "Значения нет в справочнике",
+        }]}
+        self.db.flush()
+        self.db.expunge_all()
+
+        loaded = svc.load_product_detail(self.db, product.id)
+        serialized = svc.serialize_product(loaded, detailed=True)["values"][0]
+
+        self.assertEqual(serialized["status"], "suggested")
+        self.assertEqual(serialized["proposed_value"], "да")
+        self.assertFalse(self.db.dirty)
 
     def test_saved_duplicate_raw_observation_is_repaired(self):
         template = self.template("Таймер", ("Есть", "Нет", "До 15 минут"))
@@ -327,6 +351,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
             value = product.values[0]
             value.status = "conflict"
             value.source_details = {"unknown_values": [dict(fact, source="ChatGPT", url="https://example.com", reason="Старое неверное сопоставление") for fact in facts]}
+            svc.migrate_existing_attribute_suggestions(self.db)
             result = svc.serialize_product(product, detailed=True)
             self.assertEqual(result["counts"]["conflicts"], 0)
             self.assertEqual(value.status, "kept")
@@ -805,7 +830,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
                     self.assertEqual(value.final_value, current)
                     self.assertEqual(value.proposed_value, "" if current else "85")
 
-    def test_saved_numeric_range_suggestions_are_repaired_on_read(self):
+    def test_saved_numeric_range_suggestions_are_repaired_by_migration(self):
         template = self.template("Высота, см", ("88.5", "85.5", "86.5", "85"))
         product = self.product(template, "85")
         value = product.values[0]
@@ -816,6 +841,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
             for source in ["Bosch", "ChatGPT"]
         ]}
         self.db.commit()
+        svc.migrate_existing_attribute_suggestions(self.db)
         serialized = svc.serialize_product(product, detailed=True)["values"][0]
         self.assertEqual(serialized["proposed_value"], "")
         self.assertEqual(serialized["final_value"], "85")
@@ -854,7 +880,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
                 self.assertEqual(value.final_value, "23")
                 self.assertNotIn("current_value_hint", value.source_details)
 
-    def test_saved_area_conflict_from_centimeter_bug_is_repaired_on_read(self):
+    def test_saved_area_conflict_from_centimeter_bug_is_repaired_by_migration(self):
         template = self.template("Рекомендуемая площадь помещения, кв.м", ("23",))
         product = self.product(template, "23")
         value = product.values[0]
@@ -874,6 +900,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
             }],
         }
 
+        svc.migrate_existing_attribute_suggestions(self.db)
         serialized = svc.serialize_product(product, detailed=True)["values"][0]
 
         self.assertEqual(serialized["status"], "kept")
@@ -1131,7 +1158,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
                     self.assertEqual(product.batch.summary["suggestions"], 1)
                     self.assertEqual(product.batch.summary["conflicts"], 0)
 
-    def test_saved_empty_conflict_with_source_proposals_is_repaired_on_read(self):
+    def test_saved_empty_conflict_with_source_proposals_is_repaired_by_migration(self):
         template = self.template("Количество полок", ("1", "4"), "number")
         product = self.product(template)
         value = product.values[0]
@@ -1153,6 +1180,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
         value.proposed_value = ""
         value.reason = "Источники предлагают разные значения"
 
+        svc.migrate_existing_attribute_suggestions(self.db)
         serialized = svc.serialize_product(product, detailed=True)["values"][0]
 
         self.assertEqual(serialized["status"], "suggested")
@@ -1352,6 +1380,7 @@ class AttributeReviewRulesTest(unittest.TestCase):
         )
         stored.source_details["unknown_values"][0]["suggestions"] = []
         stored.proposed_value = raw
+        svc.migrate_existing_attribute_suggestions(self.db)
         serialized = svc.serialize_product(product, detailed=True)
         serialized_value = next(
             item for item in serialized["values"]

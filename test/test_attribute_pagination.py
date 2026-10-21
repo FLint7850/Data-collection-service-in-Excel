@@ -136,6 +136,32 @@ class AttributePaginationTest(unittest.TestCase):
             self.assertEqual(response['total'], 4000)
             self.assertNotIn('values', response['items'][0])
 
+    def test_product_detail_has_a_bounded_query_count_and_does_not_mutate(self):
+        queries = []
+
+        def query(_conn, _cursor, statement, *_args):
+            queries.append(statement)
+
+        event.listen(self.engine, 'before_cursor_execute', query)
+        try:
+            with Session(self.engine, autoflush=False) as db:
+                product_id = db.scalar(
+                    select(AttributeProduct.id)
+                    .where(AttributeProduct.batch_id == self.batch_id)
+                    .order_by(AttributeProduct.id)
+                    .limit(1)
+                )
+                queries.clear()
+                product = svc.load_product_detail(db, product_id)
+                payload = svc.serialize_product(product, detailed=True)
+                self.assertEqual(len(payload['values']), 4)
+                self.assertFalse(db.dirty)
+        finally:
+            event.remove(self.engine, 'before_cursor_execute', query)
+
+        self.assertLessEqual(len(queries), 15)
+        self.assertFalse(any('attribute_value_synonyms' in statement for statement in queries))
+
     def test_export_streams_all_pages_without_loading_product_objects(self):
         batch = self.db.scalar(select(AttributeBatch).where(AttributeBatch.id == self.batch_id)
                                .options(raiseload(AttributeBatch.products)))

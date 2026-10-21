@@ -72,11 +72,12 @@ from services.attribute_assistant import (
     save_template_revision,
     list_mapping_rules,
     list_value_mapping_rules,
+    load_product_detail,
     snapshot_product,
     serialize_batch,
     serialize_product,
+    serialize_product_value,
     serialize_template,
-    serialize_value,
     touch_product,
     update_product_value,
     update_template_from_csv,
@@ -259,6 +260,13 @@ def _batch(batch_id: int) -> AttributeBatch:
 
 def _product(product_id: int) -> AttributeProduct:
     row = g.db.get(AttributeProduct, product_id)
+    if not row:
+        raise ValueError("Товар не найден")
+    return row
+
+
+def _product_detail(product_id: int) -> AttributeProduct:
+    row = load_product_detail(g.db, product_id)
     if not row:
         raise ValueError("Товар не найден")
     return row
@@ -515,7 +523,7 @@ def api_attribute_batch_products(batch_id: int):
 def api_attribute_product(product_id: int):
     ensure_storage()
     try:
-        product = _product(product_id)
+        product = _product_detail(product_id)
         return jsonify(serialize_product(product, detailed=True))
     except ValueError as error:
         return jsonify({"error": str(error)}), 404
@@ -526,7 +534,7 @@ def api_attribute_product_process(product_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        product = _product(product_id)
+        product = _product_detail(product_id)
         expected_version = _assert_product_version(product, payload)
         donor_ids = _integer_list(payload, "donor_ids", required=True)
         _remember_batch_donor_selection(product.batch, donor_ids)
@@ -624,7 +632,7 @@ def api_attribute_product_similar(product_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        product = _product(product_id)
+        product = _product_detail(product_id)
         _assert_product_version(product, payload)
         snapshot_product(g.db, product, "Перед поиском по похожим товарам")
         changed = apply_similar_products(g.db, product)
@@ -652,7 +660,7 @@ def api_attribute_value_update(value_id: int):
         return jsonify(_product_mutation_payload(
             value.product,
             detailed=False,
-            value=serialize_value(value),
+            value=serialize_product_value(value),
         ))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
@@ -707,7 +715,7 @@ def api_attribute_value_mapping_rule(value_id: int):
             value.product,
             detailed=False,
             rule_id=rule.id,
-            value=serialize_value(value),
+            value=serialize_product_value(value),
         )), 201
     except (TypeError, ValueError) as error:
         return jsonify({"error": str(error)}), 400
@@ -789,7 +797,7 @@ def api_attribute_product_chatgpt_analyze(product_id: int):
     try:
         from services.attribute_ai import analyze_product_with_chatgpt
 
-        product = _product(product_id)
+        product = _product_detail(product_id)
         _assert_product_version(product, payload)
         donor_ids = (
             _integer_list(payload, "donor_ids")
@@ -1087,7 +1095,7 @@ def api_attribute_product_template(product_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        product = _product(product_id)
+        product = _product_detail(product_id)
         _assert_product_version(product, payload)
         template = _template(_required_int(payload, "template_id"))
         assign_product_template(g.db, product, template)
@@ -1110,7 +1118,7 @@ def api_attribute_product_map_attribute(product_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        product = _product(product_id)
+        product = _product_detail(product_id)
         _assert_product_version(product, payload)
         field = g.db.get(AttributeTemplateField, _required_int(payload, "field_id"))
         donor_id = _required_int(payload, "donor_id")
@@ -1193,7 +1201,7 @@ def api_attribute_product_history_restore(product_id: int, revision_id: int):
     ensure_storage()
     payload = _json_body()
     try:
-        product = _product(product_id)
+        product = _product_detail(product_id)
         _assert_product_version(product, payload)
         revision = g.db.get(AttributeProductRevision, revision_id)
         if not revision:

@@ -276,14 +276,16 @@ class ProgramAndProposalIntegrationTest(unittest.TestCase):
         self.assertEqual(svc.refresh_batch_summary(product.batch)["suggestions"], 0)
         self.assertEqual(svc.refresh_product_status(product), "ready")
 
-    def test_historical_same_suggestion_is_removed_but_real_changes_remain(self):
+    def test_historical_same_suggestion_migration_keeps_real_changes(self):
         product = self.product(["Отдельностоящий", "Встраиваемый"], name="Тип установки", current="Отдельностоящий")
         target = product.values[0]
         target.status, target.proposed_value = "suggested", "отдельностоящий"
+        svc.migrate_existing_attribute_suggestions(self.db)
         serialized = svc.serialize_value(target)
         self.assertEqual(serialized["status"], "kept")
         self.assertEqual(serialized["proposed_value"], "")
         target.status, target.proposed_value = "suggested", "Встраиваемый"
+        svc.migrate_existing_attribute_suggestions(self.db)
         self.assertEqual(svc.serialize_value(target)["status"], "conflict")
 
     def test_manually_accepted_programs_are_normalized(self):
