@@ -17,7 +17,7 @@ from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 
-from config import ATTRIBUTE_ASSISTANT_DIR
+from config import ATTRIBUTE_ASSISTANT_DIR, env_int
 from models import AttributeProduct, AttributeProductSource, Donor
 from services.attribute_programs import is_program_list, match_programs, program_dictionary
 from services.attribute_files import delete_after_commit, stage_text
@@ -61,8 +61,12 @@ from services.attribute_assistant import (
 
 
 ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v18-product-description"
-ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD = 30
-ATTRIBUTE_AI_MAX_PAGE_CHARS = 60_000
+ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD = env_int(
+    "ATTRIBUTE_CHATGPT_MAX_ALLOWED_PER_FIELD", 12, minimum=1, maximum=100,
+)
+ATTRIBUTE_AI_MAX_PAGE_CHARS = env_int(
+    "ATTRIBUTE_CHATGPT_MAX_PAGE_CHARS", 30_000, minimum=5_000, maximum=100_000,
+)
 ATTRIBUTE_AI_MAX_RESPONSE_CHARS = 2_000_000
 ATTRIBUTE_AI_MAX_SOURCE_HINTS_PER_FIELD = 3
 ATTRIBUTE_AI_MIN_SOURCE_HINT_SCORE = 0.55
@@ -185,9 +189,6 @@ def _shortlist_allowed_values(
 ) -> list[str]:
     active = [item for item in field.allowed_values if item.is_active]
     limit = max(1, int(limit))
-    if len(active) <= limit:
-        return [item.value for item in active]
-
     selected: list[str] = []
     for hint in hints:
         canonical, _confidence, _reason, suggestions = _allowed_match(
@@ -264,7 +265,10 @@ def _template_context(
             item["source_ids"] = ids
         if is_program_list(field):
             item.update(program_dictionary(field, evidence))
-        else:
+        elif hints:
+            # The service performs the final match against the complete
+            # dictionary. Sending values for unrelated fields multiplies the
+            # prompt size without helping the model map source facts.
             allowed = _shortlist_allowed_values(field, hints, evidence, evidence_tokens=evidence_tokens)
             if allowed:
                 item["allowed_values"] = allowed
@@ -313,6 +317,9 @@ def build_product_prompt(
     truncated = len(visible) > ATTRIBUTE_AI_MAX_PAGE_CHARS
     visible = visible[:ATTRIBUTE_AI_MAX_PAGE_CHARS]
     description = clean_text(parsed.get("description"))
+    prompt_description = description
+    if description and exact_value_key(description) in exact_value_key(visible):
+        prompt_description = ""
     evidence = (
         _page_evidence(visible, parsed)
         if html or parsed.get("attributes") or description
@@ -332,7 +339,7 @@ def build_product_prompt(
         "official_product_url": source_url,
         "parser_attributes": parsed_attribute_facts(parsed),
         "template_fields": _template_context(product, parsed, evidence),
-        **({"product_description": description} if description else {}),
+        **({"product_description": prompt_description} if prompt_description else {}),
         "page_evidence": visible,
         **({"page_evidence_truncated": True} if truncated else {}),
     }

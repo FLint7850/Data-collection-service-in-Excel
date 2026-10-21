@@ -1356,6 +1356,31 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertNotIn("По типу установки", visible)
         self.assertNotIn("скрытая справка", visible)
 
+    def test_hidden_specification_tab_is_not_removed_as_ui_noise(self):
+        html = """
+        <h1>Холодильник Kuppersbusch FK 8550.0i</h1>
+        <nav class="tabs">
+          <a href="#description">Описание</a>
+          <a href="#product-specifications">Характеристики</a>
+        </nav>
+        <div id="description">Карточка товара</div>
+        <div id="product-specifications" style="display: none">
+          <table>
+            <tr><th colspan="2">Общие характеристики</th></tr>
+            <tr><td><span>Модель</span></td><td><span>FK 8550.0i</span></td></tr>
+            <tr><td><span>Уровень шума, дБ</span></td><td><span>41</span></td></tr>
+          </table>
+        </div>
+        """
+
+        parsed = service.parse_product_html(html, "https://example.com/fk-8550-0i/")
+
+        self.assertEqual(parsed["model"], "FK 8550.0i")
+        self.assertEqual(parsed["attributes"], [
+            {"name": "Модель", "value": "FK 8550.0i", "group": ""},
+            {"name": "Уровень шума, дБ", "value": "41", "group": ""},
+        ])
+
     def test_tooltip_panels_are_excluded_before_discovering_characteristic_rows(self):
         for marker in (
             'class="tooltip-popper tooltip-popper_large"',

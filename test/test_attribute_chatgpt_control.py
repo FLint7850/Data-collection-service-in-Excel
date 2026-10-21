@@ -71,6 +71,42 @@ class AttributeChatGptControlTests(unittest.TestCase):
                 control.analyze_with_chatgpt("all products")
         self.assert_one_submission(request)
 
+    def test_rate_limit_is_retried_with_a_new_bridge_job(self):
+        second_request_id = "b" * 32
+        result = {"text": "recovered after rate limit"}
+        with patch.object(
+            control.uuid,
+            "uuid4",
+            side_effect=[SimpleNamespace(hex=self.request_id), SimpleNamespace(hex=second_request_id)],
+        ), patch.object(control.random, "uniform", return_value=0), patch.object(
+            control, "RATE_LIMIT_RETRIES", 2,
+        ), patch.object(control, "bridge_request", side_effect=[
+            self.state("failed", error="exceeded retry limit, last status: 429 Too Many Requests"),
+            {"id": second_request_id, "status": "completed", "result": result},
+        ]) as request:
+            self.assertEqual(control.analyze_with_chatgpt("all products"), result)
+
+        posts = [call for call in request.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0].kwargs["json_body"]["request_id"], self.request_id)
+        self.assertEqual(posts[1].kwargs["json_body"]["request_id"], second_request_id)
+        self.assertEqual(self.sleep.call_args_list[-1].args[0], control.RATE_LIMIT_BACKOFF_SECONDS)
+        self.assertEqual(self.release.call_count, 2)
+
+    def test_rate_limit_stops_after_configured_retry_count(self):
+        rate_limit = "429 Too Many Requests"
+        with patch.object(control, "RATE_LIMIT_RETRIES", 2), \
+                patch.object(control.random, "uniform", return_value=0), \
+                patch.object(control, "_analyze_once", side_effect=RuntimeError(rate_limit)) as analyze:
+            with self.assertRaisesRegex(RuntimeError, rate_limit):
+                control.analyze_with_chatgpt("all products")
+
+        self.assertEqual(analyze.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in self.sleep.call_args_list],
+            [control.RATE_LIMIT_BACKOFF_SECONDS, control.RATE_LIMIT_BACKOFF_SECONDS * 2],
+        )
+
     def test_lost_bridge_reports_uncertain_remote_state(self):
         with patch.object(control, "bridge_request", side_effect=[
             self.state(), control.BridgeTransportError("offline"),

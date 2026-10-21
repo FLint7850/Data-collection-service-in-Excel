@@ -1626,17 +1626,53 @@ def _is_semantically_hidden_ui(node: Any) -> bool:
     return bool(HIDDEN_UI_STYLE_RE.search(str(node.get("style") or "")))
 
 
+def _referenced_specification_panel_ids(node: Any) -> set[str]:
+    """Return hidden local targets opened by specification controls.
+
+    Product pages commonly keep inactive tabs in the DOM with
+    ``display:none``.  Those panels are real product content, not tooltip
+    noise, when a local control named "Characteristics" points at them.
+    """
+
+    targets: set[str] = set()
+    for control in node.find_all(["a", "button"]):
+        title = clean_text(
+            control.get_text(" ")
+            or control.get("aria-label")
+            or control.get("title")
+        )
+        if not title or not SPECIFICATION_HEADING_RE.search(title):
+            continue
+        for attribute in ("href", "data-target", "data-bs-target", "aria-controls"):
+            raw_target = clean_text(control.get(attribute))
+            if not raw_target:
+                continue
+            for target in raw_target.split():
+                if target.startswith("#"):
+                    target = target[1:]
+                elif attribute != "aria-controls":
+                    continue
+                target = target.lstrip("#")
+                if target:
+                    targets.add(target)
+    return targets
+
+
 def _remove_ui_noise(node: Any) -> None:
     """Remove content which a user cannot see as part of the specification.
 
     Semantic HTML state is checked first, so inline tooltip templates such as
-    ``style="display:none"`` are excluded on any site. Known UI selectors stay
-    as a compatibility fallback for markup that has no accessibility metadata.
+    ``style="display:none"`` are excluded on any site. A hidden local panel is
+    retained when a specification tab explicitly points to it: inactive tabs
+    are real product content. Known UI selectors stay as a compatibility
+    fallback for markup that has no accessibility metadata.
     """
 
+    specification_panel_ids = _referenced_specification_panel_ids(node)
     semantic_noise = [
         candidate for candidate in node.find_all(True)
         if _is_semantically_hidden_ui(candidate)
+        and clean_text(candidate.get("id")) not in specification_panel_ids
     ]
     # Remove children first because hidden/popup containers may be nested.
     for noisy in reversed(semantic_noise):

@@ -1,12 +1,14 @@
 """Authentication and analysis calls for the isolated Codex App Server bridge."""
 
 from typing import Any
+import random
+import re
 import time
 import uuid
 
 import requests
 
-from config import env_str
+from config import env_float, env_int, env_str
 from services.attribute_assistant import clean_text
 
 
@@ -15,6 +17,19 @@ BRIDGE_TOKEN = env_str("ATTRIBUTE_CHATGPT_BRIDGE_TOKEN", "")
 BRIDGE_ANALYSIS_REQUEST_TIMEOUT = (5, 30)
 BRIDGE_POLL_INTERVAL = 2.0
 BRIDGE_RECOVERY_TIMEOUT = 60.0
+RATE_LIMIT_RETRIES = env_int(
+    "ATTRIBUTE_CHATGPT_RATE_LIMIT_RETRIES", 0, minimum=0, maximum=10,
+)
+RATE_LIMIT_BACKOFF_SECONDS = env_float(
+    "ATTRIBUTE_CHATGPT_RATE_LIMIT_BACKOFF_SECONDS", 5.0, minimum=0.1, maximum=300.0,
+)
+RATE_LIMIT_BACKOFF_MAX_SECONDS = env_float(
+    "ATTRIBUTE_CHATGPT_RATE_LIMIT_BACKOFF_MAX_SECONDS", 60.0, minimum=1.0, maximum=600.0,
+)
+RATE_LIMIT_ERROR_RE = re.compile(
+    r"(?:\b429\b|too\s+many\s+requests|rate[\s_-]*limit|слишком\s+много\s+запросов)",
+    re.IGNORECASE,
+)
 
 
 class BridgeTransportError(RuntimeError):
@@ -25,6 +40,10 @@ class BridgeHttpError(RuntimeError):
     def __init__(self, message: str, status_code: int):
         super().__init__(message)
         self.status_code = status_code
+
+
+class ChatGptRateLimitError(RuntimeError):
+    """The account limit is exhausted and the surrounding batch must stop."""
 
 
 def bridge_request(
@@ -85,8 +104,8 @@ def logout_chatgpt() -> dict[str, Any]:
     return bridge_request("POST", "/logout", timeout=30)
 
 
-def analyze_with_chatgpt(prompt: str) -> dict[str, Any]:
-    """Submit one prompt and retrieve that job's result over short HTTP requests."""
+def _analyze_once(prompt: str) -> dict[str, Any]:
+    """Submit one idempotent bridge job and retrieve its result."""
     request_id = uuid.uuid4().hex
     state: dict[str, Any] | None = None
     last_contact = time.monotonic()
@@ -141,6 +160,44 @@ def analyze_with_chatgpt(prompt: str) -> dict[str, Any]:
                 ) from error
             state = None
             time.sleep(BRIDGE_POLL_INTERVAL)
+
+
+def _is_rate_limit_error(error: BaseException) -> bool:
+    return (
+        isinstance(error, BridgeHttpError) and error.status_code == 429
+    ) or bool(RATE_LIMIT_ERROR_RE.search(clean_text(error)))
+
+
+def _rate_limit_retry_delay(retry_index: int) -> float:
+    base_delay = min(
+        RATE_LIMIT_BACKOFF_MAX_SECONDS,
+        RATE_LIMIT_BACKOFF_SECONDS * (2 ** max(0, retry_index)),
+    )
+    # Independent workers must not all retry at the same instant.
+    return base_delay + random.uniform(0.0, base_delay * 0.25)
+
+
+def analyze_with_chatgpt(prompt: str) -> dict[str, Any]:
+    """Analyze a prompt, retrying only confirmed temporary rate limits.
+
+    Transport failures are deliberately not resubmitted because the bridge may
+    still be processing the original job. A completed bridge failure carrying
+    HTTP 429 is safe to retry with a fresh operation id.
+    """
+
+    for retry_index in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            return _analyze_once(prompt)
+        except RuntimeError as error:
+            if not _is_rate_limit_error(error):
+                raise
+            if retry_index >= RATE_LIMIT_RETRIES:
+                raise ChatGptRateLimitError(
+                    "Лимит ChatGPT временно исчерпан (429). Массовая операция остановлена, "
+                    "чтобы не отправлять остальные товары впустую. Повторите её после восстановления лимита"
+                ) from error
+            time.sleep(_rate_limit_retry_delay(retry_index))
+    raise RuntimeError("ChatGPT не смог выполнить анализ после повторных попыток")
 
 
 def _release_analysis(request_id: str) -> None:

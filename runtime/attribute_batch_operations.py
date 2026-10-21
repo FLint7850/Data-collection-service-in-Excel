@@ -38,7 +38,7 @@ from services.attribute_ai import (
     record_analysis_metrics,
     validate_analysis,
 )
-from services.attribute_chatgpt_control import analyze_with_chatgpt
+from services.attribute_chatgpt_control import ChatGptRateLimitError, analyze_with_chatgpt
 
 
 _LOCK = threading.RLock()
@@ -46,7 +46,7 @@ _DB_WRITE_LOCK = threading.RLock()
 _JOBS: dict[int, dict[str, Any]] = {}
 _THREADS: dict[int, threading.Thread] = {}
 _ACTIVE_STATUSES = {"queued", "running"}
-CHATGPT_CONCURRENCY = env_int("ATTRIBUTE_CHATGPT_CONCURRENCY", 3, minimum=1, maximum=8)
+CHATGPT_CONCURRENCY = env_int("ATTRIBUTE_CHATGPT_CONCURRENCY", 1, minimum=1, maximum=8)
 
 
 def _now() -> str:
@@ -338,16 +338,25 @@ def _analyze_prepared_product(prompt: str) -> dict[str, Any]:
     return {**response, "request_seconds": time.perf_counter() - started}
 
 
-def _apply_chatgpt_result(batch_id: int, prepared: dict[str, Any], future: Future) -> None:
+def _apply_chatgpt_result(
+    batch_id: int,
+    prepared: dict[str, Any],
+    future: Future,
+) -> BaseException | None:
     with _DB_WRITE_LOCK:
-        _apply_chatgpt_result_locked(batch_id, prepared, future)
+        return _apply_chatgpt_result_locked(batch_id, prepared, future)
 
 
-def _apply_chatgpt_result_locked(batch_id: int, prepared: dict[str, Any], future: Future) -> None:
+def _apply_chatgpt_result_locked(
+    batch_id: int,
+    prepared: dict[str, Any],
+    future: Future,
+) -> BaseException | None:
     """Save each completed response serially, in its own short transaction."""
     db = SessionLocal()
     product: AttributeProduct | None = None
     failed = False
+    failure: BaseException | None = None
     changed = 0
     attributes_found = 0
     try:
@@ -396,6 +405,7 @@ def _apply_chatgpt_result_locked(batch_id: int, prepared: dict[str, Any], future
         db.commit()
     except Exception as error:
         failed = True
+        failure = error
         db.rollback()
         _append_error(batch_id, product, error)
     finally:
@@ -406,6 +416,7 @@ def _apply_chatgpt_result_locked(batch_id: int, prepared: dict[str, Any], future
             changed=changed if not failed else 0,
             attributes_found=attributes_found if not failed else 0,
         )
+    return failure
 
 
 def _run_chatgpt_products(
@@ -453,7 +464,9 @@ def _run_chatgpt_products(
                     prepared_count += 1
                     _update(batch_id, prepared=prepared_count)
             elif future in analysis_pending:
-                _apply_chatgpt_result(batch_id, analysis_pending.pop(future), future)
+                failure = _apply_chatgpt_result(batch_id, analysis_pending.pop(future), future)
+                if isinstance(failure, ChatGptRateLimitError):
+                    raise failure
 
     with ThreadPoolExecutor(max_workers=source_workers, thread_name_prefix="attribute-source") as source_pool, \
             ThreadPoolExecutor(max_workers=CHATGPT_CONCURRENCY, thread_name_prefix="attribute-chatgpt") as ai_pool:
