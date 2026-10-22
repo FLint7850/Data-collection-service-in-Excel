@@ -91,7 +91,13 @@ def log_fetch_result(method: str, url: str, html: Optional[str], elapsed: float 
 
 
 def log_fetch_exception(method: str, url: str, error: BaseException) -> None:
-    fetch_debug_log(f"method={method}; url={url}; error={type(error).__name__}: {error}", "warning")
+    from services.scraping.proxy import redact_proxy_credentials
+
+    fetch_debug_log(
+        f"method={method}; url={url}; error={type(error).__name__}: "
+        f"{redact_proxy_credentials(error)}",
+        "warning",
+    )
 
 
 def get_log_auto_cleanup() -> bool:

@@ -60,14 +60,14 @@ services:
       ATTRIBUTE_ASSISTANT_DIR: /app/storage/attribute-assistant
       ATTRIBUTE_CHATGPT_BRIDGE_URL: http://attribute-ai:4580
       ATTRIBUTE_CHATGPT_BRIDGE_TOKEN: ${ATTRIBUTE_CHATGPT_BRIDGE_TOKEN:-}
-      ATTRIBUTE_CHATGPT_PROXY_URL: ""
+      ATTRIBUTE_CHATGPT_PROXY_URL: ${ATTRIBUTE_CHATGPT_PROXY_URL:-}
       FILE_IMPORT_DIR: /app/storage/file-import
       PRICE_CONVERTER_DIR: ${PRICE_CONVERTER_DIR:-storage/price-converter}
       TMPDIR: /tmp/parser
       FORCE_BROWSER_SETUP: 0
-      # DELETE is stable on Docker Desktop bind mounts. Linux deployments may
-      # explicitly set SQLITE_JOURNAL_MODE=WAL for a database on a native volume.
-      SQLITE_JOURNAL_MODE: ${SQLITE_JOURNAL_MODE:-DELETE}
+      # WAL reduces reader/writer contention. Keep the SQLite data directory on
+      # a local/native filesystem; network filesystems do not support WAL safely.
+      SQLITE_JOURNAL_MODE: ${SQLITE_JOURNAL_MODE:-WAL}
       SQLITE_BUSY_TIMEOUT_MS: 30000
       WEB_GRACEFUL_TIMEOUT: 90
       WEB_CONCURRENCY: 1

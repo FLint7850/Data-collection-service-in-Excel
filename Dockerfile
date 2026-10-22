@@ -16,7 +16,7 @@ ARG DEBIAN_MIRROR=https://mirror.yandex.ru
 RUN mkdir -p /tmp/parser \
     && sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gosu \
+    && apt-get install -y --no-install-recommends ca-certificates curl gosu nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -35,7 +35,14 @@ RUN pip install pyflakes==3.4.0 \
     && python -m unittest discover -s test -v \
     && python -m compileall -q app.py config.py database routes runtime services
 
+FROM base AS proxy-runtime-dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -c "import javascript_fixes; javascript_fixes.terminate()"
+
 FROM base AS runtime
+COPY --from=proxy-runtime-dependencies /usr/local/lib/python3.11/site-packages/javascript_fixes/js /usr/local/lib/python3.11/site-packages/javascript_fixes/js
 COPY . .
 RUN addgroup --system --gid 10001 app \
     && adduser --system --uid 10001 --ingroup app --home /app app \

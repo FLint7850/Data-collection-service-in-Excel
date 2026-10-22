@@ -57,6 +57,7 @@ function cloneMonitor(monitor: NewsMonitor): NewsMonitor {
 
 function prepareMonitor(monitor: NewsMonitor): NewsMonitor {
   const next = cloneMonitor(monitor);
+  next.use_proxy = Boolean(next.use_proxy);
   next.extraction_rules = {
     ...next.extraction_rules,
     model_start_marker: next.extraction_rules.model_start_marker || "",
@@ -82,6 +83,7 @@ function monitorPayload(monitor: NewsMonitor): MonitorPayload {
     thread_count: monitor.thread_count,
     connection_method: monitor.connection_method,
     auto_connection_fallback: monitor.auto_connection_fallback,
+    use_proxy: Boolean(monitor.use_proxy),
     exclusions: monitor.exclusions,
     product_url_filters: monitor.product_url_filters,
     product_url_exclusions: monitor.product_url_exclusions,

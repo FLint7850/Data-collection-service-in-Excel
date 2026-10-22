@@ -78,6 +78,7 @@ def make_news_monitor(group: str, brand: str, urls: List[str], site_url: str = "
         "thread_count": 4,
         "connection_method": normalize_connection_method(None),
         "auto_connection_fallback": True,
+        "use_proxy": False,
         "exclusions": DEFAULT_EXCLUSIONS.copy(),
         "product_url_filters": [],
         "product_url_exclusions": [],
@@ -158,6 +159,7 @@ def normalize_news_monitor(item: Dict[str, object]) -> Dict[str, object]:
     monitor["thread_count"] = parse_thread_count(item.get("thread_count", 4))
     monitor["connection_method"] = normalize_connection_method(item.get("connection_method"))
     monitor["auto_connection_fallback"] = bool(item.get("auto_connection_fallback", True))
+    monitor["use_proxy"] = bool(item.get("use_proxy", False))
     monitor["exclusions"] = normalize_patterns(item.get("exclusions", DEFAULT_EXCLUSIONS))
     monitor["product_url_filters"] = normalize_patterns(item.get("product_url_filters", []))
     monitor["product_url_exclusions"] = normalize_patterns(item.get("product_url_exclusions", []))
@@ -221,6 +223,7 @@ def donor_model_to_monitor(row: Donor) -> Dict[str, object]:
         "connection_method": donor_connection_code(row),
         "connection_id": row.connection_id,
         "auto_connection_fallback": bool(row.auto_connection_fallback),
+        "use_proxy": bool(getattr(row, "use_proxy", False)),
         "exclusions": normalize_patterns(row.exclusions or DEFAULT_EXCLUSIONS),
         "product_url_filters": normalize_patterns(row.product_url_filters or []),
         "product_url_exclusions": normalize_patterns(getattr(row, "product_url_exclusions", None) or []),
@@ -322,6 +325,7 @@ def upsert_donor_model(session, monitor: Dict[str, object]) -> int:
     row.thread_count = parse_thread_count(normalized.get("thread_count", 4))
     row.connection_id = connection_method_id_for(session, normalized.get("connection_method"))
     row.auto_connection_fallback = bool(normalized.get("auto_connection_fallback", True))
+    row.use_proxy = bool(normalized.get("use_proxy", False))
     row.exclusions = normalize_patterns(normalized.get("exclusions", DEFAULT_EXCLUSIONS))
     row.product_url_filters = normalize_patterns(normalized.get("product_url_filters", []))
     row.product_url_exclusions = normalize_patterns(normalized.get("product_url_exclusions", []))

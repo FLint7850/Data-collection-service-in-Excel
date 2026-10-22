@@ -20,6 +20,7 @@ PROJECT_MUTABLE_FIELDS = {
     "auto_cleanup",
     "connection_method",
     "auto_connection_fallback",
+    "use_proxy",
     "persist_profile",
 }
 

@@ -13,6 +13,7 @@ from services.scraping import (
     product_url_filter_patterns,
 )
 from services.scraping.checkpoints import delete_scrape_checkpoint, load_scrape_checkpoint
+from services.scraping.proxy import resolve_scraping_proxy_url
 
 
 def close_project_browser_session(project: Dict[str, object]) -> None:
@@ -78,6 +79,8 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         delete_scrape_checkpoint("projects", project.get("id"))
     profile_dir = project_browser_profile_dir(project)
     runtime_thread_count = project_runtime_thread_count(project)
+    use_proxy = bool(project.get("use_proxy", False))
+    proxy_url = resolve_scraping_proxy_url(use_proxy)
     if crawler:
         crawler.close_browser_sessions()
         cleanup_project_profile_if_disabled(project)
@@ -91,12 +94,15 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
         crawler.product_url_exclusions = normalize_patterns(project.get("product_url_exclusions", []))
         crawler.connection_method = normalize_connection_method(project.get("connection_method"))
         crawler.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
+        crawler.use_proxy = use_proxy
+        crawler.proxy_url = proxy_url
         crawler.profile_dir = profile_dir
         crawler.browser_session = BrowserMethodSession(
             project["stop_event"],
             crawler.thread_count,
             profile_dir=crawler.profile_dir,
             initial_method=crawler.connection_method,
+            proxy_url=proxy_url,
         )
         crawler.active_connection_method = crawler.connection_method
         with crawler.connection_method_state["lock"]:
@@ -122,6 +128,7 @@ def start_project(project: Dict[str, object], resume: bool = False) -> Dict[str,
             extraction_rules=normalize_extraction_rules(project.get("extraction_rules", {})),
             connection_method=project.get("connection_method", "requests"),
             auto_connection_fallback=bool(project.get("auto_connection_fallback", True)),
+            use_proxy=use_proxy,
             profile_dir=profile_dir,
         )
         project["crawler"] = crawler

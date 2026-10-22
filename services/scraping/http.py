@@ -197,7 +197,10 @@ def canonicalize_product_url_by_filters(url: str, filters: Iterable[str]) -> str
 def is_product_url_for_filters(url: str, filters: Iterable[str]) -> bool:
     return bool([pattern for pattern in filters if str(pattern).strip()]) and product_url_matches_filters(url, filters)
 
-def fetch_with_botasaurus_request(url: str) -> Optional[str]:
+def fetch_with_botasaurus_request(
+    url: str,
+    proxy_url: Optional[str] = None,
+) -> Optional[str]:
     """Fallback через Botasaurus Request: браузероподобный HTTP-запрос с Google Referrer."""
     from services.log_service import log_fetch_exception
     try:
@@ -207,7 +210,12 @@ def fetch_with_botasaurus_request(url: str) -> Optional[str]:
         log_fetch_exception("botasaurus-request:import", url, error)
         return None
 
-    @botasaurus_request(max_retry=MAX_RETRIES, output=None, create_error_logs=False)
+    @botasaurus_request(
+        max_retry=MAX_RETRIES,
+        proxy=proxy_url,
+        output=None,
+        create_error_logs=False,
+    )
     def _fetch_html(request_client: Request, target_url: str):
         response = request_client.get(target_url)
         response.raise_for_status()

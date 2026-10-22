@@ -138,6 +138,8 @@ def api_update_news_monitor(monitor_id: str):
             monitor["connection_method"] = normalize_connection_method(payload.get("connection_method"))
         if "auto_connection_fallback" in payload:
             monitor["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
+        if "use_proxy" in payload:
+            monitor["use_proxy"] = bool(payload.get("use_proxy"))
         if "exclusions" in payload:
             exclusions = normalize_patterns(payload.get("exclusions"))
             monitor["exclusions"] = exclusions
@@ -183,7 +185,11 @@ def api_scan_news_monitor(monitor_id: str):
         sync_brand_runtime_fields(monitor)
         persist_news_monitor_state(monitor, force=True)
         response_monitor = public_news_monitor_progress(monitor)
-    if not start_news_scan(monitor_id, manual=True):
+    try:
+        started = start_news_scan(monitor_id, manual=True)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+    if not started:
         return jsonify({"error": "Сканирование уже выполняется"}), 409
     return jsonify({"monitor": response_monitor})
 
@@ -233,7 +239,11 @@ def api_resume_news_monitor(monitor_id: str):
         monitor["brand_state"] = dict(monitor["state"])
         persist_news_monitor_state(monitor, force=True)
         response_monitor = public_news_monitor_progress(monitor)
-    if not start_news_scan(monitor_id, manual=True, resume=True):
+    try:
+        started = start_news_scan(monitor_id, manual=True, resume=True)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+    if not started:
         return jsonify({"error": "Сканирование уже выполняется"}), 409
     add_news_log(monitor, "Продолжение сканирования новинок запущено", "info")
     return jsonify({"monitor": response_monitor})
@@ -314,6 +324,7 @@ def api_create_news_monitor():
         urls,
         site_url,
     )
+    monitor["use_proxy"] = bool(payload.get("use_proxy", False))
     with news_lock:
         news_settings.setdefault("monitors", []).append(monitor)
         save_news_monitor(monitor)

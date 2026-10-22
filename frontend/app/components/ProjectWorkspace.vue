@@ -88,6 +88,7 @@ function projectPayload(project: Project): ProjectSavePayload {
     thread_count: Number(project.thread_count || 4),
     connection_method: project.connection_method,
     auto_connection_fallback: project.auto_connection_fallback,
+    use_proxy: Boolean(project.use_proxy),
     persist_profile: project.persist_profile,
     exclusions: project.exclusions,
     product_url_filters: project.product_url_filters,
@@ -420,6 +421,18 @@ onMounted(async () => {
               <span>
                 <strong>Автопереключение</strong>
                 <small>Пробовать резервный способ подключения при блокировке.</small>
+              </span>
+            </UCard>
+            <UCard
+              as="label"
+              variant="subtle"
+              class="switch-card"
+              :ui="{ body: 'switch-card-body' }"
+            >
+              <USwitch v-model="draft.use_proxy" :disabled="isActive" />
+              <span>
+                <strong>Использовать прокси</strong>
+                <small>Все запросы к сайту проекта выполнять через настроенный прокси.</small>
               </span>
             </UCard>
             <UCard

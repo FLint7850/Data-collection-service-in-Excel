@@ -1103,6 +1103,7 @@ def migrate_news_tables(connection) -> None:
             "start_urls": "JSON NOT NULL DEFAULT '[]'",
             "thread_count": "INTEGER NOT NULL DEFAULT 4",
             "auto_connection_fallback": "BOOLEAN NOT NULL DEFAULT 1",
+            "use_proxy": "BOOLEAN NOT NULL DEFAULT 0",
             "exclusions": "JSON NOT NULL DEFAULT '[]'",
             "product_url_filters": "JSON NOT NULL DEFAULT '[]'",
             "product_url_exclusions": "JSON NOT NULL DEFAULT '[]'",
@@ -1393,6 +1394,8 @@ def migrate_projects_table(connection) -> None:
         columns = table_columns(connection, "projects")
     if "persist_profile" not in columns:
         connection.execute(text("ALTER TABLE projects ADD COLUMN persist_profile BOOLEAN NOT NULL DEFAULT 0"))
+    if "use_proxy" not in columns:
+        connection.execute(text("ALTER TABLE projects ADD COLUMN use_proxy BOOLEAN NOT NULL DEFAULT 0"))
 
 
 def migrate_donor_start_urls(connection) -> None:
@@ -1431,6 +1434,10 @@ def migrate_donors_table(connection) -> None:
 
     if "product_url_exclusions" not in columns:
         connection.execute(text("ALTER TABLE donors ADD COLUMN product_url_exclusions JSON NOT NULL DEFAULT '[]'"))
+        columns = table_columns(connection, "donors")
+
+    if "use_proxy" not in columns:
+        connection.execute(text("ALTER TABLE donors ADD COLUMN use_proxy BOOLEAN NOT NULL DEFAULT 0"))
         columns = table_columns(connection, "donors")
 
     if "connection_method" in columns:

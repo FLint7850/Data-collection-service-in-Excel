@@ -109,6 +109,7 @@ export interface Project {
   auto_cleanup: boolean;
   connection_method: string;
   auto_connection_fallback: boolean;
+  use_proxy: boolean;
   persist_profile: boolean;
 }
 
@@ -178,6 +179,7 @@ export interface NewsMonitor extends NewsMonitorSummary {
   thread_count: number;
   connection_method: string;
   auto_connection_fallback: boolean;
+  use_proxy: boolean;
   exclusions: string[];
   product_url_filters: string[];
   product_url_exclusions: string[];

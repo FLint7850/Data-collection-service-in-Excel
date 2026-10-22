@@ -14,7 +14,7 @@ BRAND_MUTABLE_FIELDS = {
 }
 DONOR_MUTABLE_FIELDS = {
     "site_url", "start_urls", "thread_count", "connection_id",
-    "auto_connection_fallback", "exclusions", "product_url_filters",
+    "auto_connection_fallback", "use_proxy", "exclusions", "product_url_filters",
     "product_url_exclusions", "extraction_rules", "selector_settings",
     "seen_models", "known_new_products",
 }

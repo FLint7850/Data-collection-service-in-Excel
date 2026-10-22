@@ -52,6 +52,7 @@ def make_project(name: str = "Проект 1", start_urls: Optional[List[str]] =
         "auto_cleanup": False,
         "connection_method": normalize_connection_method(None),
         "auto_connection_fallback": True,
+        "use_proxy": False,
         "persist_profile": False,
         "worker_thread": None,
         "stop_event": threading.Event(),
@@ -86,6 +87,7 @@ def public_project(project: Dict[str, object], include_details: bool = True) -> 
             "extraction_rules": project.get("extraction_rules", {}),
             "auto_cleanup": project.get("auto_cleanup", False),
             "auto_connection_fallback": project.get("auto_connection_fallback", True),
+            "use_proxy": bool(project.get("use_proxy", False)),
             "persist_profile": bool(project.get("persist_profile", False)),
         }
     )
@@ -109,6 +111,7 @@ def project_model_to_dict(row: Project) -> Dict[str, object]:
         "auto_cleanup": bool(row.auto_cleanup),
         "connection_method": normalize_connection_method(row.connection_method),
         "auto_connection_fallback": bool(row.auto_connection_fallback),
+        "use_proxy": bool(getattr(row, "use_proxy", False)),
         "persist_profile": bool(getattr(row, "persist_profile", False)),
         "worker_thread": None,
         "stop_event": threading.Event(),
@@ -139,6 +142,7 @@ def upsert_project_model(session, project: Dict[str, object]) -> int:
     row.auto_cleanup = bool(project.get("auto_cleanup", False))
     row.connection_method = normalize_connection_method(project.get("connection_method"))
     row.auto_connection_fallback = bool(project.get("auto_connection_fallback", True))
+    row.use_proxy = bool(project.get("use_proxy", False))
     row.persist_profile = bool(project.get("persist_profile", False))
     session.flush()
     return int(row.id)

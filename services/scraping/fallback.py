@@ -47,6 +47,7 @@ from services.scraping.http import (
     same_site,
     should_follow_project_url,
 )
+from services.scraping.proxy import redact_proxy_credentials, resolve_scraping_proxy_url
 
 class ProductSiteCrawler:
     def __init__(
@@ -63,6 +64,7 @@ class ProductSiteCrawler:
         extraction_rules: Optional[Dict[str, str]] = None,
         connection_method: str = "requests",
         auto_connection_fallback: bool = True,
+        use_proxy: bool = False,
         connection_method_state: Optional[Dict[str, object]] = None,
         allow_empty_price: bool = False,
         browser_session: Optional[BrowserMethodSession] = None,
@@ -84,6 +86,8 @@ class ProductSiteCrawler:
         self.product_url_exclusions = normalize_patterns(product_url_exclusions or [])
         self.connection_method = normalize_connection_method(connection_method)
         self.auto_connection_fallback = bool(auto_connection_fallback)
+        self.use_proxy = bool(use_proxy)
+        self.proxy_url = resolve_scraping_proxy_url(self.use_proxy)
         self.allow_empty_price = bool(allow_empty_price)
         self.profile_dir = profile_dir
         if connection_method_state is None:
@@ -110,6 +114,7 @@ class ProductSiteCrawler:
             self.thread_count,
             profile_dir=self.profile_dir,
             initial_method=self.connection_method,
+            proxy_url=self.proxy_url,
         )
         self.owns_browser_session = owns_browser_session
         self.browser_sessions_lock = threading.Lock()
@@ -174,7 +179,12 @@ class ProductSiteCrawler:
         session = getattr(self.thread_local, "session", None)
         if session is None:
             session = requests.Session()
+            session.trust_env = False
             session.headers.update(self.headers)
+            if self.proxy_url:
+                session.proxies.update(
+                    {"http": self.proxy_url, "https": self.proxy_url}
+                )
             self.thread_local.session = session
         return session
 
@@ -349,7 +359,7 @@ class ProductSiteCrawler:
                     last_error = "страница похожа на блокировку или пустой JS-шаблон"
                     break
                 except requests.RequestException as exc:
-                    last_error = str(exc)
+                    last_error = redact_proxy_credentials(exc)
                     if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code in {404, 410}:
                         with self.data_lock:
                             self.permanent_failures.add(url)
@@ -373,7 +383,7 @@ class ProductSiteCrawler:
         if method == "requests":
             return self.fetch_with_requests(target_url)
         if method == "botasaurus-request":
-            return fetch_with_botasaurus_request(target_url)
+            return fetch_with_botasaurus_request(target_url, self.proxy_url)
         if method in BOTASAURUS_HEADLESS_METHODS or method == "playwright":
             return self.browser_session_for_worker().fetch(
                 target_url,
@@ -397,9 +407,9 @@ class ProductSiteCrawler:
         if method == "scrapegraphai":
             return self.browser_session_for_worker().fetch(target_url, method)
         if method == "scrapy":
-            return fetch_with_scrapy(target_url)
+            return fetch_with_scrapy(target_url, self.proxy_url)
         if method == "crawlee":
-            return fetch_with_crawlee(target_url)
+            return fetch_with_crawlee(target_url, self.proxy_url)
         return None
 
     def fetch_by_method_with_timeout(self, url: str, method: str) -> Optional[str]:
@@ -407,7 +417,11 @@ class ProductSiteCrawler:
             try:
                 return self.fetch_by_method(url, method)
             except Exception as error:
-                self.log(f"Метод подключения {method} завершился ошибкой для {url}: {error}", "warning")
+                self.log(
+                    f"Метод подключения {method} завершился ошибкой для {url}: "
+                    f"{redact_proxy_credentials(error)}",
+                    "warning",
+                )
                 return None
 
         result_queue: Queue = Queue(maxsize=1)
@@ -429,7 +443,11 @@ class ProductSiteCrawler:
             )
             return None
         if status == "error":
-            self.log(f"Метод подключения {method} завершился ошибкой для {url}: {value}", "warning")
+            self.log(
+                f"Метод подключения {method} завершился ошибкой для {url}: "
+                f"{redact_proxy_credentials(value)}",
+                "warning",
+            )
             return None
         return value if isinstance(value, str) else None
 

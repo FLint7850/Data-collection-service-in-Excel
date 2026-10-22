@@ -30,6 +30,7 @@ NEWS_MONITOR_DETAIL_FIELDS = frozenset(
         "connection_id",
         "connection_method",
         "auto_connection_fallback",
+        "use_proxy",
         "exclusions",
         "product_url_filters",
         "product_url_exclusions",

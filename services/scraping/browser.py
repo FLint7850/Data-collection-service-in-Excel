@@ -26,6 +26,7 @@ from services.scraping.extraction import extract_listing_products, extract_produ
 from services.scraping.http import is_product_url_for_filters
 
 from services.scraping.http import looks_blocked_or_empty
+from services.scraping.proxy import browser_proxy_config, redact_proxy_credentials
 
 
 _BOTASAURUS_CONFIG_PATCH_LOCK = threading.Lock()
@@ -148,12 +149,14 @@ class PlaywrightBrowserSession:
         max_pages: int = 1,
         profile_dir: Optional[Path] = None,
         prefer_headless_shell: bool = True,
+        proxy_url: Optional[str] = None,
     ) -> None:
         from services.projects import parse_thread_count
         self.stop_signal = stop_signal
         self.max_pages = max(1, parse_thread_count(max_pages))
         self.profile_dir = profile_dir
         self.prefer_headless_shell = bool(prefer_headless_shell)
+        self.proxy_url = proxy_url
         self.executable_path = env_str("PLAYWRIGHT_BROWSER_EXECUTABLE") or botasaurus_browser_executable(
             prefer_headless_shell=self.prefer_headless_shell,
         )
@@ -199,7 +202,11 @@ class PlaywrightBrowserSession:
                 self._loop.run_forever()
         except BaseException as error:  # noqa: BLE001
             self._start_error = error
-            fetch_debug_log(f"browser-session start failed: {type(error).__name__}: {error}", "warning")
+            fetch_debug_log(
+                f"browser-session start failed: {type(error).__name__}: "
+                f"{redact_proxy_credentials(error)}",
+                "warning",
+            )
             self._ready.set()
         finally:
             try:
@@ -235,6 +242,9 @@ class PlaywrightBrowserSession:
         }
         if self.executable_path:
             launch_options["executable_path"] = self.executable_path
+        proxy_config = browser_proxy_config(self.proxy_url)
+        if proxy_config:
+            launch_options["proxy"] = proxy_config
         context_options = dict(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -627,12 +637,14 @@ class BotasaurusBrowserSession:
         stop_signal: Optional[threading.Event] = None,
         max_pages: int = 1,
         profile: Optional[str] = None,
+        proxy_url: Optional[str] = None,
     ) -> None:
         from services.projects import parse_thread_count
 
         self.stop_signal = stop_signal
         self.max_pages = max(1, parse_thread_count(max_pages))
         self.profile = profile
+        self.proxy_url = proxy_url
         self.executable_path = botasaurus_browser_executable(
             prefer_headless_shell=self.prefer_headless_shell
         )
@@ -680,6 +692,7 @@ class BotasaurusBrowserSession:
             headless=self.headless,
             chrome_executable_path=self.executable_path,
             profile=self.profile,
+            proxy=self.proxy_url,
             add_arguments=browser_arguments,
             window_size=[1280, 720],
             block_images_and_css=self.block_images_and_css,
@@ -886,11 +899,13 @@ class Crawl4AIBrowserSession:
         self,
         stop_signal: Optional[threading.Event] = None,
         max_pages: int = 1,
+        proxy_url: Optional[str] = None,
     ) -> None:
         from services.projects import parse_thread_count
 
         self.stop_signal = stop_signal
         self.max_pages = max(1, parse_thread_count(max_pages))
+        self.proxy_url = proxy_url
         self._state_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._ready = threading.Event()
@@ -936,7 +951,11 @@ class Crawl4AIBrowserSession:
                 self._loop.run_forever()
         except BaseException as error:  # noqa: BLE001
             self._start_error = error
-            fetch_debug_log(f"crawl4ai-session start failed: {type(error).__name__}: {error}", "warning")
+            fetch_debug_log(
+                f"crawl4ai-session start failed: {type(error).__name__}: "
+                f"{redact_proxy_credentials(error)}",
+                "warning",
+            )
             self._ready.set()
         finally:
             try:
@@ -957,7 +976,7 @@ class Crawl4AIBrowserSession:
         # Crawl4AI creates its global cache manager during import, so the
         # writable base must be configured before importing the package.
         os.environ["CRAWL4_AI_BASE_DIRECTORY"] = str(crawl4ai_storage)
-        from crawl4ai import AsyncWebCrawler, BrowserConfig
+        from crawl4ai import AsyncWebCrawler, BrowserConfig, ProxyConfig
 
         browser_config = BrowserConfig(
             browser_type="chromium",
@@ -982,6 +1001,11 @@ class Crawl4AIBrowserSession:
                 f"--{self._process_token}",
             ],
             verbose=False,
+            proxy_config=(
+                ProxyConfig.from_string(self.proxy_url)
+                if self.proxy_url
+                else None
+            ),
         )
         self._crawler = AsyncWebCrawler(
             config=browser_config,
@@ -1165,6 +1189,7 @@ class BrowserMethodSession:
         max_pages: int = 1,
         profile_dir: Optional[Path] = None,
         initial_method: str = "playwright",
+        proxy_url: Optional[str] = None,
     ) -> None:
         from services.projects import parse_thread_count
 
@@ -1172,13 +1197,22 @@ class BrowserMethodSession:
         self.max_pages = max(1, parse_thread_count(max_pages))
         self.profile_dir = profile_dir
         self.initial_method = str(initial_method or "playwright")
+        self.proxy_url = proxy_url
         self.prefer_headless_shell = self.initial_method != "protected-site"
         self._lifecycle_lock = threading.RLock()
         self._closed = False
         self.playwright_session = self._new_playwright_session()
-        self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
+        self.botasaurus_session = BotasaurusBrowserSession(
+            self.stop_signal,
+            self.max_pages,
+            proxy_url=self.proxy_url,
+        )
         self.debug_visible_session = self._new_debug_visible_session()
-        self.crawl4ai_session = Crawl4AIBrowserSession(self.stop_signal, self.max_pages)
+        self.crawl4ai_session = Crawl4AIBrowserSession(
+            self.stop_signal,
+            self.max_pages,
+            proxy_url=self.proxy_url,
+        )
         self.scrapegraphai_session = ScrapeGraphAISession(
             self.playwright_session,
             self.stop_signal,
@@ -1190,6 +1224,7 @@ class BrowserMethodSession:
             self.max_pages,
             profile_dir=self.profile_dir,
             prefer_headless_shell=self.prefer_headless_shell,
+            proxy_url=self.proxy_url,
         )
 
     def _new_debug_visible_session(self) -> "BotasaurusDebugVisibleSession":
@@ -1201,6 +1236,7 @@ class BrowserMethodSession:
                 else "protected_sites_debug_visible"
             ),
             max_pages=self.max_pages,
+            proxy_url=self.proxy_url,
         )
 
     def fetch(
@@ -1259,9 +1295,17 @@ class BrowserMethodSession:
             else:
                 self.prefer_headless_shell = self.initial_method != "protected-site"
             self.playwright_session = self._new_playwright_session()
-            self.botasaurus_session = BotasaurusBrowserSession(self.stop_signal, self.max_pages)
+            self.botasaurus_session = BotasaurusBrowserSession(
+                self.stop_signal,
+                self.max_pages,
+                proxy_url=self.proxy_url,
+            )
             self.debug_visible_session = self._new_debug_visible_session()
-            self.crawl4ai_session = Crawl4AIBrowserSession(self.stop_signal, self.max_pages)
+            self.crawl4ai_session = Crawl4AIBrowserSession(
+                self.stop_signal,
+                self.max_pages,
+                proxy_url=self.proxy_url,
+            )
             self.scrapegraphai_session = ScrapeGraphAISession(
                 self.playwright_session,
                 self.stop_signal,
@@ -1287,11 +1331,13 @@ class BotasaurusDebugVisibleSession(BotasaurusBrowserSession):
         stop_signal: Optional[threading.Event] = None,
         profile: str = "protected_sites_debug_visible",
         max_pages: int = 1,
+        proxy_url: Optional[str] = None,
     ) -> None:
         super().__init__(
             stop_signal,
             max_pages=max_pages,
             profile=profile or "protected_sites_debug_visible",
+            proxy_url=proxy_url,
         )
 
 
@@ -1300,6 +1346,7 @@ ENGINE_OUTPUT_MARKER = "__PARSER_ENGINE_HTML_BASE64__:"
 
 SCRAPY_FETCH_SCRIPT = r"""
 import base64
+import os
 import sys
 
 import scrapy
@@ -1308,6 +1355,7 @@ from scrapy.crawler import CrawlerProcess
 url = sys.argv[1]
 timeout = int(float(sys.argv[2]))
 marker = sys.argv[3]
+proxy_url = os.environ.get("PARSER_REQUEST_PROXY", "").strip()
 
 
 class SinglePageSpider(scrapy.Spider):
@@ -1331,7 +1379,8 @@ class SinglePageSpider(scrapy.Spider):
     }
 
     async def start(self):
-        yield scrapy.Request(url, dont_filter=True)
+        request_meta = {"proxy": proxy_url} if proxy_url else {}
+        yield scrapy.Request(url, dont_filter=True, meta=request_meta)
 
     def parse(self, response):
         SinglePageSpider.body = bytes(response.body or b"")
@@ -1358,10 +1407,12 @@ storage_dir = os.path.join(tempfile.gettempdir(), "parser-crawlee", uuid.uuid4()
 os.environ["CRAWLEE_STORAGE_DIR"] = storage_dir
 
 from crawlee.crawlers._http import HttpCrawler
+from crawlee.proxy_configuration import ProxyConfiguration
 
 url = sys.argv[1]
 timeout = int(float(sys.argv[2]))
 marker = sys.argv[3]
+proxy_url = os.environ.get("PARSER_REQUEST_PROXY", "").strip()
 
 
 async def main():
@@ -1372,6 +1423,11 @@ async def main():
         request_handler_timeout=timedelta(seconds=timeout),
         configure_logging=False,
         ignore_http_error_status_codes=list(range(300, 600)),
+        proxy_configuration=(
+            ProxyConfiguration(proxy_urls=[proxy_url])
+            if proxy_url
+            else None
+        ),
     )
 
     @crawler.router.default_handler
@@ -1391,13 +1447,16 @@ finally:
 
 PLAYWRIGHT_FETCH_SCRIPT = r"""
 import base64
+import os
 import sys
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from playwright.sync_api import sync_playwright
 
 url = sys.argv[1]
 timeout = int(float(sys.argv[2])) * 1000
 marker = sys.argv[3]
+proxy_url = os.environ.get("PARSER_REQUEST_PROXY", "").strip()
 blocked_resource_types = {"image", "media", "font", "stylesheet"}
 blocked_url_parts = (
     "google-analytics",
@@ -1424,8 +1483,27 @@ def should_block(request):
     return any(part in request_url for part in blocked_url_parts)
 
 with sync_playwright() as p:
+    launch_proxy = None
+    if proxy_url:
+        parsed_proxy = urlsplit(proxy_url)
+        launch_proxy = {
+            "server": urlunsplit(
+                (
+                    parsed_proxy.scheme,
+                    f"{parsed_proxy.hostname}:{parsed_proxy.port}",
+                    "",
+                    "",
+                    "",
+                )
+            )
+        }
+        if parsed_proxy.username is not None:
+            launch_proxy["username"] = unquote(parsed_proxy.username)
+        if parsed_proxy.password is not None:
+            launch_proxy["password"] = unquote(parsed_proxy.password)
     browser = p.chromium.launch(
         headless=True,
+        proxy=launch_proxy,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
@@ -1503,15 +1581,34 @@ def fetch_with_python_engine(
     process_started=None,
     process_finished=None,
     input_text: Optional[str] = None,
+    proxy_url: Optional[str] = None,
 ) -> Optional[str]:
     command = [sys.executable, "-c", script, url, str(timeout_seconds), ENGINE_OUTPUT_MARKER]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if os.name == "nt":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     try:
+        process_env = os.environ.copy()
+        # Connection routing is controlled exclusively by the persisted switch.
+        # Do not let host-level proxy variables turn a "direct" scan into an
+        # implicit proxied scan (or conflict with the explicitly selected proxy).
+        for variable_name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            process_env.pop(variable_name, None)
+        if proxy_url:
+            process_env["PARSER_REQUEST_PROXY"] = proxy_url
+        else:
+            process_env.pop("PARSER_REQUEST_PROXY", None)
         process = subprocess.Popen(
             command,
             cwd=str(BASE_DIR),
+            env=process_env,
             stdin=subprocess.PIPE if input_text is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1582,13 +1679,31 @@ def fetch_with_python_engine(
     raise RuntimeError(f"{engine_name}: движок не вернул HTML. Вывод: {details}")
 
 
-def fetch_with_scrapy(url: str) -> Optional[str]:
+def fetch_with_scrapy(
+    url: str,
+    proxy_url: Optional[str] = None,
+) -> Optional[str]:
     if find_spec("scrapy") is None:
         return None
-    return fetch_with_python_engine(SCRAPY_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Scrapy")
+    return fetch_with_python_engine(
+        SCRAPY_FETCH_SCRIPT,
+        url,
+        REQUEST_TIMEOUT,
+        "Scrapy",
+        proxy_url=proxy_url,
+    )
 
 
-def fetch_with_crawlee(url: str) -> Optional[str]:
+def fetch_with_crawlee(
+    url: str,
+    proxy_url: Optional[str] = None,
+) -> Optional[str]:
     if find_spec("crawlee") is None:
         return None
-    return fetch_with_python_engine(CRAWLEE_FETCH_SCRIPT, url, REQUEST_TIMEOUT, "Crawlee")
+    return fetch_with_python_engine(
+        CRAWLEE_FETCH_SCRIPT,
+        url,
+        REQUEST_TIMEOUT,
+        "Crawlee",
+        proxy_url=proxy_url,
+    )

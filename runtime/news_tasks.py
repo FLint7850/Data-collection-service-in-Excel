@@ -41,6 +41,7 @@ from services.scraping import (
     product_url_filter_patterns,
 )
 from services.scraping.checkpoints import delete_scrape_checkpoint, load_scrape_checkpoint, save_scrape_checkpoint
+from services.scraping.proxy import resolve_scraping_proxy_url
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import selectinload
 
@@ -519,6 +520,25 @@ def news_monitor_thread_alive(monitor_id: object) -> bool:
 
 def start_news_scan(monitor_id: str, manual: bool, resume: bool = False) -> bool:
     monitor_id = str(monitor_id)
+    from services.news import add_news_log, get_news_monitor, save_news_monitor
+
+    monitor = get_news_monitor(monitor_id)
+    if monitor:
+        try:
+            resolve_scraping_proxy_url(bool(monitor.get("use_proxy", False)))
+        except RuntimeError as error:
+            with news_lock:
+                monitor["state"] = {
+                    **monitor.get("state", {}),
+                    "status": "error",
+                    "stage": "Ошибка настройки прокси",
+                    "error": str(error),
+                    "finished_at": datetime.now(MSK_TZ).isoformat(timespec="seconds"),
+                }
+                monitor["brand_state"] = dict(monitor["state"])
+                save_news_monitor(monitor)
+            add_news_log(monitor, str(error), "error")
+            raise
 
     def run() -> None:
         try:
@@ -775,6 +795,7 @@ def collect_products_for_monitor(
             extraction_rules=normalize_extraction_rules(monitor.get("extraction_rules", {})),
             connection_method=normalize_connection_method(monitor.get("connection_method")),
             auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
+            use_proxy=bool(monitor.get("use_proxy", False)),
             connection_method_state=connection_method_state,
             allow_empty_price=True,
             browser_session=browser_session,
@@ -796,6 +817,8 @@ def collect_products_for_monitor(
         crawler.product_url_exclusions = normalize_patterns(monitor.get("product_url_exclusions", []))
         crawler.connection_method = normalize_connection_method(monitor.get("connection_method"))
         crawler.auto_connection_fallback = bool(monitor.get("auto_connection_fallback", True))
+        crawler.use_proxy = bool(monitor.get("use_proxy", False))
+        crawler.proxy_url = resolve_scraping_proxy_url(crawler.use_proxy)
         crawler.connection_method_state = connection_method_state or crawler.connection_method_state
         crawler.active_connection_method = crawler.connection_method
         crawler.browser_session = browser_session
@@ -853,6 +876,7 @@ def enrich_news_product(
         1,
         connection_method=normalize_connection_method(monitor.get("connection_method")),
         auto_connection_fallback=bool(monitor.get("auto_connection_fallback", True)),
+        use_proxy=bool(monitor.get("use_proxy", False)),
         connection_method_state=connection_method_state,
         allow_empty_price=True,
         browser_session=browser_session,
@@ -1224,11 +1248,13 @@ def scan_news_monitor(monitor_id: str, manual: bool = False, resume: bool = Fals
     availability_skipped = 0
     profile_dir = news_monitor_profile_storage_dir(monitor) if news_monitor_should_keep_browser_profile(monitor) else None
     initial_connection_method = normalize_connection_method(monitor.get("connection_method"))
+    proxy_url = resolve_scraping_proxy_url(bool(monitor.get("use_proxy", False)))
     browser_session = BrowserMethodSession(
         stop_event,
         parse_thread_count(monitor.get("thread_count", 4)),
         profile_dir=profile_dir,
         initial_method=initial_connection_method,
+        proxy_url=proxy_url,
     )
     with news_lock:
         news_browser_sessions[monitor_id] = browser_session

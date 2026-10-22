@@ -41,6 +41,12 @@ const weekdayOptions = [
         </template>
         <USelect v-model="monitor.connection_method" :items="connectionOptions" class="w-full" />
       </UFormField>
+      <UFormField label="Прокси">
+        <label class="flex min-h-8 cursor-pointer items-center gap-3">
+          <USwitch v-model="monitor.use_proxy" />
+          <span class="text-sm">Использовать прокси для этого донора</span>
+        </label>
+      </UFormField>
       <UFormField label="Стартовые URL" class="field-span-2">
         <UTextarea
           :model-value="monitor.start_urls.join('\n')"

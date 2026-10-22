@@ -62,6 +62,7 @@ def api_create_project():
     name = str(payload.get("name") or f"Проект {len(projects) + 1}").strip()
     start_urls = normalize_start_urls(payload.get("start_urls") or DEFAULT_START_URL)
     project = make_project(name, start_urls)
+    project["use_proxy"] = bool(payload.get("use_proxy", False))
     with projects_lock:
         projects[project["id"]] = project
         save_project(project)
@@ -99,6 +100,8 @@ def api_update_project(project_id: str):
             project["connection_method"] = normalize_connection_method(payload.get("connection_method"))
         if "auto_connection_fallback" in payload:
             project["auto_connection_fallback"] = bool(payload.get("auto_connection_fallback"))
+        if "use_proxy" in payload:
+            project["use_proxy"] = bool(payload.get("use_proxy"))
         if "persist_profile" in payload:
             project["persist_profile"] = bool(payload.get("persist_profile"))
         if "auto_cleanup" in payload:

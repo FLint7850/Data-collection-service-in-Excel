@@ -11,6 +11,7 @@ export interface ProjectSavePayload {
   thread_count: number;
   connection_method: string;
   auto_connection_fallback: boolean;
+  use_proxy: boolean;
   persist_profile: boolean;
   exclusions: string[];
   product_url_filters: string[];
