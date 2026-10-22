@@ -17,10 +17,64 @@ const analysisIdleTimeoutMs = Number.isFinite(configuredIdleTimeoutMs) && config
   ? configuredIdleTimeoutMs : 600000;
 const maxRequestBytes = Number(process.env.ATTRIBUTE_AI_MAX_REQUEST_BYTES || 8 * 1024 * 1024);
 const analysisModel = process.env.ATTRIBUTE_CHATGPT_MODEL?.trim() || "gpt-6-astra";
-const analysisReasoningEffort = process.env.ATTRIBUTE_CHATGPT_REASONING_EFFORT?.trim() || "medium";
-const configuredConcurrency = Number(process.env.ATTRIBUTE_CHATGPT_CONCURRENCY || 3);
+const analysisReasoningEffort = process.env.ATTRIBUTE_CHATGPT_REASONING_EFFORT?.trim() || "low";
+const configuredConcurrency = Number(process.env.ATTRIBUTE_CHATGPT_CONCURRENCY || 1);
 const analysisConcurrency = Number.isInteger(configuredConcurrency)
-  ? Math.max(1, Math.min(8, configuredConcurrency)) : 3;
+  ? Math.max(1, Math.min(8, configuredConcurrency)) : 1;
+const analysisRetryDelaysMs = [60000, 120000, 240000];
+const attributeBaseInstructions = [
+  "You are a deterministic product-attribute extraction service.",
+  "Use only the supplied developer instructions and user data.",
+  "Do not call tools, inspect files, access the network, or add explanations.",
+  "Return only the final value that conforms to the supplied JSON Schema.",
+].join(" ");
+const disabledAgentFeatures = [
+  "apps",
+  "browser_use",
+  "browser_use_external",
+  "browser_use_full_cdp_access",
+  "computer_use",
+  "goals",
+  "hooks",
+  "image_generation",
+  "in_app_browser",
+  "in_app_chat",
+  "in_app_dictation",
+  "in_app_local_automation",
+  "multi_agent",
+  "plugins",
+  "remote_plugin",
+  "shell_tool",
+  "skill_search",
+  "sleep_tool",
+  "tool_call_mcp_elicitation",
+  "tool_suggest",
+  "unified_exec",
+  "unified_exec_tty",
+  "view_image",
+  "workspace_dependencies",
+];
+
+function isRateLimitError(error) {
+  return /(?:\b429\b|too\s+many\s+requests|rate[\s_-]*limit)/i.test(
+    error instanceof Error ? error.message : String(error),
+  );
+}
+
+function analysisRequest(value) {
+  if (typeof value === "string") return { input: value, instructions: "", outputSchema: null, metadata: {} };
+  const input = typeof value?.input === "string" ? value.input : "";
+  const instructions = typeof value?.instructions === "string" ? value.instructions : "";
+  const outputSchema = value?.output_schema && typeof value.output_schema === "object"
+    ? value.output_schema : (value?.outputSchema && typeof value.outputSchema === "object" ? value.outputSchema : null);
+  const metadata = value?.metadata && typeof value.metadata === "object"
+    ? Object.fromEntries(Object.entries(value.metadata).map(([key, item]) => [String(key), String(item)])) : {};
+  return { input, instructions, outputSchema, metadata };
+}
+
+function requestDigest(value) {
+  return createHash("sha256").update(JSON.stringify(analysisRequest(value))).digest("hex");
+}
 
 function codexCommand() {
   const configured = (process.env.CODEX_BIN || "").trim();
@@ -92,9 +146,11 @@ export class CodexAppServer {
     mkdirSync(codexHome, { recursive: true });
     const command = codexCommand();
     const shell = process.platform === "win32" && command.toLowerCase().endsWith(".cmd");
-    const args = proxyUrl
-      ? ["--enable", "respect_system_proxy", "app-server"]
-      : ["app-server"];
+    const args = [
+      ...(proxyUrl ? ["--enable", "respect_system_proxy"] : []),
+      ...disabledAgentFeatures.flatMap((feature) => ["--disable", feature]),
+      "app-server",
+    ];
     const child = spawn(command, args, {
       cwd: process.cwd(),
       env: codexEnvironment(),
@@ -269,13 +325,17 @@ export class CodexAppServer {
     return { ok: true };
   }
 
-  async analyze(prompt) {
+  async analyze(value) {
     await this.ensureStarted();
+    const request = analysisRequest(value);
+    if (!request.input.trim()) throw new Error("Пустой запрос анализа");
     const sandboxDir = this.sandboxDir;
     mkdirSync(sandboxDir, { recursive: true });
     const started = await this.request("thread/start", {
       cwd: sandboxDir,
       model: this.model,
+      baseInstructions: attributeBaseInstructions,
+      developerInstructions: request.instructions || null,
       approvalPolicy: "never",
       sandbox: "read-only",
       ephemeral: true,
@@ -283,10 +343,15 @@ export class CodexAppServer {
     const threadId = started?.thread?.id || started?.threadId || started?.id;
     if (!threadId) throw new Error("Codex App Server не вернул идентификатор задачи");
     const messages = [];
+    let usage = null;
     const listener = (event) => {
-      if (event.method !== "item/completed") return;
       const params = event.params || {};
       if ((params.threadId || params.thread_id) !== threadId) return;
+      if (event.method === "thread/tokenUsage/updated") {
+        usage = params.tokenUsage?.last || params.token_usage?.last || usage;
+        return;
+      }
+      if (event.method !== "item/completed") return;
       const item = params.item || {};
       if (item.type !== "agentMessage" && item.type !== "agent_message") return;
       if (item.phase === "commentary" || item.channel === "commentary") return;
@@ -298,12 +363,15 @@ export class CodexAppServer {
     let turnId = "";
     let completed = false;
     try {
-      const turn = await this.request("turn/start", {
+      const turnParams = {
         threadId,
-        input: [{ type: "text", text: prompt }],
+        input: [{ type: "text", text: request.input }],
         effort: this.reasoningEffort,
         model: this.model,
-      }, 60000);
+        summary: "none",
+      };
+      if (request.outputSchema) turnParams.outputSchema = request.outputSchema;
+      const turn = await this.request("turn/start", turnParams, 60000);
       turnId = turn?.turn?.id || turn?.turnId || "";
       const event = await completion.promise;
       completed = true;
@@ -316,7 +384,14 @@ export class CodexAppServer {
         const fallback = agentText(event.params?.turn || event.params || {});
         if (fallback) messages.push(fallback);
       }
-      return { thread_id: threadId, turn_id: turnId, text: (messages.at(-1) || "").trim() };
+      return {
+        thread_id: threadId,
+        turn_id: turnId,
+        text: (messages.at(-1) || "").trim(),
+        model: this.model,
+        reasoning_effort: this.reasoningEffort,
+        ...(usage ? { usage } : {}),
+      };
     } catch (error) {
       if (turnId && !completed && this.child?.stdin?.writable) {
         try {
@@ -349,13 +424,25 @@ function httpError(message, statusCode) {
 }
 
 export class AnalysisJobs {
-  constructor(analyze, { retentionMs = 3600000, maxEntries = 100, concurrency = analysisConcurrency, log = console.info } = {}) {
+  constructor(analyze, {
+    retentionMs = 3600000,
+    maxEntries = 100,
+    concurrency = analysisConcurrency,
+    retryDelaysMs = analysisRetryDelaysMs,
+    sleep = (delayMs) => new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs)),
+    random = Math.random,
+    log = console.info,
+  } = {}) {
     this.analyze = analyze;
     this.retentionMs = retentionMs;
     this.maxEntries = maxEntries;
     this.log = log;
     this.jobs = new Map();
+    this.resultCache = new Map();
     this.concurrency = concurrency;
+    this.retryDelaysMs = retryDelaysMs.map((item) => Math.max(0, Number(item) || 0));
+    this.sleep = sleep;
+    this.random = random;
     this.active = 0;
     this.queue = [];
   }
@@ -365,6 +452,17 @@ export class AnalysisJobs {
     for (const [id, job] of this.jobs) {
       if (job.finishedAt && now - job.finishedAt >= this.retentionMs) this.jobs.delete(id);
     }
+    for (const [digest, cached] of this.resultCache) {
+      if (now - cached.finishedAt >= this.retentionMs) this.resultCache.delete(digest);
+    }
+  }
+
+  cacheResult(digest, result, finishedAt) {
+    if (!this.resultCache.has(digest) && this.resultCache.size >= this.maxEntries) {
+      const oldest = this.resultCache.keys().next().value;
+      if (oldest !== undefined) this.resultCache.delete(oldest);
+    }
+    this.resultCache.set(digest, { result, finishedAt });
   }
 
   publicState(job) {
@@ -376,11 +474,12 @@ export class AnalysisJobs {
     };
   }
 
-  start(id, prompt) {
+  start(id, value) {
     if (!/^[a-f0-9]{32}$/.test(id)) throw httpError("Некорректный идентификатор анализа", 400);
-    if (!prompt.trim()) throw httpError("Пустой запрос анализа", 400);
+    const request = analysisRequest(value);
+    if (!request.input.trim()) throw httpError("Пустой запрос анализа", 400);
     this.prune();
-    const digest = createHash("sha256").update(prompt).digest("hex");
+    const digest = requestDigest(request);
     const existing = this.jobs.get(id);
     if (existing) {
       if (existing.digest !== digest) throw httpError("Идентификатор уже используется другим запросом", 409);
@@ -389,21 +488,40 @@ export class AnalysisJobs {
     if (this.jobs.size >= this.maxEntries) {
       throw httpError("Хранилище анализов заполнено. Дождитесь освобождения завершённых задач", 503);
     }
+    const cached = this.resultCache.get(digest);
+    if (cached) {
+      const finishedAt = Date.now();
+      const result = {
+        ...cached.result,
+        metrics: {
+          ...(cached.result.metrics || {}),
+          queue_ms: 0,
+          analysis_ms: 0,
+          cache_hit: true,
+        },
+      };
+      const job = {
+        id, digest, status: "completed", result, error: "",
+        createdAt: finishedAt, finishedAt,
+      };
+      this.jobs.set(id, job);
+      return this.publicState(job);
+    }
     const job = {
       id, digest, status: "queued", result: null, error: "", createdAt: Date.now(), finishedAt: null,
     };
     this.jobs.set(id, job);
     // A single queue limits all callers, including different batches and manual analysis.
-    this.queue.push({ job, prompt });
+    this.queue.push({ job, request });
     this.drain();
     return this.publicState(job);
   }
 
   drain() {
     while (this.active < this.concurrency && this.queue.length) {
-      const { job, prompt } = this.queue.shift();
+      const { job, request } = this.queue.shift();
       this.active += 1;
-      void this.run(job, prompt).finally(() => {
+      void this.run(job, request).finally(() => {
         this.active -= 1;
         this.drain();
       });
@@ -420,12 +538,31 @@ export class AnalysisJobs {
     return { ok: true };
   }
 
-  async run(job, prompt) {
+  async run(job, request) {
     const startedAt = Date.now();
     job.status = "running";
-    this.log(`Attribute ChatGPT ${job.id}: started, prompt_chars=${prompt.length}`);
+    const instructionChars = request.instructions.length;
+    const inputChars = request.input.length;
+    const promptChars = instructionChars + inputChars;
+    this.log(
+      `Attribute ChatGPT ${job.id}: started, input_chars=${inputChars}, `
+      + `instruction_chars=${instructionChars}, model=${analysisModel}, effort=${analysisReasoningEffort}`,
+    );
     try {
-      job.result = await this.analyze(prompt);
+      let result;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          result = await this.analyze(request);
+          break;
+        } catch (error) {
+          if (!isRateLimitError(error) || attempt >= this.retryDelaysMs.length) throw error;
+          const baseDelay = this.retryDelaysMs[attempt];
+          const delay = Math.round(baseDelay * (1 + this.random() * 0.15));
+          this.log(`Attribute ChatGPT ${job.id}: rate_limited, retry=${attempt + 1}, delay_ms=${delay}`);
+          await this.sleep(delay);
+        }
+      }
+      job.result = result;
       job.status = "completed";
     } catch (error) {
       job.status = "failed";
@@ -434,17 +571,29 @@ export class AnalysisJobs {
       job.finishedAt = Date.now();
       const responseChars = typeof job.result?.text === "string" ? job.result.text.length : 0;
       if (job.status === "completed") {
+        const usage = job.result?.usage && typeof job.result.usage === "object" ? job.result.usage : {};
         job.result = {
           ...job.result,
           metrics: {
             queue_ms: startedAt - job.createdAt,
             analysis_ms: job.finishedAt - startedAt,
-            prompt_chars: prompt.length,
+            prompt_chars: promptChars,
+            input_chars: inputChars,
+            instruction_chars: instructionChars,
             response_chars: responseChars,
+            cache_hit: false,
+            ...(Object.keys(usage).length ? { usage } : {}),
           },
         };
+        this.cacheResult(job.digest, job.result, job.finishedAt);
       }
-      this.log(`Attribute ChatGPT ${job.id}: ${job.status}, duration_ms=${job.finishedAt - startedAt}, response_chars=${responseChars}`);
+      const errorSuffix = job.status === "failed"
+        ? `, error=${JSON.stringify(job.error.slice(0, 500))}` : "";
+      const usage = job.result?.usage || {};
+      const usageSuffix = job.status === "completed" && usage.totalTokens !== undefined
+        ? `, tokens=${usage.totalTokens}, input_tokens=${usage.inputTokens || 0}, cached_tokens=${usage.cachedInputTokens || 0}, reasoning_tokens=${usage.reasoningOutputTokens || 0}`
+        : "";
+      this.log(`Attribute ChatGPT ${job.id}: ${job.status}, duration_ms=${job.finishedAt - startedAt}, response_chars=${responseChars}${usageSuffix}${errorSuffix}`);
     }
   }
 
@@ -477,7 +626,10 @@ async function readJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-export function createBridgeServer(codex, { token = bridgeToken, jobs = new AnalysisJobs((prompt) => codex.analyze(prompt)) } = {}) {
+export function createBridgeServer(codex, {
+  token = bridgeToken,
+  jobs = new AnalysisJobs((request) => codex.analyze(request)),
+} = {}) {
   return createServer(async (request, response) => {
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
@@ -503,7 +655,13 @@ export function createBridgeServer(codex, { token = bridgeToken, jobs = new Anal
     }
     if (request.method === "POST" && url.pathname === "/analyses") {
       const body = await readJson(request);
-      const state = jobs.start(String(body.request_id || ""), String(body.prompt || ""));
+      const state = jobs.start(String(body.request_id || ""), {
+        input: typeof body.input === "string" ? body.input : String(body.prompt || ""),
+        instructions: typeof body.instructions === "string" ? body.instructions : "",
+        output_schema: body.output_schema && typeof body.output_schema === "object"
+          ? body.output_schema : null,
+        metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {},
+      });
       sendJson(response, 202, state);
       return;
     }

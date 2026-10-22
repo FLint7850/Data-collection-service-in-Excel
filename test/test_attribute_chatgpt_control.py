@@ -29,7 +29,7 @@ class AttributeChatGptControlTests(unittest.TestCase):
         posts = [call for call in request.call_args_list if call.args[0] == "POST"]
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0].args[1], "/analyses")
-        self.assertEqual(posts[0].kwargs["json_body"], {"request_id": self.request_id, "prompt": "all products"})
+        self.assertEqual(posts[0].kwargs["json_body"], {"request_id": self.request_id, "input": "all products"})
         for call in request.call_args_list:
             self.assertEqual(call.kwargs["timeout"], (5, 30))
             if call.args[0] == "GET":
@@ -71,41 +71,38 @@ class AttributeChatGptControlTests(unittest.TestCase):
                 control.analyze_with_chatgpt("all products")
         self.assert_one_submission(request)
 
-    def test_rate_limit_is_retried_with_a_new_bridge_job(self):
-        second_request_id = "b" * 32
-        result = {"text": "recovered after rate limit"}
-        with patch.object(
-            control.uuid,
-            "uuid4",
-            side_effect=[SimpleNamespace(hex=self.request_id), SimpleNamespace(hex=second_request_id)],
-        ), patch.object(control.random, "uniform", return_value=0), patch.object(
-            control, "RATE_LIMIT_RETRIES", 2,
-        ), patch.object(control, "bridge_request", side_effect=[
-            self.state("failed", error="exceeded retry limit, last status: 429 Too Many Requests"),
-            {"id": second_request_id, "status": "completed", "result": result},
-        ]) as request:
-            self.assertEqual(control.analyze_with_chatgpt("all products"), result)
+    def test_structured_analysis_request_is_forwarded_without_duplication(self):
+        schema = {"type": "object", "properties": {"attributes": {"type": "array"}}}
+        analysis_request = {
+            "input": "one product",
+            "instructions": "stable template",
+            "output_schema": schema,
+            "metadata": {"workload": "attribute-analysis", "product_id": 17},
+        }
+        result = {"text": '{"attributes":[]}', "usage": {"totalTokens": 1200}}
+        with patch.object(control, "bridge_request", return_value=self.state("completed", result=result)) as request:
+            self.assertEqual(control.analyze_with_chatgpt(analysis_request), result)
 
         posts = [call for call in request.call_args_list if call.args[0] == "POST"]
-        self.assertEqual(len(posts), 2)
-        self.assertEqual(posts[0].kwargs["json_body"]["request_id"], self.request_id)
-        self.assertEqual(posts[1].kwargs["json_body"]["request_id"], second_request_id)
-        self.assertEqual(self.sleep.call_args_list[-1].args[0], control.RATE_LIMIT_BACKOFF_SECONDS)
-        self.assertEqual(self.release.call_count, 2)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].kwargs["json_body"], {
+            "request_id": self.request_id,
+            "input": "one product",
+            "instructions": "stable template",
+            "output_schema": schema,
+            "metadata": {"workload": "attribute-analysis", "product_id": "17"},
+        })
 
-    def test_rate_limit_stops_after_configured_retry_count(self):
-        rate_limit = "429 Too Many Requests"
-        with patch.object(control, "RATE_LIMIT_RETRIES", 2), \
-                patch.object(control.random, "uniform", return_value=0), \
-                patch.object(control, "_analyze_once", side_effect=RuntimeError(rate_limit)) as analyze:
-            with self.assertRaisesRegex(RuntimeError, rate_limit):
+    def test_rate_limit_is_not_retried_by_python_after_bridge_recovery_failed(self):
+        with patch.object(control, "bridge_request", return_value=self.state(
+            "failed", error="429 Too Many Requests after bridge retries",
+        )) as request:
+            with self.assertRaisesRegex(control.ChatGptRateLimitError, "автоматическое восстановление"):
                 control.analyze_with_chatgpt("all products")
 
-        self.assertEqual(analyze.call_count, 3)
-        self.assertEqual(
-            [call.args[0] for call in self.sleep.call_args_list],
-            [control.RATE_LIMIT_BACKOFF_SECONDS, control.RATE_LIMIT_BACKOFF_SECONDS * 2],
-        )
+        posts = [call for call in request.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.release.assert_called_once_with(self.request_id)
 
     def test_lost_bridge_reports_uncertain_remote_state(self):
         with patch.object(control, "bridge_request", side_effect=[

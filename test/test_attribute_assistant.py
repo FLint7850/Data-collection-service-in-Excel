@@ -459,21 +459,22 @@ class AttributeAssistantTest(unittest.TestCase):
         )
         self.assertIsNone(field)
 
-        prompt, _evidence = attribute_ai.build_product_prompt(
+        request, _evidence = attribute_ai.build_product_analysis_request(
             batch.products[0],
             source_url="https://example.com/w7096xw",
             parsed={"attributes": [{"name": source_name, "value": "310 мм"}]},
         )
-        context = json.loads(prompt.split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
+        context = json.loads(request["input"].split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
+        template_context = json.loads(request["instructions"].split("АКТУАЛЬНЫЙ ШАБЛОН:\n", 1)[1])
         catalog_field = next(
             item
-            for item in context["template_field_catalog"]
+            for item in template_context["template_field_catalog"]
             if item["name"] == "Диаметр загрузочного люка, см"
         )
         prompt_field = next(item for item in context["template_fields"] if item["id"] == catalog_field["id"])
         self.assertIn(1, prompt_field["source_ids"])
         self.assertEqual(context["parser_attributes"][0], {"source_id": 1, "name": source_name, "value": "310 мм"})
-        self.assertIn("31", prompt_field["allowed_values"])
+        self.assertNotIn("allowed_values", prompt_field)
 
         analysis = attribute_ai.validate_analysis(
             batch.products[0],
@@ -2533,6 +2534,10 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(analysis["suggestions"], [])
         self.assertEqual(analysis["observed_attributes"], [])
         self.assertEqual(analysis["warnings"], ["Нет данных"])
+        request, _evidence = attribute_ai.build_product_analysis_request(
+            batch.products[0], source_url="https://example.com/product",
+        )
+        self.assertIn("ПРОГРАММЫ И РЕЖИМЫ", request["instructions"])
         for prompt in (attribute_ai.UNIVERSAL_ATTRIBUTE_PROMPT,):
             self.assertIn('"attributes"', prompt)
             self.assertIn("allowed_value", prompt)
@@ -2624,9 +2629,13 @@ class AttributeAssistantTest(unittest.TestCase):
         service.replace_template_field_synonyms(self.db, field, ['Режимы обработки'])
         parsed = {"attributes": [{"name": "Режимы обработки", "value": "Новый режим"}]}
         def context():
-            prompt, evidence = ai.build_product_prompt(batch.products[0], source_url='https://example.com/product',
-                                                       parsed=parsed, html='<p>Режимы обработки: Новый режим</p>')
-            return json.loads(prompt.split('КОНТЕКСТ ДЛЯ АНАЛИЗА:\n', 1)[1]), evidence
+            request, evidence = ai.build_product_analysis_request(
+                batch.products[0], source_url='https://example.com/product',
+                parsed=parsed, html='<p>Режимы обработки: Новый режим</p>',
+            )
+            data = json.loads(request['input'].split('КОНТЕКСТ ДЛЯ АНАЛИЗА:\n', 1)[1])
+            data.update(json.loads(request['instructions'].split('АКТУАЛЬНЫЙ ШАБЛОН:\n', 1)[1]))
+            return data, evidence
         data, evidence = context()
         self.assertEqual(len(data['template_field_catalog']), len(template.fields))
         self.assertEqual(data['parser_attributes'], ai.parsed_attribute_facts(parsed))
@@ -3490,7 +3499,7 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertEqual(target.proposed_value, "Белый")
         self.assertFalse(target.source_details.get("unknown_values"))
 
-    def test_chatgpt_prompt_uses_relevant_allowed_value_shortlist(self):
+    def test_chatgpt_prompt_does_not_embed_large_value_dictionaries(self):
         from services import attribute_ai
 
         template = service.import_template_csv(
@@ -3508,18 +3517,22 @@ class AttributeAssistantTest(unittest.TestCase):
             '_MODEL_;_ATTRIBUTES_\r\nKBN96ADD0;""\r\n'.encode("cp1251"),
             filename="products.csv",
         )
-        prompt, _evidence = attribute_ai.build_product_prompt(
+        request, _evidence = attribute_ai.build_product_analysis_request(
             batch.products[0],
             source_url="https://example.com/product",
             html="<div>Страна производства: Германия</div>",
             parsed={"attributes": [{"name": "Страна производства", "value": "Германия"}]},
         )
+        prompt = request["instructions"] + "\n\n" + request["input"]
         context = json.loads(prompt.split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
         prompt_field = context["template_fields"][0]
-        self.assertEqual(prompt_field["allowed_values_total"], 121)
-        self.assertLessEqual(len(prompt_field["allowed_values"]), 30)
-        self.assertIn("Германия", prompt_field["allowed_values"])
-        self.assertLess(len(prompt), 70_000)
+        self.assertNotIn("allowed_values_total", prompt_field)
+        self.assertNotIn("allowed_values", prompt_field)
+        self.assertNotIn("Страна 119", prompt)
+        self.assertNotIn("ПРОГРАММЫ И РЕЖИМЫ", request["instructions"])
+        self.assertLess(len(prompt), 8_000)
+        self.assertEqual(request["metadata"]["workload"], "attribute-assistant")
+        self.assertEqual(request["output_schema"], attribute_ai.ATTRIBUTE_AI_OUTPUT_SCHEMA)
 
     def _chatgpt_parallel_batch(self, count=4):
         from runtime import attribute_batch_operations as runtime
@@ -3601,10 +3614,13 @@ class AttributeAssistantTest(unittest.TestCase):
                 with lock:
                     active_preparations -= 1
 
-        def analyze(prompt):
+        def analyze(request):
             nonlocal active, max_active
             self.assertNotEqual(threading.get_ident(), coordinator)
-            context = json.loads(prompt.split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
+            self.assertIsInstance(request, dict)
+            self.assertIn("АКТУАЛЬНЫЙ ШАБЛОН", request["instructions"])
+            self.assertEqual(request["metadata"]["workload"], "attribute-assistant")
+            context = json.loads(request["input"].split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
             self.assertNotIn("products", context)
             model = context["product"]["model"]
             self.assertEqual(context["official_product_url"], f"https://example.com/{model}")
@@ -3676,8 +3692,8 @@ class AttributeAssistantTest(unittest.TestCase):
             return (f"https://example.com/{product.model}", "<div>Цвет: Белый</div>",
                     {"attributes": [{"name": "Цвет", "value": "Белый"}]}, "test")
 
-        def analyze(prompt):
-            model = json.loads(prompt.split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])["product"]["model"]
+        def analyze(request):
+            model = json.loads(request["input"].split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])["product"]["model"]
             if model == "WM-1":
                 raise RuntimeError("Model failed")
             if model == "WM-2":
@@ -3700,6 +3716,35 @@ class AttributeAssistantTest(unittest.TestCase):
         for product_id in product_ids[3:]:
             product = self.db.get(AttributeProduct, product_id)
             self.assertEqual(next(value for value in product.values if value.attribute_name == "Цвет").proposed_value, "Белый")
+
+    def test_chatgpt_batch_stops_submitting_products_after_persistent_rate_limit(self):
+        from services.attribute_chatgpt_control import ChatGptRateLimitError
+
+        runtime, _template, batch, product_ids = self._chatgpt_parallel_batch(count=3)
+
+        def prepare(_db, product, _donor_ids, **_kwargs):
+            return (
+                f"https://example.com/{product.model}",
+                "<div>Цвет: Белый</div>",
+                {"attributes": [{"name": "Цвет", "value": "Белый"}]},
+                "test",
+            )
+
+        with patch.object(runtime, "CHATGPT_CONCURRENCY", 1), \
+                patch.object(runtime, "SessionLocal", side_effect=lambda: Session(self.engine, expire_on_commit=False)), \
+                patch.object(runtime, "prepare_product_source", side_effect=prepare), \
+                patch.object(
+                    runtime,
+                    "analyze_with_chatgpt",
+                    side_effect=ChatGptRateLimitError("429 после повторных попыток"),
+                ) as requests:
+            with self.assertRaises(ChatGptRateLimitError):
+                runtime._run_chatgpt_products(batch.id, product_ids, [], {}, object())
+
+        self.assertEqual(requests.call_count, 1)
+        state = runtime.get_attribute_batch_operation(batch.id)
+        self.assertEqual((state["processed"], state["failed"]), (1, 1))
+        self.assertEqual(state["errors"][0]["product_id"], product_ids[0])
 
     def test_chatgpt_batch_does_not_send_unprepared_products(self):
         runtime, template, batch, product_ids = self._chatgpt_parallel_batch(count=2)

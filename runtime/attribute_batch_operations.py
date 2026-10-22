@@ -32,7 +32,7 @@ from services.attribute_assistant import (
 )
 from services.attribute_ai import (
     apply_analysis,
-    build_product_prompt,
+    build_product_analysis_request,
     parsed_attribute_facts,
     prepare_product_source,
     record_analysis_metrics,
@@ -306,7 +306,13 @@ def _prepare_chatgpt_product(
             fetcher=fetcher,
             persist=False,
         )
-        prompt, evidence = build_product_prompt(product, source_url=source_url, html=html, parsed=parsed)
+        analysis_request, evidence = build_product_analysis_request(
+            product,
+            source_url=source_url,
+            html=html,
+            parsed=parsed,
+        )
+        request_chars = len(analysis_request["instructions"]) + len(analysis_request["input"])
         db.rollback()
         return {
             "product_id": product_id,
@@ -316,8 +322,8 @@ def _prepare_chatgpt_product(
             "selected_donor_ids": selected_donor_ids,
             "url_overrides": overrides,
             "source_url": source_url,
-            "prompt": prompt,
-            "prompt_chars": len(prompt),
+            "analysis_request": analysis_request,
+            "prompt_chars": request_chars,
             "evidence": evidence,
             "source_facts": parsed_attribute_facts(parsed),
             "initial_snapshot": initial_snapshot,
@@ -332,9 +338,9 @@ def _prepare_chatgpt_product(
         db.close()
 
 
-def _analyze_prepared_product(prompt: str) -> dict[str, Any]:
+def _analyze_prepared_product(analysis_request: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
-    response = analyze_with_chatgpt(prompt)
+    response = analyze_with_chatgpt(analysis_request)
     return {**response, "request_seconds": time.perf_counter() - started}
 
 
@@ -478,8 +484,8 @@ def _run_chatgpt_products(
             })
             while prepared_ready and len(analysis_pending) < CHATGPT_CONCURRENCY:
                 prepared = prepared_ready.popleft()
-                prompt = prepared.pop("prompt")
-                analysis_pending[ai_pool.submit(_analyze_prepared_product, prompt)] = prepared
+                analysis_request = prepared.pop("analysis_request")
+                analysis_pending[ai_pool.submit(_analyze_prepared_product, analysis_request)] = prepared
             submit_preparations(source_pool)
             if not (preparation_pending or prepared_ready or analysis_pending):
                 continue

@@ -1,14 +1,13 @@
 """Authentication and analysis calls for the isolated Codex App Server bridge."""
 
 from typing import Any
-import random
 import re
 import time
 import uuid
 
 import requests
 
-from config import env_float, env_int, env_str
+from config import env_str
 from services.attribute_assistant import clean_text
 
 
@@ -17,15 +16,6 @@ BRIDGE_TOKEN = env_str("ATTRIBUTE_CHATGPT_BRIDGE_TOKEN", "")
 BRIDGE_ANALYSIS_REQUEST_TIMEOUT = (5, 30)
 BRIDGE_POLL_INTERVAL = 2.0
 BRIDGE_RECOVERY_TIMEOUT = 60.0
-RATE_LIMIT_RETRIES = env_int(
-    "ATTRIBUTE_CHATGPT_RATE_LIMIT_RETRIES", 0, minimum=0, maximum=10,
-)
-RATE_LIMIT_BACKOFF_SECONDS = env_float(
-    "ATTRIBUTE_CHATGPT_RATE_LIMIT_BACKOFF_SECONDS", 5.0, minimum=0.1, maximum=300.0,
-)
-RATE_LIMIT_BACKOFF_MAX_SECONDS = env_float(
-    "ATTRIBUTE_CHATGPT_RATE_LIMIT_BACKOFF_MAX_SECONDS", 60.0, minimum=1.0, maximum=600.0,
-)
 RATE_LIMIT_ERROR_RE = re.compile(
     r"(?:\b429\b|too\s+many\s+requests|rate[\s_-]*limit|слишком\s+много\s+запросов)",
     re.IGNORECASE,
@@ -43,7 +33,7 @@ class BridgeHttpError(RuntimeError):
 
 
 class ChatGptRateLimitError(RuntimeError):
-    """The account limit is exhausted and the surrounding batch must stop."""
+    """Temporary throttling persisted after the bounded recovery attempts."""
 
 
 def bridge_request(
@@ -104,9 +94,35 @@ def logout_chatgpt() -> dict[str, Any]:
     return bridge_request("POST", "/logout", timeout=30)
 
 
-def _analyze_once(prompt: str) -> dict[str, Any]:
+def _analysis_payload(request: str | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(request, str):
+        return {"input": request}
+    if not isinstance(request, dict):
+        raise TypeError("Запрос ChatGPT должен быть строкой или объектом")
+    input_text = request.get("input")
+    if not isinstance(input_text, str) or not input_text.strip():
+        raise ValueError("Пустой запрос анализа ChatGPT")
+    payload: dict[str, Any] = {"input": input_text}
+    instructions = request.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        payload["instructions"] = instructions
+    output_schema = request.get("output_schema")
+    if isinstance(output_schema, dict):
+        payload["output_schema"] = output_schema
+    metadata = request.get("metadata")
+    if isinstance(metadata, dict):
+        payload["metadata"] = {
+            str(key): str(value)
+            for key, value in metadata.items()
+            if str(key).strip() and value is not None
+        }
+    return payload
+
+
+def _analyze_once(request: str | dict[str, Any]) -> dict[str, Any]:
     """Submit one idempotent bridge job and retrieve its result."""
     request_id = uuid.uuid4().hex
+    payload = {"request_id": request_id, **_analysis_payload(request)}
     state: dict[str, Any] | None = None
     last_contact = time.monotonic()
     try:
@@ -114,7 +130,7 @@ def _analyze_once(prompt: str) -> dict[str, Any]:
             "POST",
             "/analyses",
             timeout=BRIDGE_ANALYSIS_REQUEST_TIMEOUT,
-            json_body={"request_id": request_id, "prompt": prompt},
+            json_body=payload,
         )
         last_contact = time.monotonic()
     except BridgeHttpError as error:
@@ -141,7 +157,13 @@ def _analyze_once(prompt: str) -> dict[str, Any]:
                 return result
             if status == "failed":
                 _release_analysis(request_id)
-                raise RuntimeError(clean_text(state.get("error")) or "ChatGPT не смог выполнить анализ")
+                message = clean_text(state.get("error")) or "ChatGPT не смог выполнить анализ"
+                if RATE_LIMIT_ERROR_RE.search(message):
+                    raise ChatGptRateLimitError(
+                        "ChatGPT временно ограничил интенсивность анализа (429), а автоматическое "
+                        "восстановление на bridge не помогло. Операция остановлена без отправки остальных товаров"
+                    )
+                raise RuntimeError(message)
             if status not in {"queued", "running"}:
                 raise RuntimeError("Codex bridge вернул неизвестное состояние анализа")
             time.sleep(BRIDGE_POLL_INTERVAL)
@@ -162,42 +184,14 @@ def _analyze_once(prompt: str) -> dict[str, Any]:
             time.sleep(BRIDGE_POLL_INTERVAL)
 
 
-def _is_rate_limit_error(error: BaseException) -> bool:
-    return (
-        isinstance(error, BridgeHttpError) and error.status_code == 429
-    ) or bool(RATE_LIMIT_ERROR_RE.search(clean_text(error)))
+def analyze_with_chatgpt(request: str | dict[str, Any]) -> dict[str, Any]:
+    """Run one logical, idempotent analysis job.
 
-
-def _rate_limit_retry_delay(retry_index: int) -> float:
-    base_delay = min(
-        RATE_LIMIT_BACKOFF_MAX_SECONDS,
-        RATE_LIMIT_BACKOFF_SECONDS * (2 ** max(0, retry_index)),
-    )
-    # Independent workers must not all retry at the same instant.
-    return base_delay + random.uniform(0.0, base_delay * 0.25)
-
-
-def analyze_with_chatgpt(prompt: str) -> dict[str, Any]:
-    """Analyze a prompt, retrying only confirmed temporary rate limits.
-
-    Transport failures are deliberately not resubmitted because the bridge may
-    still be processing the original job. A completed bridge failure carrying
-    HTTP 429 is safe to retry with a fresh operation id.
+    The bridge owns model retries so nested retry loops cannot multiply a large
+    product request. Transport recovery only polls the original request id.
     """
 
-    for retry_index in range(RATE_LIMIT_RETRIES + 1):
-        try:
-            return _analyze_once(prompt)
-        except RuntimeError as error:
-            if not _is_rate_limit_error(error):
-                raise
-            if retry_index >= RATE_LIMIT_RETRIES:
-                raise ChatGptRateLimitError(
-                    "Лимит ChatGPT временно исчерпан (429). Массовая операция остановлена, "
-                    "чтобы не отправлять остальные товары впустую. Повторите её после восстановления лимита"
-                ) from error
-            time.sleep(_rate_limit_retry_delay(retry_index))
-    raise RuntimeError("ChatGPT не смог выполнить анализ после повторных попыток")
+    return _analyze_once(request)
 
 
 def _release_analysis(request_id: str) -> None:

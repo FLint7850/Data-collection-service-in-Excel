@@ -12,12 +12,11 @@ import re
 import time
 from pathlib import Path
 from typing import Any
-from difflib import SequenceMatcher
 
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 
-from config import ATTRIBUTE_ASSISTANT_DIR, env_int
+from config import ATTRIBUTE_ASSISTANT_DIR
 from models import AttributeProduct, AttributeProductSource, Donor
 from services.attribute_programs import is_program_list, match_programs, program_dictionary
 from services.attribute_files import delete_after_commit, stage_text
@@ -60,20 +59,69 @@ from services.attribute_assistant import (
 )
 
 
-ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v18-product-description"
-ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD = env_int(
-    "ATTRIBUTE_CHATGPT_MAX_ALLOWED_PER_FIELD", 12, minimum=1, maximum=100,
-)
-ATTRIBUTE_AI_MAX_PAGE_CHARS = env_int(
-    "ATTRIBUTE_CHATGPT_MAX_PAGE_CHARS", 30_000, minimum=5_000, maximum=100_000,
-)
+ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v21-production"
+ATTRIBUTE_AI_MAX_PAGE_CHARS = 12_000
 ATTRIBUTE_AI_MAX_RESPONSE_CHARS = 2_000_000
 ATTRIBUTE_AI_MAX_SOURCE_HINTS_PER_FIELD = 3
 ATTRIBUTE_AI_MIN_SOURCE_HINT_SCORE = 0.55
 
+# Codex App Server forwards this JSON Schema to the Responses API.  It keeps
+# malformed prose/Markdown out of the hot path while the stricter, domain-aware
+# validation below remains the source of truth for values and evidence.
+ATTRIBUTE_AI_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "attributes": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {
+                        "type": "array",
+                        "minItems": 3,
+                        "maxItems": 4,
+                        "items": {
+                            "anyOf": [
+                                {"type": "integer"},
+                                {"type": "number"},
+                                {"type": "string"},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "name": {"type": "string"},
+                            "value": {"type": "string"},
+                            "evidence": {"type": "string"},
+                            "field_id": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                            "confidence": {"type": "integer", "minimum": 50, "maximum": 85},
+                            "allowed_value": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        },
+                        "required": [
+                            "name", "value", "evidence", "field_id", "confidence", "allowed_value",
+                        ],
+                    },
+                ]
+            },
+        },
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["attributes", "warnings"],
+}
+
 UNIVERSAL_ATTRIBUTE_PROMPT = (
     Path(__file__).with_name("prompts") / "attribute_analysis.md"
 ).read_text(encoding="utf-8").strip()
+_PROGRAM_RULES_START = UNIVERSAL_ATTRIBUTE_PROMPT.index("ПРОГРАММЫ И РЕЖИМЫ")
+_PROGRAM_RULES_END = UNIVERSAL_ATTRIBUTE_PROMPT.index("Если источник не содержит характеристики")
+_ATTRIBUTE_PROMPT_PREFIX = UNIVERSAL_ATTRIBUTE_PROMPT[:_PROGRAM_RULES_START].rstrip()
+_ATTRIBUTE_PROGRAM_RULES = UNIVERSAL_ATTRIBUTE_PROMPT[
+    _PROGRAM_RULES_START:_PROGRAM_RULES_END
+].strip()
+_ATTRIBUTE_PROMPT_SUFFIX = UNIVERSAL_ATTRIBUTE_PROMPT[_PROGRAM_RULES_END:].strip()
 
 
 def _compact_visible_text(html: str) -> str:
@@ -179,58 +227,6 @@ def _field_source_hints(field, target, parsed: dict[str, Any]) -> list[dict[str,
     return list(unique.values())
 
 
-def _shortlist_allowed_values(
-    field,
-    hints: list[dict[str, str]],
-    evidence: str,
-    *,
-    limit: int = ATTRIBUTE_AI_MAX_ALLOWED_PER_FIELD,
-    evidence_tokens: set[str] | None = None,
-) -> list[str]:
-    active = [item for item in field.allowed_values if item.is_active]
-    limit = max(1, int(limit))
-    selected: list[str] = []
-    for hint in hints:
-        canonical, _confidence, _reason, suggestions = _allowed_match(
-            field, hint["value"], hint["name"]
-        )
-        for value in [canonical, *suggestions]:
-            if value and value not in selected:
-                selected.append(value)
-
-    hint_keys = list(dict.fromkeys(value_match_key(item["value"]) for item in hints if clean_text(item["value"])))
-    if evidence_tokens is None:
-        evidence_tokens = set(normalize_key(evidence).split())
-    ranked: list[tuple[float, int, str]] = []
-    for item in active:
-        if item.value in selected:
-            continue
-        key = value_match_key(item.value)
-        tokens = set(key.split())
-        score = 0.0
-        if any(key == hint_key or key in hint_key or hint_key in key for hint_key in hint_keys):
-            score = max(score, 0.94)
-        if tokens and tokens <= evidence_tokens:
-            score = max(score, 0.76)
-        for hint_key in hint_keys:
-            matcher = SequenceMatcher(None, hint_key, key)
-            # These are upper bounds, so skipping cannot drop a candidate
-            # that would enter the previous ranking or beat its existing score.
-            threshold = max(score, 0.48)
-            if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
-                continue
-            score = max(score, matcher.ratio())
-        if score >= 0.48:
-            ranked.append((score, -item.sort_order, item.value))
-    ranked.sort(reverse=True)
-    for _score, _order, value in ranked:
-        if value not in selected:
-            selected.append(value)
-        if len(selected) >= limit:
-            break
-    return selected[:limit]
-
-
 def _template_context(
     product: AttributeProduct,
     parsed: dict[str, Any],
@@ -247,7 +243,6 @@ def _template_context(
         return result
     facts = parsed_attribute_facts(parsed)
     source_ids = {(normalize_key(fact["name"]), dictionary_value_key(fact["value"])): fact["source_id"] for fact in facts}
-    evidence_tokens = set(normalize_key(evidence).split())
     for field in template.fields:
         target = values_by_field.get(field.id)
         current = exact_value_key(target.current_value if target else "")
@@ -265,16 +260,6 @@ def _template_context(
             item["source_ids"] = ids
         if is_program_list(field):
             item.update(program_dictionary(field, evidence))
-        elif hints:
-            # The service performs the final match against the complete
-            # dictionary. Sending values for unrelated fields multiplies the
-            # prompt size without helping the model map source facts.
-            allowed = _shortlist_allowed_values(field, hints, evidence, evidence_tokens=evidence_tokens)
-            if allowed:
-                item["allowed_values"] = allowed
-                total = sum(value.is_active for value in field.allowed_values)
-                if total > len(allowed):
-                    item["allowed_values_total"] = total
         if len(item) > 1:
             result.append(item)
     return result
@@ -305,13 +290,22 @@ def _template_field_catalog(product: AttributeProduct) -> list[dict[str, Any]]:
     ]
 
 
-def build_product_prompt(
+def _analysis_instructions(product: AttributeProduct) -> str:
+    template = product_template(product)
+    sections = [_ATTRIBUTE_PROMPT_PREFIX]
+    if template is not None and any(is_program_list(field) for field in template.fields):
+        sections.append(_ATTRIBUTE_PROGRAM_RULES)
+    sections.append(_ATTRIBUTE_PROMPT_SUFFIX)
+    return "\n\n".join(section for section in sections if section)
+
+
+def build_product_analysis_request(
     product: AttributeProduct,
     *,
     source_url: str,
     html: str = "",
     parsed: dict[str, Any] | None = None,
-) -> tuple[str, str]:
+) -> tuple[dict[str, Any], str]:
     parsed = parsed or {}
     visible = _compact_visible_text(html)
     truncated = len(visible) > ATTRIBUTE_AI_MAX_PAGE_CHARS
@@ -327,9 +321,6 @@ def build_product_prompt(
     )
     template = product_template(product)
     context = {
-        # The shared template prefix precedes per-product facts; no mutable
-        # dictionary data or analysis results are cached in the application.
-        "template_field_catalog": _template_field_catalog(product),
         "product": {
             "name": product.name,
             "model": product.model,
@@ -343,12 +334,46 @@ def build_product_prompt(
         "page_evidence": visible,
         **({"page_evidence_truncated": True} if truncated else {}),
     }
-    prompt = UNIVERSAL_ATTRIBUTE_PROMPT + "\n\nКОНТЕКСТ ДЛЯ АНАЛИЗА:\n" + json.dumps(
+    # Put the reusable rubric and template before per-product data. Requests
+    # for products using one template now share a stable prompt-cache prefix.
+    instructions = _analysis_instructions(product) + "\n\nАКТУАЛЬНЫЙ ШАБЛОН:\n" + json.dumps(
+        {"template_field_catalog": _template_field_catalog(product)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    input_text = "КОНТЕКСТ ДЛЯ АНАЛИЗА:\n" + json.dumps(
         context,
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return prompt, evidence
+    return {
+        "input": input_text,
+        "instructions": instructions,
+        "output_schema": ATTRIBUTE_AI_OUTPUT_SCHEMA,
+        "metadata": {
+            "workload": "attribute-assistant",
+            "prompt_version": ATTRIBUTE_AI_PROMPT_VERSION,
+            "product_id": str(product.id or ""),
+        },
+    }, evidence
+
+
+def build_product_prompt(
+    product: AttributeProduct,
+    *,
+    source_url: str,
+    html: str = "",
+    parsed: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Compatibility/debug view of the exact instructions and product input."""
+
+    request, evidence = build_product_analysis_request(
+        product,
+        source_url=source_url,
+        html=html,
+        parsed=parsed,
+    )
+    return request["instructions"] + "\n\n" + request["input"], evidence
 
 
 def _parse_json_response(value: object) -> dict[str, Any]:
@@ -1109,10 +1134,13 @@ def prepare_product_source(
     html = stored_html
     parsed: dict[str, Any] = stored_parsed
     try:
+        # An exact manually entered URL still belongs to the selected donor.
+        # Use the donor-aware fetch path so its browser mode, headers and
+        # extraction settings are preserved; only own-site URLs are generic.
         downloaded_html, final_url = (
-            fetch_public_html(source_url)
-            if user_supplied_url or donor is None
-            else fetch_donor_product_html(donor, source_url, fetcher=fetcher)
+            fetch_donor_product_html(donor, source_url, fetcher=fetcher)
+            if donor is not None
+            else fetch_public_html(source_url)
         )
         source_url = final_url
         downloaded_parsed = (
@@ -1157,7 +1185,6 @@ def prepare_product_source(
             raise ValueError(
                 f"Не удалось подтвердить карточку модели {product.model}: {clean_text(error)}"
             ) from error
-        # The bridge can still open the exact public URL itself (useful for anti-bot pages).
         if persist and donor and not parsed.get("attributes"):
             _upsert_source(
                 product,
@@ -1168,6 +1195,10 @@ def prepare_product_source(
                 status="resolved",
                 message=f"{resolved_by or 'Ссылка найдена'}; локальная загрузка: {clean_text(error)}",
             )
+        if not html and not parsed.get("attributes") and not clean_text(parsed.get("description")):
+            raise ValueError(
+                f"Не удалось загрузить данные карточки для анализа ChatGPT: {clean_text(error)}"
+            ) from error
     if persist:
         db.flush()
     return source_url, html, parsed, resolved_by
@@ -1202,7 +1233,7 @@ def analyze_product_with_chatgpt(
         fetcher=fetcher,
         persist=False,
     )
-    prompt, page_evidence = build_product_prompt(
+    analysis_request, page_evidence = build_product_analysis_request(
         product,
         source_url=source_url,
         html=html,
@@ -1210,7 +1241,7 @@ def analyze_product_with_chatgpt(
     )
     db.rollback()
     request_started = time.perf_counter()
-    response = analyze_with_chatgpt(prompt)
+    response = analyze_with_chatgpt(analysis_request)
     response_received = time.perf_counter()
     product = db.get(AttributeProduct, product_id)
     if product is None:
@@ -1230,7 +1261,9 @@ def analyze_product_with_chatgpt(
         source_facts=parsed_attribute_facts(parsed),
     )
     record_analysis_metrics(
-        analysis, prompt, response,
+        analysis,
+        len(analysis_request["instructions"]) + len(analysis_request["input"]),
+        response,
         preparation_seconds=request_started - preparation_started,
         request_seconds=response_received - request_started,
         validation_seconds=time.perf_counter() - response_received,

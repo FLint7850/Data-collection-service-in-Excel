@@ -56,9 +56,9 @@ test("reusing an id for different products is rejected", () => {
 test("global queue limits concurrent calls and starts the next product without waiting for the slowest", async () => {
   const started = [];
   const finish = new Map();
-  const jobs = new AnalysisJobs((prompt) => {
-    started.push(prompt);
-    return new Promise((resolve) => finish.set(prompt, resolve));
+  const jobs = new AnalysisJobs((request) => {
+    started.push(request.input);
+    return new Promise((resolve) => finish.set(request.input, resolve));
   }, { concurrency: 2, log: quiet });
   const ids = Array.from({ length: 5 }, (_, i) => i.toString(16).padStart(32, "0"));
   ids.forEach((id, i) => jobs.start(id, `product-${i}`));
@@ -85,7 +85,7 @@ test("global queue limits concurrent calls and starts the next product without w
 
 test("a failed request releases its slot and does not cancel queued products", async () => {
   let fail;
-  const jobs = new AnalysisJobs((prompt) => prompt === "bad"
+  const jobs = new AnalysisJobs((request) => request.input === "bad"
     ? new Promise((_, reject) => { fail = reject; })
     : Promise.resolve({ text: "good" }), { concurrency: 1, log: quiet });
   jobs.start(requestId, "bad");
@@ -99,8 +99,30 @@ test("a failed request releases its slot and does not cancel queued products", a
   assert.equal(jobs.active, 0);
 });
 
+test("rate limiting is retried inside one bridge job without duplicating the queue item", async () => {
+  let calls = 0;
+  const delays = [];
+  const jobs = new AnalysisJobs(async (request) => {
+    calls += 1;
+    if (calls < 3) throw new Error("429 Too Many Requests");
+    return { text: request.input };
+  }, {
+    retryDelaysMs: [60, 120],
+    sleep: async (delay) => { delays.push(delay); },
+    random: () => 0,
+    log: quiet,
+  });
+  jobs.start(requestId, "one product");
+  await settle();
+  await settle();
+  assert.equal(jobs.get(requestId).status, "completed");
+  assert.equal(jobs.get(requestId).result.text, "one product");
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [60, 120]);
+});
+
 test("acknowledged results free storage for batches larger than the retention capacity", async () => {
-  const jobs = new AnalysisJobs(async (prompt) => ({ text: prompt }), { maxEntries: 3, concurrency: 2, log: quiet });
+  const jobs = new AnalysisJobs(async (request) => ({ text: request.input }), { maxEntries: 3, concurrency: 2, log: quiet });
   for (let i = 0; i < 105; i++) {
     const id = i.toString(16).padStart(32, "0");
     jobs.start(id, `product-${i}`);
@@ -114,16 +136,18 @@ test("acknowledged results free storage for batches larger than the retention ca
 
 test("model errors are retained and not retried", async () => {
   let calls = 0;
+  const logs = [];
   const jobs = new AnalysisJobs(async () => {
     calls += 1;
     throw new Error("model failed");
-  }, { log: quiet });
+  }, { log: (line) => logs.push(line) });
   jobs.start(requestId, "all products");
   await settle();
   assert.equal(jobs.get(requestId).status, "failed");
   assert.equal(jobs.get(requestId).error, "model failed");
   assert.equal(jobs.start(requestId, "all products").status, "failed");
   assert.equal(calls, 1);
+  assert.match(logs.at(-1), /failed.*error="model failed"/);
 });
 
 test("active jobs are not expired or evicted by a capacity limit", () => {
@@ -152,24 +176,58 @@ test("activity allows one analysis to run longer than the idle timeout", async (
   }
   event(codex, "item/completed", { threadId: "thread-1", item: { type: "agentMessage", text: "one answer" } });
   event(codex, "turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
-  assert.deepEqual(await analysis, { thread_id: "thread-1", turn_id: "turn-1", text: "one answer" });
+  assert.deepEqual(await analysis, {
+    thread_id: "thread-1", turn_id: "turn-1", text: "one answer",
+    model: "gpt-6-astra", reasoning_effort: "low",
+  });
   assert.equal(requests.filter(({ method }) => method === "turn/start").length, 1);
   assert.equal(requests.some(({ method }) => method === "turn/interrupt"), false);
   assert.equal(codex.listeners.size, 0);
   assert.equal(codex.turnWaiters.size, 0);
 });
 
-test("attribute analysis explicitly uses GPT-6 Astra with medium effort", async (t) => {
+test("attribute analysis uses compact instructions, structured output, and GPT-6 Astra low", async (t) => {
   const { codex, requests } = fakeCodex(t);
-  const analysis = codex.analyze("all products");
+  const outputSchema = { type: "object", properties: { attributes: { type: "array" } } };
+  const analysis = codex.analyze({
+    input: "one product",
+    instructions: "stable template",
+    output_schema: outputSchema,
+    metadata: { workload: "attribute-analysis" },
+  });
   await settle();
   event(codex, "item/completed", { threadId: "thread-1", item: { type: "agentMessage", text: "one answer" } });
   event(codex, "turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
   await analysis;
   assert.deepEqual(requests.find(({ method }) => method === "turn/start").params, {
-    threadId: "thread-1", input: [{ type: "text", text: "all products" }], effort: "medium", model: "gpt-6-astra",
+    threadId: "thread-1",
+    input: [{ type: "text", text: "one product" }],
+    effort: "low",
+    model: "gpt-6-astra",
+    summary: "none",
+    outputSchema,
   });
-  assert.equal(requests.find(({ method }) => method === "thread/start").params.model, "gpt-6-astra");
+  const thread = requests.find(({ method }) => method === "thread/start").params;
+  assert.equal(thread.model, "gpt-6-astra");
+  assert.equal(thread.developerInstructions, "stable template");
+  assert.equal("dynamicTools" in thread, false);
+  assert.equal("environments" in thread, false);
+  assert.equal("allowProviderModelFallback" in thread, false);
+  assert.match(thread.baseInstructions, /deterministic product-attribute extraction service/);
+});
+
+test("exact token usage from App Server is returned with the analysis", async (t) => {
+  const { codex } = fakeCodex(t);
+  const analysis = codex.analyze("one product");
+  await settle();
+  const usage = {
+    inputTokens: 1200, cachedInputTokens: 900, outputTokens: 80,
+    reasoningOutputTokens: 20, totalTokens: 1300,
+  };
+  event(codex, "thread/tokenUsage/updated", { threadId: "thread-1", tokenUsage: { last: usage } });
+  event(codex, "item/completed", { threadId: "thread-1", item: { type: "agentMessage", text: "answer" } });
+  event(codex, "turn/completed", { threadId: "thread-1", turn: { status: "completed" } });
+  assert.deepEqual((await analysis).usage, usage);
 });
 
 test("only the final answer is returned, excluding progress and intermediate messages", async (t) => {
@@ -197,9 +255,24 @@ test("completion logs response size and duration without logging product data", 
   const jobs = new AnalysisJobs(async () => ({ text: "private answer" }), { log: (line) => logs.push(line) });
   jobs.start(requestId, "private prompt");
   await settle();
-  assert.match(logs[0], /prompt_chars=14/);
+  assert.match(logs[0], /input_chars=14, instruction_chars=0/);
   assert.match(logs[1], /completed, duration_ms=\d+, response_chars=14/);
   assert.equal(logs.some((line) => line.includes("private")), false);
+});
+
+test("a released identical request is served from the bounded result cache", async () => {
+  let calls = 0;
+  const jobs = new AnalysisJobs(async (request) => {
+    calls += 1;
+    return { text: request.input };
+  }, { log: quiet });
+  jobs.start(requestId, { input: "same product", instructions: "same template" });
+  await settle();
+  jobs.release(requestId);
+  const repeated = jobs.start("b".repeat(32), { input: "same product", instructions: "same template" });
+  assert.equal(repeated.status, "completed");
+  assert.equal(repeated.result.metrics.cache_hit, true);
+  assert.equal(calls, 1);
 });
 
 test("a stalled analysis is interrupted and all waiters are removed", async (t) => {
@@ -301,7 +374,13 @@ test("HTTP submission returns immediately and the same result is retrievable lat
   const base = `http://127.0.0.1:${server.address().port}`;
   const headers = { authorization: "Bearer test-token", "content-type": "application/json" };
   const response = await fetch(`${base}/analyses`, {
-    method: "POST", headers, body: JSON.stringify({ request_id: requestId, prompt: "all products" }),
+    method: "POST", headers, body: JSON.stringify({
+      request_id: requestId,
+      input: "all products",
+      instructions: "stable template",
+      output_schema: { type: "object" },
+      metadata: { workload: "test" },
+    }),
   });
   assert.equal(response.status, 202);
   assert.equal((await response.json()).id, requestId);
