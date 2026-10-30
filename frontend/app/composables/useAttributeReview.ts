@@ -50,6 +50,7 @@ export function useAttributeReview(
         error,
         tab,
         inputMode,
+        urlPurpose,
         workspace,
         donors,
         selectedTemplateId,
@@ -312,8 +313,12 @@ export function useAttributeReview(
             return;
         }
 
+        if (urlPurpose.value === "catalog" && !selectedTemplateId.value) {
+            error.value = "Для создания товара выберите шаблон категории.";
+            return;
+        }
         const batch = await run("url-import", () =>
-            api.importUrls(urls, selectedTemplateId.value, processingMode.value),
+            api.importUrls(urls, selectedTemplateId.value, processingMode.value, "", urlPurpose.value),
         );
         if (batch) await openBatch(batch.id);
     }

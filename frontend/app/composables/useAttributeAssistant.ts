@@ -32,6 +32,7 @@ export function useAttributeAssistant() {
     const error = ref("");
     const tab = ref<AttributeAssistantTab>("start");
     const inputMode = ref<"csv" | "urls">("csv");
+    const urlPurpose = ref<"enrich" | "catalog">("enrich");
     const workspace = ref<AttributeWorkspace>({
         templates: [],
         donors: [],
@@ -178,6 +179,7 @@ export function useAttributeAssistant() {
         error,
         tab,
         inputMode,
+        urlPurpose,
         workspace,
         templates,
         donors,

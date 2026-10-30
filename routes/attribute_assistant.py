@@ -464,17 +464,110 @@ def api_attribute_batch_urls():
             raise ValueError(
                 f"За одну обработку можно передать не больше {ATTRIBUTE_ASSISTANT_MAX_URLS} ссылок"
             )
+        shop_id = payload.get("shop_id")
+        if shop_id is not None:
+            if type(shop_id) is not int or shop_id < 1:
+                raise ValueError("Некорректный ID магазина")
+            from models import AttributeShopConnection
+            shop = g.db.get(AttributeShopConnection, shop_id)
+            if shop is None or not shop.enabled:
+                raise ValueError("Целевой магазин недоступен")
         batch = create_batch_from_urls(
             g.db,
             urls,
             template=template,
             name=payload.get("name", ""),
             processing_mode=payload.get("processing_mode", "suggest"),
+            purpose=payload.get("purpose", "enrich"),
+            shop_id=payload.get("shop_id"),
         )
         g.db.flush()
         return jsonify(serialize_batch(batch)), 201
     except (TypeError, ValueError) as error:
         return jsonify({"error": str(error)}), 400
+
+
+@bp.get("/api/attribute-assistant/catalog/shops")
+def api_catalog_shops():
+    from models import AttributeShopConnection
+    return jsonify({"items": [
+        {"id": row.id, "name": row.name, "endpoint": row.endpoint}
+        for row in g.db.scalars(select(AttributeShopConnection).where(AttributeShopConnection.enabled.is_(True)).order_by(AttributeShopConnection.name))
+    ]})
+
+
+@bp.get("/api/attribute-assistant/catalog/products/<int:product_id>/preflight")
+def api_catalog_preflight(product_id: int):
+    from services.catalog_products import catalog_preflight
+    try:
+        product = _product_detail(product_id)
+        return jsonify(catalog_preflight(g.db, product))
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
+
+
+@bp.patch("/api/attribute-assistant/catalog/products/<int:product_id>")
+def api_catalog_update(product_id: int):
+    from services.catalog_products import update_catalog_draft, serialize_catalog_draft, catalog_preflight
+    payload = _json_body()
+    try:
+        product = _product_detail(product_id)
+        _assert_product_version(product, payload)
+        update_catalog_draft(g.db, product, payload)
+        return jsonify({"version": product.version, "catalog_draft": serialize_catalog_draft(product),
+                        "preflight": catalog_preflight(g.db, product)})
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@bp.post("/api/attribute-assistant/catalog/batches/<int:batch_id>/export")
+def api_catalog_export(batch_id: int):
+    from services.catalog_products import export_catalog_batch
+    payload = _json_body()
+    try:
+        _batch(batch_id)
+        if payload.get("all") is True:
+            from models import AttributeCatalogDraft
+            product_ids = list(g.db.scalars(
+                select(AttributeProduct.id).join(AttributeCatalogDraft)
+                .where(AttributeProduct.batch_id == batch_id)
+                .order_by(AttributeProduct.sort_order, AttributeProduct.id).limit(2001)
+            ).all())
+        else:
+            product_ids = _integer_list(payload, "product_ids", required=True)
+        include_attributes = payload.get("include_attributes", True)
+        if type(include_attributes) is not bool:
+            raise ValueError("include_attributes должен быть логическим значением")
+        path, checks = export_catalog_batch(g.db, batch_id, product_ids, include_attributes=include_attributes)
+        return jsonify({"filename": path.name, "product_count": len(checks),
+                        "download_url": f"/api/attribute-assistant/catalog/exports/{path.name}",
+                        "warnings": [{"id": c["id"], "warnings": c["warnings"]} for c in checks if c["warnings"]]})
+    except (ValueError, UnicodeError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@bp.post("/api/attribute-assistant/catalog/batches/<int:batch_id>/attributes")
+def api_catalog_attributes_export(batch_id: int):
+    from services.catalog_products import export_catalog_attributes
+    payload = _json_body()
+    try:
+        _batch(batch_id)
+        product_ids = _integer_list(payload, "product_ids", required=True)
+        path = export_catalog_attributes(g.db, batch_id, product_ids)
+        return jsonify({"filename": path.name,
+                        "download_url": f"/api/attribute-assistant/catalog/exports/{path.name}"})
+    except (ValueError, UnicodeError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@bp.get("/api/attribute-assistant/catalog/exports/<filename>")
+def api_catalog_download(filename: str):
+    from services.catalog_products import catalog_export_path
+    try:
+        path = catalog_export_path(filename)
+        return send_file(path, as_attachment=True, download_name=path.name, mimetype="text/csv")
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
 
 
 @bp.get("/api/attribute-assistant/batches/<int:batch_id>")

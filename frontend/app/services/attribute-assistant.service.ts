@@ -91,6 +91,7 @@ export const attributeAssistantService = {
     templateId: number | null,
     processingMode: AttributeProcessingMode,
     name = "",
+    purpose: "enrich" | "catalog" = "enrich",
   ) =>
     $fetch<AttributeBatch>(`${base}/batches/urls`, {
       method: "POST",
@@ -99,8 +100,31 @@ export const attributeAssistantService = {
         template_id: templateId,
         processing_mode: processingMode,
         name,
+        purpose,
       },
     }),
+
+  catalogShops: () => $fetch<{ items: Array<{ id: number; name: string }> }>(`${base}/catalog/shops`),
+  catalogPreflight: (id: number) => $fetch<{
+    ok: boolean; errors: string[]; warnings: string[]; total_fields: number; blank_fields: number;
+  }>(`${base}/catalog/products/${id}/preflight`),
+  catalogUpdate: (id: number, body: Record<string, unknown>) => $fetch<{
+    version: number; catalog_draft: import("~/types/attribute-assistant").CatalogDraft;
+  }>(`${base}/catalog/products/${id}`, { method: "PATCH", body }),
+  catalogAttributesExport: (batchId: number, productId: number) =>
+    $fetch<{ download_url: string }>(`${base}/catalog/batches/${batchId}/attributes`, {
+      method: "POST", body: { product_ids: [productId] },
+    }),
+  catalogExportAll: (batchId: number) =>
+    $fetch<{ download_url: string; product_count: number }>(`${base}/catalog/batches/${batchId}/export`, {
+      method: "POST", body: { all: true, include_attributes: true },
+    }),
+  catalogExport: (batchId: number, productIds: number[], includeAttributes: boolean) =>
+    $fetch<{ download_url: string; warnings: Array<{ id: number; warnings: string[] }> }>(
+      `${base}/catalog/batches/${batchId}/export`, {
+        method: "POST", body: { product_ids: productIds, include_attributes: includeAttributes },
+      },
+    ),
 
   batch: (id: number, signal?: AbortSignal) =>
     $fetch<AttributeBatch>(`${base}/batches/${id}`, { signal }),

@@ -150,7 +150,20 @@ export interface AttributeAllowedValueOptions {
   values: AttributeAllowedValue[];
 }
 
+export interface CatalogDraft {
+  id: number;
+  product_id: number;
+  shop_id: number | null;
+  template_version: number;
+  state: string;
+  price: string;
+  description: string;
+  images: string[];
+  source_metadata: Record<string, unknown>;
+}
+
 export interface AttributeProduct {
+  catalog_draft?: CatalogDraft | null;
   id: number;
   version: number;
   batch_id?: number;

@@ -87,6 +87,7 @@ const {
   error,
   tab,
   inputMode,
+  urlPurpose,
   workspace,
   templates,
   selectedTemplateId,
@@ -158,6 +159,22 @@ const {
   saveAllowedValue,
   allowedValueMenuItems,
 } = templatesState;
+
+const catalogBatchExporting = ref(false);
+const catalogBatchError = ref("");
+async function exportCatalogBatch() {
+  if (!selectedBatch.value) return;
+  catalogBatchExporting.value = true;
+  catalogBatchError.value = "";
+  try {
+    const result = await attributeApi.catalogExportAll(selectedBatch.value.id);
+    window.location.assign(result.download_url);
+  } catch (caught) {
+    catalogBatchError.value = errorMessage(caught);
+  } finally {
+    catalogBatchExporting.value = false;
+  }
+}
 
 const recentBatches = computed(() =>
   workspace.value.batches.slice(0, ATTRIBUTE_ASSISTANT_UI.recentBatchCount),
@@ -356,6 +373,13 @@ onBeforeUnmount(() => {
             description="Категорию попробуем определить по странице. Если не получится — используем выбранный ниже шаблон."
           >
             <UTextarea v-model="urlsText" :rows="7" placeholder="https://site.ru/product/model" class="w-full" />
+          </UFormField>
+
+          <UFormField v-if="inputMode === 'urls'" label="Назначение ссылок" description="При создании новых товаров будут подготовлены черновики и CSV для импорта. Фотографии пока не скачиваются.">
+            <USelect v-model="urlPurpose" :items="[
+              { label: 'Обогатить существующий товар', value: 'enrich' },
+              { label: 'Создать новые товары (черновики)', value: 'catalog' },
+            ]" class="w-full" />
           </UFormField>
 
           <div class="aa-form-row">
@@ -757,6 +781,7 @@ onBeforeUnmount(() => {
 
           <UButton v-if="selectedBatch.original_ready" :to="attributeApi.batchOriginalDownloadUrl(selectedBatch.id)" external color="neutral" variant="soft" icon="i-lucide-file-spreadsheet">Исходный CSV</UButton>
           <UButton :to="attributeApi.batchReportDownloadUrl(selectedBatch.id)" external color="neutral" variant="soft" icon="i-lucide-file-text">Скачать отчёт</UButton>
+          <UButton v-if="selectedProduct?.catalog_draft" color="primary" variant="soft" icon="i-lucide-file-down" :loading="catalogBatchExporting" @click="exportCatalogBatch">CSV всех новых товаров</UButton>
           <UButton color="neutral" variant="soft" :disabled="hasBusy" @click="exportReadyOnly">Экспортировать готовые</UButton>
           <UButton color="primary" :disabled="hasBusy" @click="exportBatch">
             <UIcon name="i-lucide-download" /> Экспорт всех
@@ -771,6 +796,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <UAlert v-if="catalogBatchError" color="error" variant="subtle" icon="i-lucide-alert-triangle" :description="catalogBatchError" />
       <div class="aa-metrics">
         <MetricCard label="Готово" :value="selectedBatch.summary.ready" icon="i-lucide-circle-check-big" tone="mint" />
         <MetricCard label="Предложений" :value="selectedBatch.summary.suggestions" icon="i-lucide-lightbulb" tone="blue" />
@@ -814,6 +840,12 @@ onBeforeUnmount(() => {
         </aside>
 
         <main v-if="selectedProduct" class="aa-product-work">
+          <CatalogDraftPanel
+            v-if="selectedProduct.catalog_draft"
+            :key="selectedProduct.id"
+            :product="selectedProduct"
+            @saved="selectedProduct && openProduct(selectedProduct.id)"
+          />
           <UCard as="section" variant="outline" class="aa-card aa-source-card">
             <div class="aa-product-title">
               <div>

@@ -2736,7 +2736,13 @@ def create_batch_from_urls(
     template: AttributeTemplate | None,
     name: str = "",
     processing_mode: str = "suggest",
+    purpose: str = "enrich",
+    shop_id: int | None = None,
 ) -> AttributeBatch:
+    if purpose not in {"enrich", "catalog"}:
+        raise ValueError("Неизвестная цель обработки")
+    if purpose == "catalog" and template is None:
+        raise ValueError("Для создания карточки выберите точный шаблон категории")
     template_id = template.id if template is not None else None
     cleaned_urls = list(dict.fromkeys(clean_text(url) for url in urls if clean_text(url)))
     if not cleaned_urls:
@@ -2757,6 +2763,9 @@ def create_batch_from_urls(
         try:
             html, final_url = fetch_public_html(url)
             page = parse_product_html(html, final_url)
+            if purpose == "catalog":
+                from services.catalog_products import extract_catalog_data
+                page["catalog"] = extract_catalog_data(html, final_url)
             page.update(_input_url=url, _status="parsed", _error="")
             return page
         except Exception as error:
@@ -2845,7 +2854,8 @@ def create_batch_from_urls(
             model=model,
             name=page["name"],
             brand=page["brand"],
-            category_name=page["category"],
+            category_name=(selected_template.category.full_path if purpose == "catalog" and selected_template
+                           else page["category"]),
             source_url=page["url"],
             search_text=product_search_text(
                 model,
@@ -2854,7 +2864,8 @@ def create_batch_from_urls(
                 page["category"],
             ),
             sort_order=index - 1,
-            processing_state={"template_unresolved": selected_template is None},
+            processing_state={"template_unresolved": selected_template is None,
+                              "purpose": purpose},
             status="needs_template" if selected_template is None else "needs_review",
         )
         db.add(product)
@@ -2864,8 +2875,8 @@ def create_batch_from_urls(
                 product,
                 selected_template,
                 page_stack,
-                current_source="current_site",
-                current_role="Исходная страница сайта",
+                current_source="external_site" if purpose == "catalog" else "current_site",
+                current_role="Внешняя страница товара" if purpose == "catalog" else "Исходная страница сайта",
             )
             mapped_current = sum(
                 value.is_in_template and bool(value.current_value)
@@ -2885,7 +2896,7 @@ def create_batch_from_urls(
             AttributeProductSource(
                 url=page["url"],
                 priority=0,
-                role="own_site",
+                role="external_product" if purpose == "catalog" else "own_site",
                 status=(
                     "error" if page["_status"] == "error"
                     else "needs_template" if selected_template is None
@@ -2894,6 +2905,9 @@ def create_batch_from_urls(
                 parsed_data={**{key: value for key, value in page.items() if not key.startswith("_")}, "message": page["_error"]},
             )
         )
+        if purpose == "catalog" and selected_template is not None:
+            from services.catalog_products import attach_catalog_draft
+            db.add(attach_catalog_draft(product, page, shop_id=shop_id))
         db.flush()
         refresh_product_status(product)
     refresh_batch_summary(batch)
@@ -6570,6 +6584,7 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
         "donor_url_overrides": dict(product.donor_url_overrides or {}),
         "donor_urls": list(product.donor_urls or []),
         "processing_state": dict(product.processing_state or {}),
+        "catalog_draft": None,
         "counts": {
             "missing": sum(value.is_in_template and not value.final_value for value in product.values),
             "conflicts": sum(value.status == "conflict" for value in product.values),
@@ -6578,6 +6593,8 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
         },
     }
     if detailed:
+        from services.catalog_products import serialize_catalog_draft
+        result["catalog_draft"] = serialize_catalog_draft(product)
         template = product_template(product)
         if template and result["template"] is not None:
             result["template"]["fields"] = [
@@ -6626,6 +6643,7 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
                 "donor_name": (
                     "ChatGPT" if source.role == "chatgpt"
                     else source.donor.brand.name if source.donor
+                    else "Внешняя страница товара" if source.role == "external_product"
                     else "Страница сайта"
                 ),
                 "source_type": (
@@ -6646,7 +6664,7 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
                 "already_filled": int(((source.parsed_data or {}).get("processing_stats") or {}).get("already_filled") or 0),
             }
             for source in product.sources
-            if source.donor is not None or source.role == "chatgpt"
+            if source.donor is not None or source.role in {"chatgpt", "external_product"}
         ]
     return result
 
@@ -7013,7 +7031,7 @@ def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
         for product in batch.products:
             if ready_only and product.status != "ready":
                 continue
-            ordered = sorted(product.values, key=lambda value: (not value.is_in_template, value.sort_order, value.id))
+            ordered = sorted((v for v in product.values if v.is_in_template), key=lambda value: (value.sort_order, value.id))
             yield {"_MODEL_": product.model, "_ATTRIBUTES_": "\n".join(
                 f"{value.group_name}|{value.attribute_name}|{value.final_value}" for value in ordered
             )}
@@ -7023,7 +7041,7 @@ def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
     session.flush()
     product, value = AttributeProduct, AttributeProductValue
     statement = select(product.id, product.model, value.id, value.group_name, value.attribute_name, value.final_value)
-    statement = statement.outerjoin(value, value.product_id == product.id).where(product.batch_id == batch.id)
+    statement = statement.outerjoin(value, (value.product_id == product.id) & (value.is_in_template.is_(True))).where(product.batch_id == batch.id)
     if ready_only:
         statement = statement.where(product.status == "ready")
     statement = statement.order_by(product.sort_order, product.id, value.is_in_template.desc(), value.sort_order, value.id)
@@ -7105,6 +7123,10 @@ def delete_batch_files(db: Session, batch: AttributeBatch) -> int:
         for source in product.sources:
             remember(source.raw_html_path)
     for path in (ATTRIBUTE_ASSISTANT_DIR / "exports").glob(f"attributes_{batch.id}_*.csv"):
+        candidates.add(path)
+    for path in (ATTRIBUTE_ASSISTANT_DIR / "exports").glob(f"catalog_{batch.id}_*.csv"):
+        candidates.add(path)
+    for path in (ATTRIBUTE_ASSISTANT_DIR / "exports").glob(f"catalog_attr_{batch.id}_*.csv"):
         candidates.add(path)
     for path in (ATTRIBUTE_ASSISTANT_DIR / "reports").glob(f"attribute_report_{batch.id}_*.csv"):
         candidates.add(path)

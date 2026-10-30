@@ -416,6 +416,9 @@ class AttributeProduct(Base):
         "AttributeProductValue", back_populates="product", cascade="all, delete-orphan",
         order_by="AttributeProductValue.sort_order",
     )
+    catalog_draft: Mapped["AttributeCatalogDraft | None"] = relationship(
+        "AttributeCatalogDraft", back_populates="product", uselist=False, cascade="all, delete-orphan"
+    )
     sources: Mapped[list["AttributeProductSource"]] = relationship(
         "AttributeProductSource", back_populates="product", cascade="all, delete-orphan",
         order_by="AttributeProductSource.priority",
@@ -426,6 +429,29 @@ class AttributeProduct(Base):
         Index("ix_attribute_products_batch_search", "batch_id", "search_text"),
         Index("ix_attribute_products_batch_sort", "batch_id", "sort_order", "id"),
     )
+
+
+class AttributeCatalogDraft(Base):
+    """Publication metadata; never download remote images while drafting.
+
+    Separate from AttributeProduct so existing attribute workflows need no data migration.
+    """
+    __tablename__ = "attribute_catalog_drafts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("attribute_products.id", ondelete="CASCADE"), nullable=False, unique=True)
+    shop_id: Mapped[int | None] = mapped_column(ForeignKey("attribute_shop_connections.id", ondelete="SET NULL"), nullable=True)
+    template_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    images: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
+    source_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    product: Mapped["AttributeProduct"] = relationship("AttributeProduct", back_populates="catalog_draft")
+    shop: Mapped["AttributeShopConnection | None"] = relationship("AttributeShopConnection")
 
 
 class AttributeProductValue(Base):
