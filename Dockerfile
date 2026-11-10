@@ -16,7 +16,7 @@ ARG DEBIAN_MIRROR=https://mirror.yandex.ru
 RUN mkdir -p /tmp/parser \
     && sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl gosu nodejs \
+    && apt-get install -y --no-install-recommends ca-certificates curl gosu libatomic1 nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
