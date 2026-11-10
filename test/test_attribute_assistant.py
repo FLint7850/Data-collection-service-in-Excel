@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, raiseload
 from models import (
     AttributeAllowedValue,
     AttributeBatch,
+    AttributeBatchOperation,
     AttributeProduct,
     AttributeProductRevision,
     AttributeProductSource,
@@ -1077,8 +1078,25 @@ class AttributeAssistantTest(unittest.TestCase):
             "<h1>Страница не найдена</h1>",
             "https://example.com/catalog/HVX-T999XX/",
         )
-        self.assertTrue(parsed_404["model_inferred_from_url"])
+        self.assertEqual(parsed_404["model"], "")
+        self.assertNotIn("model_inferred_from_url", parsed_404)
         self.assertFalse(service._parsed_product_matches_model(parsed_404, "HVX-T999XX"))
+
+    def test_product_parser_does_not_treat_sku_or_article_as_model(self):
+        parsed = service.parse_product_html(
+            """
+            <script type="application/ld+json">
+            {"@type":"Product","name":"Газовая панель Haier HHX-M64RFB",
+             "sku":"TD0050129RU","mpn":"TD0050129RU",
+             "additionalProperty":[{"name":"Артикул","value":"TD0050129RU"}]}
+            </script>
+            """,
+            "https://example.com/products/unrelated-slug/",
+        )
+
+        self.assertEqual(parsed["model"], "HHX-M64RFB")
+        self.assertNotEqual(parsed["model"], "TD0050129RU")
+        self.assertFalse(any(item["name"] == "Артикул" for item in parsed["attributes"]))
 
     def test_donor_processing_rejects_wrong_page_at_inferred_series_url(self):
         template = self.make_template()
@@ -1640,6 +1658,66 @@ class AttributeAssistantTest(unittest.TestCase):
         self.assertFalse(any(not value.is_in_template for value in product.values))
         with self.assertRaisesRegex(ValueError, "только атрибуты вне шаблона"):
             service.delete_extra_product_value(self.db, color)
+
+    def test_url_import_uses_configured_donor_fetch_and_parses_identity(self):
+        template = self.make_template()
+        donor = Donor(
+            brand=Brand(name="Haier", group_name="Тест"),
+            legacy_id="haier-direct-url",
+            site_url="https://haieronline.ru/",
+            thread_count=2,
+            extraction_rules={"model_selector": "h1"},
+        )
+        self.db.add(donor)
+        self.db.commit()
+        html = """
+        <h1>Газовая варочная панель Haier hhq-m64cx</h1>
+        <script type="application/ld+json">
+        {"@type":"Product","name":"Газовая варочная панель Haier hhq-m64cx",
+         "sku":"AA000000RU","additionalProperty":[
+         {"name":"Артикул","value":"AA000000RU"},
+         {"name":"Цвет","value":"Белый"}]}
+        </script>
+        """
+        url = "https://haieronline.ru/catalog/built-in/gas-cove/hhq-m64cx/"
+
+        with patch.object(
+            service,
+            "fetch_donor_product_html",
+            return_value=(html, url),
+        ) as donor_fetch, patch.object(service, "fetch_public_html") as generic_fetch:
+            batch = service.create_batch_from_urls(
+                self.db,
+                [url],
+                template=template,
+                purpose="catalog",
+            )
+
+        product = batch.products[0]
+        donor_fetch.assert_called_once()
+        generic_fetch.assert_not_called()
+        self.assertEqual(product.name, "Газовая варочная панель Haier hhq-m64cx")
+        self.assertEqual(product.model, "HHQ-M64CX")
+        self.assertEqual(product.brand, "Haier")
+        self.assertFalse(product.catalog_draft.source_metadata["model_inferred"])
+        self.assertEqual(product.sources[0].parsed_data["model"], "HHQ-M64CX")
+
+    def test_catalog_url_import_rejects_an_empty_product_page(self):
+        template = self.make_template()
+        self.db.commit()
+
+        with patch.object(
+            service,
+            "fetch_public_html",
+            return_value=("<html><body><div id='app'></div></body></html>", "https://example.com/item"),
+        ):
+            with self.assertRaisesRegex(ValueError, "название товара не распознано"):
+                service.create_batch_from_urls(
+                    self.db,
+                    ["https://example.com/item"],
+                    template=template,
+                    purpose="catalog",
+                )
 
     def test_cached_url_attributes_can_backfill_current_values(self):
         template = self.make_template()
@@ -2517,6 +2595,119 @@ class AttributeAssistantTest(unittest.TestCase):
                 self.assertEqual(analysis["suggestions"], [])
                 self.assertTrue(analysis["warnings"])
 
+    def test_chatgpt_url_identity_from_title_corrects_parser_values(self):
+        from services import attribute_ai
+
+        template = self.make_template()
+        self.db.commit()
+        title = "Встраиваемый духовой шкаф ASKO OCM64BSH черное стекло"
+        html = f"<h1>{title}</h1><h2>Характеристики</h2>"
+        with patch.object(
+            service,
+            "fetch_public_html",
+            return_value=(html, "https://example.com/products/ocm64bsh"),
+        ):
+            batch = service.create_batch_from_urls(
+                self.db,
+                ["https://example.com/products/ocm64bsh"],
+                template=template,
+            )
+        product = batch.products[0]
+        product.name = title
+        product.model = "НЕВЕРНАЯ-МОДЕЛЬ"
+        product.brand = "Неверный производитель"
+
+        request, _evidence = attribute_ai.build_product_analysis_request(
+            product,
+            source_url=product.source_url,
+            parsed={"name": "Заголовок страницы донора", "attributes": []},
+        )
+        context = json.loads(request["input"].split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
+        self.assertEqual(context["identity_from_name"], {
+            "name": title,
+            "current_model": "НЕВЕРНАЯ-МОДЕЛЬ",
+            "current_brand": "Неверный производитель",
+        })
+
+        analysis = attribute_ai.validate_analysis(
+            product,
+            {
+                "identity": {
+                    "model": "OCM64BSH",
+                    "brand": "ASKO",
+                    "evidence": "ASKO OCM64BSH",
+                    "confidence": 96,
+                },
+                "attributes": [],
+                "warnings": [],
+            },
+            identity_source_name=title,
+        )
+        changed = attribute_ai.apply_analysis(
+            self.db,
+            product,
+            analysis,
+            source_url=product.source_url,
+        )
+
+        self.assertEqual(changed, 2)
+        self.assertEqual(product.model, "OCM64BSH")
+        self.assertEqual(product.brand, "ASKO")
+        self.assertIn("ocm64bsh", product.search_text.lower())
+        self.assertIn("asko", product.search_text.lower())
+        chatgpt_source = next(source for source in product.sources if source.role == "chatgpt")
+        self.assertEqual(chatgpt_source.parsed_data["identity"]["model"], "OCM64BSH")
+        self.assertEqual(chatgpt_source.parsed_data["processing_stats"]["identity_changed"], 2)
+
+    def test_chatgpt_url_identity_must_be_quoted_from_title(self):
+        from services import attribute_ai
+
+        template = self.make_template()
+        self.db.commit()
+        title = "Встраиваемый духовой шкаф ASKO OCM64BSH черное стекло"
+        html = f"<h1>{title}</h1>"
+        with patch.object(
+            service,
+            "fetch_public_html",
+            return_value=(html, "https://example.com/products/ocm64bsh"),
+        ):
+            batch = service.create_batch_from_urls(
+                self.db,
+                ["https://example.com/products/ocm64bsh"],
+                template=template,
+            )
+        product = batch.products[0]
+        product.name = title
+        product.model = "ТЕКУЩАЯ-МОДЕЛЬ"
+        product.brand = "Текущий производитель"
+
+        analysis = attribute_ai.validate_analysis(
+            product,
+            {
+                "identity": {
+                    "model": "INVENTED-9000",
+                    "brand": "Invented",
+                    "evidence": "ASKO OCM64BSH",
+                    "confidence": 99,
+                },
+                "attributes": [],
+                "warnings": [],
+            },
+            identity_source_name=title,
+        )
+        changed = attribute_ai.apply_analysis(
+            self.db,
+            product,
+            analysis,
+            source_url=product.source_url,
+        )
+
+        self.assertEqual(changed, 0)
+        self.assertNotIn("identity", analysis)
+        self.assertEqual(product.model, "ТЕКУЩАЯ-МОДЕЛЬ")
+        self.assertEqual(product.brand, "Текущий производитель")
+        self.assertTrue(any("отклонено" in warning for warning in analysis["warnings"]))
+
     def test_chatgpt_requires_one_compact_response_format(self):
         from services import attribute_ai
 
@@ -2537,6 +2728,10 @@ class AttributeAssistantTest(unittest.TestCase):
         request, _evidence = attribute_ai.build_product_analysis_request(
             batch.products[0], source_url="https://example.com/product",
         )
+        context = json.loads(request["input"].split("КОНТЕКСТ ДЛЯ АНАЛИЗА:\n", 1)[1])
+        self.assertNotIn("identity_from_name", context)
+        self.assertIn("identity", attribute_ai.ATTRIBUTE_AI_OUTPUT_SCHEMA["properties"])
+        self.assertIn("identity", attribute_ai.ATTRIBUTE_AI_OUTPUT_SCHEMA["required"])
         self.assertIn("ПРОГРАММЫ И РЕЖИМЫ", request["instructions"])
         for prompt in (attribute_ai.UNIVERSAL_ATTRIBUTE_PROMPT,):
             self.assertIn('"attributes"', prompt)
@@ -3547,6 +3742,62 @@ class AttributeAssistantTest(unittest.TestCase):
         }
         self.addCleanup(runtime._JOBS.pop, batch.id, None)
         return runtime, template, batch, [product.id for product in batch.products]
+
+    def test_background_operation_checkpoint_survives_memory_reset(self):
+        from runtime import attribute_batch_operations as runtime
+
+        template = self.make_template()
+        batch = service.create_batch_from_csv(
+            self.db,
+            template,
+            '_MODEL_;_ATTRIBUTES_\r\nWM-1;""\r\n'.encode("cp1251"),
+            filename="products.csv",
+        )
+        self.db.commit()
+        state = {
+            "id": "persisted-operation",
+            "batch_id": batch.id,
+            "kind": "chatgpt",
+            "status": "running",
+            "stage": "chatgpt",
+            "total": 1,
+            "prepared": 1,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "percent": 0,
+            "changed": 0,
+            "attributes_found": 0,
+            "current_product_id": batch.products[0].id,
+            "current_product": "WM-1",
+            "errors": [],
+            "completed_product_ids": [],
+            "failed_product_ids": [],
+            "cancel_requested": False,
+            "started_at": "2026-11-02T12:00:00+00:00",
+            "finished_at": "",
+            "error": "",
+        }
+        session_factory = lambda: Session(self.engine, expire_on_commit=False)
+        with patch.object(runtime, "SessionLocal", side_effect=session_factory):
+            runtime._persist_operation(
+                state,
+                payload={"product_ids": [batch.products[0].id], "donor_ids": []},
+                force=True,
+            )
+            runtime._JOBS.pop(batch.id, None)
+            loaded = runtime.get_attribute_batch_operation(batch.id)
+
+        self.addCleanup(runtime._JOBS.pop, batch.id, None)
+        self.addCleanup(runtime._LAST_PERSIST.pop, batch.id, None)
+        self.assertEqual(loaded["id"], "persisted-operation")
+        self.assertEqual(loaded["status"], "paused")
+        self.assertNotIn("completed_product_ids", loaded)
+        with Session(self.engine) as check:
+            self.assertEqual(
+                check.get(AttributeBatchOperation, "persisted-operation").status,
+                "paused",
+            )
 
     def test_donor_batch_uses_bounded_product_parallelism(self):
         runtime, _template, batch, product_ids = self._chatgpt_parallel_batch()

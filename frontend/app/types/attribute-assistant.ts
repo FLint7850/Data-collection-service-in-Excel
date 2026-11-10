@@ -119,6 +119,16 @@ export interface AttributeSource {
   unknown: number;
   ambiguous: number;
   already_filled: number;
+  metrics?: {
+    preparation_ms?: number;
+    request_ms?: number;
+    validation_ms?: number;
+    prompt_chars?: number;
+    response_chars?: number;
+    observed_facts?: number;
+    bridge?: { cache_hit?: boolean; usage?: { inputTokens?: number; outputTokens?: number } };
+  };
+  page_cache?: { content_hash?: string; fetched_at?: string; available?: boolean };
 }
 
 export interface AttributeDonorReport {
@@ -235,9 +245,9 @@ export interface AttributeBatchOperationError {
 export interface AttributeBatchOperation {
   id: string;
   batch_id: number;
-  kind: "" | "donors" | "chatgpt";
-  status: "idle" | "queued" | "running" | "completed" | "failed";
-  stage: "" | "queued" | "preparing" | "donors" | "chatgpt" | "applying" | "completed" | "failed";
+  kind: "" | "donors" | "chatgpt" | "auto" | "url_import";
+  status: "idle" | "queued" | "running" | "cancelling" | "paused" | "completed" | "failed";
+  stage: "" | "queued" | "preparing" | "url_import" | "donors" | "chatgpt" | "applying" | "cancelling" | "paused" | "completed" | "failed";
   total: number;
   prepared: number;
   processed: number;

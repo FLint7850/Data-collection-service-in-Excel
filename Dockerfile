@@ -20,13 +20,14 @@ RUN mkdir -p /tmp/parser \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt \
-    && rm -rf /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin/temp \
+RUN python -m pip install --upgrade pip
+RUN python -m pip install -r requirements.txt
+RUN rm -rf /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin/temp \
     && mkdir -p /tmp/parser /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
     && chmod -R 1777 /tmp/parser \
-    && chmod -R a+rwX /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin \
-    && python -m playwright install --with-deps chromium chromium-headless-shell
+    && chmod -R a+rwX /usr/local/lib/python3.11/site-packages/botasaurus_requests/bin
+RUN python -m playwright install-deps chromium chromium-headless-shell
+RUN python -m playwright install chromium chromium-headless-shell
 
 FROM base AS test
 COPY . .

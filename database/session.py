@@ -757,7 +757,8 @@ def migrate_attribute_assistant_tables(connection) -> None:
 
     from services.attribute_text import mapping_value_key, product_search_text
 
-    if table_columns(connection, "attribute_allowed_values"):
+    allowed_columns = table_columns(connection, "attribute_allowed_values")
+    if allowed_columns:
         if "search_value" not in original_columns.get("attribute_allowed_values", {}):
             rows = list(connection.execute(
                 text("SELECT id, value FROM attribute_allowed_values")
@@ -767,10 +768,11 @@ def migrate_attribute_assistant_tables(connection) -> None:
                     text("UPDATE attribute_allowed_values SET search_value = :value WHERE id = :id"),
                     {"id": row["id"], "value": product_search_text(row["value"])},
                 )
-        connection.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_attribute_allowed_values_field_search "
-            "ON attribute_allowed_values (field_id, is_active, search_value)"
-        ))
+        if {"field_id", "is_active", "search_value"} <= set(table_columns(connection, "attribute_allowed_values")):
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_attribute_allowed_values_field_search "
+                "ON attribute_allowed_values (field_id, is_active, search_value)"
+            ))
     if table_columns(connection, "attribute_value_synonyms"):
         if "search_synonym" not in original_columns.get("attribute_value_synonyms", {}):
             rows = list(connection.execute(

@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, false, func, or_, select
 from sqlalchemy.orm import Session
 
 from models import AttributeProduct, AttributeProductValue
@@ -72,9 +72,14 @@ def product_page(
     filtered = select(rows)
     if status != "all":
         filtered = filtered.where(conditions[status])
-    query = product_search_text(query)
-    if query:
-        filtered = filtered.where(rows.c.search_text.contains(query, autoescape=True))
+    raw_query = str(query or "").strip()
+    query = product_search_text(raw_query)
+    if raw_query:
+        # A punctuation-only query must not become an empty SQL filter (which
+        # used to match every product, notably for "%" and "_").
+        filtered = filtered.where(
+            rows.c.search_text.contains(query, autoescape=True) if query else false()
+        )
         matched = int(db.scalar(select(func.count()).select_from(filtered.subquery())) or 0)
     else:
         matched = int(counts[status])

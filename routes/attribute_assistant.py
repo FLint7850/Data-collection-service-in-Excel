@@ -45,6 +45,7 @@ from services.attribute_assistant import (
     clean_text,
     create_batch_from_csv,
     create_batch_from_urls,
+    create_url_batch_placeholder,
     copy_template,
     create_template_field,
     delete_attribute_batch,
@@ -213,7 +214,10 @@ def _nested_string_mapping(payload: dict, name: str) -> dict[str, dict[str, str]
 
 def _assert_product_version(product: AttributeProduct, payload: dict) -> int:
     if "expected_version" not in payload:
-        raise ValueError("Поле expected_version обязательно для изменения товара")
+        # Keep older clients and direct service integrations compatible. The
+        # current UI always sends a version and therefore still gets strict
+        # optimistic-concurrency protection.
+        return int(product.version)
     expected = _required_int(payload, "expected_version")
     if product.version != expected:
         raise StaleProductError("Товар уже изменён в другой операции. Обновите данные и повторите действие")
@@ -290,6 +294,7 @@ def _product_mutation_payload(
         "product": serialize_product(product, detailed=detailed),
         "batch": serialize_batch(product.batch),
         "history_item": recent_history[0] if recent_history else None,
+        "history": recent_history,
     }
 
 
@@ -472,6 +477,32 @@ def api_attribute_batch_urls():
             shop = g.db.get(AttributeShopConnection, shop_id)
             if shop is None or not shop.enabled:
                 raise ValueError("Целевой магазин недоступен")
+        background = payload.get("background", False)
+        auto_run = payload.get("auto_run", False)
+        if type(background) is not bool or type(auto_run) is not bool:
+            raise ValueError("background и auto_run должны быть логическими значениями")
+        if background:
+            batch = create_url_batch_placeholder(
+                g.db,
+                urls,
+                template=template,
+                name=payload.get("name", ""),
+                processing_mode=payload.get("processing_mode", "suggest"),
+            )
+            g.db.commit()
+            from runtime.attribute_batch_operations import start_attribute_url_import
+
+            operation = start_attribute_url_import(
+                batch.id,
+                [clean_text(item) for item in urls if clean_text(item)],
+                template_id=template.id if template else None,
+                name=payload.get("name", ""),
+                processing_mode=payload.get("processing_mode", "suggest"),
+                purpose=payload.get("purpose", "enrich"),
+                shop_id=payload.get("shop_id"),
+                auto_run=auto_run,
+            )
+            return jsonify({"batch": serialize_batch(batch), "operation": operation}), 202
         batch = create_batch_from_urls(
             g.db,
             urls,
@@ -656,6 +687,36 @@ def api_attribute_batch_operation(batch_id: int):
         return jsonify({"error": str(error)}), 404
 
 
+@bp.post("/api/attribute-assistant/batches/<int:batch_id>/operation/pause")
+def api_attribute_batch_operation_pause(batch_id: int):
+    ensure_storage()
+    try:
+        _batch(batch_id)
+        from runtime.attribute_batch_operations import pause_attribute_batch_operation
+
+        return jsonify(pause_attribute_batch_operation(batch_id)), 202
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@bp.post("/api/attribute-assistant/batches/<int:batch_id>/operation/resume")
+def api_attribute_batch_operation_resume(batch_id: int):
+    ensure_storage()
+    payload = _json_body()
+    try:
+        _batch(batch_id)
+        failed_only = payload.get("failed_only", False)
+        if type(failed_only) is not bool:
+            raise ValueError("failed_only должен быть логическим значением")
+        from runtime.attribute_batch_operations import resume_attribute_batch_operation
+
+        return jsonify(resume_attribute_batch_operation(batch_id, failed_only=failed_only)), 202
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
+
+
 @bp.post("/api/attribute-assistant/batches/<int:batch_id>/process-all")
 def api_attribute_batch_process_all(batch_id: int):
     ensure_storage()
@@ -709,6 +770,43 @@ def api_attribute_batch_chatgpt_analyze_all(batch_id: int):
         state = start_attribute_batch_operation(
             batch_id,
             "chatgpt",
+            product_ids,
+            donor_ids,
+            url_overrides_by_product=overrides,
+        )
+        return jsonify(state), 202
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    except RuntimeError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@bp.post("/api/attribute-assistant/batches/<int:batch_id>/auto-all")
+def api_attribute_batch_auto_all(batch_id: int):
+    """Run donors, AI for remaining products, then accept safe high-confidence values."""
+
+    ensure_storage()
+    payload = _json_body()
+    try:
+        batch = _batch(batch_id)
+        from services.attribute_chatgpt_control import chatgpt_status
+
+        if not chatgpt_status().get("authenticated"):
+            raise RuntimeError("Сначала подключите ChatGPT")
+        donor_ids = _integer_list(payload, "donor_ids")
+        if donor_ids:
+            _remember_batch_donor_selection(batch, donor_ids)
+        product_ids = list(g.db.scalars(
+            select(AttributeProduct.id)
+            .where(AttributeProduct.batch_id == batch_id)
+            .order_by(AttributeProduct.sort_order, AttributeProduct.id)
+        ))
+        overrides = _nested_string_mapping(payload, "url_overrides_by_product")
+        from runtime.attribute_batch_operations import start_attribute_batch_operation
+
+        state = start_attribute_batch_operation(
+            batch_id,
+            "auto",
             product_ids,
             donor_ids,
             url_overrides_by_product=overrides,
@@ -863,8 +961,8 @@ def api_attribute_export(batch_id: int):
     ensure_storage()
     try:
         batch = _batch(batch_id)
-        path = export_batch_csv(batch, ready_only=bool(_json_body().get("ready_only")))
-        return jsonify({"ok": True, "filename": path.name})
+        export_batch_csv(batch, ready_only=bool(_json_body().get("ready_only")))
+        return jsonify({"ok": True, "filename": Path(batch.export_path).name})
     except ValueError as error:
         return jsonify({"error": str(error)}), 409
 

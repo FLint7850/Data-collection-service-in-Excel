@@ -55,7 +55,7 @@ class AttributePaginationTest(unittest.TestCase):
 
     def test_import_retains_all_rows_with_bounded_memory_and_matching(self):
         summary = batch_summary(self.db, self.batch_id)
-        self.assertEqual(summary, {'products': 4000, 'ready': 0, 'needs_review': 4000,
+        self.assertEqual(summary, {'products': 4000, 'ready': 0, 'needs_review': 4000, 'attributes': 16000,
                                    'filled': 8000, 'missing': 4000, 'conflicts': 0, 'suggestions': 0})
         self.assertEqual(self.match_calls, 2)
         self.assertLess(self.peak_objects, 1500)

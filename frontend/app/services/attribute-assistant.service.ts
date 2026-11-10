@@ -92,8 +92,9 @@ export const attributeAssistantService = {
     processingMode: AttributeProcessingMode,
     name = "",
     purpose: "enrich" | "catalog" = "enrich",
+    autoRun = false,
   ) =>
-    $fetch<AttributeBatch>(`${base}/batches/urls`, {
+    $fetch<{ batch: AttributeBatch; operation: AttributeBatchOperation }>(`${base}/batches/urls`, {
       method: "POST",
       body: {
         urls,
@@ -101,6 +102,8 @@ export const attributeAssistantService = {
         processing_mode: processingMode,
         name,
         purpose,
+        background: true,
+        auto_run: autoRun,
       },
     }),
 
@@ -142,6 +145,22 @@ export const attributeAssistantService = {
     }),
   batchOperation: (id: number, signal?: AbortSignal) =>
     $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation`, { signal }),
+  pauseBatchOperation: (id: number) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation/pause`, { method: "POST" }),
+  resumeBatchOperation: (id: number, failedOnly = false) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/operation/resume`, {
+      method: "POST",
+      body: { failed_only: failedOnly },
+    }),
+  autoProcessBatch: (
+    id: number,
+    donorIds: number[],
+    urlOverridesByProduct: Record<string, Record<string, string>> = {},
+  ) =>
+    $fetch<AttributeBatchOperation>(`${base}/batches/${id}/auto-all`, {
+      method: "POST",
+      body: { donor_ids: donorIds, url_overrides_by_product: urlOverridesByProduct },
+    }),
   processBatch: (
     id: number,
     donorIds: number[],

@@ -81,7 +81,7 @@ describe("large attribute batches", () => {
 
   it("opens only the bounded list and loads attributes on click", async () => {
     await review.openBatch(1);
-    expect(api.products).toHaveBeenCalledWith(1, "", "all", 0, 80, expect.any(AbortSignal));
+    expect(api.products).toHaveBeenCalledWith(1, "", "needs_review", 0, 80, expect.any(AbortSignal));
     expect(review.filteredProducts.value).toHaveLength(80);
     expect(review.selectedProduct.value).toBeNull();
     expect(api.product).not.toHaveBeenCalled();
@@ -114,6 +114,7 @@ describe("large attribute batches", () => {
     await review.openBatch(1, 4);
     expect(review.attributeStatusItems.value).toEqual([
       { label: "Все атрибуты (7)", value: "all" },
+      { label: "Требуют решения (3)", value: "review" },
       { label: "Вне шаблона (1)", value: "outside_template" },
       { label: "Конфликт (1)", value: "conflict" },
       { label: "Предложения (1)", value: "suggested" },
@@ -282,7 +283,7 @@ describe("large attribute batches", () => {
     const requests = api.products.mock.calls.length;
     await vi.advanceTimersByTimeAsync(250);
     expect(api.products).toHaveBeenCalledTimes(requests);
-    expect(api.products).toHaveBeenLastCalledWith(2, "", "all", 0, 80, expect.any(AbortSignal));
+    expect(api.products).toHaveBeenLastCalledWith(2, "", "needs_review", 0, 80, expect.any(AbortSignal));
     expect(review.selectedDonors.value).toEqual([]);
     expect(review.donorUrlOverrides.value).toEqual({});
   });

@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import csv
 import gzip
+import hashlib
 import io
 import json
 import re
@@ -18,15 +19,17 @@ import threading
 import uuid
 import xml.etree.ElementTree as ET
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from fractions import Fraction
 from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import chardet
@@ -98,6 +101,22 @@ from services.scraping.http import looks_blocked_or_empty
 
 
 SPACE_RE = re.compile(r"\s+")
+_ALLOWED_INDEX_LOCK = threading.RLock()
+_SHARED_ALLOWED_INDEXES: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_SHARED_ALLOWED_INDEX_LIMIT = 128
+PRODUCT_IDENTIFIER_ATTRIBUTE_KEYS = {
+    "артикул",
+    "артикул производителя",
+    "код товара",
+    "код продукта",
+    "sku",
+    "mpn",
+}
+EXPORT_EXCLUDED_ATTRIBUTE_KEYS = PRODUCT_IDENTIFIER_ATTRIBUTE_KEYS | {
+    "специальная цена",
+    "спец цена",
+    "special price",
+}
 NUMBER_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
 NUMBER_RANGE_RE = re.compile(r"^([+-]?\d+(?:[.,]\d+)?)\s*[-–—−]\s*([+-]?\d+(?:[.,]\d+)?)$")
 DIMENSION_RE = re.compile(r"^[+-]?\d+(?:[.,]\d+)?(?:\s*[xXхХ×]\s*[+-]?\d+(?:[.,]\d+)?){1,3}$")
@@ -428,22 +447,103 @@ def _boolean_equivalence_key(value: Any) -> str:
     return ""
 
 
-def _canonical_matching_value(allowed: Iterable[AttributeAllowedValue], value: Any) -> str:
+def _compiled_allowed_index(
+    field: AttributeTemplateField,
+    allowed: list[AttributeAllowedValue],
+) -> dict[str, Any]:
+    """Share immutable lookup structures between identical template dictionaries."""
+
+    digest = hashlib.sha256()
+    for item in allowed:
+        digest.update(exact_value_key(item.value).encode("utf-8"))
+        digest.update(f"\0{item.sort_order}\0".encode("ascii"))
+        for synonym in item.synonyms:
+            digest.update(exact_value_key(synonym.synonym).encode("utf-8"))
+            digest.update(b"\0")
+    signature = digest.hexdigest()
+    # Value synonyms can be edited without changing an allowed-value id. Key
+    # the instance cache by actual content so a new synonym is visible before
+    # the surrounding transaction is committed.
+    local = getattr(field, "_compiled_allowed_index", None)
+    if local and local[0] == signature:
+        return local[1]
+    with _ALLOWED_INDEX_LOCK:
+        compiled = _SHARED_ALLOWED_INDEXES.get(signature)
+        if compiled is not None:
+            _SHARED_ALLOWED_INDEXES.move_to_end(signature)
+            field._compiled_allowed_index = (signature, compiled)
+            return compiled
+
+    exact: dict[str, str] = {}
+    folded: dict[str, str] = {}
+    synonym_exact: dict[str, str] = {}
+    synonym_folded: dict[str, str] = {}
+    numeric: list[tuple[Decimal, int, str]] = []
+    dimensions: list[tuple[tuple[Decimal, ...], int, str]] = []
+    fuzzy: list[tuple[str, str]] = []
+    boolean: dict[str, str] = {}
+    for item in allowed:
+        exact.setdefault(exact_value_key(item.value), item.value)
+        folded.setdefault(value_match_key(item.value), item.value)
+        fuzzy.append((value_match_key(item.value), item.value))
+        boolean_key = _boolean_equivalence_key(item.value)
+        if boolean_key:
+            boolean.setdefault(boolean_key, item.value)
+        if NUMBER_RE.fullmatch(item.value):
+            numeric.append((Decimal(item.value.replace(",", ".")), item.sort_order, item.value))
+        vector = _linear_measure_vector(item.value)
+        if vector is not None and len(vector) >= 2:
+            dimensions.append((vector, item.sort_order, item.value))
+        for synonym in item.synonyms:
+            synonym_exact.setdefault(exact_value_key(synonym.synonym), item.value)
+            synonym_folded.setdefault(value_match_key(synonym.synonym), item.value)
+    numeric.sort()
+    compiled = {
+        "exact": exact,
+        "folded": folded,
+        "synonym_exact": synonym_exact,
+        "synonym_folded": synonym_folded,
+        "numeric": numeric,
+        "dimensions": dimensions,
+        "fuzzy": fuzzy,
+        "boolean": boolean,
+    }
+    with _ALLOWED_INDEX_LOCK:
+        _SHARED_ALLOWED_INDEXES[signature] = compiled
+        _SHARED_ALLOWED_INDEXES.move_to_end(signature)
+        while len(_SHARED_ALLOWED_INDEXES) > _SHARED_ALLOWED_INDEX_LIMIT:
+            _SHARED_ALLOWED_INDEXES.popitem(last=False)
+    field._compiled_allowed_index = (signature, compiled)
+    return compiled
+
+
+def _canonical_matching_value(
+    allowed: Iterable[AttributeAllowedValue],
+    value: Any,
+    compiled: dict[str, Any] | None = None,
+) -> str:
     active = [item for item in allowed if item.is_active]
     exact_key = exact_value_key(value)
-    exact = next((item.value for item in active if exact_value_key(item.value) == exact_key), "")
+    exact = (
+        str(compiled["exact"].get(exact_key, ""))
+        if compiled is not None
+        else next((item.value for item in active if exact_value_key(item.value) == exact_key), "")
+    )
     if exact:
         return exact
     key = value_match_key(value)
-    case_insensitive = next(
-        (item.value for item in active if value_match_key(item.value) == key),
-        "",
-    ) if key else ""
+    case_insensitive = (
+        str(compiled["folded"].get(key, ""))
+        if compiled is not None and key
+        else next((item.value for item in active if value_match_key(item.value) == key), "") if key else ""
+    )
     if case_insensitive:
         return case_insensitive
     boolean_key = _boolean_equivalence_key(value)
     if not boolean_key:
         return ""
+    if compiled is not None:
+        return str(compiled["boolean"].get(boolean_key, ""))
     return next(
         (
             item.value
@@ -617,7 +717,11 @@ def allowed_value_options(
 ) -> dict[str, Any]:
     safe_limit = max(1, min(int(limit or ALLOWED_VALUE_PAGE_SIZE), MAX_PAGE_SIZE))
     safe_offset = max(0, int(offset or 0))
-    query_key = product_search_text(query)
+    query_text = exact_value_key(query)
+    query_key = product_search_text(query_text)
+    punctuation_sensitive = bool(
+        query_text and any(not character.isalnum() and not character.isspace() for character in query_text)
+    )
     db = object_session(field)
 
     # Detached/transient fields are used by a few pure domain callers. Persisted
@@ -625,16 +729,21 @@ def allowed_value_options(
     # become one ORM collection merely to render a single page.
     if db is None or field.id is None:
         available = [item for item in field.allowed_values if include_inactive or item.is_active]
-        if query_key:
+        if query_text:
             ranked: list[tuple[int, int, AttributeAllowedValue]] = []
             for item in available:
-                searchable = [product_search_text(item.value), *(
-                    product_search_text(synonym.synonym) for synonym in item.synonyms
-                )]
-                matching = [text for text in searchable if query_key in text]
+                searchable = (
+                    [value_match_key(item.value), *(value_match_key(synonym.synonym) for synonym in item.synonyms)]
+                    if punctuation_sensitive
+                    else [product_search_text(item.value), *(
+                        product_search_text(synonym.synonym) for synonym in item.synonyms
+                    )]
+                )
+                needle = value_match_key(query_text) if punctuation_sensitive else query_key
+                matching = [text for text in searchable if needle in text]
                 if matching:
                     quality = min(
-                        0 if text == query_key else 1 if text.startswith(query_key) else 2
+                        0 if text == needle else 1 if text.startswith(needle) else 2
                         for text in matching
                     )
                     ranked.append((quality, item.sort_order, item))
@@ -658,9 +767,14 @@ def allowed_value_options(
         ) or 0)
         match_condition = None
         quality = None
-        if query_key:
-            value_key = allowed.search_value
-            synonym_key = synonym.search_synonym
+        if query_text:
+            if punctuation_sensitive:
+                query_key = value_match_key(query_text)
+                value_key = func.lower(allowed.value)
+                synonym_key = func.lower(synonym.synonym)
+            else:
+                value_key = allowed.search_value
+                synonym_key = synonym.search_synonym
 
             def synonym_exists(condition):
                 return exists(select(synonym.id).where(
@@ -1683,6 +1797,40 @@ def _remove_ui_noise(node: Any) -> None:
             noisy.decompose()
 
 
+def compact_product_page_text(html: str) -> str:
+    """Return stable, prompt-safe visible product text for reuse across runs."""
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    _remove_ui_noise(soup)
+    for node in soup.select("script, style, svg, canvas, noscript, form, nav, footer, iframe"):
+        node.decompose()
+    seen_paragraphs: set[str] = set()
+    lines: list[str] = []
+    previous = ""
+    for raw_line in soup.get_text("\n", strip=True).splitlines():
+        line = clean_text(raw_line)
+        if not line or line == previous:
+            continue
+        previous = line
+        if len(line) >= 120:
+            if line in seen_paragraphs:
+                continue
+            seen_paragraphs.add(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def attach_page_snapshot(parsed: dict[str, Any], html: str) -> dict[str, Any]:
+    """Attach reusable, non-executable page evidence to parsed product data."""
+
+    visible = compact_product_page_text(html)
+    if visible:
+        parsed["page_evidence"] = visible
+        parsed["page_content_hash"] = hashlib.sha256(visible.encode("utf-8")).hexdigest()
+        parsed["page_fetched_at"] = datetime.now(timezone.utc).isoformat()
+    return parsed
+
+
 def _text_without_ui_noise(node: Any) -> str:
     """Read a specification cell without tooltip/help text nested inside it."""
 
@@ -1704,18 +1852,11 @@ def _append_parsed_attribute(
     key = (normalize_key(clean_name), exact_value_key(clean_value))
     if not clean_name or not clean_value or clean_name == clean_value:
         return
+    if key[0] in PRODUCT_IDENTIFIER_ATTRIBUTE_KEYS:
+        return
     if key in seen:
-        # A fast parser may have found the pair before the structural parser.
-        # Keep one row, but let the later, more contextual pass fill its group.
-        if clean_group:
-            for item in reversed(result["attributes"]):
-                if (
-                    normalize_key(item.get("name")) == key[0]
-                    and exact_value_key(item.get("value")) == key[1]
-                    and not clean_text(item.get("group"))
-                ):
-                    item["group"] = clean_group
-                    break
+        # A semantic parser already owns this pair. Do not let the generic
+        # structural fallback change its group after the fact.
         return
     result["attributes"].append({
         "name": clean_name,
@@ -1779,6 +1920,14 @@ def _structural_direct_children(node: Any) -> list[Any]:
 def _has_nested_structural_row(node: Any) -> bool:
     """Reject wrappers whose child/descendant already is a label/value row."""
 
+    if re.search(
+        r"(?:^|[_-]{1,2})(?:name|value|key|val|label)(?:$|[_-])",
+        _node_marker(node),
+        re.IGNORECASE,
+    ):
+        # This node is one cell whose inline spans form a single label/value,
+        # for example "Габаритные размеры" + "(шхвхг)".
+        return False
     if node.find(["table", "dl", "ul", "ol"], recursive=True):
         return True
 
@@ -2262,6 +2411,15 @@ def _append_structural_specification_attributes(
             row_key = id(row)
             if row_key in processed_rows:
                 continue
+            # A value cell can itself contain two visual spans. Treating those
+            # spans as another row creates false characteristics such as
+            # "Автоматическое взвешивание = Самоочистка".
+            if re.search(
+                r"(?:^|[_-]{1,2})(?:name|value|key|val|label)(?:$|[_-])",
+                _node_marker(row),
+                re.IGNORECASE,
+            ):
+                continue
             parts = _structural_row_parts(row)
             if parts is None:
                 continue
@@ -2277,7 +2435,7 @@ def _append_structural_specification_attributes(
 
 
 def _infer_product_model(name: str, url: str = "", brand: str = "") -> str:
-    """Extract a model-like code from generic product metadata without brand rules."""
+    """Extract a model-like code from the product title; URL only ranks title candidates."""
 
     tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9./_@-]*", clean_text(name))
     brand_key = normalize_key(brand)
@@ -2289,7 +2447,7 @@ def _infer_product_model(name: str, url: str = "", brand: str = "") -> str:
             candidate = " ".join(parts).strip(" .,/\\_-")
             compact = normalize_model(candidate)
             if (
-                len(compact) < 4
+                len(compact) < 3
                 or not any(char.isalpha() for char in candidate)
                 or not any(char.isdigit() for char in candidate)
                 or normalize_key(parts[0]) == brand_key
@@ -2305,13 +2463,6 @@ def _infer_product_model(name: str, url: str = "", brand: str = "") -> str:
             ranked.append((score, -width, candidate))
     if ranked:
         return max(ranked)[2]
-    slug = clean_text(Path(urlparse(url).path.rstrip("/")).stem)
-    if (
-        slug
-        and any(char.isalpha() for char in slug)
-        and any(char.isdigit() for char in slug)
-    ):
-        return slug
     return ""
 
 
@@ -2410,7 +2561,9 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
             if "Product" not in types:
                 continue
             result["name"] = clean_text(item.get("name")) or result["name"]
-            result["model"] = clean_text(item.get("model") or item.get("mpn") or item.get("sku")) or result["model"]
+            # SKU/MPN are article identifiers on many shops and must not
+            # silently replace the actual model from the product title.
+            result["model"] = clean_text(item.get("model")) or result["model"]
             brand = item.get("brand")
             result["brand"] = clean_text(brand.get("name") if isinstance(brand, dict) else brand) or result["brand"]
             result["category"] = clean_text(item.get("category")) or result["category"]
@@ -2419,6 +2572,8 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
                 structured_descriptions.append(description)
             for prop in item.get("additionalProperty") or []:
                 if isinstance(prop, dict) and prop.get("name"):
+                    if normalize_key(prop.get("name")) in PRODUCT_IDENTIFIER_ATTRIBUTE_KEYS:
+                        continue
                     result["attributes"].append({
                         "name": clean_text(prop.get("name")),
                         "value": exact_value_key(prop.get("value")),
@@ -2490,6 +2645,10 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
                 if containing_root is not None
                 else ""
             )
+            # detail-properties titles describe a visual page section, not the
+            # CSV attribute group used by the target template.
+            if row_selector == ".detail-properties__field":
+                group = ""
             if not group:
                 block = row.find_parent(
                     class_=re.compile(
@@ -2498,7 +2657,7 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
                         re.I,
                     )
                 )
-                if block:
+                if block and row_selector != ".detail-properties__field":
                     heading = block.select_one(
                         ".characteristic-list__caption,.characteristics__title,.characteristic__title,"
                         ".specifications__title,.specification__title,.properties__title,.parameters__title,"
@@ -2526,18 +2685,14 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
     if not result["model"]:
         for attr in result["attributes"]:
             if normalize_key(attr["name"]) in {
-                "модель", "код модели", "номер модели", "артикул", "код товара",
-                "код продукта", "sku", "mpn",
+                "модель", "код модели", "номер модели",
             }:
                 result["model"] = attr["value"]
                 break
     if not result["model"]:
         for selector, attribute in (
             ('meta[itemprop="model"]', "content"),
-            ('meta[itemprop="sku"]', "content"),
-            ('meta[itemprop="mpn"]', "content"),
             ('[itemprop="model"]', None),
-            ('[itemprop="sku"]', None),
             ('[data-product-model]', "data-product-model"),
             ('[data-model]', "data-model"),
         ):
@@ -2553,13 +2708,6 @@ def parse_product_html(html: str, url: str = "") -> dict[str, Any]:
             result["brand"],
         )
         result["model"] = inferred_model
-        if (
-            inferred_model
-            and normalize_model(inferred_model) not in normalize_model(result["name"])
-        ):
-            # The URL is useful for display/fallback parsing, but it cannot
-            # prove that an automatically generated URL opened the right page.
-            result["model_inferred_from_url"] = True
     crumbs = [clean_text(node.get_text(" ")) for node in soup.select('[itemprop="itemListElement"], .breadcrumb a, .breadcrumbs a')]
     if crumbs and not result["category"]:
         result["category"] = " > ".join(dict.fromkeys(item for item in crumbs if item))
@@ -2593,11 +2741,17 @@ def parse_product_html_for_donor(
 
     try:
         result["name"] = selected_text(settings.get("name_selector")) or result["name"]
-        result["model"] = (
+        selected_model = (
             selected_text(settings.get("model_selector"))
             or selected_text(rules.get("model_selector"))
-            or result["model"]
         )
+        if selected_model:
+            # Existing donor configs sometimes point model_selector at the H1
+            # containing the full product name.  Keep only its model token.
+            result["model"] = (
+                _infer_product_model(selected_model, url, result["brand"])
+                or selected_model
+            )
         result["category"] = selected_text(settings.get("category_selector")) or result["category"]
         description = selected_text(settings.get("description_selector"))
         if description:
@@ -2738,6 +2892,8 @@ def create_batch_from_urls(
     processing_mode: str = "suggest",
     purpose: str = "enrich",
     shop_id: int | None = None,
+    existing_batch: AttributeBatch | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> AttributeBatch:
     if purpose not in {"enrich", "catalog"}:
         raise ValueError("Неизвестная цель обработки")
@@ -2753,16 +2909,80 @@ def create_batch_from_urls(
         )
     if any(len(url) > 2048 for url in cleaned_urls):
         raise ValueError("Длина одной ссылки не должна превышать 2048 символов")
-    # Do not retain the template lookup transaction during bounded network I/O.
-    db.rollback()
-    template = db.get(AttributeTemplate, template_id) if template_id is not None else None
+
+    # A direct product URL should be loaded with the same connection method as
+    # its configured donor.  Some official sites return an empty JS shell to a
+    # plain requests client but are already configured to use another engine.
+    from services.file_import_service import find_brand_in_name
+
+    known_brands = sorted(
+        {
+            clean_text(item)
+            for item in db.scalars(select(Brand.name))
+            if clean_text(item)
+        },
+        key=len,
+        reverse=True,
+    )
+    input_hosts = {_host_key(url) for url in cleaned_urls if _host_key(url)}
+    donor_statement = select(Donor).options(
+        selectinload(Donor.brand),
+        selectinload(Donor.connection_method_row),
+    )
+    if input_hosts:
+        donor_statement = donor_statement.where(or_(
+            *(func.lower(Donor.site_url).contains(host) for host in input_hosts)
+        ))
+    donor_rows = list(db.scalars(donor_statement)) if input_hosts else []
+    url_donors = [
+        SimpleNamespace(
+            **{column.key: getattr(donor, column.key) for column in inspect(Donor).columns},
+            brand=SimpleNamespace(name=donor.brand.name),
+            connection_method_row=(
+                SimpleNamespace(code=donor.connection_method_row.code)
+                if donor.connection_method_row is not None
+                else None
+            ),
+        )
+        for donor in donor_rows
+    ]
+
+    # Keep the caller's transaction intact. A synchronous caller may have
+    # imported the template immediately before starting URL processing; a
+    # rollback here would silently delete that uncommitted template.
     if template_id is not None and template is None:
         raise ValueError("Шаблон был удалён до начала импорта")
 
     def load_page(url: str) -> dict[str, Any]:
         try:
-            html, final_url = fetch_public_html(url)
-            page = parse_product_html(html, final_url)
+            donor = next(
+                (item for item in url_donors if _same_site(item.site_url, url)),
+                None,
+            )
+            if donor is not None:
+                html, final_url = fetch_donor_product_html(
+                    donor,
+                    url,
+                    fetcher=page_fetcher,
+                )
+                page = parse_product_html_for_donor(html, final_url, donor)
+            else:
+                html, final_url = fetch_public_html(url)
+                page = parse_product_html(html, final_url)
+            attach_page_snapshot(page, html)
+            page["brand"] = find_brand_in_name(
+                clean_text(page.get("name")),
+                clean_text(page.get("brand")),
+                known_brands,
+            )
+            page["model"] = clean_text(
+                page.get("model")
+                or _infer_product_model(page.get("name", ""), final_url, page.get("brand", ""))
+            ).upper()
+            if not clean_text(page.get("name")):
+                raise ValueError("Страница открылась, но название товара не распознано")
+            if not clean_text(page.get("model")):
+                raise ValueError("Страница открылась, но модель не найдена в названии товара")
             if purpose == "catalog":
                 from services.catalog_products import extract_catalog_data
                 page["catalog"] = extract_catalog_data(html, final_url)
@@ -2775,25 +2995,59 @@ def create_batch_from_urls(
                 "_status": "error",
                 "_error": clean_text(error),
                 "name": "",
-                "model": Path(urlparse(url).path.rstrip("/")).name,
+                "model": "",
                 "brand": "",
                 "category": "",
                 "attributes": [],
             }
 
     parsed_by_index: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(
-        max_workers=min(URL_IMPORT_CONCURRENCY, len(cleaned_urls)),
-        thread_name_prefix="attribute-url-import",
-    ) as executor:
-        futures = {
-            executor.submit(load_page, url): index
-            for index, url in enumerate(cleaned_urls)
-        }
-        for future in as_completed(futures):
-            parsed_by_index[futures[future]] = future.result()
+    max_pages = max((donor.thread_count for donor in url_donors), default=1)
+    fetcher_context = (
+        DonorPageFetcher(max_pages=max_pages)
+        if url_donors
+        else nullcontext(None)
+    )
+    with fetcher_context as page_fetcher:
+        with ThreadPoolExecutor(
+            max_workers=min(URL_IMPORT_CONCURRENCY, len(cleaned_urls)),
+            thread_name_prefix="attribute-url-import",
+        ) as executor:
+            indexed_urls = iter(enumerate(cleaned_urls))
+            pending: dict[Future, int] = {}
+
+            def submit_next() -> bool:
+                try:
+                    index, url = next(indexed_urls)
+                except StopIteration:
+                    return False
+                pending[executor.submit(load_page, url)] = index
+                return True
+
+            for _ in range(min(URL_IMPORT_CONCURRENCY, len(cleaned_urls))):
+                submit_next()
+            while pending:
+                completed, _ = wait(set(pending), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = pending.pop(future)
+                    parsed_by_index[index] = future.result()
+                    if progress_callback is not None:
+                        progress_callback(
+                            len(parsed_by_index),
+                            len(cleaned_urls),
+                            cleaned_urls[index],
+                        )
+                    submit_next()
 
     parsed_pages = [parsed_by_index[index] for index in range(len(cleaned_urls))]
+    if purpose == "catalog":
+        failed_pages = [page for page in parsed_pages if page.get("_status") == "error"]
+        if failed_pages:
+            details = "; ".join(
+                f"{page['_input_url']}: {page['_error']}"
+                for page in failed_pages
+            )
+            raise ValueError("Не удалось разобрать карточку товара. " + details)
     discovered_templates: list[AttributeTemplate] = []
     for page in parsed_pages:
         page["_template"] = template or find_template_for_category(
@@ -2822,12 +3076,7 @@ def create_batch_from_urls(
             "Шаблон не определён автоматически. Выберите его вручную."
             + (f" {details}" if details else "")
         )
-    batch = AttributeBatch(
-        template=batch_template,
-        name=clean_text(name) or f"Ссылки {len(cleaned_urls)}",
-        input_mode="urls",
-        processing_mode=validated_processing_mode(processing_mode).value,
-        source_urls=[
+    source_urls = [
             {
                 "url": page["_input_url"],
                 "final_url": page.get("url", ""),
@@ -2836,18 +3085,34 @@ def create_batch_from_urls(
                 "template_id": page["_template"].id if page["_template"] is not None else None,
             }
             for page in parsed_pages
-        ],
-    )
-    db.add(batch)
+        ]
+    if existing_batch is None:
+        batch = AttributeBatch(
+            template=batch_template,
+            name=clean_text(name) or f"Ссылки {len(cleaned_urls)}",
+            input_mode="urls",
+            processing_mode=validated_processing_mode(processing_mode).value,
+            source_urls=source_urls,
+        )
+        db.add(batch)
+    else:
+        if existing_batch.products:
+            raise ValueError("Фоновая обработка ссылок уже содержит товары")
+        batch = existing_batch
+        batch.template = batch_template
+        batch.name = clean_text(name) or batch.name or f"Ссылки {len(cleaned_urls)}"
+        batch.input_mode = "urls"
+        batch.processing_mode = validated_processing_mode(processing_mode).value
+        batch.source_urls = source_urls
+        batch.status = "review"
     db.flush()
     for index, page in enumerate(parsed_pages, start=1):
         selected_template = page["_template"]
-        model = (
+        model_candidate = (
             clean_text(page["model"])
             or _infer_product_model(page["name"], page["url"], page["brand"])
-            or clean_text(Path(urlparse(page["url"]).path.rstrip("/")).stem)
-            or f"Товар {index}"
         )
+        model = model_candidate.upper() if model_candidate else f"Товар {index}"
         product = AttributeProduct(
             batch=batch,
             template=selected_template,
@@ -2911,6 +3176,49 @@ def create_batch_from_urls(
         db.flush()
         refresh_product_status(product)
     refresh_batch_summary(batch)
+    db.flush()
+    return batch
+
+
+def create_url_batch_placeholder(
+    db: Session,
+    urls: list[str],
+    *,
+    template: AttributeTemplate | None,
+    name: str = "",
+    processing_mode: str = "suggest",
+) -> AttributeBatch:
+    """Create a visible batch before bounded URL I/O starts in the background."""
+
+    cleaned_urls = list(dict.fromkeys(clean_text(url) for url in urls if clean_text(url)))
+    if not cleaned_urls:
+        raise ValueError("Добавьте хотя бы одну ссылку")
+    if len(cleaned_urls) > ATTRIBUTE_ASSISTANT_MAX_URLS:
+        raise ValueError(
+            f"За одну обработку можно передать не больше {ATTRIBUTE_ASSISTANT_MAX_URLS} ссылок"
+        )
+    if any(len(url) > 2048 for url in cleaned_urls):
+        raise ValueError("Длина одной ссылки не должна превышать 2048 символов")
+    placeholder_template = template or db.scalar(
+        select(AttributeTemplate)
+        .where(AttributeTemplate.is_active.is_(True))
+        .order_by(AttributeTemplate.is_default.desc(), AttributeTemplate.updated_at.desc())
+    )
+    if placeholder_template is None:
+        raise ValueError("Сначала создайте хотя бы один активный шаблон")
+    batch = AttributeBatch(
+        template=placeholder_template,
+        name=clean_text(name) or f"Ссылки {len(cleaned_urls)}",
+        input_mode="urls",
+        processing_mode=validated_processing_mode(processing_mode).value,
+        status="importing",
+        source_urls=[{"url": url, "status": "queued", "error": ""} for url in cleaned_urls],
+        summary={
+            "products": 0, "attributes": 0, "ready": 0, "needs_review": 0,
+            "filled": 0, "missing": 0, "conflicts": 0, "suggestions": 0,
+        },
+    )
+    db.add(batch)
     db.flush()
     return batch
 
@@ -4920,14 +5228,14 @@ def _allowed_match_single(
     key = exact_value_key(value)
     if not key:
         return "", 0, "Значение не заполнено", []
-    canonical = _canonical_matching_value(allowed, value)
+    compiled = _compiled_allowed_index(field, allowed)
+    canonical = _canonical_matching_value(allowed, value, compiled)
     if canonical:
         reason = "Точное значение справочника" if exact_value_key(canonical) == key else "Совпадение со справочником без учёта регистра"
         return canonical, 100, reason, []
-    for comparison in (exact_value_key, value_match_key):
-        for item in allowed:
-            if any(comparison(synonym.synonym) == comparison(value) for synonym in item.synonyms):
-                return item.value, 98, "Синоним значения", []
+    synonym = compiled["synonym_exact"].get(key) or compiled["synonym_folded"].get(value_match_key(value))
+    if synonym:
+        return str(synonym), 98, "Синоним значения", []
     class_code_key = _standard_class_code_key(field, value)
     if class_code_key:
         class_matches = [
@@ -4985,11 +5293,10 @@ def _allowed_match_single(
         return "", 0, "Точного диапазона нет в справочнике; варианты подобраны по числовой близости", [item[-1] for item in ranked[:3]]
     if NUMBER_RE.fullmatch(value):
         numeric_value = Decimal(value.replace(",", "."))
-        numeric_allowed = []
-        for item in allowed:
-            if NUMBER_RE.fullmatch(item.value):
-                distance = abs(Decimal(item.value.replace(",", ".")) - numeric_value)
-                numeric_allowed.append((distance, item.sort_order, item.value))
+        numeric_allowed = [
+            (abs(number - numeric_value), sort_order, item_value)
+            for number, sort_order, item_value in compiled["numeric"]
+        ]
         numeric_allowed.sort()
         nearby = [item for distance, _order, item in numeric_allowed
                   if distance <= max(abs(numeric_value), abs(Decimal(item.replace(",", ".")))) * Decimal("0.2")]
@@ -4997,9 +5304,8 @@ def _allowed_match_single(
     dimension_value = _linear_measure_vector(value)
     if dimension_value is not None and len(dimension_value) >= 2:
         numeric_dimensions = []
-        for item in allowed:
-            item_value = _linear_measure_vector(item.value)
-            if item_value is None or len(item_value) != len(dimension_value):
+        for item_value, sort_order, item_text in compiled["dimensions"]:
+            if len(item_value) != len(dimension_value):
                 continue
             relative_distance = sum(
                 (
@@ -5012,7 +5318,7 @@ def _allowed_match_single(
                 (abs(left - right) for left, right in zip(dimension_value, item_value)),
                 Decimal(0),
             )
-            numeric_dimensions.append((relative_distance, absolute_distance, item.sort_order, item.value))
+            numeric_dimensions.append((relative_distance, absolute_distance, sort_order, item_text))
         numeric_dimensions.sort()
         nearby_dimensions = [
             item
@@ -5034,7 +5340,8 @@ def _allowed_match_single(
             phrase_suggestions,
         )
     ranked = sorted(
-        ((SequenceMatcher(None, value_match_key(value), value_match_key(item.value)).ratio(), item.value) for item in allowed),
+        ((SequenceMatcher(None, value_match_key(value), item_key).ratio(), item_value)
+         for item_key, item_value in compiled["fuzzy"]),
         reverse=True,
     )
     return "", 0, "Значения нет в справочнике", [item for score, item in ranked if score >= 0.6][:3]
@@ -6002,6 +6309,7 @@ def process_product_donors(
     write_lock: threading.RLock | None = None,
     commit_result: bool = False,
     require_opened: bool = False,
+    release_transaction: bool = False,
 ) -> dict[str, Any]:
     donor_ids = list(dict.fromkeys(int(item) for item in donor_ids))
     if not donor_ids:
@@ -6036,9 +6344,12 @@ def process_product_donors(
     model = product.model
     product_name = product.name
     category_name = product.category_name or (template.category.full_path if template else "")
-    # Network I/O must not keep a SQLite transaction open. The immutable donor
-    # DTOs above contain everything the fetch phase needs.
-    db.rollback()
+    # Background workers own their short-lived session and may explicitly
+    # release its read transaction before network I/O. Interactive callers can
+    # have uncommitted imports in the same session, so rolling back by default
+    # would delete the product that is about to receive the result.
+    if release_transaction:
+        db.rollback()
     collected: list[dict[str, Any]] = []
     max_pages = max((donor.thread_count for donor in donors.values()), default=1)
     fetcher_context = nullcontext(fetcher) if fetcher is not None else DonorPageFetcher(max_pages=max_pages)
@@ -6656,6 +6967,12 @@ def serialize_product(product: AttributeProduct, detailed: bool = False) -> dict
                 "role": source.role,
                 "status": source.status,
                 "message": (source.parsed_data or {}).get("message", ""),
+                "metrics": dict((source.parsed_data or {}).get("analysis_metrics") or {}),
+                "page_cache": {
+                    "content_hash": clean_text((source.parsed_data or {}).get("page_content_hash")),
+                    "fetched_at": clean_text((source.parsed_data or {}).get("page_fetched_at")),
+                    "available": bool(clean_text((source.parsed_data or {}).get("page_evidence"))),
+                },
                 "attributes": [],
                 "attributes_found": len((source.parsed_data or {}).get("attributes") or []),
                 "mapped": int(((source.parsed_data or {}).get("processing_stats") or {}).get("mapped") or 0),
@@ -6871,12 +7188,29 @@ def delete_extra_product_value(db: Session, value: AttributeProductValue) -> Att
 
 
 def bulk_action(
-    db: Session,
-    batch: AttributeBatch,
-    action: str,
+    db_or_batch: Session | AttributeBatch,
+    batch_or_action: AttributeBatch | str,
+    action: str | None = None,
     minimum_confidence: int = BULK_CONFIDENCE,
     dash_reason: str = "",
 ) -> int:
+    # Preserve the original convenient API ``bulk_action(batch, action)`` while
+    # allowing background workers to pass an explicit session.
+    if isinstance(db_or_batch, AttributeBatch):
+        batch = db_or_batch
+        db = object_session(batch)
+        if db is None:
+            raise ValueError("Пакет не привязан к сессии")
+        if not isinstance(batch_or_action, str):
+            raise ValueError("Неизвестное массовое действие")
+        resolved_action = batch_or_action
+    else:
+        db = db_or_batch
+        if not isinstance(batch_or_action, AttributeBatch):
+            raise ValueError("Обработка не найдена")
+        batch = batch_or_action
+        resolved_action = clean_text(action)
+    action = resolved_action
     if action not in {"accept_high", "fill_dashes"}:
         raise ValueError("Неизвестное массовое действие")
     if not 0 <= minimum_confidence <= 100:
@@ -7031,7 +7365,13 @@ def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
         for product in batch.products:
             if ready_only and product.status != "ready":
                 continue
-            ordered = sorted((v for v in product.values if v.is_in_template), key=lambda value: (value.sort_order, value.id))
+            ordered = sorted(
+                (
+                    value for value in product.values
+                    if normalize_key(value.attribute_name) not in EXPORT_EXCLUDED_ATTRIBUTE_KEYS
+                ),
+                key=lambda value: (not value.is_in_template, value.sort_order, value.id),
+            )
             yield {"_MODEL_": product.model, "_ATTRIBUTES_": "\n".join(
                 f"{value.group_name}|{value.attribute_name}|{value.final_value}" for value in ordered
             )}
@@ -7041,7 +7381,9 @@ def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
     session.flush()
     product, value = AttributeProduct, AttributeProductValue
     statement = select(product.id, product.model, value.id, value.group_name, value.attribute_name, value.final_value)
-    statement = statement.outerjoin(value, (value.product_id == product.id) & (value.is_in_template.is_(True))).where(product.batch_id == batch.id)
+    statement = statement.outerjoin(value, value.product_id == product.id).where(
+        product.batch_id == batch.id,
+    )
     if ready_only:
         statement = statement.where(product.status == "ready")
     statement = statement.order_by(product.sort_order, product.id, value.is_in_template.desc(), value.sort_order, value.id)
@@ -7053,7 +7395,10 @@ def _batch_export_rows(batch: AttributeBatch, ready_only: bool):
                 if current_id is not None:
                     yield {"_MODEL_": model, "_ATTRIBUTES_": "\n".join(attributes)}
                 current_id, model, attributes = product_id, product_model, []
-            if value_id is not None:
+            if (
+                value_id is not None
+                and normalize_key(name) not in EXPORT_EXCLUDED_ATTRIBUTE_KEYS
+            ):
                 attributes.append(f"{group_name}|{name}|{final}")
         if current_id is not None:
             yield {"_MODEL_": model, "_ATTRIBUTES_": "\n".join(attributes)}
@@ -7088,7 +7433,10 @@ def export_batch_csv(batch: AttributeBatch, *, ready_only: bool = False) -> Path
         delete_after_commit(db, previous_path)
     batch.status = "completed"
     refresh_batch_summary(batch)
-    return path
+    # The final path is promoted atomically on transaction commit. Returning
+    # the staged file keeps synchronous callers (and the current HTTP request)
+    # able to read the generated export before that commit happens.
+    return temporary_path
 
 
 def resolve_export_path(batch: AttributeBatch) -> Path | None:
@@ -7096,7 +7444,8 @@ def resolve_export_path(batch: AttributeBatch) -> Path | None:
         return None
     path = Path(batch.export_path).resolve()
     root = (ATTRIBUTE_ASSISTANT_DIR / "exports").resolve()
-    return path if path.is_file() and root in path.parents else None
+    db = object_session(batch)
+    return path if root in path.parents and file_ready(db, path) else None
 
 
 def delete_batch_files(db: Session, batch: AttributeBatch) -> int:

@@ -8,7 +8,7 @@ import type {
 
 export const ALL_FILTER_VALUE = "all";
 export const PRODUCT_STATUS_VALUES = new Set(["ready", "conflict", "missing", "outside_template", "needs_review"]);
-export const ATTRIBUTE_STATUS_VALUES = new Set(["outside_template", "conflict", "suggested", "from_source", "unfilled"]);
+export const ATTRIBUTE_STATUS_VALUES = new Set(["review", "outside_template", "conflict", "suggested", "from_source", "unfilled"]);
 export function processingModeItems(
     settings: AttributeAssistantSettings | null,
 ): Array<{ label: string; value: AttributeProcessingMode }> {
@@ -206,6 +206,12 @@ export function matchesAttributeStatus(value: AttributeValue, status: string): b
     if (status === "outside_template") return !value.is_in_template;
     if (!value.is_in_template) return false;
     const effectiveStatus = attributeReviewStatus(value);
+    if (status === "review") {
+        const selectedValue = value.final_value.trim() || value.current_value.trim();
+        return ["conflict", "suggested", "unknown", "ambiguous", "missing"].includes(effectiveStatus)
+            || hasPendingProposal(value)
+            || !selectedValue;
+    }
     if (status === "conflict") return effectiveStatus === "conflict";
     if (status === "suggested") return (!value.current_value.trim() || isTechnicalDash(value.current_value))
         && (effectiveStatus === "suggested" || (effectiveStatus !== "conflict" && hasPendingProposal(value)));

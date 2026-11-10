@@ -32,6 +32,7 @@ data/*.db
 data/*.db-journal
 data/*.db-shm
 data/*.db-wal
+data/backups/
 /storage/
 
 # Logs
@@ -42,6 +43,7 @@ server-error*.log
 runtime/*
 !runtime/*.py
 /.codex-tmp/
+/.codex-tmp-assistant/
 
 # Local tunnel/runtime tools
 /tools/*

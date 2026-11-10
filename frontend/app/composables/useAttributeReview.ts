@@ -74,6 +74,7 @@ export function useAttributeReview(
     const unknownNewValues = ref<Record<string, string>>({});
     const donorRecommendations = ref<AttributeDonor[]>([]);
     const donorUrlOverrides = ref<Record<string, string>>({});
+    const autoRunAfterImport = ref(true);
     const historyItems = ref<AttributeHistoryItem[]>([]);
     const batchOperation = ref<AttributeBatchOperation | null>(null);
     const productPage = ref<AttributeProductPage | null>(null);
@@ -128,6 +129,7 @@ export function useAttributeReview(
         const count = (status: string) => values.filter((value) => matchesAttributeStatus(value, status)).length;
         return [
             { label: `Все атрибуты (${values.length})`, value: ALL_FILTER_VALUE },
+            { label: `Требуют решения (${count("review")})`, value: "review" },
             { label: `Вне шаблона (${count("outside_template")})`, value: "outside_template" },
             { label: `Конфликт (${count("conflict")})`, value: "conflict" },
             { label: `Предложения (${count("suggested")})`, value: "suggested" },
@@ -155,7 +157,7 @@ export function useAttributeReview(
     });
 
     const batchOperationRunning = computed(() =>
-        ["queued", "running"].includes(batchOperation.value?.status || ""),
+        ["queued", "running", "cancelling"].includes(batchOperation.value?.status || ""),
     );
 
     const batchChatGptLoading = computed(() =>
@@ -317,10 +319,22 @@ export function useAttributeReview(
             error.value = "Для создания товара выберите шаблон категории.";
             return;
         }
-        const batch = await run("url-import", () =>
-            api.importUrls(urls, selectedTemplateId.value, processingMode.value, "", urlPurpose.value),
+        const created = await run("url-import", () =>
+            api.importUrls(
+                urls,
+                selectedTemplateId.value,
+                processingMode.value,
+                "",
+                urlPurpose.value,
+                autoRunAfterImport.value && Boolean(chatGpt.value?.authenticated),
+            ),
         );
-        if (batch) await openBatch(batch.id);
+        if (created) {
+            await openBatch(created.batch.id);
+            batchOperation.value = created.operation;
+            scheduleBatchOperationPoll(created.operation.batch_id);
+            notify(`Фоновый импорт запущен для ${urls.length} ссылок`);
+        }
     }
 
     function clearBatchOperationPoll() {
@@ -350,15 +364,15 @@ export function useAttributeReview(
             if (disposed || selectedBatch.value?.id !== batchId) return;
             batchOperation.value = operation;
 
-            if (["queued", "running"].includes(operation.status)) {
+            if (["queued", "running", "cancelling"].includes(operation.status)) {
                 scheduleBatchOperationPoll(batchId);
                 return;
             }
 
             clearBatchOperationPoll();
             const justFinished = previous?.id === operation.id
-                && ["queued", "running"].includes(previous.status)
-                && ["completed", "failed"].includes(operation.status);
+                && ["queued", "running", "cancelling"].includes(previous.status)
+                && ["completed", "failed", "paused"].includes(operation.status);
             if (!justFinished) return;
 
             await refreshBatch();
@@ -371,7 +385,13 @@ export function useAttributeReview(
                 + " · успешно: " + operation.succeeded
                 + " · ошибок: " + operation.failed;
 
-            if (operation.status === "failed") {
+            if (operation.status === "paused") {
+                toast.add({
+                    title: "Массовая операция приостановлена",
+                    description: operation.error || summary,
+                    color: "warning",
+                });
+            } else if (operation.status === "failed") {
                 toast.add({
                     title: "Массовая операция остановлена",
                     description: operation.error || summary,
@@ -446,6 +466,54 @@ export function useAttributeReview(
         notify("ChatGPT-анализ запущен для " + result.total + " товаров");
     }
 
+    async function autoProcessAllProducts() {
+        if (!selectedBatch.value || batchOperationRunning.value) return;
+        if (!chatGpt.value?.authenticated) {
+            error.value = "Сначала подключите ChatGPT.";
+            return;
+        }
+        if (selectedBatch.value.input_mode !== "urls" && !selectedDonors.value.length) {
+            error.value = "Для CSV-обработки выберите хотя бы одного донора.";
+            return;
+        }
+        const total = selectedBatch.value.summary.products;
+        if (!await confirmAction({
+            title: `Автоматически обработать ${total} товаров?`,
+            description: "Сервис проверит доноров, отправит ChatGPT только нерешённые поля и примет безопасные предложения высокой уверенности.",
+            confirmLabel: "Запустить автообработку",
+        })) return;
+        const result = await run("auto-all", () => api.autoProcessBatch(
+            selectedBatch.value!.id,
+            selectedDonors.value,
+            currentProductOverrides(),
+        ));
+        if (!result) return;
+        batchOperation.value = result;
+        scheduleBatchOperationPoll(result.batch_id);
+        notify(`Автообработка запущена для ${total} товаров`);
+    }
+
+    async function pauseBatchOperation() {
+        if (!selectedBatch.value || !batchOperationRunning.value) return;
+        const result = await run("operation-pause", () =>
+            api.pauseBatchOperation(selectedBatch.value!.id),
+        );
+        if (!result) return;
+        batchOperation.value = result;
+        scheduleBatchOperationPoll(result.batch_id);
+    }
+
+    async function resumeBatchOperation(failedOnly = false) {
+        if (!selectedBatch.value || batchOperationRunning.value) return;
+        const result = await run(failedOnly ? "operation-retry" : "operation-resume", () =>
+            api.resumeBatchOperation(selectedBatch.value!.id, failedOnly),
+        );
+        if (!result) return;
+        batchOperation.value = result;
+        scheduleBatchOperationPoll(result.batch_id);
+        notify(failedOnly ? "Повтор ошибок запущен" : "Операция продолжена");
+    }
+
     async function openBatch(
         id: number,
         requestedProductId: number | null = null,
@@ -476,8 +544,8 @@ export function useAttributeReview(
 
         if (resetFilters && batchChanged) {
             productQuery.value = "";
-            productStatusFilter.value = ALL_FILTER_VALUE;
-            attributeStatusFilter.value = ALL_FILTER_VALUE;
+            productStatusFilter.value = "needs_review";
+            attributeStatusFilter.value = "review";
         }
 
         const batchSignal = requests.start("batch");
@@ -556,6 +624,24 @@ export function useAttributeReview(
     function changeProductPage(direction: number) {
         if (!productPage.value || loadingProducts.value) return;
         void loadProducts(Math.max(0, productPage.value.offset + direction * productPage.value.limit));
+    }
+
+    async function navigateReviewProduct(direction: -1 | 1) {
+        const page = productPage.value;
+        if (!page || loadingProducts.value) return;
+        const index = page.items.findIndex((item) => item.id === selectedProduct.value?.id);
+        const next = page.items[index + direction];
+        if (next) {
+            await openProduct(next.id, { resetAttributeFilter: false });
+            return;
+        }
+        const nextOffset = page.offset + direction * page.limit;
+        if (nextOffset < 0 || (direction > 0 && !page.has_more)) return;
+        await loadProducts(Math.max(0, nextOffset));
+        const target = direction > 0
+            ? productPage.value?.items[0]
+            : productPage.value?.items.at(-1);
+        if (target) await openProduct(target.id, { resetAttributeFilter: false });
     }
 
     async function removeBatch(batch: AttributeBatch) {
@@ -797,12 +883,12 @@ export function useAttributeReview(
         }
     }
 
-    async function restoreHistory(id: number) {
-        if (!selectedProduct.value || !await confirmAction({
+    async function restoreHistory(id: number, confirm = true) {
+        if (!selectedProduct.value || (confirm && !await confirmAction({
             title: "Восстановить состояние товара?",
             description: "Текущие решения по атрибутам будут заменены выбранным состоянием.",
             confirmLabel: "Восстановить",
-        })) return;
+        }))) return;
 
         const product = await run(
             "history-restore",
@@ -821,6 +907,7 @@ export function useAttributeReview(
         value: AttributeValue,
         action: "accept" | "reject" | "dash",
         manual = "",
+        advance = false,
     ) {
         const dashReason = action === "dash"
             ? await promptValue({
@@ -846,6 +933,25 @@ export function useAttributeReview(
         const index = selectedProduct.value.values.findIndex((item) => item.id === updated.value.id);
         if (index >= 0) selectedProduct.value.values[index] = updated.value;
         applyProductMutation(updated);
+        if (advance) await navigateReviewProduct(1);
+    }
+
+    async function acceptFirstPending() {
+        const value = filteredAttributeValues.value.find((item) =>
+            canConfirmConflictFinal(item) || hasPendingProposal(item),
+        );
+        if (!value) return;
+        await valueAction(
+            value,
+            "accept",
+            canConfirmConflictFinal(value) ? value.final_value : displayedProposal(value),
+            true,
+        );
+    }
+
+    async function restoreLatestHistory() {
+        const latest = historyItems.value[0];
+        if (latest) await restoreHistory(latest.id, false);
     }
 
     async function removeOutsideTemplateValue(value: AttributeValue) {
@@ -1018,12 +1124,14 @@ export function useAttributeReview(
         loadingProducts,
         productPage,
         changeProductPage,
+        navigateReviewProduct,
         loadProducts,
         selectedDonors,
         unknownSelections,
         unknownNewValues,
         donorRecommendations,
         donorUrlOverrides,
+        autoRunAfterImport,
         historyItems,
         batchOperation,
         productQuery,
@@ -1049,6 +1157,9 @@ export function useAttributeReview(
         loadBatchOperation,
         processAllProducts,
         askChatGptForAllProducts,
+        autoProcessAllProducts,
+        pauseBatchOperation,
+        resumeBatchOperation,
         openBatch,
         removeBatch,
         refreshProductHistory,
@@ -1061,6 +1172,8 @@ export function useAttributeReview(
         assignCurrentTemplate,
         exportReadyOnly,
         restoreHistory,
+        restoreLatestHistory,
+        acceptFirstPending,
         valueAction,
         removeOutsideTemplateValue,
         selectFinalValue,

@@ -35,6 +35,7 @@ import {
 import { ATTRIBUTE_ASSISTANT_UI } from "~/config/attribute-assistant";
 import { attributeAssistantService as attributeApi } from "~/services/attribute-assistant.service";
 import { errorMessage } from "~/utils/format";
+import type { AttributeSource } from "~/types/attribute-assistant";
 
 definePageMeta({
   title: "Атрибуты",
@@ -180,6 +181,18 @@ const recentBatches = computed(() =>
   workspace.value.batches.slice(0, ATTRIBUTE_ASSISTANT_UI.recentBatchCount),
 );
 
+function sourceMetricSummary(source: AttributeSource): string {
+  const metrics = source.metrics;
+  if (!metrics || (!metrics.preparation_ms && !metrics.request_ms)) return "";
+  const parts = [
+    metrics.preparation_ms !== undefined ? `страница ${(metrics.preparation_ms / 1000).toFixed(1)} с` : "",
+    metrics.request_ms !== undefined ? `AI ${(metrics.request_ms / 1000).toFixed(1)} с` : "",
+    metrics.bridge?.usage?.inputTokens !== undefined ? `${metrics.bridge.usage.inputTokens} входных токенов` : "",
+    metrics.bridge?.cache_hit ? "кеш AI" : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
 /**
  * Проверка товаров / batch / доноры / атрибуты.
  */
@@ -190,10 +203,12 @@ const {
   loadingProducts,
   productPage,
   changeProductPage,
+  navigateReviewProduct,
   selectedDonors,
   unknownSelections,
   unknownNewValues,
   donorUrlOverrides,
+  autoRunAfterImport,
   historyItems,
   batchOperation,
   productQuery,
@@ -215,6 +230,9 @@ const {
   createBatch,
   processAllProducts,
   askChatGptForAllProducts,
+  autoProcessAllProducts,
+  pauseBatchOperation,
+  resumeBatchOperation,
   openBatch,
   removeBatch,
   openProduct,
@@ -226,6 +244,8 @@ const {
   assignCurrentTemplate,
   exportReadyOnly,
   restoreHistory,
+  restoreLatestHistory,
+  acceptFirstPending,
   valueAction,
   removeOutsideTemplateValue,
   selectFinalValue,
@@ -277,10 +297,29 @@ onMounted(async () => {
   }
 });
 
+function handleReviewShortcut(event: KeyboardEvent) {
+  if (!event.altKey || tab.value !== "review") return;
+  const target = event.target as HTMLElement | null;
+  if (target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target?.tagName || "")) return;
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    void navigateReviewProduct(event.key === "ArrowDown" ? 1 : -1);
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    void acceptFirstPending();
+  } else if (event.key === "Backspace") {
+    event.preventDefault();
+    void restoreLatestHistory();
+  }
+}
+
+onMounted(() => window.addEventListener("keydown", handleReviewShortcut));
+
 /**
  * Очистка polling, debounce, listeners и timers.
  */
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", handleReviewShortcut);
   routeState.dispose();
   reviewState.dispose();
   templatesState.dispose();
@@ -381,6 +420,14 @@ onBeforeUnmount(() => {
               { label: 'Создать новые товары (черновики)', value: 'catalog' },
             ]" class="w-full" />
           </UFormField>
+
+          <UCheckbox
+            v-if="inputMode === 'urls'"
+            v-model="autoRunAfterImport"
+            label="Сразу обработать автоматически"
+            description="После импорта ChatGPT проверит только нерешённые поля. Повторно загружать страницу не потребуется."
+            :disabled="!chatGpt?.authenticated"
+          />
 
           <div class="aa-form-row">
             <UFormField label="Шаблон категории">
@@ -853,9 +900,14 @@ onBeforeUnmount(() => {
                 <h2>{{ selectedProduct.model }}</h2>
                 <p>{{ selectedProduct.name }}</p>
               </div>
-              <UBadge :color="selectedProduct.status === 'ready' ? 'success' : 'warning'" variant="subtle">
-                {{ selectedProduct.status === "ready" ? "Готов" : "Нужна проверка" }}
-              </UBadge>
+              <div class="aa-inline-actions">
+                <UButton color="neutral" variant="ghost" size="sm" icon="i-lucide-chevron-up" title="Предыдущий товар · Alt+↑" @click="navigateReviewProduct(-1)">Назад</UButton>
+                <UButton color="primary" variant="soft" size="sm" trailing-icon="i-lucide-chevron-down" title="Следующий товар · Alt+↓" @click="navigateReviewProduct(1)">Следующая проблема</UButton>
+                <UButton v-if="historyItems.length" color="neutral" variant="ghost" size="sm" icon="i-lucide-undo-2" title="Отменить последнее изменение · Alt+Backspace" @click="restoreLatestHistory">Отменить</UButton>
+                <UBadge :color="selectedProduct.status === 'ready' ? 'success' : 'warning'" variant="subtle">
+                  {{ selectedProduct.status === "ready" ? "Готов" : "Нужна проверка" }}
+                </UBadge>
+              </div>
             </div>
 
             <div class="aa-product-settings">
@@ -948,24 +1000,56 @@ onBeforeUnmount(() => {
                 <div class="aa-inline-actions">
                   <UButton
                     color="primary"
+                    icon="i-lucide-zap"
+                    :loading="isBusy('auto-all')"
+                    :disabled="batchOperationRunning || !chatGpt?.authenticated || (selectedBatch.input_mode !== 'urls' && !selectedDonors.length)"
+                    @click="autoProcessAllProducts"
+                  >Обработать автоматически</UButton>
+                  <UButton
+                    color="neutral"
+                    variant="soft"
                     icon="i-lucide-scan-search"
                     :loading="isBusy('process-all')"
                     :disabled="batchOperationRunning || !selectedDonors.length"
                     @click="processAllProducts"
                   >Найти и проверить (все товары)</UButton>
                   <UButton
-                    color="primary"
+                    color="neutral"
                     variant="soft"
                     icon="i-lucide-sparkles"
                     :loading="batchChatGptLoading"
                     :disabled="batchChatGptLoading || batchOperationRunning || !batchOperation || !chatGpt?.authenticated"
                     @click="askChatGptForAllProducts"
                   >Спросить ChatGPT (все товары)</UButton>
+                  <UButton
+                    v-if="batchOperationRunning"
+                    color="warning"
+                    variant="soft"
+                    icon="i-lucide-pause"
+                    :loading="isBusy('operation-pause') || batchOperation?.status === 'cancelling'"
+                    @click="pauseBatchOperation"
+                  >Приостановить</UButton>
+                  <UButton
+                    v-else-if="batchOperation?.status === 'paused'"
+                    color="primary"
+                    variant="soft"
+                    icon="i-lucide-play"
+                    :loading="isBusy('operation-resume')"
+                    @click="resumeBatchOperation(false)"
+                  >Продолжить</UButton>
+                  <UButton
+                    v-if="!batchOperationRunning && batchOperation?.failed"
+                    color="warning"
+                    variant="soft"
+                    icon="i-lucide-refresh-cw"
+                    :loading="isBusy('operation-retry')"
+                    @click="resumeBatchOperation(true)"
+                  >Повторить ошибки</UButton>
                 </div>
               </div>
-              <div v-if="batchOperation?.kind === 'donors' && batchOperation.status !== 'idle'" class="aa-batch-operation-progress">
+              <div v-if="batchOperation && batchOperation.status !== 'idle'" class="aa-batch-operation-progress">
                 <div>
-                  <strong>{{ batchOperationRunning ? "Поиск и проверка всех товаров" : "Последняя массовая операция" }}</strong>
+                  <strong>{{ batchOperationRunning ? (batchOperation.kind === 'url_import' ? "Импорт страниц по ссылкам" : batchOperation.kind === 'auto' ? "Автоматическая обработка" : batchOperation.kind === 'chatgpt' ? "Анализ ChatGPT" : "Поиск и проверка всех товаров") : "Последняя массовая операция" }}</strong>
                   <span>
                     {{ batchOperation.processed }} из {{ batchOperation.total }}
                     · успешно {{ batchOperation.succeeded }}
@@ -975,11 +1059,8 @@ onBeforeUnmount(() => {
                 </div>
                 <UProgress :model-value="batchOperation.percent" color="primary" size="sm" />
                 <small v-if="batchOperation.current_product">Сейчас: {{ batchOperation.current_product }}</small>
-                <small v-else-if="batchOperation.status === 'failed'" class="aa-operation-error">{{ batchOperation.error || batchOperation.errors[0]?.error }}</small>
+                <small v-else-if="['failed', 'paused'].includes(batchOperation.status)" class="aa-operation-error">{{ batchOperation.error || batchOperation.errors[0]?.error }}</small>
               </div>
-              <p v-else-if="batchOperation?.kind === 'chatgpt' && batchOperation.status === 'failed'" class="aa-operation-error" role="alert">
-                {{ batchOperation.error || batchOperation.errors[0]?.error || "Не удалось выполнить анализ ChatGPT" }}
-              </p>
             </div>
 
 
@@ -998,6 +1079,7 @@ onBeforeUnmount(() => {
                     <em :class="['aa-source-kind', `is-${sourceKind(source)}`]">{{ sourceKindLabel(source) }}</em>
                   </span>
                   <small :title="source.message || source.role">{{ source.message || source.role }}</small>
+                  <small v-if="sourceMetricSummary(source)" class="aa-muted">{{ sourceMetricSummary(source) }}</small>
                 </span>
                 <b>{{ sourceStatusText(source.status, source.attributes_found, source.mapped, source.ambiguous, source.unknown, source.already_filled) }}</b>
               </ULink>
@@ -1137,8 +1219,9 @@ onBeforeUnmount(() => {
                     variant="soft"
                     icon="i-lucide-check"
                     :loading="isBusy(`value-${value.id}`)"
-                    @click="valueAction(value, 'accept', displayedProposal(value))"
-                  >Принять</UButton>
+                    title="Принять и перейти дальше · Alt+Enter"
+                    @click="valueAction(value, 'accept', displayedProposal(value), true)"
+                  >Принять и дальше</UButton>
                   <UButton
                     v-if="hasPendingProposal(value)"
                     color="error"

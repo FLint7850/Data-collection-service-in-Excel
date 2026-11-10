@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 
 from config import ATTRIBUTE_ASSISTANT_DIR
@@ -21,6 +20,7 @@ from models import AttributeProduct, AttributeProductSource, Donor
 from services.attribute_programs import is_program_list, match_programs, program_dictionary
 from services.attribute_files import delete_after_commit, stage_text
 from services.attribute_settings import StaleProductError
+from services.attribute_text import product_search_text
 from services.attribute_assistant import (
     BOOLEAN_FALSE_KEYS,
     _linear_scale_was_inferred,
@@ -37,7 +37,9 @@ from services.attribute_assistant import (
     _recalculate_candidate_state,
     _dimension_component_axis,
     _assemble_dimension_value,
+    attach_page_snapshot,
     clean_text,
+    compact_product_page_text,
     fetch_donor_product_html,
     fetch_public_html,
     normalize_key,
@@ -48,7 +50,6 @@ from services.attribute_assistant import (
     parse_product_html,
     parse_product_html_for_donor,
     _parsed_product_matches_model,
-    _remove_ui_noise,
     RELATED_MODEL_URL_REASON,
     product_template,
     refresh_batch_summary,
@@ -59,7 +60,7 @@ from services.attribute_assistant import (
 )
 
 
-ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v21-production"
+ATTRIBUTE_AI_PROMPT_VERSION = "attribute-assistant-chatgpt-v22-product-identity"
 ATTRIBUTE_AI_MAX_PAGE_CHARS = 12_000
 ATTRIBUTE_AI_MAX_RESPONSE_CHARS = 2_000_000
 ATTRIBUTE_AI_MAX_SOURCE_HINTS_PER_FIELD = 3
@@ -72,6 +73,22 @@ ATTRIBUTE_AI_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "identity": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "model": {"type": "string"},
+                        "brand": {"type": "string"},
+                        "evidence": {"type": "string"},
+                        "confidence": {"type": "integer", "minimum": 70, "maximum": 100},
+                    },
+                    "required": ["model", "brand", "evidence", "confidence"],
+                },
+                {"type": "null"},
+            ],
+        },
         "attributes": {
             "type": "array",
             "items": {
@@ -109,7 +126,7 @@ ATTRIBUTE_AI_OUTPUT_SCHEMA: dict[str, Any] = {
         },
         "warnings": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["attributes", "warnings"],
+    "required": ["identity", "attributes", "warnings"],
 }
 
 UNIVERSAL_ATTRIBUTE_PROMPT = (
@@ -125,26 +142,70 @@ _ATTRIBUTE_PROMPT_SUFFIX = UNIVERSAL_ATTRIBUTE_PROMPT[_PROGRAM_RULES_END:].strip
 
 
 def _compact_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
-    _remove_ui_noise(soup)
-    for node in soup.select("script, style, svg, canvas, noscript, form, nav, footer, iframe"):
-        node.decompose()
-    # Repeated long paragraphs are often duplicated feature popups. Keep short
-    # lines, especially repeated measurements belonging to different axes.
-    seen_paragraphs: set[str] = set()
-    lines: list[str] = []
-    previous = ""
-    for raw_line in soup.get_text("\n", strip=True).splitlines():
-        line = clean_text(raw_line)
-        if not line or line == previous:
-            continue
-        previous = line
-        if len(line) >= 120:
-            if line in seen_paragraphs:
-                continue
-            seen_paragraphs.add(line)
-        lines.append(line)
-    return "\n".join(lines)
+    """Compatibility wrapper used by tests and debug tooling."""
+
+    return compact_product_page_text(html)
+
+
+def _open_template_fields(product: AttributeProduct) -> list[Any]:
+    """Return fields which still benefit from AI instead of confirmed values."""
+
+    template = product_template(product)
+    if template is None:
+        return []
+    values = {
+        value.template_field_id: value
+        for value in product.values
+        if value.template_field_id is not None
+    }
+    return [
+        field
+        for field in template.fields
+        if (target := values.get(field.id)) is None or not _has_confirmed_decision(target)
+    ]
+
+
+def _scoped_source_facts(
+    product: AttributeProduct,
+    parsed: dict[str, Any],
+    fields: list[Any],
+) -> list[dict[str, Any]]:
+    """Keep parser facts that can help at least one unresolved field."""
+
+    facts = parsed_attribute_facts(parsed)
+    if not fields or not facts:
+        return []
+    scoped = [
+        fact
+        for fact in facts
+        if max((_mapping_score(fact["name"], field) for field in fields), default=0.0) >= 0.42
+    ]
+    return scoped or facts
+
+
+def _focused_visible_text(visible: str, fields: list[Any], limit: int) -> str:
+    """Bound free-form evidence around unresolved fields and product identity."""
+
+    if len(visible) <= limit:
+        return visible
+    tokens = {
+        token
+        for field in fields
+        for name in (field.name, *list(field.synonyms or []))
+        for token in _name_tokens(name)
+        if len(token) >= 3
+    }
+    lines = visible.splitlines()
+    selected_indexes = set(range(min(24, len(lines))))
+    for index, line in enumerate(lines):
+        normalized = normalize_key(line)
+        if tokens and any(token in normalized for token in tokens):
+            selected_indexes.update({max(0, index - 1), index, min(len(lines) - 1, index + 1)})
+    selected: list[str] = []
+    for index in sorted(selected_indexes):
+        if lines[index] not in selected:
+            selected.append(lines[index])
+    return ("\n".join(selected) or visible)[:limit]
 
 
 def _page_evidence(visible_text: str, parsed: dict[str, Any]) -> str:
@@ -231,6 +292,7 @@ def _template_context(
     product: AttributeProduct,
     parsed: dict[str, Any],
     evidence: str,
+    fields: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     values_by_field = {
         item.template_field_id: item
@@ -243,7 +305,7 @@ def _template_context(
         return result
     facts = parsed_attribute_facts(parsed)
     source_ids = {(normalize_key(fact["name"]), dictionary_value_key(fact["value"])): fact["source_id"] for fact in facts}
-    for field in template.fields:
+    for field in (template.fields if fields is None else fields):
         target = values_by_field.get(field.id)
         current = exact_value_key(target.current_value if target else "")
         proposed = exact_value_key(target.proposed_value if target else "")
@@ -274,7 +336,20 @@ def parsed_attribute_facts(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _template_field_catalog(product: AttributeProduct) -> list[dict[str, Any]]:
+def page_snapshot(parsed: dict[str, Any]) -> dict[str, str]:
+    """Small reusable subset stored with the validated AI source."""
+
+    return {
+        key: clean_text(parsed.get(key)) if key != "page_evidence" else str(parsed.get(key) or "")
+        for key in ("page_evidence", "page_content_hash", "page_fetched_at")
+        if parsed.get(key)
+    }
+
+
+def _template_field_catalog(
+    product: AttributeProduct,
+    fields: list[Any] | None = None,
+) -> list[dict[str, Any]]:
     template = product_template(product)
     if template is None:
         return []
@@ -286,7 +361,7 @@ def _template_field_catalog(product: AttributeProduct) -> list[dict[str, Any]]:
             "value_type": field.value_type,
             **({"synonyms": list(field.synonyms)} if field.synonyms else {}),
         }
-        for field in template.fields
+        for field in (template.fields if fields is None else fields)
     ]
 
 
@@ -307,19 +382,39 @@ def build_product_analysis_request(
     parsed: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     parsed = parsed or {}
-    visible = _compact_visible_text(html)
+    cached_visible = parsed.get("page_evidence")
+    visible = _compact_visible_text(html) if html else (
+        cached_visible if isinstance(cached_visible, str) else ""
+    )
+    open_fields = _open_template_fields(product)
     truncated = len(visible) > ATTRIBUTE_AI_MAX_PAGE_CHARS
-    visible = visible[:ATTRIBUTE_AI_MAX_PAGE_CHARS]
+    visible = _focused_visible_text(visible, open_fields, ATTRIBUTE_AI_MAX_PAGE_CHARS)
+    source_facts = _scoped_source_facts(product, parsed, open_fields)
+    scoped_parsed = {
+        **parsed,
+        "attributes": [
+            {"name": fact["name"], "value": fact["value"]}
+            for fact in source_facts
+        ],
+    }
     description = clean_text(parsed.get("description"))
     prompt_description = description
     if description and exact_value_key(description) in exact_value_key(visible):
         prompt_description = ""
     evidence = (
-        _page_evidence(visible, parsed)
+        _page_evidence(visible, scoped_parsed)
         if html or parsed.get("attributes") or description
         else ""
     )
     template = product_template(product)
+    # URL imports preserve the title from the page supplied by the user.  A
+    # later donor page may have a different (or overly generic) title, so it
+    # must not silently become the source of product identity.
+    identity_source_name = clean_text(product.name) or clean_text(parsed.get("name"))
+    infer_identity = (
+        clean_text(getattr(getattr(product, "batch", None), "input_mode", "")) == "urls"
+        and bool(identity_source_name)
+    )
     context = {
         "product": {
             "name": product.name,
@@ -328,8 +423,15 @@ def build_product_analysis_request(
             "category": product.category_name or (template.category.full_path if template else ""),
         },
         "official_product_url": source_url,
-        "parser_attributes": parsed_attribute_facts(parsed),
-        "template_fields": _template_context(product, parsed, evidence),
+        **({
+            "identity_from_name": {
+                "name": identity_source_name,
+                "current_model": product.model,
+                "current_brand": product.brand,
+            }
+        } if infer_identity else {}),
+        "parser_attributes": source_facts,
+        "template_fields": _template_context(product, scoped_parsed, evidence, open_fields),
         **({"product_description": prompt_description} if prompt_description else {}),
         "page_evidence": visible,
         **({"page_evidence_truncated": True} if truncated else {}),
@@ -337,7 +439,7 @@ def build_product_analysis_request(
     # Put the reusable rubric and template before per-product data. Requests
     # for products using one template now share a stable prompt-cache prefix.
     instructions = _analysis_instructions(product) + "\n\nАКТУАЛЬНЫЙ ШАБЛОН:\n" + json.dumps(
-        {"template_field_catalog": _template_field_catalog(product)},
+        {"template_field_catalog": _template_field_catalog(product, open_fields)},
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -355,6 +457,8 @@ def build_product_analysis_request(
             "prompt_version": ATTRIBUTE_AI_PROMPT_VERSION,
             "product_id": str(product.id or ""),
         },
+        # Private validation context. The bridge allow-list ignores this key.
+        "_source_facts": source_facts,
     }, evidence
 
 
@@ -524,18 +628,86 @@ def _clear_replaceable_chatgpt_evidence(product: AttributeProduct) -> None:
         _recalculate_candidate_state(product, target)
 
 
+def _validated_product_identity(
+    product: AttributeProduct,
+    raw_identity: object,
+    identity_source_name: str,
+) -> tuple[dict[str, Any], list[str]]:
+    """Accept only identity text that is quoted directly from the product name."""
+
+    if clean_text(getattr(getattr(product, "batch", None), "input_mode", "")) != "urls":
+        return {}, []
+    if raw_identity is None:
+        return {}, []
+    if not isinstance(raw_identity, dict):
+        return {}, ["Модель и производитель ChatGPT отклонены: некорректный формат"]
+
+    source_name = clean_text(identity_source_name) or clean_text(product.name)
+    model = clean_text(raw_identity.get("model"))
+    brand = clean_text(raw_identity.get("brand"))
+    evidence = clean_text(raw_identity.get("evidence"))
+    raw_confidence = raw_identity.get("confidence")
+    confidence = (
+        raw_confidence
+        if isinstance(raw_confidence, int) and not isinstance(raw_confidence, bool)
+        else 0
+    )
+
+    if not model and not brand:
+        return {}, []
+    if not source_name:
+        return {}, ["Модель и производитель ChatGPT отклонены: нет названия-источника"]
+    if not evidence:
+        return {}, ["Модель и производитель ChatGPT отклонены: нет цитаты из названия"]
+    if len(evidence) > 1000:
+        return {}, ["Модель и производитель ChatGPT отклонены: слишком длинная цитата"]
+    if confidence < 70 or confidence > 100:
+        return {}, ["Модель и производитель ChatGPT отклонены: некорректная уверенность"]
+    if not _evidence_present(evidence, source_name, exact=True):
+        return {}, ["Модель и производитель ChatGPT отклонены: цитата не найдена в названии"]
+    accepted: dict[str, str] = {}
+    warnings: list[str] = []
+    for field, value, label in (
+        ("model", model, "модель"),
+        ("brand", brand, "производитель"),
+    ):
+        if not value:
+            continue
+        if len(value) > 255 or "\x00" in value:
+            warnings.append(f"Значение «{label}» ChatGPT отклонено: недопустимый формат")
+            continue
+        if not _evidence_present(value, evidence, exact=True):
+            warnings.append(f"Значение «{label}» ChatGPT отклонено: отсутствует в цитате")
+            continue
+        accepted[field] = value
+    if not accepted:
+        return {}, warnings or ["ChatGPT не подтвердил модель и производителя названием"]
+    return {
+        **accepted,
+        "evidence": evidence,
+        "confidence": confidence,
+    }, warnings
+
+
 def validate_analysis(
     product: AttributeProduct,
     response: object,
     *,
     page_evidence: str = "",
     source_facts: list[dict[str, Any]] | None = None,
+    identity_source_name: str = "",
 ) -> dict[str, Any]:
     raw = _parse_json_response(response)
     attributes = raw.get("attributes")
     if not isinstance(attributes, list):
         raise ValueError("Ответ ChatGPT должен содержать массив attributes. Повторите анализ")
     warnings = [clean_text(item) for item in raw.get("warnings") or [] if clean_text(item)]
+    identity, identity_warnings = _validated_product_identity(
+        product,
+        raw.get("identity"),
+        identity_source_name,
+    )
+    warnings.extend(identity_warnings)
     template = product_template(product)
     if template is None:
         raise ValueError("Для товара не выбран шаблон атрибутов")
@@ -754,6 +926,7 @@ def validate_analysis(
                               "suggestions": alternatives, "reason": reason, "evidence": evidence})
 
     return {
+        **({"identity": identity} if identity else {}),
         "observed_attributes": observed,
         "unmatched_attributes": unmatched,
         "suggestions": suggestions,
@@ -792,6 +965,24 @@ def apply_analysis(
     refresh_summary: bool = True,
 ) -> int:
     _clear_replaceable_chatgpt_evidence(product)
+    identity = dict(analysis.get("identity") or {})
+    if clean_text(identity.get("model")):
+        identity["model"] = clean_text(identity["model"]).upper()
+    identity_changed = 0
+    for field in ("model", "brand"):
+        proposed = clean_text(identity.get(field))
+        if field == "model":
+            proposed = proposed.upper()
+        if proposed and proposed != clean_text(getattr(product, field, "")):
+            setattr(product, field, proposed)
+            identity_changed += 1
+    if identity_changed:
+        product.search_text = product_search_text(
+            product.model,
+            product.name,
+            product.brand,
+            product.category_name,
+        )
     values = {
         item.template_field_id: item
         for item in product.values
@@ -899,10 +1090,16 @@ def apply_analysis(
     chatgpt_source.role = "chatgpt"
     chatgpt_source.status = "parsed"
     chatgpt_source.parsed_data = {
-        "message": f"ChatGPT: найдено {len(observed_attributes)}, применено {changed}",
+        "message": (
+            f"ChatGPT: найдено характеристик {len(observed_attributes)}, применено {changed}; "
+            f"реквизитов изменено {identity_changed}"
+        ),
+        **({"identity": identity} if identity else {}),
+        **dict(analysis.get("page_snapshot") or {}),
         "attributes": observed_attributes,
         "processing_stats": {
             "mapped": changed,
+            "identity_changed": identity_changed,
             "unknown": unmatched_count,
             "ambiguous": max(0, suggestions_count - changed),
             "already_filled": 0,
@@ -914,7 +1111,7 @@ def apply_analysis(
     refresh_product_status(product)
     if refresh_summary:
         refresh_batch_summary(product.batch)
-    return changed
+    return changed + identity_changed
 
 
 def _upsert_source(
@@ -1128,7 +1325,10 @@ def prepare_product_source(
 
     # Old snapshots without raw HTML and without a stored description are
     # downloaded once more; otherwise ChatGPT could never inspect their prose.
-    if stored_parsed.get("attributes") and clean_text(stored_parsed.get("description")):
+    if stored_parsed.get("attributes") and (
+        clean_text(stored_parsed.get("description"))
+        or clean_text(stored_parsed.get("page_evidence"))
+    ):
         return source_url, stored_html, stored_parsed, resolved_by
 
     html = stored_html
@@ -1148,6 +1348,7 @@ def prepare_product_source(
             if donor
             else parse_product_html(downloaded_html, final_url)
         )
+        attach_page_snapshot(downloaded_parsed, downloaded_html)
         if (
             donor is not None
             and not user_supplied_url
@@ -1258,8 +1459,10 @@ def analyze_product_with_chatgpt(
         product,
         response.get("text", ""),
         page_evidence=page_evidence,
-        source_facts=parsed_attribute_facts(parsed),
+        source_facts=list(analysis_request.get("_source_facts") or []),
+        identity_source_name=clean_text(product.name) or clean_text(parsed.get("name")),
     )
+    analysis["page_snapshot"] = page_snapshot(parsed)
     record_analysis_metrics(
         analysis,
         len(analysis_request["instructions"]) + len(analysis_request["input"]),

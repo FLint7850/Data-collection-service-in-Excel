@@ -387,6 +387,32 @@ class AttributeBatch(Base):
     )
 
 
+class AttributeBatchOperation(Base):
+    """Persisted background work so a container restart never hides progress."""
+
+    __tablename__ = "attribute_batch_operations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("attribute_batches.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    state: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_attribute_batch_operations_batch_updated", "batch_id", "updated_at"),
+        Index("ix_attribute_batch_operations_status", "status"),
+    )
+
+
 class AttributeProduct(Base):
     __tablename__ = "attribute_products"
 

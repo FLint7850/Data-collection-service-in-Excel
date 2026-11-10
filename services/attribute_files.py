@@ -56,8 +56,16 @@ def delete_after_commit(
         if resolved != resolved_root and resolved_root not in resolved.parents:
             return
     pending = db.info.setdefault(_DELETES_KEY, [])
-    if resolved not in pending:
-        pending.append(resolved)
+    if any(original == resolved for original, _staged in pending):
+        return
+    staged = resolved.with_name(f".{resolved.name}.{uuid.uuid4().hex}.deleted")
+    try:
+        if resolved.exists():
+            os.replace(resolved, staged)
+    except OSError:
+        # A concurrently removed file is already in the desired state.
+        staged = resolved
+    pending.append((resolved, staged))
 
 
 def file_ready(db: Session | None, path: Path | str) -> bool:
@@ -89,8 +97,8 @@ def _promote_attribute_files(db: Session) -> None:
 
 @event.listens_for(Session, "after_commit")
 def _finish_attribute_files(db: Session) -> None:
-    for path in db.info.pop(_DELETES_KEY, []):
-        _remove(path)
+    for original, staged in db.info.pop(_DELETES_KEY, []):
+        _remove(staged if staged != original else original)
     db.info.pop(_WRITES_KEY, None)
     db.info.pop(_PROMOTED_KEY, None)
 
@@ -101,4 +109,9 @@ def _rollback_attribute_files(db: Session) -> None:
         _remove(temporary)
     for destination in db.info.pop(_PROMOTED_KEY, []):
         _remove(destination)
-    db.info.pop(_DELETES_KEY, None)
+    for original, staged in reversed(db.info.pop(_DELETES_KEY, [])):
+        if staged != original and staged.exists() and not original.exists():
+            try:
+                os.replace(staged, original)
+            except OSError:
+                pass
